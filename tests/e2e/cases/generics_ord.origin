@@ -1,0 +1,14 @@
+use std::io;
+
+fn max2[T: Ord](a: T, b: T) -> T {
+    match a.cmp(b) {
+        Ordering::Less => b,
+        Ordering::Equal => a,
+        Ordering::Greater => a,
+    }
+}
+
+fn main() {
+    io::println(max2(3, 7).to_str());
+    io::println(max2("apple", "banana"));
+}

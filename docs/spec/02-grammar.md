@@ -217,6 +217,12 @@ a binding. This is a name-resolution decision, not a parsing one. A pattern that
 a unit variant unintentionally is a common bug, so the compiler MUST emit a warning when
 a binding pattern's name differs from an in-scope unit variant only by case.
 
+In Origin 0.1 this rule can only fire for a `const`: an enum variant is never in scope
+unqualified, because there are no glob imports (§07) and a variant is always written
+`Enum::Variant`. The unit-variant half of the rule becomes reachable when glob imports
+land (Phase 7), and is specified now so that adding them does not silently change the
+meaning of existing patterns.
+
 ## Parser restrictions
 
 Two restrictions keep the grammar unambiguous. Both are REJECTED with a diagnostic that

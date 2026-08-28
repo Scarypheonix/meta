@@ -1,0 +1,9 @@
+use std::io;
+
+fn is_even(n: i64) -> bool { if n == 0 { true } else { is_odd(n - 1) } }
+fn is_odd(n: i64) -> bool { if n == 0 { false } else { is_even(n - 1) } }
+
+fn main() {
+    io::println(is_even(10).to_str());
+    io::println(is_odd(10).to_str());
+}

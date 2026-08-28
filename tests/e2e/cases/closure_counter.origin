@@ -1,0 +1,16 @@
+use std::io;
+
+struct Cell { mut value: i64 }
+
+fn make_counter() -> fn() -> i64 {
+    let cell = Cell { value: 0 };
+    || { cell.value = cell.value + 1; cell.value }
+}
+
+fn main() {
+    let c = make_counter();
+    let d = make_counter();
+    io::println(c().to_str());
+    io::println(c().to_str());
+    io::println(d().to_str());
+}

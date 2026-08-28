@@ -4,8 +4,8 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Current phase: 1 — tree-walking interpreter. Phase 0 is complete** (see
-`docs/phases/0-complete.md`).
+**Current phase: 2 — type system. Phases 0 and 1 are complete** (see
+`docs/phases/`).
 
 ---
 
@@ -13,6 +13,10 @@ for how to work in this repository. The project origin prompt is superseded by i
 
 ```bash
 ./check              # THE gate: gofmt + go vet + go build + full test suite
+go run ./cmd/originc run  path.origin     # run a program
+go run ./cmd/originc check path.origin    # diagnostics only
+go run ./cmd/originc dump-ast path.origin # print the syntax tree
+go test -run xxx -fuzz FuzzParse ./tests/fuzz/   # fuzz the parser
 ./check fmt          # formatting only
 ./check test         # tests only
 gofmt -w cmd internal tests
@@ -28,7 +32,15 @@ either is breached.
 
 ```
 cmd/originc/          stage0 compiler driver (Go)
-internal/             compiler packages (Go) — see "Module boundaries"
+internal/source/      file identity, byte offset -> line/column (one implementation)
+internal/diag/        spans, codes, diagnostic rendering
+internal/lex/         tokens
+internal/ast/         the AST (sealed interface, ADR-0015) and its dumper
+internal/parse/       the grammar, with multi-error recovery
+internal/resolve/     name resolution, closure capture; owns the name side tables
+internal/interp/      tree-walking interpreter (Phase 1)
+internal/prelude/     Option, Result, Ordering — written in Origin
+internal/driver/      pass ordering and error suppression
 tests/conformance/    type-system accept/reject corpus, one file per case
 tests/e2e/            programs + exact expected stdout/stderr/exit
 tests/docs/           documentation invariants (ADR numbering, code registry, lints)
@@ -139,17 +151,24 @@ This project outlasts any single context window.
 
 ## Status
 
-**In flight:** nothing. Phase 0 closed.
+**In flight:** nothing. Phase 1 closed.
 
-**Known-broken:** nothing.
+**Known-broken:** nothing. Three known *incomplete* things, all recorded in
+`docs/deferred.md` against Phase 2: no tuple element access (`t.0`), integer arithmetic
+is 64-bit only, and field mutability is checked when it happens rather than at compile
+time. Each stops rather than producing a wrong answer.
 
-**Next action:** Phase 1 — lexer with source positions, then the Pratt parser with
-error recovery (multiple syntax errors per pass), then the AST, name resolution with
-lexical scoping and closures, then the tree-walking interpreter. Phase 1 exits when the
-interpreter runs recursive fibonacci, a closure-based counter, a linked list and mutual
-recursion, and parser errors point at the right line and column. The four programs are
-already written with their expected output in `docs/spec/10-examples.md` §2–§5 and
-seeded under `tests/e2e/cases/`.
+**Next action:** Phase 2 — the type system. In order: a shared type representation;
+Hindley–Milner inference with mandatory signatures and the value restriction (ADR-0009);
+algebraic data types and Maranget exhaustiveness (spec §05); traits with associated
+types and coherence (spec §06, ADR-0011); generics with monomorphization (ADR-0010); and
+the module system (spec §07), which Phase 1 stubbed at one file plus the prelude.
+
+Phase 2 exits when `tests/conformance/` has 200+ cases with correct verdicts and type
+errors name the source span and explain the conflict in plain language. The harness is
+already wired: add the code to `implementedCodes` in
+`tests/conformance/conformance_test.go` in the same commit that starts emitting it, and
+the three skipped cases turn themselves on.
 
 **Awaiting the user:** nothing blocking. Two things only the target machine can
 confirm, both at Phase 5: that a compiled Mach-O binary runs, and that `lldb` breaks on

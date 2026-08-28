@@ -32,6 +32,10 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Doc comment capture | needed by LSP hover, not before | Phase 8 |
 | Effect checking for `match` guards | closes the one "unspecified" clause in the spec (§05) | Phase 4 |
 | Cycle detection in structural `==` | a cyclic graph makes `==` diverge (§04) | Phase 7 |
+| Tuple element access (`t.0`) | found in Phase 1: the grammar's `.` takes an identifier, so a tuple can only be read by pattern. Needs either integer field syntax or a lexer rule for `.0` | Phase 2 |
+| Float formatting in `to_str` | the spec does not fix a rendering; the interpreter uses the shortest round-tripping form and the e2e suite avoids depending on it | Phase 7 |
+| Per-width integer overflow | Phase 1 is dynamically typed and computes every integer at 64 bits; `255u8 + 1` needs the type checker to know the width | Phase 2 |
+| Static field-mutability check | assigning a non-`mut` field is caught when it happens rather than at compile time, because Phase 1 has no types | Phase 2 |
 
 ## Runtime
 

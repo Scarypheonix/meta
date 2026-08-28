@@ -1,0 +1,9 @@
+// EXPECT: reject E0002
+// spec: 02-grammar.md — comparison operators are non-associative.
+
+fn main() {
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    let ok = a < b < c;
+}

@@ -1,0 +1,355 @@
+package interp
+
+import (
+	"fmt"
+
+	"github.com/scarypheonix/meta/internal/ast"
+	"github.com/scarypheonix/meta/internal/diag"
+	"github.com/scarypheonix/meta/internal/resolve"
+)
+
+func (in *Interp) evalCall(c *ast.Call) (Value, ctrl) {
+	// A call to a tuple variant constructs it; anything else evaluates the callee first,
+	// then the arguments left to right (spec/04-expressions.md).
+	if pe, ok := c.Fn.(*ast.PathExpr); ok {
+		if ref, found := in.res.Ref(pe.NodeID()); found && ref.Kind == resolve.Variant {
+			return in.constructVariant(c, ref)
+		}
+	}
+
+	callee, ctl := in.evalExpr(c.Fn)
+	if ctl.stops() {
+		return Unit{}, ctl
+	}
+	args := make([]Value, 0, len(c.Args))
+	for _, a := range c.Args {
+		v, ac := in.evalExpr(a)
+		if ac.stops() {
+			return Unit{}, ac
+		}
+		args = append(args, v)
+	}
+
+	switch f := callee.(type) {
+	case *Closure:
+		return in.callClosure(f, args, c.Span()), normal
+	case *Builtin:
+		return in.callBuiltin(f.Name, args, c), normal
+	}
+	in.trap(c.Fn.Span(), "%s is not callable", TypeName(callee))
+	return Unit{}, normal
+}
+
+func (in *Interp) constructVariant(c *ast.Call, ref resolve.Ref) (Value, ctrl) {
+	if ref.Variant.Kind != ast.TupleVariant {
+		in.trap(c.Span(), "`%s` takes no arguments", ref.Variant.Name.Name)
+	}
+	if len(c.Args) != len(ref.Variant.Types) {
+		in.trap(c.Span(), "`%s` takes %d value(s) but %d were supplied",
+			ref.Variant.Name.Name, len(ref.Variant.Types), len(c.Args))
+	}
+	vals := make([]Value, 0, len(c.Args))
+	for _, a := range c.Args {
+		v, ac := in.evalExpr(a)
+		if ac.stops() {
+			return Unit{}, ac
+		}
+		vals = append(vals, v)
+	}
+	return &Enum{Def: ref.Enum, Variant: ref.Variant, Vals: vals}, normal
+}
+
+func (in *Interp) evalMethodCall(m *ast.MethodCall) (Value, ctrl) {
+	recv, c := in.evalExpr(m.Recv)
+	if c.stops() {
+		return Unit{}, c
+	}
+	args := make([]Value, 0, len(m.Args))
+	for _, a := range m.Args {
+		v, ac := in.evalExpr(a)
+		if ac.stops() {
+			return Unit{}, ac
+		}
+		args = append(args, v)
+	}
+	return in.callMethod(recv, m.Name.Name, args, m.Span()), normal
+}
+
+// callMethodOn is the entry point used by the `for` desugaring.
+func (in *Interp) callMethodOn(recv Value, name string, args []Value, span diag.Span) Value {
+	return in.callMethod(recv, name, args, span)
+}
+
+// callMethod resolves a method call: user-declared impl methods first, then the
+// builtin methods on primitives (spec/06-traits-generics.md's resolution order, minus
+// the trait machinery that arrives in Phase 2).
+func (in *Interp) callMethod(recv Value, name string, args []Value, span diag.Span) Value {
+	if fn := in.userMethod(recv, name); fn != nil {
+		return in.callFunction(fn, args, recv, true, span)
+	}
+	if v, ok := in.builtinMethod(recv, name, args, span); ok {
+		return v
+	}
+	in.trap(span, "no method `%s` on %s", name, TypeName(recv))
+	return Unit{}
+}
+
+func (in *Interp) userMethod(recv Value, name string) *ast.FnDecl {
+	var typeName string
+	switch r := recv.(type) {
+	case *Struct:
+		typeName = r.Def.Name.Name
+	case *Enum:
+		typeName = r.Def.Name.Name
+	default:
+		return nil
+	}
+	if methods, ok := in.res.Methods[typeName]; ok {
+		return methods[name]
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Builtins
+// ---------------------------------------------------------------------------
+
+func (in *Interp) callBuiltin(name string, args []Value, c *ast.Call) Value {
+	span := c.Span()
+	switch name {
+	case "io::print", "io::println":
+		if len(args) != 1 {
+			in.trap(span, "`%s` takes exactly one argument", name)
+		}
+		s, ok := args[0].(*Str)
+		if !ok {
+			in.trap(span, "`%s` takes a `String`, found %s; call `.to_str()` first", name, TypeName(args[0]))
+		}
+		if name == "io::println" {
+			fmt.Fprintln(in.stdout, s.S)
+		} else {
+			fmt.Fprint(in.stdout, s.S)
+		}
+		return Unit{}
+
+	case "panic":
+		if len(args) != 1 {
+			in.trap(span, "`panic` takes exactly one argument")
+		}
+		s, ok := args[0].(*Str)
+		if !ok {
+			in.trap(span, "`panic` takes a `String`, found %s", TypeName(args[0]))
+		}
+		in.trap(span, "%s", s.S)
+
+	case "ref_eq":
+		if len(args) != 2 {
+			in.trap(span, "`ref_eq` takes exactly two arguments")
+		}
+		eq, err := refEq(args[0], args[1])
+		if err != nil {
+			in.trap(span, "%s", err.Error())
+		}
+		return Bool(eq)
+	}
+	in.trap(span, "unknown builtin `%s`", name)
+	return Unit{}
+}
+
+// builtinMethod implements the methods the prelude will eventually declare in Origin.
+// Phase 7 replaces these with a real standard library; until then they live here so the
+// end-to-end suite can exercise the language.
+func (in *Interp) builtinMethod(recv Value, name string, args []Value, span diag.Span) (Value, bool) {
+	switch name {
+	case "to_str":
+		if len(args) != 0 {
+			in.trap(span, "`to_str` takes no arguments")
+		}
+		return &Str{S: Display(recv)}, true
+
+	case "wrapping_add", "wrapping_sub", "wrapping_mul":
+		a, b := in.twoInts(recv, args, name, span)
+		switch name {
+		case "wrapping_add":
+			return Int(a + b), true
+		case "wrapping_sub":
+			return Int(a - b), true
+		default:
+			return Int(a * b), true
+		}
+
+	case "saturating_add", "saturating_sub", "saturating_mul":
+		a, b := in.twoInts(recv, args, name, span)
+		return Int(saturate(name, a, b)), true
+
+	case "checked_add", "checked_sub", "checked_mul":
+		a, b := in.twoInts(recv, args, name, span)
+		v, ok := checkedOp(name, a, b)
+		if !ok {
+			return in.optionNone(span), true
+		}
+		return in.optionSome(Int(v), span), true
+
+	case "cmp":
+		if len(args) != 1 {
+			in.trap(span, "`cmp` takes exactly one argument")
+		}
+		return in.ordering(recv, args[0], span), true
+
+	case "len":
+		if s, ok := recv.(*Str); ok {
+			return Int(int64(len(s.S))), true
+		}
+	}
+	return nil, false
+}
+
+func (in *Interp) twoInts(recv Value, args []Value, name string, span diag.Span) (int64, int64) {
+	if len(args) != 1 {
+		in.trap(span, "`%s` takes exactly one argument", name)
+	}
+	a, ok := recv.(Int)
+	if !ok {
+		in.trap(span, "`%s` applies to integers, found %s", name, TypeName(recv))
+	}
+	b, ok := args[0].(Int)
+	if !ok {
+		in.trap(span, "`%s` takes an integer, found %s", name, TypeName(args[0]))
+	}
+	return int64(a), int64(b)
+}
+
+const (
+	maxI64 = 1<<63 - 1
+	minI64 = -1 << 63
+)
+
+func checkedOp(name string, a, b int64) (int64, bool) {
+	switch name {
+	case "checked_add":
+		s := a + b
+		if (a > 0 && b > 0 && s < 0) || (a < 0 && b < 0 && s >= 0) {
+			return 0, false
+		}
+		return s, true
+	case "checked_sub":
+		d := a - b
+		if (a >= 0 && b < 0 && d < 0) || (a < 0 && b > 0 && d >= 0) {
+			return 0, false
+		}
+		return d, true
+	default:
+		if a == 0 || b == 0 {
+			return 0, true
+		}
+		p := a * b
+		if p/b != a || (a == minI64 && b == -1) || (b == minI64 && a == -1) {
+			return 0, false
+		}
+		return p, true
+	}
+}
+
+func saturate(name string, a, b int64) int64 {
+	checked := "checked_" + name[len("saturating_"):]
+	if v, ok := checkedOp(checked, a, b); ok {
+		return v
+	}
+	// Overflowed: clamp in the direction the true result went.
+	switch name {
+	case "saturating_add":
+		if b > 0 {
+			return maxI64
+		}
+		return minI64
+	case "saturating_sub":
+		if b > 0 {
+			return minI64
+		}
+		return maxI64
+	default:
+		if (a > 0) == (b > 0) {
+			return maxI64
+		}
+		return minI64
+	}
+}
+
+// optionSome and optionNone build prelude `Option` values. They trap if the prelude is
+// missing rather than inventing a substitute.
+func (in *Interp) optionSome(v Value, span diag.Span) Value {
+	def, va := in.preludeVariant("Option", "Some", span)
+	return &Enum{Def: def, Variant: va, Vals: []Value{v}}
+}
+
+func (in *Interp) optionNone(span diag.Span) Value {
+	def, va := in.preludeVariant("Option", "None", span)
+	return &Enum{Def: def, Variant: va}
+}
+
+func (in *Interp) ordering(a, b Value, span diag.Span) Value {
+	cmp, err := compareValues(a, b)
+	if err != nil {
+		in.trap(span, "%s", err.Error())
+	}
+	name := "Equal"
+	switch {
+	case cmp < 0:
+		name = "Less"
+	case cmp > 0:
+		name = "Greater"
+	}
+	def, va := in.preludeVariant("Ordering", name, span)
+	return &Enum{Def: def, Variant: va}
+}
+
+func compareValues(a, b Value) (int, error) {
+	switch x := a.(type) {
+	case Int:
+		y, ok := b.(Int)
+		if !ok {
+			return 0, fmt.Errorf("cannot compare an integer with %s", TypeName(b))
+		}
+		return compareInt(int64(x), int64(y)), nil
+	case Float:
+		y, ok := b.(Float)
+		if !ok {
+			return 0, fmt.Errorf("cannot compare a float with %s", TypeName(b))
+		}
+		switch {
+		case float64(x) < float64(y):
+			return -1, nil
+		case float64(x) > float64(y):
+			return 1, nil
+		}
+		return 0, nil
+	case Char:
+		y, ok := b.(Char)
+		if !ok {
+			return 0, fmt.Errorf("cannot compare a char with %s", TypeName(b))
+		}
+		return compareInt(int64(x), int64(y)), nil
+	case *Str:
+		y, ok := b.(*Str)
+		if !ok {
+			return 0, fmt.Errorf("cannot compare a String with %s", TypeName(b))
+		}
+		return compareString(x.S, y.S), nil
+	}
+	return 0, fmt.Errorf("`cmp` is not defined on %s", TypeName(a))
+}
+
+// preludeVariant looks up an enum variant the interpreter needs to build.
+func (in *Interp) preludeVariant(enum, variant string, span diag.Span) (*ast.EnumDecl, *ast.Variant) {
+	def := in.res.Enums[enum]
+	if def == nil {
+		in.trap(span, "the prelude does not define `%s`", enum)
+	}
+	for _, v := range def.Variants {
+		if v.Name.Name == variant {
+			return def, v
+		}
+	}
+	in.trap(span, "the prelude's `%s` has no variant `%s`", enum, variant)
+	return nil, nil
+}

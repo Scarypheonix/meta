@@ -1,0 +1,7 @@
+// EXPECT: reject E0594
+// spec: 04-expressions.md — a place is a `mut` binding or a `mut` field.
+
+fn main() {
+    let x = 1;
+    x = 2;
+}

@@ -9,7 +9,7 @@ func TestVersionIsSet(t *testing.T) {
 }
 
 func TestUsageMentionsEverySubcommand(t *testing.T) {
-	for _, sub := range []string{"version", "check", "build", "run"} {
+	for _, sub := range []string{"version", "check", "build", "run", "dump-ast"} {
 		if !contains(usage, sub) {
 			t.Errorf("usage text does not mention subcommand %q", sub)
 		}

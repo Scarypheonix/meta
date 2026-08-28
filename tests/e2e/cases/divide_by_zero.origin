@@ -1,0 +1,6 @@
+use std::io;
+
+fn main() {
+    let z = 0;
+    io::println((1 / z).to_str());
+}

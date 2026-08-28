@@ -1,0 +1,6 @@
+// EXPECT: reject E0433
+// spec: 07-modules.md — every path must resolve.
+
+fn main() {
+    let x = no_such_function(1);
+}

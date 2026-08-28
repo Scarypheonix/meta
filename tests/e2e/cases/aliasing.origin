@@ -1,0 +1,16 @@
+use std::io;
+
+struct Counter { mut n: i64 }
+
+fn bump(c: Counter) { c.n = c.n + 1; }
+
+fn main() {
+    let a = Counter { n: 0 };
+    let b = a;
+    bump(b);
+    bump(a);
+    io::println(a.n.to_str());
+    io::println(ref_eq(a, b).to_str());
+    io::println((Counter { n: 2 } == a).to_str());
+    io::println(ref_eq(Counter { n: 2 }, a).to_str());
+}

@@ -1,0 +1,22 @@
+// The Origin prelude, in scope in every module without a `use`.
+//
+// Phase 1 defines only the types the language's own semantics depend on: `Option` for
+// the `for` desugaring and the checked-arithmetic methods, `Result` for `?`, and
+// `Ordering` for `cmp`. The rest of the standard library is written in Origin in
+// Phase 7; the interpreter's builtin methods stand in until then.
+
+pub enum Option[T] {
+    None,
+    Some(T),
+}
+
+pub enum Result[T, E] {
+    Ok(T),
+    Err(E),
+}
+
+pub enum Ordering {
+    Less,
+    Equal,
+    Greater,
+}
