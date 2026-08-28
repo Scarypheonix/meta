@@ -1,0 +1,9 @@
+// EXPECT: accept
+// spec: 03-types.md — a bounded-free type parameter supports only what every type does.
+
+fn id[T](x: T) -> T { x }
+
+fn main() {
+    let a = id(1);
+    let b = id("s");
+}

@@ -1,0 +1,12 @@
+# Build output
+/originc
+/dist/
+*.o
+*.a
+
+# Go
+/vendor/
+
+# Editors
+.DS_Store
+*.swp

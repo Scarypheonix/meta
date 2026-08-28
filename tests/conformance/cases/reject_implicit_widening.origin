@@ -1,0 +1,8 @@
+// EXPECT: reject E0308
+// spec: 03-types.md — Origin has no implicit numeric coercion, not even widening.
+
+fn main() {
+    let a = 1i32;
+    let b: i64 = 2;
+    let c = a + b;
+}
