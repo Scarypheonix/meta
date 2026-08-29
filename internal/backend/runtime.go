@@ -45,6 +45,7 @@ type runtimeLabels struct {
 	intToStr x86.Label
 	print    x86.Label
 	println  x86.Label
+	panic    x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -61,6 +62,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.intToStr = e.a.NewLabel("rt_int_to_str")
 	e.rt.print = e.a.NewLabel("rt_print")
 	e.rt.println = e.a.NewLabel("rt_println")
+	e.rt.panic = e.a.NewLabel("rt_panic")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -68,6 +70,52 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitTrap()
 	e.emitIntToStr()
 	e.emitPrint()
+	e.emitPanic()
+}
+
+// emitPanic reports a `panic` and exits 101: rdi = the message String, rsi = the address
+// of the site's " at file:line:col\n" suffix, rdx = its length.
+//
+// Unlike every other trap, a panic's text is not a constant: the message is a String the
+// program computed. Only the two ends are known while compiling, so the runtime writes
+// three pieces and the result reads exactly as the interpreter's does — which is what
+// the end-to-end suite compares.
+func (e *emitter) emitPanic() {
+	a := e.a
+	a.Align(16)
+	a.Bind(e.rt.panic)
+
+	a.Push(x86.RBP)
+	a.MovRR(x86.RBP, x86.RSP)
+	a.Push(x86.RBX)
+	a.Push(x86.R12)
+	a.Push(x86.R13)
+	a.Push(x86.R14)
+
+	a.MovRR(x86.RBX, x86.RDI) // the message
+	a.MovRR(x86.R12, x86.RSI) // the suffix
+	a.MovRR(x86.R13, x86.RDX)
+
+	a.MovRI(x86.RDI, 2)
+	a.MovRI(x86.RSI, e.panicPrefix.addr)
+	a.MovRI(x86.RDX, uint64(e.panicPrefix.length))
+	a.Call(e.rt.write)
+
+	a.MovRI(x86.RDI, 2)
+	a.MovRR(x86.RSI, x86.RBX)
+	a.AddRI(x86.RSI, strBytesOff)
+	a.MovRM(x86.RDX, x86.At(x86.RBX, objHeaderSize))
+	a.Call(e.rt.write)
+
+	a.MovRI(x86.RDI, 2)
+	a.MovRR(x86.RSI, x86.R12)
+	a.MovRR(x86.RDX, x86.R13)
+	a.Call(e.rt.write)
+
+	a.MovRI(x86.RAX, e.target.SysExit)
+	a.MovRI(x86.RDI, 101)
+	a.Syscall()
+	a.Ud2()
 }
 
 // emitStart is the program's entry point: claim a heap, call `main`, exit cleanly.

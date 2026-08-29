@@ -6,20 +6,27 @@
 package driver
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
 	"github.com/scarypheonix/meta/internal/ast"
+	"github.com/scarypheonix/meta/internal/backend"
+	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/check"
 	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/interp"
 	"github.com/scarypheonix/meta/internal/mono"
+	"github.com/scarypheonix/meta/internal/obj"
 	"github.com/scarypheonix/meta/internal/opt"
 	"github.com/scarypheonix/meta/internal/parse"
 	"github.com/scarypheonix/meta/internal/prelude"
@@ -226,6 +233,9 @@ const (
 	Interpreter Engine = iota
 	// VM is the Phase 3 bytecode virtual machine.
 	VM
+	// Native is the Phase 5 backend: the program is compiled to machine code, written
+	// to a temporary executable, and run as a process.
+	Native
 )
 
 // RunWith compiles a program and executes it on the chosen engine at -O0.
@@ -261,7 +271,114 @@ func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer
 		fmt.Fprintf(stderr, "originc: %v\n", err)
 		return ExitDiagnostics
 	}
+	if engine == Native {
+		return runNative(code, stdout, stderr)
+	}
 	return vm.New(code, vm.Config{}, stdout, stderr).Run()
+}
+
+// runNative compiles to an executable for the host, runs it, and returns its exit
+// status.
+//
+// It exists so that the end-to-end differential can include the native engine: the same
+// corpus, the same expectations, compared byte for byte against the interpreter and the
+// virtual machine. Only the host's own format can be run, which is why the container
+// verifies ELF and the Mach-O acceptance criterion belongs to the user's machine
+// (ADR-0003).
+func runNative(code *bytecode.Program, stdout, stderr io.Writer) int {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		fmt.Fprintln(stderr, "originc: this host cannot run what it builds; use `originc build`")
+		return ExitUsage
+	}
+	img, err := backend.Build(code, obj.Linux)
+	if err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitDiagnostics
+	}
+
+	dir, err := os.MkdirTemp("", "origin-native")
+	if err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitDiagnostics
+	}
+	defer os.RemoveAll(dir)
+
+	exe := filepath.Join(dir, "program")
+	if err := WriteExecutable(img, exe); err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitDiagnostics
+	}
+
+	cmd := exec.Command(exe)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	if err := cmd.Run(); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return ee.ExitCode()
+		}
+		fmt.Fprintf(stderr, "originc: running the compiled program: %v\n", err)
+		return ExitDiagnostics
+	}
+	return ExitOK
+}
+
+// WriteExecutable writes an image to disk with the execute bit set.
+func WriteExecutable(img *obj.Image, path string) error {
+	var buf bytes.Buffer
+	if err := img.Write(&buf); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0o755)
+}
+
+// Build compiles a program to a native executable.
+func Build(path, outPath, targetName string, level opt.Level, stdout, stderr io.Writer) int {
+	target, err := obj.TargetFor(targetName)
+	if err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitUsage
+	}
+	units, err := LoadUnits(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitUsage
+	}
+	prog, ok := CompilePackage(units, stderr)
+	if !ok {
+		return ExitDiagnostics
+	}
+	code, cerr := compile.Program(prog.Resolved, prog.Types, prog.Mono, prog.AllASTs...)
+	if cerr != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", cerr)
+		return ExitDiagnostics
+	}
+	if err := opt.Run(code, level); err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitDiagnostics
+	}
+	img, err := backend.Build(code, target)
+	if err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitDiagnostics
+	}
+	if outPath == "" {
+		outPath = defaultOutputName(path)
+	}
+	if err := WriteExecutable(img, outPath); err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitDiagnostics
+	}
+	return ExitOK
+}
+
+// defaultOutputName is the source's name with its extension removed, which is what a
+// programmer expects `originc build hello.origin` to leave behind.
+func defaultOutputName(path string) string {
+	base := filepath.Base(strings.TrimSuffix(path, ".origin"))
+	if base == "." || base == "/" || base == "" {
+		return "a.out"
+	}
+	return base
 }
 
 // RunRoundTrip executes a program through the IR with no optimization passes, which

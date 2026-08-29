@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -97,7 +98,35 @@ var engines = []engineSpec{
 	{"vm-O0", driver.VM, opt.O0},
 	{"vm-O1", driver.VM, opt.O1},
 	{"vm-O2", driver.VM, opt.O2},
+	{"native-O0", driver.Native, opt.O0},
+	{"native-O1", driver.Native, opt.O1},
+	{"native-O2", driver.Native, opt.O2},
 }
+
+// nativeSupported reports whether a case can go through the native backend yet.
+//
+// The backend does not lower every operation, and a case that reaches one gets an
+// `unimplemented:` error rather than a wrong answer (process rule 8). Skipping those
+// here, by name and with the reason, is how the suite stays honest about what is built:
+// a case in this list is a case the native engine is not being tested on, and the list
+// is meant to empty out.
+var nativeSkips = map[string]string{
+	"aliasing":                            "aggregates are not lowered natively yet (get_field)",
+	"closure_counter":                     "aggregates are not lowered natively yet (struct, closure)",
+	"generics_ord":                        "the `cmp` builtin needs the Ordering enum, so it needs aggregates",
+	"generics_user_trait_impl":            "aggregates are not lowered natively yet (get_field)",
+	"linked_list":                         "aggregates are not lowered natively yet (variant, get_payload)",
+	"mutual_recursion":                    "aggregates are not lowered natively yet (is_variant)",
+	"opt_cse_must_not_merge_allocations":  "aggregates are not lowered natively yet (struct, ref_eq)",
+	"opt_float_semantics_survive_folding": "rendering a float needs shortest-round-trip formatting in emitted code",
+	"opt_licm_must_not_hoist_a_trap":      "aggregates are not lowered natively yet (variant)",
+	"opt_loop_invariant_arithmetic":       "aggregates are not lowered natively yet (variant)",
+	"result_and_try":                      "aggregates are not lowered natively yet (variant, get_payload)",
+}
+
+// runsNatively reports whether the host can execute what the backend produces. Only
+// x86-64 Linux can, which is the point of ADR-0003's second writer.
+func runsNatively() bool { return runtime.GOOS == "linux" && runtime.GOARCH == "amd64" }
 
 // TestPrograms compiles and runs each case on each engine and level, comparing stdout,
 // stderr and exit status byte for byte against the expected files.
@@ -115,6 +144,9 @@ func TestPrograms(t *testing.T) {
 		t.Run(c.Name, func(t *testing.T) {
 			for _, e := range engines {
 				t.Run(e.name, func(t *testing.T) {
+					if skip, ok := skipNative(c, e); ok {
+						t.Skip(skip)
+					}
 					stdout, stderr, code := runCase(t, root, c, e)
 
 					if stdout != c.WantOut {
@@ -148,6 +180,9 @@ func TestEnginesAgree(t *testing.T) {
 		t.Run(c.Name, func(t *testing.T) {
 			baseOut, baseErr, baseCode := runCase(t, root, c, engines[0])
 			for _, e := range engines[1:] {
+				if _, skipped := skipNative(c, e); skipped {
+					continue
+				}
 				out, errText, code := runCase(t, root, c, e)
 				if out != baseOut {
 					t.Errorf("stdout differs between %s and %s\n--- %s ---\n%s\n--- %s ---\n%s",
@@ -190,4 +225,18 @@ func TestSuiteIsNotEmpty(t *testing.T) {
 	if n := len(loadCases(t)); n < 5 {
 		t.Errorf("only %d end-to-end cases; the suite is too thin to be meaningful", n)
 	}
+}
+
+// skipNative reports why a case cannot run on the native engine, if it cannot.
+func skipNative(c caseFile, e engineSpec) (string, bool) {
+	if e.engine != driver.Native {
+		return "", false
+	}
+	if !runsNatively() {
+		return "this host cannot execute an x86-64 Linux executable", true
+	}
+	if reason, listed := nativeSkips[c.Name]; listed {
+		return "Phase 5: " + reason, true
+	}
+	return "", false
 }

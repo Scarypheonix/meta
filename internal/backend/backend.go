@@ -108,11 +108,17 @@ type emitter struct {
 	stringType     layout.TypeID
 	newlineAddr    uint64
 	outOfMemoryMsg staticStr
+	// panicPrefix is the "origin: " a panic's message is wrapped in, so that the three
+	// engines print the same line.
+	panicPrefix staticStr
 	// constStr maps a constant-pool index to the String object built for it, so a
 	// literal costs no allocation at run time.
 	constStr map[int]staticStr
 	// trapMsg deduplicates the fully formatted trap messages.
 	trapMsg map[string]staticStr
+	// literals holds the Strings the backend itself needs, such as the two a bool
+	// renders as.
+	literals map[string]staticStr
 
 	fnLabels []x86.Label
 
@@ -138,6 +144,7 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 		stringType: prog.StringType,
 		constStr:   map[int]staticStr{},
 		trapMsg:    map[string]staticStr{},
+		literals:   map[string]staticStr{},
 	}
 
 	// The two constants the runtime itself needs come first, so their addresses do not
@@ -145,6 +152,7 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 	e.newlineAddr = e.roDataAddr + uint64(len(e.roData))
 	e.roData = append(e.roData, '\n')
 	e.outOfMemoryMsg = e.rawString("origin: out of memory at <runtime>\n")
+	e.panicPrefix = e.rawString("origin: ")
 
 	if prog.Entry < 0 || prog.Entry >= len(funcs) || funcs[prog.Entry] == nil {
 		return nil, fmt.Errorf("the program has no `main` to start at")

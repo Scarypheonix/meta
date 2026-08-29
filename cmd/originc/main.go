@@ -8,6 +8,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/scarypheonix/meta/internal/driver"
@@ -25,11 +26,13 @@ usage:
   originc check <file>       parse and resolve, emit diagnostics only
   originc run <file>         run a program with the tree-walking interpreter
   originc run --vm <file>    run it on the bytecode virtual machine instead
+  originc run --native <f>   compile it to machine code and run that
   originc run -O1 <file>     run it on the VM with the optimizer (also -O0, -O2)
   originc dump-ir <file>     print the SSA intermediate representation
   originc dump-ast <file>    print the parsed syntax tree
   originc dump-bytecode <f>  print the compiled bytecode
   originc build <file>       compile to a native executable
+  originc build -o <out> --target linux|macos <file>
 
 exit status:
   0    success
@@ -37,11 +40,21 @@ exit status:
   2    the command line was wrong
   101  the program trapped
 
-The build subcommand is unimplemented until Phase 5 (native x86-64 backend).
+The build subcommand defaults to the host's format and -O1. A macOS build can
+be produced anywhere; running one is the target machine's business.
 `
 
 func main() {
 	os.Exit(guarded(os.Args[1:]))
+}
+
+// hostTarget is the format this machine can run, so that `originc build` with no
+// `--target` produces something the person who typed it can execute.
+func hostTarget() string {
+	if runtime.GOOS == "darwin" {
+		return "macos"
+	}
+	return "linux"
 }
 
 // guarded runs the requested subcommand and converts a compiler panic into the exit
@@ -86,25 +99,35 @@ func run(args []string) int {
 		fmt.Fprint(os.Stdout, usage)
 		return driver.ExitOK
 	case "check", "run", "dump-ast", "dump-bytecode", "dump-ir":
+		// The engine is the interpreter unless one is named. An optimization level
+		// implies the virtual machine — the interpreter walks the tree and has no
+		// optimizer — but only when no engine was asked for by name, or `--native -O2`
+		// would silently run something else.
 		engine := driver.Interpreter
+		named := false
 		level := opt.O0
 		rest := args[1:]
 		for len(rest) > 0 {
 			switch rest[0] {
 			case "--vm":
-				engine = driver.VM
+				engine, named = driver.VM, true
+			case "--native":
+				engine, named = driver.Native, true
 			case "-O0":
 				level = opt.O0
 			case "-O1":
-				engine, level = driver.VM, opt.O1
+				level = opt.O1
 			case "-O2":
-				engine, level = driver.VM, opt.O2
+				level = opt.O2
 			default:
 				goto done
 			}
 			rest = rest[1:]
 		}
 	done:
+		if !named && level != opt.O0 {
+			engine = driver.VM
+		}
 		if len(rest) != 1 {
 			fmt.Fprintf(os.Stderr, "originc: `%s` takes exactly one file or directory\n", args[0])
 			return driver.ExitUsage
@@ -122,7 +145,41 @@ func run(args []string) int {
 			return driver.DumpAST(rest[0], os.Stdout, os.Stderr)
 		}
 	case "build":
-		panic("unimplemented: originc build (Phase 5: native x86-64 backend)")
+		out := ""
+		target := hostTarget()
+		level := opt.O1
+		rest := args[1:]
+		for len(rest) > 1 {
+			switch rest[0] {
+			case "-o":
+				if len(rest) < 2 {
+					fmt.Fprintln(os.Stderr, "originc: `-o` takes a file name")
+					return driver.ExitUsage
+				}
+				out, rest = rest[1], rest[1:]
+			case "--target":
+				if len(rest) < 2 {
+					fmt.Fprintln(os.Stderr, "originc: `--target` takes `linux` or `macos`")
+					return driver.ExitUsage
+				}
+				target, rest = rest[1], rest[1:]
+			case "-O0":
+				level = opt.O0
+			case "-O1":
+				level = opt.O1
+			case "-O2":
+				level = opt.O2
+			default:
+				goto builtArgs
+			}
+			rest = rest[1:]
+		}
+	builtArgs:
+		if len(rest) != 1 {
+			fmt.Fprintln(os.Stderr, "originc: `build` takes exactly one file or directory")
+			return driver.ExitUsage
+		}
+		return driver.Build(rest[0], out, target, level, os.Stdout, os.Stderr)
 	default:
 		fmt.Fprintf(os.Stderr, "originc: unknown subcommand %q\n\n", args[0])
 		fmt.Fprint(os.Stderr, usage)

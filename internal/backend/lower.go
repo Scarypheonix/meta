@@ -96,6 +96,25 @@ func (e *emitter) instr(v *ir.Value) error {
 		e.a.XorRI(scratchA, 1)
 		e.def(v, scratchA)
 
+	case ir.OpAddF, ir.OpSubF, ir.OpMulF, ir.OpDivF:
+		return e.floatArith(v)
+
+	case ir.OpRemF:
+		// Float remainder is not an SSE instruction; x87's `fprem` is the only hardware
+		// form and pulling in the x87 stack for one operation is not worth it.
+		return fmt.Errorf("unimplemented: float remainder in native code")
+
+	case ir.OpNegF:
+		// Negating a float flips its sign bit, which is a raw-word operation: -0.0 and
+		// NaN keep their payloads, which arithmetic negation would not guarantee.
+		e.load(scratchA, v.Args[0])
+		e.a.MovRI(x86.RAX, 1<<63)
+		e.a.XorRR(scratchA, x86.RAX)
+		e.def(v, scratchA)
+
+	case ir.OpCast:
+		return e.cast(v)
+
 	case ir.OpAnd, ir.OpOr, ir.OpXor:
 		return e.bitwise(v)
 
@@ -282,6 +301,8 @@ func (e *emitter) compare(v *ir.Value) error {
 		cond = signedCond(v.Op)
 	case bytecode.KindUint:
 		cond = unsignedCond(v.Op)
+	case bytecode.KindFloat:
+		return e.floatCompare(v)
 	case bytecode.KindUnknown:
 		return fmt.Errorf("this is a compiler bug: a comparison reached the backend with no operand kind")
 	default:
@@ -380,10 +401,11 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 1 {
 			return fmt.Errorf("this is a compiler bug: panic takes one argument, got %d", len(v.Args))
 		}
+		suffix := e.rawString(fmt.Sprintf(" at %s\n", v.Span))
 		e.load(x86.RDI, v.Args[0])
-		e.a.MovRM(x86.RSI, x86.At(x86.RDI, objHeaderSize))
-		e.a.AddRI(x86.RDI, strBytesOff)
-		e.a.Call(e.rt.trap)
+		e.a.MovRI(x86.RSI, suffix.addr)
+		e.a.MovRI(x86.RDX, uint64(suffix.length))
+		e.a.Call(e.rt.panic)
 		e.a.Ud2()
 		return nil
 	}
@@ -403,6 +425,16 @@ func (e *emitter) toStr(v *ir.Value) error {
 		// A String renders as itself.
 		e.load(scratchA, v.Args[0])
 		e.def(v, scratchA)
+		return nil
+	case bytecode.KindBool:
+		// Both results are String objects already in read-only data, so rendering a
+		// bool is a conditional move between two pointers and allocates nothing.
+		e.load(scratchA, v.Args[0])
+		e.a.MovRI(x86.RAX, e.stringLiteral("true").addr)
+		e.a.MovRI(scratchB, e.stringLiteral("false").addr)
+		e.a.TestRR(scratchA, scratchA)
+		e.a.Cmov(x86.Equal, x86.RAX, scratchB)
+		e.def(v, x86.RAX)
 		return nil
 	case bytecode.KindUnknown:
 		return fmt.Errorf("this is a compiler bug: `to_str` reached the backend with no operand kind")
@@ -496,4 +528,160 @@ func (e *emitter) phiCopies(from, to *ir.Block) {
 		e.a.Pop(scratchA)
 		e.def(live[i], scratchA)
 	}
+}
+
+// floatArith lowers `+`, `-`, `*` and `/` on floats, which never trap
+// (spec/04-expressions.md): overflow is an infinity and 0.0/0.0 is a NaN.
+//
+// Floats live in general-purpose registers like everything else and move to SSE only for
+// the arithmetic itself. That costs two moves per operation and buys one register class
+// in the allocator instead of two — a trade worth revisiting once anything float-heavy
+// exists to measure.
+func (e *emitter) floatArith(v *ir.Value) error {
+	e.load(scratchA, v.Args[0])
+	e.load(scratchB, v.Args[1])
+	e.a.MovqXR(x86.XMM0, scratchA)
+	e.a.MovqXR(x86.XMM1, scratchB)
+	switch v.Op {
+	case ir.OpAddF:
+		e.a.AddsdXX(x86.XMM0, x86.XMM1)
+	case ir.OpSubF:
+		e.a.SubsdXX(x86.XMM0, x86.XMM1)
+	case ir.OpMulF:
+		e.a.MulsdXX(x86.XMM0, x86.XMM1)
+	case ir.OpDivF:
+		e.a.DivsdXX(x86.XMM0, x86.XMM1)
+	}
+	e.a.MovqRX(x86.RAX, x86.XMM0)
+	e.def(v, x86.RAX)
+	return nil
+}
+
+// floatCompare lowers a comparison on floats.
+//
+// IEEE comparison is not the integer one with different registers. `ucomisd` sets the
+// parity flag when either operand is NaN, and every ordered comparison must be false
+// then — including `==`, which is why `NaN == NaN` is false, and `!=`, which must be
+// *true* for a NaN. Getting this wrong is the classic float bug, and
+// spec/04-expressions.md pins the behaviour that the three engines have to agree on.
+func (e *emitter) floatCompare(v *ir.Value) error {
+	e.load(scratchA, v.Args[0])
+	e.load(scratchB, v.Args[1])
+	e.a.MovqXR(x86.XMM0, scratchA)
+	e.a.MovqXR(x86.XMM1, scratchB)
+
+	// The comparison is arranged so that the unsigned conditions read correctly:
+	// ucomisd sets CF and ZF as an unsigned compare would, with PF for unordered.
+	swapped := false
+	switch v.Op {
+	case ir.OpGt, ir.OpGe:
+		// `a > b` is `b < a` with the operands exchanged, which keeps every case on the
+		// Below/BelowEqual side where NaN clears the flags rather than setting them.
+		e.a.UcomisdXX(x86.XMM1, x86.XMM0)
+		swapped = true
+	default:
+		e.a.UcomisdXX(x86.XMM0, x86.XMM1)
+	}
+
+	var cond x86.Cond
+	switch v.Op {
+	case ir.OpEq:
+		cond = x86.Equal
+	case ir.OpNe:
+		cond = x86.NotEqual
+	case ir.OpLt, ir.OpGt:
+		cond = x86.Below
+	default:
+		cond = x86.BelowEqual
+	}
+	_ = swapped
+
+	e.a.Setcc(cond, x86.RAX)
+	e.a.Movzx8(x86.RAX, x86.RAX)
+
+	// NaN makes ucomisd set ZF, PF and CF together, so `setbe` and `sete` would report
+	// true for an unordered pair. Every comparison but `!=` must be false there, and
+	// `!=` must be true, so the parity flag is folded in explicitly.
+	if v.Op == ir.OpNe {
+		e.a.Setcc(x86.Parity, scratchA)
+		e.a.Movzx8(scratchA, scratchA)
+		e.a.OrRR(x86.RAX, scratchA)
+	} else {
+		e.a.Setcc(x86.NoParity, scratchA)
+		e.a.Movzx8(scratchA, scratchA)
+		e.a.AndRR(x86.RAX, scratchA)
+	}
+	e.def(v, x86.RAX)
+	return nil
+}
+
+// cast lowers a conversion between primitive types.
+func (e *emitter) cast(v *ir.Value) error {
+	kind := bytecode.CastKind(v.Const)
+	width := v.Aux
+	bits, signed := castShape(width)
+
+	switch kind {
+	case bytecode.CastIntTrunc, bytecode.CastCharToInt:
+		e.load(scratchA, v.Args[0])
+		e.truncate(scratchA, bits, signed)
+		e.def(v, scratchA)
+		return nil
+
+	case bytecode.CastBoolToInt:
+		// A bool is already 0 or 1.
+		e.load(scratchA, v.Args[0])
+		e.def(v, scratchA)
+		return nil
+
+	case bytecode.CastIntToFloat:
+		e.load(scratchA, v.Args[0])
+		e.a.Cvtsi2sd(x86.XMM0, scratchA)
+		e.a.MovqRX(x86.RAX, x86.XMM0)
+		e.def(v, x86.RAX)
+		return nil
+
+	case bytecode.CastFloatWiden:
+		// f32 is carried as an f64 already, so widening is the identity.
+		e.load(scratchA, v.Args[0])
+		e.def(v, scratchA)
+		return nil
+	}
+	return fmt.Errorf("unimplemented: cast %d in native code", kind)
+}
+
+// truncate narrows an integer to a width, sign-extending or zero-extending to fill the
+// register, which is what keeps the one-word value model consistent.
+func (e *emitter) truncate(r x86.Reg, bits uint, signed bool) {
+	if bits >= 64 || bits == 0 {
+		return
+	}
+	shift := uint8(64 - bits)
+	e.a.ShlI(r, shift)
+	if signed {
+		e.a.SarI(r, shift)
+		return
+	}
+	e.a.ShrI(r, shift)
+}
+
+// castShape unpacks the width operand the compiler packed: the bit width, with bit 8 set
+// when the target type is signed.
+func castShape(width int) (bits uint, signed bool) {
+	return uint(width & 0xFF), width&(1<<8) != 0
+}
+
+// stringLiteral puts a String the backend itself needs — "true", "false" — into
+// read-only data, built exactly like a program's own literal.
+func (e *emitter) stringLiteral(s string) staticStr {
+	if got, ok := e.literals[s]; ok {
+		return got
+	}
+	for len(e.roData)%wordSize != 0 {
+		e.roData = append(e.roData, 0)
+	}
+	out := staticStr{addr: e.roDataAddr + uint64(len(e.roData)), length: len(s)}
+	e.roData = append(e.roData, stringObject(s, e.stringType)...)
+	e.literals[s] = out
+	return out
 }

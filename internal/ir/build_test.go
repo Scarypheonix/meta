@@ -244,3 +244,51 @@ func TestEmitRoundTripsBlockStructure(t *testing.T) {
 		verify(t, again)
 	}
 }
+
+// TestRoundTripPreservesOperands is a regression test, and the general form of a bug
+// that hid for a whole phase.
+//
+// A comparison and `to_str` carry the static kind of their operand (bytecode.Kind),
+// because native code has no runtime tag to ask. Emission dropped that field, so the
+// bytecode that came back out of the optimizer was subtly not the bytecode that went in.
+// Nothing noticed: the virtual machine reads a tag off the value and never looks at the
+// field, so every existing test passed while compiled code was being handed a kind of
+// zero.
+func TestRoundTripPreservesOperands(t *testing.T) {
+	a := newAsm()
+	a.op(bytecode.OpLoad, 0)
+	a.op(bytecode.OpConst, 0)
+	a.op(bytecode.OpLt, int32(bytecode.KindUint))
+	a.op(bytecode.OpLoad, 0)
+	a.op(bytecode.OpToStr, int32(bytecode.KindInt))
+	a.op(bytecode.OpPop)
+	a.op(bytecode.OpReturn)
+	src := a.fn(t, "kinds", 1, 1)
+
+	f := mustBuild(t, src)
+	out, err := Emit(f, src.Name, diag.Span{})
+	if err != nil {
+		t.Fatalf("emitting: %v", err)
+	}
+
+	want := map[bytecode.Op]int32{
+		bytecode.OpLt:    int32(bytecode.KindUint),
+		bytecode.OpToStr: int32(bytecode.KindInt),
+	}
+	seen := map[bytecode.Op]bool{}
+	for _, in := range out.Code {
+		w, interesting := want[in.Op]
+		if !interesting {
+			continue
+		}
+		seen[in.Op] = true
+		if in.A != w {
+			t.Errorf("%s came back with operand %d, want %d", in.Op, in.A, w)
+		}
+	}
+	for op := range want {
+		if !seen[op] {
+			t.Errorf("%s did not survive the round trip at all", op)
+		}
+	}
+}

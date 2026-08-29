@@ -199,7 +199,7 @@ func (e *emitter) emitValue(v *Value) error {
 
 	case OpToStr:
 		e.load(v.Args[0], span)
-		e.emit(bytecode.OpToStr, span)
+		e.emitA(bytecode.OpToStr, v.Const, span)
 
 	case OpTrap:
 		e.emitA(bytecode.OpTrap, v.Const, span)
@@ -213,7 +213,12 @@ func (e *emitter) emitValue(v *Value) error {
 		for _, a := range v.Args {
 			e.load(a, span)
 		}
-		e.emit(op, span)
+		// Const travels back out even for the operations that mostly do not have one.
+		// A comparison carries the static kind of its operands (bytecode.Kind), and
+		// dropping it here would leave the round trip lossy in a way only the native
+		// backend notices -- the virtual machine reads a tag off the value instead, so
+		// it would keep working while compiled code got it wrong.
+		e.emitA(op, v.Const, span)
 	}
 
 	e.emitA(bytecode.OpStore, e.slots[v], span)
