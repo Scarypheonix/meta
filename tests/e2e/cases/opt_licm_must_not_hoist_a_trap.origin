@@ -1,0 +1,16 @@
+use std::io;
+
+fn risky(n: i64, d: i64) -> i64 {
+    let mut i = 0;
+    let mut acc = 0;
+    while i < n {
+        acc = acc + 100 / d;
+        i = i + 1;
+    }
+    acc
+}
+
+fn main() {
+    io::println(risky(0, 0).to_str());
+    io::println(risky(3, 2).to_str());
+}

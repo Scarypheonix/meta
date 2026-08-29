@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/scarypheonix/meta/internal/driver"
+	"github.com/scarypheonix/meta/internal/opt"
 	"github.com/scarypheonix/meta/internal/testutil"
 )
 
@@ -80,13 +81,29 @@ func loadCases(t *testing.T) []caseFile {
 	return out
 }
 
-// TestPrograms is the end-to-end suite: compile and run each case on each engine, then
-// compare stdout, stderr and exit status byte for byte against the expected files.
+// engine names one way of running a program: an execution engine and, for the VM, an
+// optimization level.
+type engineSpec struct {
+	name   string
+	engine driver.Engine
+	level  opt.Level
+}
+
+// engines is every way a program can be run. The end-to-end corpus goes through all of
+// them and must produce byte-identical results, which is the exit criterion of Phase 3
+// (two engines) and Phase 4 (three levels).
+var engines = []engineSpec{
+	{"interpreter", driver.Interpreter, opt.O0},
+	{"vm-O0", driver.VM, opt.O0},
+	{"vm-O1", driver.VM, opt.O1},
+	{"vm-O2", driver.VM, opt.O2},
+}
+
+// TestPrograms compiles and runs each case on each engine and level, comparing stdout,
+// stderr and exit status byte for byte against the expected files.
 //
-// Running both engines against the same expectations is Phase 3's exit criterion. It is
-// a real oracle rather than a smoke test: the expectations come from
-// docs/spec/10-examples.md, so a divergence means one of the two engines disagrees with
-// the specification, and the suite says which.
+// The expectations come from docs/spec/10-examples.md, so a divergence means one of the
+// engines disagrees with the specification and the suite says which one.
 func TestPrograms(t *testing.T) {
 	cases := loadCases(t)
 	if len(cases) == 0 {
@@ -94,19 +111,11 @@ func TestPrograms(t *testing.T) {
 	}
 	root := testutil.RepoRoot(t)
 
-	engines := []struct {
-		name   string
-		engine driver.Engine
-	}{
-		{"interpreter", driver.Interpreter},
-		{"vm", driver.VM},
-	}
-
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
 			for _, e := range engines {
 				t.Run(e.name, func(t *testing.T) {
-					stdout, stderr, code := runCase(t, root, c, e.engine)
+					stdout, stderr, code := runCase(t, root, c, e)
 
 					if stdout != c.WantOut {
 						t.Errorf("stdout mismatch\n--- want ---\n%s\n--- got ---\n%s", c.WantOut, stdout)
@@ -127,25 +136,31 @@ func TestPrograms(t *testing.T) {
 	}
 }
 
-// TestEnginesAgree states the differential directly: whatever the two engines produce,
-// they must produce the same thing. It is deliberately separate from the comparison
-// against the expected files, so that a case whose expectations are wrong still reports
-// "the engines disagree" rather than two identical-looking failures.
+// TestEnginesAgree states the differential directly: whatever the engines produce, they
+// must all produce the same thing.
+//
+// It is deliberately separate from the comparison against the expected files, so that a
+// case whose expectations are wrong still reports "these two disagree" and names the
+// pair, rather than showing four identical-looking failures.
 func TestEnginesAgree(t *testing.T) {
 	root := testutil.RepoRoot(t)
 	for _, c := range loadCases(t) {
 		t.Run(c.Name, func(t *testing.T) {
-			iOut, iErr, iCode := runCase(t, root, c, driver.Interpreter)
-			vOut, vErr, vCode := runCase(t, root, c, driver.VM)
-
-			if iOut != vOut {
-				t.Errorf("stdout differs between engines\n--- interpreter ---\n%s\n--- vm ---\n%s", iOut, vOut)
-			}
-			if iErr != vErr {
-				t.Errorf("stderr differs between engines\n--- interpreter ---\n%s\n--- vm ---\n%s", iErr, vErr)
-			}
-			if iCode != vCode {
-				t.Errorf("exit status differs: interpreter %d, vm %d", iCode, vCode)
+			baseOut, baseErr, baseCode := runCase(t, root, c, engines[0])
+			for _, e := range engines[1:] {
+				out, errText, code := runCase(t, root, c, e)
+				if out != baseOut {
+					t.Errorf("stdout differs between %s and %s\n--- %s ---\n%s\n--- %s ---\n%s",
+						engines[0].name, e.name, engines[0].name, baseOut, e.name, out)
+				}
+				if errText != baseErr {
+					t.Errorf("stderr differs between %s and %s\n--- %s ---\n%s\n--- %s ---\n%s",
+						engines[0].name, e.name, engines[0].name, baseErr, e.name, errText)
+				}
+				if code != baseCode {
+					t.Errorf("exit status differs: %s gave %d, %s gave %d",
+						engines[0].name, baseCode, e.name, code)
+				}
 			}
 		})
 	}
@@ -153,7 +168,7 @@ func TestEnginesAgree(t *testing.T) {
 
 // runCase executes one case from the repository root, so that diagnostics name the case
 // by its repo-relative path and the expected stderr is stable wherever the test runs.
-func runCase(t *testing.T, root string, c caseFile, engine driver.Engine) (string, string, int) {
+func runCase(t *testing.T, root string, c caseFile, e engineSpec) (string, string, int) {
 	t.Helper()
 	wd, err := os.Getwd()
 	if err != nil {
@@ -165,7 +180,7 @@ func runCase(t *testing.T, root string, c caseFile, engine driver.Engine) (strin
 	defer func() { _ = os.Chdir(wd) }()
 
 	var stdout, stderr bytes.Buffer
-	code := driver.RunWith(c.RelPath, engine, &stdout, &stderr)
+	code := driver.RunAt(c.RelPath, e.engine, e.level, &stdout, &stderr)
 	return stdout.String(), stderr.String(), code
 }
 

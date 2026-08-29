@@ -1,0 +1,11 @@
+use std::io;
+
+fn note(m: String) -> i64 {
+    io::println(m);
+    1
+}
+
+fn main() {
+    let total = note("left") + note("right");
+    io::println(total.to_str());
+}

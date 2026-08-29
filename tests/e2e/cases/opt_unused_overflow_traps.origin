@@ -1,0 +1,7 @@
+use std::io;
+
+fn main() {
+    io::println("before");
+    let unused = i64::MAX + 1;
+    io::println("after");
+}

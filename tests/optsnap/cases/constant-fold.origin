@@ -1,0 +1,6 @@
+fn main() {
+    let folded = 2 + 3 * 4;
+    let compared = 1 < 2;
+    let wrapped = 9223372036854775807.wrapping_add(1);
+    let shifted = 1 << 4;
+}

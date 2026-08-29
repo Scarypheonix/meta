@@ -1,0 +1,5 @@
+fn main() {
+    let used = 1;
+    let ignored = (used, used);
+    let alsoIgnored = 2 < 3;
+}

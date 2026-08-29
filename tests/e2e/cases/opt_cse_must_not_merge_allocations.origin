@@ -1,0 +1,11 @@
+use std::io;
+
+struct Point { x: i64 }
+
+fn main() {
+    let a = Point { x: 1 };
+    let b = Point { x: 1 };
+    io::println((a == b).to_str());
+    io::println(ref_eq(a, b).to_str());
+    io::println(ref_eq(a, a).to_str());
+}

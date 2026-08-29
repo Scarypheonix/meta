@@ -1,0 +1,44 @@
+=== before ===
+func sum(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = unit
+  v2 = unit
+  v3 = const 1
+  v4 = const 2
+  v5 = struct 0 2 v3 v4
+  v6 = get_field 0 v5
+  v7 = get_field 1 v5
+  v8 = add v6 v7
+  return v8
+
+func main(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = func 0
+  v2 = call 0 0 v1
+  v3 = unit
+  return v3
+
+=== after ===
+func sum(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = unit
+  v2 = unit
+  v3 = const 1
+  v4 = const 2
+  v5 = struct 0 2 v3 v4
+  v6 = get_field 0 v5
+  v7 = get_field 1 v5
+  v8 = add v3 v4
+  return v8
+
+func main(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = func 0
+  v2 = call 0 0 v1
+  v3 = unit
+  return v3
+

@@ -1,0 +1,10 @@
+use std::io;
+
+fn main() {
+    let z = 0.0;
+    let nan = z / z;
+    io::println((nan == nan).to_str());
+    io::println((nan != nan).to_str());
+    io::println((0.0 == (0.0 - 0.0)).to_str());
+    io::println((1.0 / 3.0).to_str());
+}

@@ -1,0 +1,8 @@
+use std::io;
+
+fn main() {
+    io::println("before");
+    let z = 0;
+    let n = 10 / z;
+    io::println(n.to_str());
+}

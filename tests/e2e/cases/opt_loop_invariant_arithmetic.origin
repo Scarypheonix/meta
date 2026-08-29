@@ -1,0 +1,16 @@
+use std::io;
+
+fn sum_with_invariant(n: i64, a: i64, b: i64) -> i64 {
+    let mut i = 0;
+    let mut acc = 0;
+    while i < n {
+        acc = acc + (a * b) + i;
+        i = i + 1;
+    }
+    acc
+}
+
+fn main() {
+    io::println(sum_with_invariant(4, 3, 5).to_str());
+    io::println(sum_with_invariant(0, 3, 5).to_str());
+}

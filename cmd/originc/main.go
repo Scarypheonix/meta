@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/scarypheonix/meta/internal/driver"
+	"github.com/scarypheonix/meta/internal/opt"
 )
 
 // Version is the compiler version. It is not the language version; the language
@@ -24,6 +25,8 @@ usage:
   originc check <file>       parse and resolve, emit diagnostics only
   originc run <file>         run a program with the tree-walking interpreter
   originc run --vm <file>    run it on the bytecode virtual machine instead
+  originc run -O1 <file>     run it on the VM with the optimizer (also -O0, -O2)
+  originc dump-ir <file>     print the SSA intermediate representation
   originc dump-ast <file>    print the parsed syntax tree
   originc dump-bytecode <f>  print the compiled bytecode
   originc build <file>       compile to a native executable
@@ -82,13 +85,26 @@ func run(args []string) int {
 	case "help", "--help", "-h":
 		fmt.Fprint(os.Stdout, usage)
 		return driver.ExitOK
-	case "check", "run", "dump-ast", "dump-bytecode":
+	case "check", "run", "dump-ast", "dump-bytecode", "dump-ir":
 		engine := driver.Interpreter
+		level := opt.O0
 		rest := args[1:]
-		if len(rest) > 0 && rest[0] == "--vm" {
-			engine = driver.VM
+		for len(rest) > 0 {
+			switch rest[0] {
+			case "--vm":
+				engine = driver.VM
+			case "-O0":
+				level = opt.O0
+			case "-O1":
+				engine, level = driver.VM, opt.O1
+			case "-O2":
+				engine, level = driver.VM, opt.O2
+			default:
+				goto done
+			}
 			rest = rest[1:]
 		}
+	done:
 		if len(rest) != 1 {
 			fmt.Fprintf(os.Stderr, "originc: `%s` takes exactly one file or directory\n", args[0])
 			return driver.ExitUsage
@@ -97,9 +113,11 @@ func run(args []string) int {
 		case "check":
 			return driver.Check(rest[0], os.Stdout, os.Stderr)
 		case "run":
-			return driver.RunWith(rest[0], engine, os.Stdout, os.Stderr)
+			return driver.RunAt(rest[0], engine, level, os.Stdout, os.Stderr)
 		case "dump-bytecode":
 			return driver.DumpBytecode(rest[0], os.Stdout, os.Stderr)
+		case "dump-ir":
+			return driver.DumpIR(rest[0], level, os.Stdout, os.Stderr)
 		default:
 			return driver.DumpAST(rest[0], os.Stdout, os.Stderr)
 		}

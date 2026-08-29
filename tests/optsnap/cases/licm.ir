@@ -1,0 +1,80 @@
+=== before ===
+func total(params=3 captures=0)
+b0:
+  v0 = param 0
+  v1 = param 1
+  v2 = param 2
+  v3 = unit
+  v4 = unit
+  v5 = const 0
+  v6 = const 0
+  jump b1
+b1:  ; preds b0 b2
+  v8 = phi v5 v20
+  v30 = phi v6 v16
+  v10 = lt v8 v0
+  branch v10 ? b2 : b3
+b2:  ; preds b1
+  v15 = and v1 v2
+  v16 = add v30 v15
+  v17 = unit
+  v19 = const 1
+  v20 = add v8 v19
+  v21 = unit
+  v22 = unit
+  jump b1
+b3:  ; preds b1
+  v24 = unit
+  return v30
+
+func main(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = func 0
+  v2 = const 3
+  v3 = const 5
+  v4 = const 6
+  v5 = call 0 3 v1 v2 v3 v4
+  v6 = unit
+  return v6
+
+=== after ===
+func total(params=3 captures=0)
+b0:
+  v0 = param 0
+  v1 = param 1
+  v2 = param 2
+  v3 = unit
+  v4 = unit
+  v5 = const 0
+  v6 = const 0
+  v15 = and v1 v2
+  jump b1
+b1:  ; preds b0 b2
+  v8 = phi v5 v20
+  v30 = phi v6 v16
+  v10 = lt v8 v0
+  branch v10 ? b2 : b3
+b2:  ; preds b1
+  v16 = add v30 v15
+  v17 = unit
+  v19 = const 1
+  v20 = add v8 v19
+  v21 = unit
+  v22 = unit
+  jump b1
+b3:  ; preds b1
+  v24 = unit
+  return v30
+
+func main(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = func 0
+  v2 = const 3
+  v3 = const 5
+  v4 = const 6
+  v5 = call 0 3 v1 v2 v3 v4
+  v6 = unit
+  return v6
+

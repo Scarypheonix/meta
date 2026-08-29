@@ -1,0 +1,41 @@
+=== after prerequisites: constant-fold, unreachable-blocks ===
+func pick(params=1 captures=0)
+b0:
+  v0 = param 0
+  v1 = true
+  jump b1
+b1:  ; preds b0
+  jump b3
+b3:  ; preds b1
+  v9 = phi v0
+  return v9
+
+func main(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = func 0
+  v2 = const 3
+  v3 = call 0 1 v1 v2
+  v4 = unit
+  return v4
+
+=== after ===
+func pick(params=1 captures=0)
+b0:
+  v0 = param 0
+  v1 = true
+  jump b1
+b1:  ; preds b0
+  jump b3
+b3:  ; preds b1
+  return v0
+
+func main(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = func 0
+  v2 = const 3
+  v3 = call 0 1 v1 v2
+  v4 = unit
+  return v4
+

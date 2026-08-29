@@ -1,0 +1,9 @@
+fn twice(a: i64, b: i64) -> i64 {
+    let first = a * b;
+    let second = a * b;
+    first + second
+}
+
+fn main() {
+    let x = twice(2, 3);
+}

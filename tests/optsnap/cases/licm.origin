@@ -1,0 +1,13 @@
+fn total(n: i64, a: i64, b: i64) -> i64 {
+    let mut i = 0;
+    let mut acc = 0;
+    while i < n {
+        acc = acc + (a & b);
+        i = i + 1;
+    }
+    acc
+}
+
+fn main() {
+    let x = total(3, 5, 6);
+}

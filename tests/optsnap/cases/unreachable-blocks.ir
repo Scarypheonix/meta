@@ -1,0 +1,31 @@
+=== after prerequisites: constant-fold ===
+func main(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = true
+  jump b1
+b1:  ; preds b0
+  v3 = const 1
+  jump b3
+b2:
+  v5 = const 2
+  jump b3
+b3:  ; preds b1 b2
+  v7 = phi v3 v5
+  v8 = unit
+  return v8
+
+=== after ===
+func main(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = true
+  jump b1
+b1:  ; preds b0
+  v3 = const 1
+  jump b3
+b3:  ; preds b1
+  v7 = phi v3
+  v8 = unit
+  return v8
+

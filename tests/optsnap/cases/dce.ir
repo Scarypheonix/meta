@@ -1,0 +1,20 @@
+=== before ===
+func main(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = unit
+  v2 = unit
+  v3 = const 1
+  v4 = tuple 9 2 v3 v3
+  v5 = const 2
+  v6 = const 3
+  v7 = lt v5 v6
+  v8 = unit
+  return v8
+
+=== after ===
+func main(params=0 captures=0)
+b0:
+  v8 = unit
+  return v8
+

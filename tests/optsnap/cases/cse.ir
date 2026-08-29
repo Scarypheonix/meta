@@ -1,0 +1,44 @@
+=== before ===
+func twice(params=2 captures=0)
+b0:
+  v0 = param 0
+  v1 = param 1
+  v2 = unit
+  v3 = unit
+  v4 = mul v0 v1
+  v5 = mul v0 v1
+  v6 = add v4 v5
+  return v6
+
+func main(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = func 0
+  v2 = const 2
+  v3 = const 3
+  v4 = call 0 2 v1 v2 v3
+  v5 = unit
+  return v5
+
+=== after ===
+func twice(params=2 captures=0)
+b0:
+  v0 = param 0
+  v1 = param 1
+  v2 = unit
+  v3 = unit
+  v4 = mul v0 v1
+  v5 = mul v0 v1
+  v6 = add v4 v4
+  return v6
+
+func main(params=0 captures=0)
+b0:
+  v0 = unit
+  v1 = func 0
+  v2 = const 2
+  v3 = const 3
+  v4 = call 0 2 v1 v2 v3
+  v5 = unit
+  return v0
+

@@ -1,0 +1,7 @@
+fn pick(n: i64) -> i64 {
+    if true { n } else { n - 1 }
+}
+
+fn main() {
+    let a = pick(3);
+}

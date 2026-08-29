@@ -19,6 +19,7 @@ import (
 	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/interp"
+	"github.com/scarypheonix/meta/internal/opt"
 	"github.com/scarypheonix/meta/internal/parse"
 	"github.com/scarypheonix/meta/internal/prelude"
 	"github.com/scarypheonix/meta/internal/resolve"
@@ -212,12 +213,18 @@ const (
 	VM
 )
 
-// RunWith compiles a program and executes it on the chosen engine.
-//
-// Both engines must produce byte-identical stdout, byte-identical stderr and the same
-// exit status; that differential is Phase 3's exit criterion and tests/e2e runs the
-// whole corpus through both.
+// RunWith compiles a program and executes it on the chosen engine at -O0.
 func RunWith(path string, engine Engine, stdout, stderr io.Writer) int {
+	return RunAt(path, engine, opt.O0, stdout, stderr)
+}
+
+// RunAt compiles a program at an optimization level and executes it.
+//
+// Every engine and every level must produce byte-identical stdout, byte-identical
+// stderr and the same exit status. That differential is the exit criterion of Phase 3
+// (two engines) and Phase 4 (three levels), and tests/e2e runs the whole corpus through
+// all of them.
+func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer) int {
 	units, err := LoadUnits(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
@@ -232,6 +239,34 @@ func RunWith(path string, engine Engine, stdout, stderr io.Writer) int {
 	}
 	code, err := compile.Program(prog.Resolved, prog.Types, prog.AllASTs...)
 	if err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitDiagnostics
+	}
+	if err := opt.Run(code, level); err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitDiagnostics
+	}
+	return vm.New(code, vm.Config{}, stdout, stderr).Run()
+}
+
+// RunRoundTrip executes a program through the IR with no optimization passes, which
+// isolates SSA construction and emission from the passes built on them.
+func RunRoundTrip(path string, stdout, stderr io.Writer) int {
+	units, err := LoadUnits(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitUsage
+	}
+	prog, ok := CompilePackage(units, stderr)
+	if !ok {
+		return ExitDiagnostics
+	}
+	code, err := compile.Program(prog.Resolved, prog.Types, prog.AllASTs...)
+	if err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitDiagnostics
+	}
+	if err := opt.BuildOnly(code); err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
 		return ExitDiagnostics
 	}
@@ -285,6 +320,32 @@ func DumpBytecode(path string, stdout, stderr io.Writer) int {
 		return ExitDiagnostics
 	}
 	fmt.Fprint(stdout, code.Disassemble())
+	return ExitOK
+}
+
+// DumpIR compiles a program and prints its SSA form, optionally after optimizing it.
+// It is the artefact the optimizer's snapshot tests compare.
+func DumpIR(path string, level opt.Level, stdout, stderr io.Writer) int {
+	units, err := LoadUnits(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitUsage
+	}
+	prog, ok := CompilePackage(units, stderr)
+	if !ok {
+		return ExitDiagnostics
+	}
+	code, cerr := compile.Program(prog.Resolved, prog.Types, prog.AllASTs...)
+	if cerr != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", cerr)
+		return ExitDiagnostics
+	}
+	text, derr := opt.DumpIR(code, level)
+	if derr != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", derr)
+		return ExitDiagnostics
+	}
+	fmt.Fprint(stdout, text)
 	return ExitOK
 }
 

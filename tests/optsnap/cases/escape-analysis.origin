@@ -1,0 +1,10 @@
+struct Pair { a: i64, b: i64 }
+
+fn sum() -> i64 {
+    let p = Pair { a: 1, b: 2 };
+    p.a + p.b
+}
+
+fn main() {
+    let x = sum();
+}
