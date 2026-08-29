@@ -121,6 +121,14 @@ collector and the code generator must agree on, and process rule 5 puts such an
 agreement in exactly one module. Neither the collector nor the backend may derive the
 frame's shape independently.
 
+DEFERRED: stack maps are not emitted yet, and native code therefore allocates without
+collecting. A precise map requires knowing which frame slots hold references, and the
+SSA IR does not carry that: it is built from bytecode (ADR-0016), which has no types.
+The fix is the one ADR-0016 names — widen the bytecode so a value's kind travels with
+it, as `bytecode.Kind` already does for the operations whose lowering depends on it —
+and it is scheduled in `docs/deferred.md`. Emitting a map that claims a precision the
+compiler cannot supply would be a stub that lies (process rule 8).
+
 ## Object layout in native code
 
 Objects use the layouts of §08 and `internal/layout`, read through the same descriptor
@@ -153,9 +161,10 @@ The runtime routines the backend emits, and what they compile to:
 | `exit(status)` | the `exit_group` (Linux) or `exit` (macOS) syscall |
 
 Syscalls are made directly: `syscall` with the number in `rax`, arguments in
-`rdi rsi rdx r10 r8 r9`. The number differs between the two operating systems (macOS
-ORs the BSD class `0x2000000` into it), which is the only place the two builds' *code*
-differs; it is a per-target constant table, not a second code path.
+`rdi rsi rdx r10 r8 r9`. Two things differ between the operating systems — the syscall
+numbers (macOS ORs the BSD class `0x2000000` into each) and the `mmap` flag for an
+anonymous mapping — and nothing else does. They are a per-target constant table, not a
+second code path.
 
 ## Traps
 

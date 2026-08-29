@@ -104,6 +104,13 @@ func cases() []encCase {
 		{"xor rdx, 15", "xor rdx,0xf", func(a *Asm) { a.XorRI(RDX, 15) },
 			[]byte{0x48, 0x81, 0xF2, 0x0F, 0x00, 0x00, 0x00}},
 
+		{"div rcx", "div rcx", func(a *Asm) { a.Div(RCX) }, []byte{0x48, 0xF7, 0xF1}},
+		{"mov al, [r8]", "mov al,byte ptr [r8]", func(a *Asm) { a.MovRM8(RAX, At(R8, 0)) },
+			[]byte{0x41, 0x8A, 0x00}},
+		{"mov [rbx], dl", "mov byte ptr [rbx],dl", func(a *Asm) { a.MovMR8(At(RBX, 0), RDX) },
+			[]byte{0x88, 0x13}},
+		{"mov [r9+3], sil", "mov byte ptr [r9+0x3],sil", func(a *Asm) { a.MovMR8(At(R9, 3), RSI) },
+			[]byte{0x41, 0x88, 0x71, 0x03}},
 		{"neg rax", "neg rax", func(a *Asm) { a.Neg(RAX) }, []byte{0x48, 0xF7, 0xD8}},
 		{"not rbx", "not rbx", func(a *Asm) { a.Not(RBX) }, []byte{0x48, 0xF7, 0xD3}},
 		{"idiv rcx", "idiv rcx", func(a *Asm) { a.Idiv(RCX) }, []byte{0x48, 0xF7, 0xF9}},

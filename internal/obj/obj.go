@@ -61,6 +61,10 @@ type Target struct {
 	SysWrite uint64
 	SysExit  uint64
 	SysMmap  uint64
+	// MapAnonPrivate is the mmap flag pair for a private anonymous mapping, which is
+	// how the runtime asks for a heap. The two systems number MAP_ANONYMOUS
+	// differently, so it joins the syscall numbers as a per-target constant.
+	MapAnonPrivate uint64
 }
 
 // Linux is the x86-64 Linux target.
@@ -71,6 +75,8 @@ var Linux = Target{
 	SysWrite: 1,
 	SysExit:  231, // exit_group: exits every thread, which is what a program's end means
 	SysMmap:  9,
+	// MAP_PRIVATE | MAP_ANONYMOUS
+	MapAnonPrivate: 0x02 | 0x20,
 }
 
 // MacOS is the x86-64 macOS target.
@@ -81,6 +87,8 @@ var MacOS = Target{
 	SysWrite: 0x2000004,
 	SysExit:  0x2000001,
 	SysMmap:  0x20000C5,
+	// MAP_PRIVATE | MAP_ANON
+	MapAnonPrivate: 0x0002 | 0x1000,
 }
 
 // TargetFor returns the target for a format name, as `originc build --target` spells it.

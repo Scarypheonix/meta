@@ -176,6 +176,57 @@ type Instr struct {
 	Span diag.Span
 }
 
+// Kind is the static type of an operand, for the handful of opcodes whose behaviour
+// depends on it.
+//
+// The virtual machine does not need this: every value it holds carries a tag, so `to_str`
+// and `==` can look at what they were given. Native code has no tags — a register holds
+// sixty-four bits and nothing says what they mean — so the static type has to travel with
+// the instruction.
+//
+// ADR-0016 anticipated exactly this: when the backend needs something the bytecode has
+// thrown away, the answer is to widen the bytecode rather than to grow a second lowering
+// path from the AST. This is the first thing to arrive that way.
+type Kind int32
+
+// The operand kinds. KindUnknown is what an older or hand-written instruction carries,
+// and the backend rejects it rather than guessing.
+const (
+	KindUnknown Kind = iota
+	KindInt
+	KindUint
+	KindFloat
+	KindBool
+	KindChar
+	KindString
+	KindUnit
+	// KindRef is an aggregate: a struct, an enum, a tuple or a closure. Its object
+	// header names its type, so the runtime can work structurally from there.
+	KindRef
+)
+
+func (k Kind) String() string {
+	switch k {
+	case KindInt:
+		return "int"
+	case KindUint:
+		return "uint"
+	case KindFloat:
+		return "float"
+	case KindBool:
+		return "bool"
+	case KindChar:
+		return "char"
+	case KindString:
+		return "string"
+	case KindUnit:
+		return "unit"
+	case KindRef:
+		return "ref"
+	}
+	return "unknown"
+}
+
 // ConstKind says what a constant holds.
 type ConstKind uint8
 

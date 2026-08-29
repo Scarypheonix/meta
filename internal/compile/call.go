@@ -100,7 +100,9 @@ func (c *Compiler) methodCall(v *ast.MethodCall) error {
 		if err := c.expr(v.Recv); err != nil {
 			return err
 		}
-		c.emit(bytecode.OpToStr, v.Span())
+		// Rendering depends on what is being rendered, and native code cannot ask a
+		// register what it holds, so the kind travels with the instruction.
+		c.emitA(bytecode.OpToStr, int(c.kindOf(v.Recv)), v.Span())
 		return nil
 	}
 	if op, ok := builtinMethodOps[v.Name.Name]; ok && len(v.Args) == 1 {

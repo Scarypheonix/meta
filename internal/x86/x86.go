@@ -393,6 +393,21 @@ func (a *Asm) Movzx8(dst, src Reg) {
 	a.modrmReg(dst, src)
 }
 
+// MovRM8 is `mov dst8, byte [base+disp]`, zero-extending nothing: only the low byte of
+// dst changes. The runtime's byte copies use it.
+func (a *Asm) MovRM8(dst Reg, m Mem) {
+	a.rex(false, dst, 0, m.Base, dst >= RSP && dst < R8)
+	a.emit(0x8A)
+	a.modrmMem(dst, m)
+}
+
+// MovMR8 is `mov byte [base+disp], src8`.
+func (a *Asm) MovMR8(m Mem, src Reg) {
+	a.rex(false, src, 0, m.Base, src >= RSP && src < R8)
+	a.emit(0x88)
+	a.modrmMem(src, m)
+}
+
 // Cmov is `cmovcc dst, src`.
 func (a *Asm) Cmov(c Cond, dst, src Reg) {
 	a.rex(true, dst, 0, src, false)
@@ -481,6 +496,11 @@ func (a *Asm) Not(r Reg) { a.unary(2, r) }
 // Neg is `neg r`, which sets OF when the operand is the most negative integer — the one
 // case where negation overflows.
 func (a *Asm) Neg(r Reg) { a.unary(3, r) }
+
+// Div is `div r`: divides RDX:RAX by r as unsigned. Rendering a negative integer needs
+// it — the magnitude of the most negative integer does not fit in a signed 64-bit value,
+// so the digits are produced by unsigned division of the negated bits.
+func (a *Asm) Div(r Reg) { a.unary(6, r) }
 
 // Idiv is `idiv r`: divides RDX:RAX by r, quotient in RAX, remainder in RDX. The caller
 // must have executed Cqo, and must have already excluded a zero divisor and the

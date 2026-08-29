@@ -79,7 +79,10 @@ func (c *Compiler) binary(v *ast.Binary) error {
 		return err
 	}
 	if op, ok := cmpOps[v.Op]; ok {
-		c.emit(op, v.Span())
+		// The operand kind travels with the instruction: `==` and `<` mean different
+		// machine code for an integer, a float and a String, and native code has no
+		// runtime tag to ask (bytecode.Kind).
+		c.emitA(op, int(c.kindOf(v.L)), v.Span())
 		return nil
 	}
 	if c.isFloat(v.L) {
@@ -224,4 +227,40 @@ func castWidth(k types.PrimKind) int {
 		return 64
 	}
 	return w
+}
+
+// kindOf reports the static type of an expression as the backend needs to see it.
+//
+// It is deliberately total: an expression whose type the checker left as an error, or
+// one of a shape with no distinct lowering, reports KindUnknown, and the backend refuses
+// to guess rather than emitting something plausible.
+func (c *Compiler) kindOf(e ast.Expr) bytecode.Kind {
+	return kindOfType(c.typeOf(e))
+}
+
+func kindOfType(t types.Type) bytecode.Kind {
+	if p, ok := types.AsPrim(t); ok {
+		switch {
+		case p.Kind == types.Bool:
+			return bytecode.KindBool
+		case p.Kind == types.Char:
+			return bytecode.KindChar
+		case p.Kind == types.String:
+			return bytecode.KindString
+		case p.Kind == types.UnitKind:
+			return bytecode.KindUnit
+		case p.Kind.IsFloat():
+			return bytecode.KindFloat
+		case p.Kind.IsSigned():
+			return bytecode.KindInt
+		case p.Kind.IsInteger():
+			return bytecode.KindUint
+		}
+		return bytecode.KindUnknown
+	}
+	switch types.Prune(t).(type) {
+	case *types.Named, *types.TupleT, *types.FnT:
+		return bytecode.KindRef
+	}
+	return bytecode.KindUnknown
 }
