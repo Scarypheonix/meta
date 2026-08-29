@@ -24,27 +24,19 @@ import (
 // implementedCodes are the diagnostic codes the compiler can emit today. Add a code
 // here in the same commit that starts emitting it.
 var implementedCodes = map[string]string{
-	"E0001": "", // lexical error
-	"E0002": "", // syntax error
-	"E0034": "", // ambiguous / duplicate method
-	"E0433": "", // unresolved path
-	"E0594": "", // cannot assign
+	// Emitted today.
+	"E0001": "", "E0002": "", "E0004": "", "E0005": "", "E0006": "", "E0007": "",
+	"E0023": "", "E0026": "", "E0027": "", "E0034": "", "E0046": "", "E0061": "",
+	"E0062": "", "E0063": "", "E0107": "", "E0109": "", "E0119": "", "E0220": "",
+	"E0277": "", "E0308": "", "E0309": "", "E0310": "", "E0369": "", "E0404": "",
+	"E0407": "", "E0411": "", "E0412": "", "E0423": "", "E0424": "", "E0432": "",
+	"E0433": "", "E0532": "", "E0533": "", "E0560": "", "E0571": "", "E0573": "",
+	"E0574": "", "E0594": "", "E0599": "", "E0600": "", "E0603": "", "E0605": "",
+	"E0609": "", "E0618": "", "E0658": "", "W0001": "", "W0002": "", "W0003": "",
 
 	// Not yet emitted; the value names the phase that will emit it.
-	"E0004": "Phase 2 (exhaustiveness checker)",
-	"E0005": "Phase 2 (refutability checker)",
-	"E0006": "Phase 2 (usefulness checker)",
-	"E0007": "Phase 2 (or-pattern binding check)",
-	"E0117": "Phase 2 (coherence)",
-	"E0119": "Phase 2 (coherence)",
-	"E0277": "Phase 2 (trait bounds)",
-	"E0308": "Phase 2 (type checker)",
-	"E0309": "Phase 2 (type checker)",
-	"E0310": "Phase 2 (occurs check)",
-	"E0432": "Phase 2 (module system)",
-	"E0599": "Phase 2 (method resolution)",
-	"E0603": "Phase 2 (visibility)",
-	"E0055": "Phase 2 (monomorphization)",
+	"E0117": "Phase 8 (orphan rule needs more than one package)",
+	"E0055": "Phase 4 (monomorphization)",
 }
 
 func caseFiles(t *testing.T) []string {

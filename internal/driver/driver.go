@@ -11,6 +11,7 @@ import (
 	"os"
 
 	"github.com/scarypheonix/meta/internal/ast"
+	"github.com/scarypheonix/meta/internal/check"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/interp"
 	"github.com/scarypheonix/meta/internal/parse"
@@ -31,11 +32,12 @@ const (
 	ExitTrap = interp.TrapExitCode
 )
 
-// Program is a source file that has been parsed and resolved.
+// Program is a source file that has been parsed, resolved and type-checked.
 type Program struct {
 	File     *source.File
 	AST      *ast.File
 	Resolved *resolve.Result
+	Types    *check.Result
 }
 
 // Compile lexes, parses and resolves a source file together with the prelude, writing
@@ -43,9 +45,13 @@ type Program struct {
 func Compile(f *source.File, w io.Writer) (*Program, bool) {
 	bag := diag.New()
 
+	// One id generator for the whole compilation: side tables are keyed by node id, so
+	// per-file numbering would make the prelude and the user's file collide.
+	ids := ast.NewIDGen()
+
 	preludeFile := prelude.Source()
 	preludeBag := diag.New()
-	preludeAST := parse.File(preludeFile, preludeBag)
+	preludeAST := parse.FileWith(preludeFile, preludeBag, ids)
 	if preludeBag.HasErrors() {
 		// The prelude ships with the compiler; a broken one is our bug, not the user's.
 		fmt.Fprintln(w, "this is a compiler bug: the prelude does not parse")
@@ -53,7 +59,7 @@ func Compile(f *source.File, w io.Writer) (*Program, bool) {
 		return nil, false
 	}
 
-	userAST := parse.File(f, bag)
+	userAST := parse.FileWith(f, bag, ids)
 	if bag.HasErrors() {
 		bag.Render(w)
 		return nil, false
@@ -64,10 +70,16 @@ func Compile(f *source.File, w io.Writer) (*Program, bool) {
 		bag.Render(w)
 		return nil, false
 	}
+
+	tys := check.Program(bag, res, preludeAST, userAST)
+	if bag.HasErrors() {
+		bag.Render(w)
+		return nil, false
+	}
 	if bag.WarningCount() > 0 {
 		bag.Render(w)
 	}
-	return &Program{File: f, AST: userAST, Resolved: res}, true
+	return &Program{File: f, AST: userAST, Resolved: res, Types: tys}, true
 }
 
 // Check compiles a file and reports diagnostics only.

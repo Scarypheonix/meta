@@ -24,7 +24,7 @@ type Parser struct {
 	pos  int
 	bag  *diag.Bag
 
-	nextID ast.NodeID
+	ids *ast.IDGen
 
 	// noStruct suppresses struct literals at the top level of an expression, which is
 	// what makes `if x { }` unambiguous (spec/02-grammar.md, parser restriction 1).
@@ -35,10 +35,16 @@ type Parser struct {
 	recovering bool
 }
 
-// File lexes and parses one source file. It always returns a File, however broken the
-// input; check bag.HasErrors to know whether the tree is trustworthy.
+// File lexes and parses one source file with its own id generator. Use it for a
+// single-file parse; a compilation of several files must share one generator, so that
+// node ids stay unique across them.
 func File(f *source.File, bag *diag.Bag) *ast.File {
-	p := &Parser{file: f, toks: lex.Tokens(f, bag), bag: bag, nextID: 1}
+	return FileWith(f, bag, ast.NewIDGen())
+}
+
+// FileWith parses a source file, drawing node ids from a shared generator.
+func FileWith(f *source.File, bag *diag.Bag, ids *ast.IDGen) *ast.File {
+	p := &Parser{file: f, toks: lex.Tokens(f, bag), bag: bag, ids: ids}
 	return p.parseFile()
 }
 
@@ -46,11 +52,7 @@ func File(f *source.File, bag *diag.Bag) *ast.File {
 // Token helpers
 // ---------------------------------------------------------------------------
 
-func (p *Parser) newID() ast.NodeID {
-	id := p.nextID
-	p.nextID++
-	return id
-}
+func (p *Parser) newID() ast.NodeID { return p.ids.Next() }
 
 // base builds a node identity spanning from token index start through the last token
 // consumed.

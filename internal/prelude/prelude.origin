@@ -1,9 +1,13 @@
 // The Origin prelude, in scope in every module without a `use`.
 //
-// Phase 1 defines only the types the language's own semantics depend on: `Option` for
-// the `for` desugaring and the checked-arithmetic methods, `Result` for `?`, and
-// `Ordering` for `cmp`. The rest of the standard library is written in Origin in
-// Phase 7; the interpreter's builtin methods stand in until then.
+// The types and traits here are written in Origin, not built into the compiler, so that
+// the language's own vocabulary goes through the same lexer, parser, resolver and
+// checker as user code.
+//
+// The traits declare their signatures; the impls for primitive types are provided by the
+// compiler (see internal/check's builtin impl table) because they cannot be written in
+// Origin until the standard library exists in Phase 7. `Hash` waits for `Hasher`, which
+// waits for Phase 7 as well.
 
 pub enum Option[T] {
     None,
@@ -19,4 +23,52 @@ pub enum Ordering {
     Less,
     Equal,
     Greater,
+}
+
+/// Total ordering. `<` and friends are built in for primitives; user types compare
+/// through `cmp` (spec/04-expressions.md).
+pub trait Ord {
+    fn cmp(self, other: Self) -> Ordering;
+}
+
+/// Rendering a value as text. `io::println` takes a `String`, so `to_str` is how
+/// anything else reaches it.
+pub trait Show {
+    fn to_str(self) -> String;
+}
+
+/// A sequence that can be advanced. Drives `for` together with `IntoIterator`.
+pub trait Iterator {
+    type Item;
+    fn next(mut self) -> Option[Self::Item];
+}
+
+/// Anything a `for` loop can walk.
+pub trait IntoIterator {
+    type Item;
+    type Iter: Iterator;
+    fn into_iter(self) -> Self::Iter;
+}
+
+/// Arithmetic that does not trap, for when wrapping, checking or saturating is what you
+/// actually want. `+ - *` trap on overflow (ADR-0005); these are the explicit
+/// alternatives. The compiler implements this trait for every integer type.
+pub trait Int {
+    fn wrapping_add(self, other: Self) -> Self;
+    fn wrapping_sub(self, other: Self) -> Self;
+    fn wrapping_mul(self, other: Self) -> Self;
+
+    fn checked_add(self, other: Self) -> Option[Self];
+    fn checked_sub(self, other: Self) -> Option[Self];
+    fn checked_mul(self, other: Self) -> Option[Self];
+
+    fn saturating_add(self, other: Self) -> Self;
+    fn saturating_sub(self, other: Self) -> Self;
+    fn saturating_mul(self, other: Self) -> Self;
+}
+
+/// A marker for values that may cross a channel (spec/08-memory-model.md, ADR-0014).
+/// It is derived, not implemented by hand: a type is `Send` when it has no `mut` field
+/// and its fields are all `Send`.
+pub trait Send {
 }

@@ -263,16 +263,44 @@ func renderOne(w io.Writer, d Diagnostic) {
 	span := d.Primary.Span
 	line, col := span.Position()
 	gutter := len(fmt.Sprint(maxLine(d)))
+	pad := strings.Repeat(" ", gutter+1)
 
-	fmt.Fprintf(w, "%s--> %s:%d:%d\n", strings.Repeat(" ", gutter+1), span.File.Name, line, col)
-	fmt.Fprintf(w, "%s |\n", strings.Repeat(" ", gutter+1))
-	renderLabel(w, gutter, d.Primary, '^')
-	for _, sec := range d.Secondary {
-		if sec.Span.File == span.File {
-			renderLabel(w, gutter, sec, '-')
-		}
+	fmt.Fprintf(w, "%s--> %s:%d:%d\n", pad, span.File.Name, line, col)
+	fmt.Fprintf(w, "%s |\n", pad)
+
+	// Labels are rendered in source order, not in the order they were attached, so a
+	// secondary span earlier in the file reads before the primary rather than after it.
+	type entry struct {
+		label  Label
+		marker rune
+		line   int
 	}
-	fmt.Fprintf(w, "%s |\n", strings.Repeat(" ", gutter+1))
+	entries := []entry{{label: d.Primary, marker: '^', line: line}}
+	for _, sec := range d.Secondary {
+		if sec.Span.File != span.File {
+			continue
+		}
+		sl, _ := sec.Span.Position()
+		entries = append(entries, entry{label: sec, marker: '-', line: sl})
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].line != entries[j].line {
+			return entries[i].line < entries[j].line
+		}
+		return entries[i].label.Span.Start < entries[j].label.Span.Start
+	})
+
+	prev := 0
+	for i, e := range entries {
+		// A gap between labelled lines is elided rather than printed in full.
+		if i > 0 && e.line > prev+1 {
+			fmt.Fprintf(w, "%s...\n", strings.Repeat(" ", gutter))
+		}
+		renderLabel(w, gutter, e.label, e.marker)
+		prev = e.line
+	}
+
+	fmt.Fprintf(w, "%s |\n", pad)
 	for _, n := range d.Notes {
 		fmt.Fprintf(w, "%s = note: %s\n", strings.Repeat(" ", gutter), n)
 	}

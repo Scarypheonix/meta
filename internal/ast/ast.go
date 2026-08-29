@@ -19,6 +19,24 @@ type NodeID uint32
 // NoID is the zero NodeID and never identifies a real node.
 const NoID NodeID = 0
 
+// IDGen allocates node ids.
+//
+// One generator serves a whole compilation, not one file: the side tables that resolve
+// and check produce are keyed by NodeID, so two files whose ids both start at 1 would
+// silently share entries. One generator per file was a real bug, found when the checker
+// first walked the prelude and the user's file together.
+type IDGen struct{ next NodeID }
+
+// NewIDGen returns a generator whose first id is 1.
+func NewIDGen() *IDGen { return &IDGen{next: 1} }
+
+// Next returns the next unused node id.
+func (g *IDGen) Next() NodeID {
+	id := g.next
+	g.next++
+	return id
+}
+
 // Node is implemented by every AST node.
 //
 // The seal is the unexported isNode method on Base. Embedding Base outside this package

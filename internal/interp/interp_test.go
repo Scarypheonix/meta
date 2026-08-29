@@ -38,6 +38,18 @@ func expectOut(t *testing.T, src, want string) {
 	}
 }
 
+// expectReject asserts the program is rejected with the given diagnostic code.
+func expectReject(t *testing.T, src, wantCode string) {
+	t.Helper()
+	_, stderr, code := run(t, src)
+	if code != driver.ExitDiagnostics {
+		t.Fatalf("exit status = %d, want %d (rejected)\nstderr:\n%s", code, driver.ExitDiagnostics, stderr)
+	}
+	if !strings.Contains(stderr, "["+wantCode+"]") {
+		t.Errorf("expected diagnostic %s, got:\n%s", wantCode, stderr)
+	}
+}
+
 func expectTrap(t *testing.T, src, wantMsg string) {
 	t.Helper()
 	_, stderr, code := run(t, src)
@@ -167,9 +179,10 @@ func TestFloatToIntCastTraps(t *testing.T) {
 	expectTrap(t, wrap("    let z = 0.0;\n    let n = (z / z) as i64;"), "invalid float to integer cast")
 }
 
-func TestFieldMutability(t *testing.T) {
-	// spec/08-memory-model.md: a field not declared `mut` is fixed at construction.
-	// Phase 2 rejects this at compile time; Phase 1 catches it here.
+// spec/08-memory-model.md: a field not declared `mut` is fixed at construction. Phase 1
+// caught this when the assignment ran; Phase 2's checker rejects it at compile time,
+// which is where the specification wants it.
+func TestFieldMutabilityIsACompileError(t *testing.T) {
 	src := `struct P { x: i64 }
 
 fn main() {
@@ -177,7 +190,7 @@ fn main() {
     p.x = 2;
 }
 `
-	expectTrap(t, src, "is not declared `mut`")
+	expectReject(t, src, "E0594")
 }
 
 func TestAliasingIsObservable(t *testing.T) {
@@ -251,9 +264,9 @@ fn main() {
 	expectOut(t, src, "positive\nnon-positive\nb\n")
 }
 
-func TestUnmatchedMatchTraps(t *testing.T) {
-	// Phase 2's exhaustiveness checker makes this a compile error (E0004). Until then a
-	// trap is the honest behaviour: it stops rather than producing a wrong answer.
+// Phase 1 trapped on an unmatched value; Phase 2's exhaustiveness checker rejects the
+// match before it can run, so the trap is now unreachable by construction.
+func TestNonExhaustiveMatchIsACompileError(t *testing.T) {
 	src := `enum E { A, B }
 
 fn main() {
@@ -263,7 +276,7 @@ fn main() {
     }
 }
 `
-	expectTrap(t, src, "no match arm matched")
+	expectReject(t, src, "E0004")
 }
 
 func TestNestedClosuresShareTheCapturedObject(t *testing.T) {

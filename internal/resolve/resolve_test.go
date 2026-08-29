@@ -7,6 +7,7 @@ import (
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/parse"
+	"github.com/scarypheonix/meta/internal/prelude"
 	"github.com/scarypheonix/meta/internal/source"
 )
 
@@ -19,6 +20,20 @@ func resolveSrc(t *testing.T, src string) (*ast.File, *Result, *diag.Bag) {
 		t.Fatalf("the test source does not parse:\n%s", bag)
 	}
 	return f, Files(bag, f), bag
+}
+
+// resolveWithPrelude resolves a file together with the prelude, sharing one id
+// generator so that node ids stay unique across both.
+func resolveWithPrelude(t *testing.T, src string) (*ast.File, *Result, *diag.Bag) {
+	t.Helper()
+	ids := ast.NewIDGen()
+	bag := diag.New()
+	pre := parse.FileWith(prelude.Source(), bag, ids)
+	f := parse.FileWith(source.NewFile("t.origin", src), bag, ids)
+	if bag.HasErrors() {
+		t.Fatalf("the test source does not parse:\n%s", bag)
+	}
+	return f, Files(bag, pre, f), bag
 }
 
 func TestItemsAreVisibleBeforeTheyAreDeclared(t *testing.T) {
@@ -247,5 +262,95 @@ fn main() {
 `)
 	if !bag.HasErrors() {
 		t.Fatal("a binding from a match arm must not be visible after the match")
+	}
+}
+
+// TestEveryTypePathResolves is a structural invariant over the whole tree, not a check
+// of one construct.
+//
+// It exists because of a real bug: the resolver walked types in declarations but not in
+// bodies, so `let x: i64 = ...` recorded no resolution, the checker read the missing
+// entry as the error type, and every annotated binding silently type-checked against
+// anything. One forgotten call site was enough. This test fails for any type position
+// that is ever added and not walked.
+func TestEveryTypePathResolves(t *testing.T) {
+	src := `
+struct Wrapper[T] { inner: T, count: i64 }
+
+enum Shape[T] { Empty, One(T), Two { a: T, b: i64 } }
+
+type Alias = Wrapper[i64];
+
+const LIMIT: i64 = 10;
+
+trait Container {
+    type Item;
+    fn get(self) -> Option[Self::Item];
+    fn size(self) -> u64 { 0 }
+}
+
+impl[T] Container for Wrapper[T] {
+    type Item = T;
+    fn get(self) -> Option[T] { Option::None }
+}
+
+impl[T] Wrapper[T] {
+    fn count_of(self) -> i64 { self.count }
+}
+
+fn generic[T: Container](x: T, y: i64) -> Option[T] where T: Container {
+    let annotated: i64 = y;
+    let cast = annotated as u8;
+    let lambda = |z: i64| -> i64 { z };
+    let inferred = lambda(annotated);
+    let tuple: (i64, bool) = (1, true);
+    let nested: Wrapper[Wrapper[i64]] = Wrapper { inner: Wrapper { inner: 1, count: 2 }, count: 3 };
+    let func: fn(i64) -> i64 = lambda;
+    let shape: Shape[i64] = Shape::One(1);
+    match shape {
+        Shape::Empty => { }
+        Shape::One(n) => { }
+        Shape::Two { a, b } => { }
+    }
+    Option::None
+}
+
+fn main() {
+    let w: Wrapper[i64] = Wrapper { inner: 1, count: 0 };
+    let r = generic(w, LIMIT);
+}
+`
+	f, res, bag := resolveWithPrelude(t, src)
+	if bag.HasErrors() {
+		t.Fatalf("this program should resolve cleanly:\n%s", bag)
+	}
+
+	unresolved := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch n.(type) {
+		case *ast.PathType, *ast.TraitRef:
+			ref, ok := res.Ref(n.NodeID())
+			if !ok {
+				t.Errorf("%s: no resolution recorded for a %T; the resolver does not walk this position",
+					n.Span(), n)
+				unresolved++
+			} else if ref.Kind == Unresolved {
+				t.Errorf("%s: %T resolved to nothing", n.Span(), n)
+				unresolved++
+			}
+		}
+		return true
+	})
+
+	// A guard against the test silently walking nothing.
+	seen := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		if _, ok := n.(*ast.PathType); ok {
+			seen++
+		}
+		return true
+	})
+	if seen < 25 {
+		t.Errorf("the walk found only %d type paths; the test is not exercising much", seen)
 	}
 }

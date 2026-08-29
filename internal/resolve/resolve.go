@@ -40,6 +40,14 @@ const (
 	Trait
 	// TypeAlias is a `type` alias.
 	TypeAlias
+	// Prim is a primitive type name such as `i64` or `bool`.
+	Prim
+	// SelfTy is `Self` inside a trait or impl.
+	SelfTy
+	// Assoc is an associated-type projection such as `Self::Item` or `T::Item`. The
+	// resolver records the base and the member; deciding which trait provides the
+	// member needs types, so it belongs to the checker.
+	Assoc
 )
 
 // Local is one binding. Identity is the pointer: two Locals with the same name in
@@ -67,6 +75,11 @@ type Ref struct {
 	Alias   *ast.TypeAliasDecl
 	Builtin string
 	Name    string
+	// BaseKind and Member describe an associated-type projection (Kind == Assoc):
+	// BaseKind is SelfTy or TypeParam, Name is the base's name, Member is the
+	// projected associated type.
+	BaseKind Kind
+	Member   string
 }
 
 // Result is the resolver's output, keyed by AST node id.
@@ -101,6 +114,16 @@ var builtins = map[string]bool{
 	"io::println": true,
 	"panic":       true,
 	"ref_eq":      true,
+}
+
+// PrimitiveNames are the built-in type names, in scope everywhere. They are not
+// declarations, so they cannot be shadowed by one: declaring `struct i64` is rejected
+// as a duplicate.
+var PrimitiveNames = []string{
+	"i8", "i16", "i32", "i64",
+	"u8", "u16", "u32", "u64",
+	"f32", "f64",
+	"bool", "char", "String",
 }
 
 type scope struct {
@@ -153,6 +176,9 @@ func Files(bag *diag.Bag, files ...*ast.File) *Result {
 		},
 	}
 	r.scope = newScope(nil)
+	for _, name := range PrimitiveNames {
+		r.scope.names[name] = Ref{Kind: Prim, Name: name}
+	}
 
 	// Items are collected before any body is resolved, so that recursion and mutual
 	// recursion work without forward declarations (spec/07-modules.md: module cycles
@@ -235,27 +261,131 @@ func (r *resolver) resolveItem(it ast.Item) {
 	switch v := it.(type) {
 	case *ast.FnDecl:
 		r.resolveFn(v)
+
 	case *ast.ConstDecl:
+		r.resolveTypeExpr(v.Type)
 		if v.Value != nil {
 			r.resolveExpr(v.Value)
 		}
-	case *ast.ImplDecl:
-		for _, m := range v.Methods {
-			r.resolveFn(m)
-		}
+
+	case *ast.StructDecl:
+		r.withGenerics(v.Generics, false, func() {
+			r.resolveWhere(v.Where)
+			for _, f := range v.Fields {
+				r.resolveTypeExpr(f.Type)
+			}
+		})
+
+	case *ast.EnumDecl:
+		r.withGenerics(v.Generics, false, func() {
+			r.resolveWhere(v.Where)
+			for _, va := range v.Variants {
+				for _, t := range va.Types {
+					r.resolveTypeExpr(t)
+				}
+				for _, f := range va.Fields {
+					r.resolveTypeExpr(f.Type)
+				}
+			}
+		})
+
+	case *ast.TypeAliasDecl:
+		r.withGenerics(v.Generics, false, func() { r.resolveTypeExpr(v.Type) })
+
 	case *ast.TraitDecl:
-		for _, m := range v.Methods {
-			if m.Body != nil {
+		r.withGenerics(v.Generics, true, func() {
+			for _, st := range v.Supertraits {
+				r.resolveTraitRef(st)
+			}
+			r.resolveWhere(v.Where)
+			for _, at := range v.AssocTypes {
+				for _, b := range at.Bounds {
+					r.resolveTraitRef(b)
+				}
+			}
+			for _, m := range v.Methods {
 				r.resolveFn(m)
 			}
+		})
+
+	case *ast.ImplDecl:
+		r.withGenerics(v.Generics, true, func() {
+			if v.Trait != nil {
+				r.resolveTraitRef(v.Trait)
+			}
+			r.resolveTypeExpr(v.Type)
+			r.resolveWhere(v.Where)
+			for _, at := range v.AssocTypes {
+				r.resolveTypeExpr(at.Type)
+			}
+			for _, m := range v.Methods {
+				r.resolveFn(m)
+			}
+		})
+	}
+}
+
+// withGenerics runs f with the given type parameters, and optionally `Self`, in scope.
+func (r *resolver) withGenerics(gs []*ast.GenericParam, withSelf bool, f func()) {
+	saved := r.scope
+	r.scope = newScope(r.scope)
+	if withSelf {
+		r.scope.names["Self"] = Ref{Kind: SelfTy, Name: "Self"}
+	}
+	for _, g := range gs {
+		r.scope.names[g.Name.Name] = Ref{Kind: TypeParam, Name: g.Name.Name}
+		for _, b := range g.Bounds {
+			r.resolveTraitRef(b)
+		}
+	}
+	f()
+	r.scope = saved
+}
+
+func (r *resolver) resolveWhere(preds []*ast.WherePred) {
+	for _, w := range preds {
+		r.resolveTypeExpr(w.Type)
+		for _, b := range w.Bounds {
+			r.resolveTraitRef(b)
 		}
 	}
 }
 
-func (r *resolver) resolveFn(fn *ast.FnDecl) {
-	if fn.Body == nil {
+func (r *resolver) resolveTraitRef(tr *ast.TraitRef) {
+	if tr == nil {
 		return
 	}
+	r.resolvePathIn(tr.Path, tr.NodeID(), false)
+	for _, a := range tr.Args {
+		r.resolveTypeExpr(a)
+	}
+}
+
+// resolveTypeExpr resolves the names inside a syntactic type. The checker reads the
+// result from the side table and never consults a scope itself (spec/07-modules.md).
+func (r *resolver) resolveTypeExpr(t ast.Type) {
+	switch v := t.(type) {
+	case nil, *ast.ErrorType, *ast.UnitType, *ast.SelfType:
+		return
+	case *ast.PathType:
+		r.resolvePathIn(v.Path, v.NodeID(), false)
+		for _, a := range v.Args {
+			r.resolveTypeExpr(a)
+		}
+	case *ast.TupleType:
+		for _, e := range v.Elems {
+			r.resolveTypeExpr(e)
+		}
+	case *ast.FnType:
+		for _, p := range v.Params {
+			r.resolveTypeExpr(p)
+		}
+		r.resolveTypeExpr(v.Ret)
+	}
+}
+
+func (r *resolver) resolveFn(fn *ast.FnDecl) {
+	// A trait's required method has no body, but its signature still needs resolving.
 	saved, savedDepth, savedLoop := r.scope, r.fnDepth, r.loopDepth
 	r.scope = newScope(r.scope)
 	r.fnDepth++
@@ -263,11 +393,19 @@ func (r *resolver) resolveFn(fn *ast.FnDecl) {
 
 	for _, g := range fn.Generics {
 		r.scope.names[g.Name.Name] = Ref{Kind: TypeParam, Name: g.Name.Name}
+		for _, b := range g.Bounds {
+			r.resolveTraitRef(b)
+		}
 	}
+	r.resolveWhere(fn.Where)
 	for _, p := range fn.Params {
+		r.resolveTypeExpr(p.Type)
 		r.bindPattern(p.Pat, p.Mut)
 	}
-	r.resolveBlock(fn.Body)
+	r.resolveTypeExpr(fn.Ret)
+	if fn.Body != nil {
+		r.resolveBlock(fn.Body)
+	}
 
 	r.scope, r.fnDepth, r.loopDepth = saved, savedDepth, savedLoop
 }
@@ -366,7 +504,17 @@ func (r *resolver) resolvePathIn(path *ast.Path, nodeID ast.NodeID, inPattern bo
 		return
 	}
 
-	// Two segments: `Enum::Variant` is the only qualified form Phase 1 resolves.
+	// `Self::Item` and `T::Item` are associated-type projections. Which trait supplies
+	// the member depends on bounds, so the checker finishes the job.
+	if (base.Kind == SelfTy || base.Kind == TypeParam) && len(path.Segments) == 2 {
+		r.out.Refs[nodeID] = Ref{
+			Kind: Assoc, BaseKind: base.Kind,
+			Name: first.Name, Member: path.Segments[1].Name,
+		}
+		return
+	}
+
+	// Two segments: `Enum::Variant` is the other qualified form.
 	if base.Kind == Enum && len(path.Segments) == 2 {
 		want := path.Segments[1]
 		for _, va := range base.Enum.Variants {
@@ -384,7 +532,7 @@ func (r *resolver) resolvePathIn(path *ast.Path, nodeID ast.NodeID, inPattern bo
 
 	r.bag.Errorf("E0433", path.Span(), "cannot resolve `%s`", full).
 		Label("unresolved path").
-		Note("Phase 1 resolves names in one file plus the prelude; the module system arrives in Phase 2")
+		Note("a qualified path is `Enum::Variant`, `Self::AssocType` or `T::AssocType`")
 	r.out.Refs[nodeID] = Ref{Kind: Unresolved}
 }
 
@@ -454,6 +602,7 @@ func (r *resolver) resolveBlock(b *ast.Block) {
 func (r *resolver) resolveStmt(s ast.Stmt) {
 	switch v := s.(type) {
 	case *ast.LetStmt:
+		r.resolveTypeExpr(v.Type)
 		// The initializer is resolved before the pattern binds, so `let x = x;` refers
 		// to the outer `x`.
 		if v.Value != nil {
@@ -477,9 +626,15 @@ func (r *resolver) resolveExpr(e ast.Expr) {
 
 	case *ast.PathExpr:
 		r.resolvePathIn(v.Path, v.NodeID(), false)
+		for _, a := range v.Args {
+			r.resolveTypeExpr(a)
+		}
 
 	case *ast.StructLit:
 		r.resolvePathIn(v.Path, v.NodeID(), false)
+		for _, a := range v.Args {
+			r.resolveTypeExpr(a)
+		}
 		for _, f := range v.Fields {
 			r.resolveExpr(f.Value)
 		}
@@ -558,6 +713,7 @@ func (r *resolver) resolveExpr(e ast.Expr) {
 
 	case *ast.Cast:
 		r.resolveExpr(v.X)
+		r.resolveTypeExpr(v.Type)
 
 	case *ast.Call:
 		r.resolveExpr(v.Fn)
@@ -620,8 +776,10 @@ func (r *resolver) resolveLambda(l *ast.Lambda) {
 	r.loopDepth = 0
 
 	for _, p := range l.Params {
+		r.resolveTypeExpr(p.Type)
 		r.bindPattern(p.Pat, false)
 	}
+	r.resolveTypeExpr(l.Ret)
 	r.resolveExpr(l.Body)
 
 	r.scope, r.fnDepth, r.loopDepth = saved, savedDepth, savedLoop

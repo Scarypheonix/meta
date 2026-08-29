@@ -195,11 +195,6 @@ func (in *Interp) builtinMethod(recv Value, name string, args []Value, span diag
 			in.trap(span, "`cmp` takes exactly one argument")
 		}
 		return in.ordering(recv, args[0], span), true
-
-	case "len":
-		if s, ok := recv.(*Str); ok {
-			return Int(int64(len(s.S))), true
-		}
 	}
 	return nil, false
 }
