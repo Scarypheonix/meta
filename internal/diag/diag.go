@@ -301,6 +301,21 @@ func renderOne(w io.Writer, d Diagnostic) {
 	}
 
 	fmt.Fprintf(w, "%s |\n", pad)
+
+	// A secondary label in another file gets its own block. Dropping it, which is what
+	// a single-file renderer does, loses exactly the information a cross-module error
+	// needs: where the other definition is.
+	for _, sec := range d.Secondary {
+		if sec.Span.File == span.File || sec.Span.File == nil {
+			continue
+		}
+		sl, sc := sec.Span.Position()
+		fmt.Fprintf(w, "%s--> %s:%d:%d\n", pad, sec.Span.File.Name, sl, sc)
+		fmt.Fprintf(w, "%s |\n", pad)
+		renderLabel(w, gutter, sec, '-')
+		fmt.Fprintf(w, "%s |\n", pad)
+	}
+
 	for _, n := range d.Notes {
 		fmt.Fprintf(w, "%s = note: %s\n", strings.Repeat(" ", gutter), n)
 	}

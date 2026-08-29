@@ -44,6 +44,8 @@ const (
 	Prim
 	// SelfTy is `Self` inside a trait or impl.
 	SelfTy
+	// ModuleRef names a module in the package's module tree.
+	ModuleRef
 	// Assoc is an associated-type projection such as `Self::Item` or `T::Item`. The
 	// resolver records the base and the member; deciding which trait provides the
 	// member needs types, so it belongs to the checker.
@@ -74,6 +76,7 @@ type Ref struct {
 	Trait   *ast.TraitDecl
 	Alias   *ast.TypeAliasDecl
 	Builtin string
+	Mod     *Module
 	Name    string
 	// BaseKind and Member describe an associated-type projection (Kind == Assoc):
 	// BaseKind is SelfTy or TypeParam, Name is the base's name, Member is the
@@ -92,6 +95,8 @@ type Result struct {
 	Captures map[ast.NodeID][]*Local
 	// Fns maps a function name to its declaration, for the interpreter's entry point.
 	Fns map[string]*ast.FnDecl
+	// Root is the package's root module.
+	Root *Module
 	// Enums maps an enum name to its declaration, so the interpreter can build prelude
 	// values such as `Option::None` without going through a scope.
 	Enums map[string]*ast.EnumDecl
@@ -104,16 +109,6 @@ type Result struct {
 func (r *Result) Ref(id ast.NodeID) (Ref, bool) {
 	ref, ok := r.Refs[id]
 	return ref, ok
-}
-
-// builtins are the compiler-provided functions available in Phase 1. Each is
-// implemented by the interpreter; the standard library written in Origin arrives in
-// Phase 7.
-var builtins = map[string]bool{
-	"io::print":   true,
-	"io::println": true,
-	"panic":       true,
-	"ref_eq":      true,
 }
 
 // PrimitiveNames are the built-in type names, in scope everywhere. They are not
@@ -152,8 +147,14 @@ type lambdaCtx struct {
 }
 
 type resolver struct {
-	bag     *diag.Bag
-	out     *Result
+	bag *diag.Bag
+	out *Result
+	// root is the package's module tree; globals holds primitives, builtins and the
+	// prelude's items; current is the module whose file is being resolved.
+	root    *Module
+	std     *Module
+	globals *scope
+	current *Module
 	scope   *scope
 	fnDepth int
 	lambdas []*lambdaCtx
@@ -161,9 +162,31 @@ type resolver struct {
 	loopDepth int
 }
 
-// Files resolves the given files as one unit, with the prelude first. It always returns
-// a Result; check bag.HasErrors before trusting it.
+// Input is one file to resolve, with the module path it lives at. The root module has
+// the empty path; `lex/token.origin` under the source root has the path "lex::token".
+type Input struct {
+	Module  string
+	File    *ast.File
+	Prelude bool
+}
+
+// Files resolves files that all belong to the root module. It is the single-file entry
+// point used by tests and by `originc run <file>`.
 func Files(bag *diag.Bag, files ...*ast.File) *Result {
+	inputs := make([]Input, 0, len(files))
+	for _, f := range files {
+		inputs = append(inputs, Input{File: f})
+	}
+	return Program(bag, inputs...)
+}
+
+// Program resolves a whole package: the prelude, the root module, and every submodule.
+//
+// Resolution happens in four passes, and the order is what makes module cycles legal
+// (spec/07-modules.md): the module tree is built, then every module's items are
+// declared, then imports are processed, then bodies are resolved. Nothing looks at a
+// body until every name in the package exists.
+func Program(bag *diag.Bag, inputs ...Input) *Result {
 	r := &resolver{
 		bag: bag,
 		out: &Result{
@@ -175,25 +198,159 @@ func Files(bag *diag.Bag, files ...*ast.File) *Result {
 			Methods:  map[string]map[string]*ast.FnDecl{},
 		},
 	}
-	r.scope = newScope(nil)
+
+	r.root = newModule("", nil)
+	r.out.Root = r.root
+	r.globals = newScope(nil)
 	for _, name := range PrimitiveNames {
-		r.scope.names[name] = Ref{Kind: Prim, Name: name}
+		r.globals.names[name] = Ref{Kind: Prim, Name: name}
+	}
+	for name := range globalBuiltins {
+		r.globals.names[name] = Ref{Kind: Builtin, Builtin: name, Name: name}
+	}
+	r.registerStdModules()
+
+	// Pass 1: place every file in the module tree.
+	var mods []*Module
+	for _, in := range inputs {
+		m := r.moduleAt(in.Module)
+		m.Files = append(m.Files, in.File)
+		m.Prelude = m.Prelude || in.Prelude
+		mods = append(mods, m)
 	}
 
-	// Items are collected before any body is resolved, so that recursion and mutual
-	// recursion work without forward declarations (spec/07-modules.md: module cycles
-	// are permitted, and so is any ordering within a module).
-	for _, f := range files {
-		for _, it := range f.Items {
+	// Pass 2: declare each module's items into its own namespace. Prelude items go into
+	// the global scope instead, which is what makes them visible without a `use`.
+	for i, in := range inputs {
+		m := mods[i]
+		r.current = m
+		if in.Prelude {
+			r.scope = r.globals
+			for _, it := range in.File.Items {
+				r.declareItem(it)
+			}
+			continue
+		}
+		r.scope = m.Scope
+		for _, it := range in.File.Items {
 			r.declareItem(it)
+			r.declareItemVisibility(it)
 		}
 	}
-	for _, f := range files {
-		for _, it := range f.Items {
+
+	// Pass 3: process imports, now that every module's items exist.
+	for i, in := range inputs {
+		if in.Prelude {
+			continue
+		}
+		r.current = mods[i]
+		r.scope = mods[i].Scope
+		for _, u := range in.File.Uses {
+			r.resolveUse(u)
+		}
+	}
+
+	// Pass 4: resolve bodies.
+	for i, in := range inputs {
+		r.current = mods[i]
+		if in.Prelude {
+			r.scope = r.globals
+		} else {
+			r.scope = mods[i].Scope
+		}
+		for _, it := range in.File.Items {
 			r.resolveItem(it)
 		}
 	}
 	return r.out
+}
+
+// globalBuiltins are compiler-provided functions in scope everywhere, with no `use`.
+var globalBuiltins = map[string]bool{
+	"panic":  true,
+	"ref_eq": true,
+}
+
+// stdModules are the compiler-provided modules of the standard library. They exist so
+// that `use std::io;` and `io::println(..)` go through ordinary module resolution
+// instead of a special case. Phase 7 replaces them with Origin source.
+var stdModules = map[string][]string{
+	"std::io": {"print", "println"},
+}
+
+func (r *resolver) registerStdModules() {
+	std := newModule("std", nil)
+	r.std = std
+	for path, names := range stdModules {
+		m := std
+		segs := splitPath(path)
+		for _, seg := range segs[1:] {
+			child, ok := m.Children[seg]
+			if !ok {
+				child = newModule(seg, m)
+				m.Children[seg] = child
+			}
+			m = child
+		}
+		for _, name := range names {
+			full := path[len("std::"):] + "::" + name
+			m.Items[name] = Ref{Kind: Builtin, Builtin: full, Name: name}
+			m.Pub[name] = true
+		}
+	}
+}
+
+func splitPath(p string) []string {
+	if p == "" {
+		return nil
+	}
+	var out []string
+	start := 0
+	for i := 0; i+1 < len(p); i++ {
+		if p[i] == ':' && p[i+1] == ':' {
+			out = append(out, p[start:i])
+			start = i + 2
+			i++
+		}
+	}
+	return append(out, p[start:])
+}
+
+// moduleAt returns the module at a `::`-separated path, creating it if needed.
+func (r *resolver) moduleAt(path string) *Module {
+	m := r.root
+	for _, seg := range splitPath(path) {
+		child, ok := m.Children[seg]
+		if !ok {
+			child = newModule(seg, m)
+			child.Scope = newScope(r.globals)
+			m.Children[seg] = child
+		}
+		m = child
+	}
+	if m.Scope == nil {
+		m.Scope = newScope(r.globals)
+	}
+	return m
+}
+
+// itemVisibility reports an item's name and whether it is `pub`.
+func itemVisibility(it ast.Item) (ast.Ident, bool, bool) {
+	switch v := it.(type) {
+	case *ast.FnDecl:
+		return v.Name, v.Pub, true
+	case *ast.StructDecl:
+		return v.Name, v.Pub, true
+	case *ast.EnumDecl:
+		return v.Name, v.Pub, true
+	case *ast.TraitDecl:
+		return v.Name, v.Pub, true
+	case *ast.ConstDecl:
+		return v.Name, v.Pub, true
+	case *ast.TypeAliasDecl:
+		return v.Name, v.Pub, true
+	}
+	return ast.Ident{}, false, false
 }
 
 func (r *resolver) declareItem(it ast.Item) {
@@ -255,6 +412,187 @@ func (r *resolver) declare(name ast.Ident, ref Ref) {
 		return
 	}
 	r.scope.names[name.Name] = ref
+	if r.current != nil {
+		r.current.Items[name.Name] = ref
+	}
+}
+
+// declareItemVisibility files an item's `pub` flag with its module.
+func (r *resolver) declareItemVisibility(it ast.Item) {
+	name, pub, ok := itemVisibility(it)
+	if !ok || name.Name == "" || r.current == nil {
+		return
+	}
+	r.current.Pub[name.Name] = pub
+}
+
+// resolveUse imports names from another module (spec/07-modules.md). Origin 0.1 has no
+// glob imports and no renaming, so a `use` names either one item or a braced list of
+// items from one module.
+func (r *resolver) resolveUse(u *ast.Use) {
+	if u.Path == nil || len(u.Path.Segments) == 0 {
+		return
+	}
+	segs := u.Path.Segments
+
+	if len(u.Names) > 0 {
+		m := r.moduleByPath(segs, u.Path.Span())
+		if m == nil {
+			return
+		}
+		for _, name := range u.Names {
+			r.importName(m, name)
+		}
+		return
+	}
+
+	// A single path: the last segment is either an item in the module named by the
+	// prefix, or a module itself.
+	if len(segs) >= 2 {
+		if m := r.lookupModule(segs[:len(segs)-1]); m != nil {
+			last := segs[len(segs)-1]
+			if child, ok := m.Children[last.Name]; ok {
+				r.scope.names[last.Name] = Ref{Kind: ModuleRef, Mod: child, Name: last.Name}
+				return
+			}
+			r.importName(m, last)
+			return
+		}
+	}
+	if m := r.lookupModule(segs); m != nil {
+		last := segs[len(segs)-1]
+		r.scope.names[last.Name] = Ref{Kind: ModuleRef, Mod: m, Name: last.Name}
+		return
+	}
+	r.bag.Errorf("E0432", u.Path.Span(), "cannot resolve import `%s`", u.Path).
+		Label("no such module or item").
+		Note("a module path names a file under the source root, or a module of `std`")
+}
+
+// importName brings one name from a module into the current scope, checking visibility.
+func (r *resolver) importName(m *Module, name ast.Ident) {
+	ref, pub, ok := m.Lookup(name.Name)
+	if !ok {
+		if child, isMod := m.Children[name.Name]; isMod {
+			r.scope.names[name.Name] = Ref{Kind: ModuleRef, Mod: child, Name: name.Name}
+			return
+		}
+		r.bag.Errorf("E0432", name.Loc, "%s has no item `%s`", m.Describe(), name.Name).
+			Label("not found in that module")
+		r.poison(name.Name)
+		return
+	}
+	if !pub {
+		r.reportPrivate(name.Loc, m, name.Name, ref)
+		r.poison(name.Name)
+		return
+	}
+	if prev, dup := r.scope.names[name.Name]; dup && prev != ref && prev.Kind != LocalVar {
+		r.bag.Errorf("E0432", name.Loc, "`%s` is imported more than once", name.Name).
+			Label("ambiguous import").
+			Note("two imports bring different items into scope under this name")
+		return
+	}
+	r.scope.names[name.Name] = ref
+}
+
+// poison binds a name that failed to import, so every later use of it resolves to the
+// already-reported marker instead of producing a second diagnostic.
+func (r *resolver) poison(name string) {
+	if name == "" {
+		return
+	}
+	r.scope.names[name] = Ref{Kind: Unresolved, Name: name}
+}
+
+// reportPrivate explains that an item exists but is not visible.
+func (r *resolver) reportPrivate(at diag.Span, m *Module, name string, ref Ref) {
+	d := r.bag.Errorf("E0603", at, "`%s` is private", name).
+		Label("not visible outside %s", m.Describe()).
+		Note("an item is private to its own module unless it is declared `pub`")
+	if loc, ok := declSpan(ref); ok {
+		d.Secondary(loc, "declared here, without `pub`")
+	}
+}
+
+func declSpan(ref Ref) (diag.Span, bool) {
+	switch ref.Kind {
+	case Fn:
+		return ref.Fn.Name.Loc, true
+	case Struct:
+		return ref.Struct.Name.Loc, true
+	case Enum:
+		return ref.Enum.Name.Loc, true
+	case Trait:
+		return ref.Trait.Name.Loc, true
+	case Const:
+		return ref.Const.Name.Loc, true
+	case TypeAlias:
+		return ref.Alias.Name.Loc, true
+	}
+	return diag.Span{}, false
+}
+
+// lookupModule resolves a module path: a name already in scope, then a sibling of the
+// current module, then a child of the root, then `std`.
+func (r *resolver) lookupModule(segs []ast.Ident) *Module {
+	if len(segs) == 0 {
+		return nil
+	}
+	first := segs[0].Name
+
+	var start *Module
+	switch {
+	case first == "std":
+		start = r.std
+	default:
+		if ref, ok := r.scope.lookup(first); ok && ref.Kind == ModuleRef {
+			start = ref.Mod
+		} else if r.current != nil && r.current.Parent != nil {
+			if sib, ok := r.current.Parent.Children[first]; ok {
+				start = sib
+			}
+		}
+		if start == nil {
+			if child, ok := r.root.Children[first]; ok {
+				start = child
+			}
+		}
+	}
+	if start == nil {
+		return nil
+	}
+	m := start
+	for _, seg := range segs[1:] {
+		child, ok := m.Children[seg.Name]
+		if !ok {
+			return nil
+		}
+		m = child
+	}
+	return m
+}
+
+// moduleByPath is lookupModule with a diagnostic when it fails.
+func (r *resolver) moduleByPath(segs []ast.Ident, at diag.Span) *Module {
+	m := r.lookupModule(segs)
+	if m == nil {
+		r.bag.Errorf("E0432", at, "cannot resolve module `%s`", pathText(segs)).
+			Label("no such module").
+			Note("a module path names a file under the source root, or a module of `std`")
+	}
+	return m
+}
+
+func pathText(segs []ast.Ident) string {
+	out := ""
+	for i, s := range segs {
+		if i > 0 {
+			out += "::"
+		}
+		out += s.Name
+	}
+	return out
 }
 
 func (r *resolver) resolveItem(it ast.Item) {
@@ -477,26 +815,18 @@ func isConstructorLike(ref Ref) bool {
 // ---------------------------------------------------------------------------
 
 // resolvePathIn resolves a path and records the result against nodeID. inPattern
-// suppresses the "did you mean a binding" phrasing.
+// changes the wording of the diagnostic, because a bare name in a pattern would
+// otherwise have bound rather than failed.
 func (r *resolver) resolvePathIn(path *ast.Path, nodeID ast.NodeID, inPattern bool) {
 	if path == nil || len(path.Segments) == 0 {
 		r.out.Refs[nodeID] = Ref{Kind: Unresolved}
 		return
 	}
-	full := path.String()
-	if builtins[full] {
-		r.out.Refs[nodeID] = Ref{Kind: Builtin, Builtin: full, Name: full}
-		return
-	}
+	segs := path.Segments
+	first := segs[0]
 
-	first := path.Segments[0]
-	base, ok := r.scope.lookup(first.Name)
-	if !ok {
-		r.reportUnresolved(path, first, inPattern)
-		r.out.Refs[nodeID] = Ref{Kind: Unresolved}
-		return
-	}
-	if len(path.Segments) == 1 {
+	base, inScope := r.scope.lookup(first.Name)
+	if inScope && len(segs) == 1 {
 		if base.Kind == LocalVar {
 			r.noteCapture(base.Local)
 		}
@@ -504,35 +834,83 @@ func (r *resolver) resolvePathIn(path *ast.Path, nodeID ast.NodeID, inPattern bo
 		return
 	}
 
-	// `Self::Item` and `T::Item` are associated-type projections. Which trait supplies
-	// the member depends on bounds, so the checker finishes the job.
-	if (base.Kind == SelfTy || base.Kind == TypeParam) && len(path.Segments) == 2 {
-		r.out.Refs[nodeID] = Ref{
-			Kind: Assoc, BaseKind: base.Kind,
-			Name: first.Name, Member: path.Segments[1].Name,
+	if inScope && len(segs) == 2 {
+		// `Self::Item` and `T::Item` are associated-type projections; which trait
+		// supplies the member depends on bounds, so the checker finishes the job.
+		if base.Kind == SelfTy || base.Kind == TypeParam {
+			r.out.Refs[nodeID] = Ref{
+				Kind: Assoc, BaseKind: base.Kind,
+				Name: first.Name, Member: segs[1].Name,
+			}
+			return
 		}
-		return
+		if base.Kind == Enum {
+			r.resolveVariant(base, segs[1], nodeID)
+			return
+		}
 	}
 
-	// Two segments: `Enum::Variant` is the other qualified form.
-	if base.Kind == Enum && len(path.Segments) == 2 {
-		want := path.Segments[1]
-		for _, va := range base.Enum.Variants {
-			if va.Name.Name == want.Name {
-				r.out.Refs[nodeID] = Ref{Kind: Variant, Enum: base.Enum, Variant: va, Name: full}
+	// Otherwise the prefix must name a module.
+	if m := r.lookupModule(segs[:len(segs)-1]); m != nil && len(segs) >= 2 {
+		last := segs[len(segs)-1]
+		ref, pub, ok := m.Lookup(last.Name)
+		if ok {
+			// An item is visible inside its own module even without `pub`.
+			if !pub && m != r.current {
+				r.reportPrivate(last.Loc, m, last.Name, ref)
+				r.out.Refs[nodeID] = Ref{Kind: Unresolved}
 				return
 			}
+			r.out.Refs[nodeID] = ref
+			return
 		}
-		r.bag.Errorf("E0433", want.Loc, "enum `%s` has no variant `%s`", base.Enum.Name.Name, want.Name).
-			Label("no such variant").
-			Note("`%s` declares %s", base.Enum.Name.Name, variantList(base.Enum))
+		// `mod::Enum::Variant`
+		if len(segs) >= 3 {
+			if outer := r.lookupModule(segs[:len(segs)-2]); outer != nil {
+				enumRef, pub, ok := outer.Lookup(segs[len(segs)-2].Name)
+				if ok && enumRef.Kind == Enum {
+					if !pub && outer != r.current {
+						r.reportPrivate(segs[len(segs)-2].Loc, outer, segs[len(segs)-2].Name, enumRef)
+						r.out.Refs[nodeID] = Ref{Kind: Unresolved}
+						return
+					}
+					r.resolveVariant(enumRef, last, nodeID)
+					return
+				}
+			}
+		}
+		r.bag.Errorf("E0433", last.Loc, "%s has no item `%s`", m.Describe(), last.Name).
+			Label("not found in that module")
 		r.out.Refs[nodeID] = Ref{Kind: Unresolved}
 		return
 	}
 
-	r.bag.Errorf("E0433", path.Span(), "cannot resolve `%s`", full).
+	if !inScope {
+		r.reportUnresolved(path, first, inPattern)
+		r.out.Refs[nodeID] = Ref{Kind: Unresolved}
+		return
+	}
+
+	r.bag.Errorf("E0433", path.Span(), "cannot resolve `%s`", path).
 		Label("unresolved path").
-		Note("a qualified path is `Enum::Variant`, `Self::AssocType` or `T::AssocType`")
+		Note("a qualified path is `module::item`, `Enum::Variant`, `Self::AssocType` or `T::AssocType`")
+	r.out.Refs[nodeID] = Ref{Kind: Unresolved}
+}
+
+// resolveVariant records a reference to one variant of an enum.
+func (r *resolver) resolveVariant(enumRef Ref, want ast.Ident, nodeID ast.NodeID) {
+	for _, va := range enumRef.Enum.Variants {
+		if va.Name.Name == want.Name {
+			r.out.Refs[nodeID] = Ref{
+				Kind: Variant, Enum: enumRef.Enum, Variant: va,
+				Name: enumRef.Enum.Name.Name + "::" + va.Name.Name,
+			}
+			return
+		}
+	}
+	r.bag.Errorf("E0433", want.Loc, "enum `%s` has no variant `%s`", enumRef.Enum.Name.Name, want.Name).
+		Label("no such variant").
+		Note("`%s` declares %s", enumRef.Enum.Name.Name, variantList(enumRef.Enum))
 	r.out.Refs[nodeID] = Ref{Kind: Unresolved}
 }
 

@@ -8,7 +8,11 @@ package driver
 import (
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/check"
@@ -40,13 +44,26 @@ type Program struct {
 	Types    *check.Result
 }
 
-// Compile lexes, parses and resolves a source file together with the prelude, writing
-// diagnostics to w. It returns the program and whether it is free of errors.
+// Compile lexes, parses, resolves and type-checks a single file with the prelude.
 func Compile(f *source.File, w io.Writer) (*Program, bool) {
+	return CompilePackage([]Unit{{File: f}}, w)
+}
+
+// Unit is one file of a package, with the module path it lives at.
+type Unit struct {
+	Module string
+	File   *source.File
+}
+
+// CompilePackage compiles a whole package: the prelude, the root module, and every
+// submodule. The pass order and its error suppression rule come from spec/09-errors.md:
+// lex, then parse (which always runs, so syntax errors are reported alongside lexical
+// ones), then resolve, then check, each gated on the previous producing no errors.
+func CompilePackage(units []Unit, w io.Writer) (*Program, bool) {
 	bag := diag.New()
 
 	// One id generator for the whole compilation: side tables are keyed by node id, so
-	// per-file numbering would make the prelude and the user's file collide.
+	// per-file numbering would make two files collide.
 	ids := ast.NewIDGen()
 
 	preludeFile := prelude.Source()
@@ -59,19 +76,33 @@ func Compile(f *source.File, w io.Writer) (*Program, bool) {
 		return nil, false
 	}
 
-	userAST := parse.FileWith(f, bag, ids)
+	inputs := []resolve.Input{{File: preludeAST, Prelude: true}}
+	asts := []*ast.File{preludeAST}
+	var rootAST *ast.File
+	var rootFile *source.File
+	for _, u := range units {
+		tree := parse.FileWith(u.File, bag, ids)
+		inputs = append(inputs, resolve.Input{Module: u.Module, File: tree})
+		asts = append(asts, tree)
+		if u.Module == "" && rootAST == nil {
+			rootAST, rootFile = tree, u.File
+		}
+	}
+	if bag.HasErrors() {
+		bag.Render(w)
+		return nil, false
+	}
+	if rootAST == nil && len(asts) > 1 {
+		rootAST, rootFile = asts[1], units[0].File
+	}
+
+	res := resolve.Program(bag, inputs...)
 	if bag.HasErrors() {
 		bag.Render(w)
 		return nil, false
 	}
 
-	res := resolve.Files(bag, preludeAST, userAST)
-	if bag.HasErrors() {
-		bag.Render(w)
-		return nil, false
-	}
-
-	tys := check.Program(bag, res, preludeAST, userAST)
+	tys := check.Program(bag, res, asts...)
 	if bag.HasErrors() {
 		bag.Render(w)
 		return nil, false
@@ -79,17 +110,88 @@ func Compile(f *source.File, w io.Writer) (*Program, bool) {
 	if bag.WarningCount() > 0 {
 		bag.Render(w)
 	}
-	return &Program{File: f, AST: userAST, Resolved: res, Types: tys}, true
+	return &Program{File: rootFile, AST: rootAST, Resolved: res, Types: tys}, true
+}
+
+// LoadUnits reads a program from disk. A file is compiled on its own; a directory is
+// compiled as a package, with each file's path under it becoming its module path
+// (spec/07-modules.md: the filesystem is the module tree).
+func LoadUnits(path string) ([]Unit, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		f, err := readFile(path)
+		if err != nil {
+			return nil, err
+		}
+		return []Unit{{File: f}}, nil
+	}
+
+	root := path
+	if sub := filepath.Join(path, "src"); dirExists(sub) {
+		root = sub
+	}
+
+	var units []Unit
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(p, ".origin") {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, p)
+		if relErr != nil {
+			return relErr
+		}
+		f, readErr := readFile(p)
+		if readErr != nil {
+			return readErr
+		}
+		units = append(units, Unit{Module: modulePath(rel), File: f})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(units) == 0 {
+		return nil, fmt.Errorf("no .origin files under %s", root)
+	}
+	// The root module first, then the rest in a stable order.
+	sort.SliceStable(units, func(i, j int) bool {
+		if (units[i].Module == "") != (units[j].Module == "") {
+			return units[i].Module == ""
+		}
+		return units[i].Module < units[j].Module
+	})
+	return units, nil
+}
+
+// modulePath turns a path relative to the source root into a module path. `main.origin`
+// and `lib.origin` at the root are the root module itself.
+func modulePath(rel string) string {
+	rel = strings.TrimSuffix(filepath.ToSlash(rel), ".origin")
+	if rel == "main" || rel == "lib" {
+		return ""
+	}
+	return strings.ReplaceAll(rel, "/", "::")
+}
+
+func dirExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && info.IsDir()
 }
 
 // Check compiles a file and reports diagnostics only.
 func Check(path string, stdout, stderr io.Writer) int {
-	f, err := readFile(path)
+	units, err := LoadUnits(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
 		return ExitUsage
 	}
-	if _, ok := Compile(f, stderr); !ok {
+	if _, ok := CompilePackage(units, stderr); !ok {
 		return ExitDiagnostics
 	}
 	return ExitOK
@@ -97,12 +199,12 @@ func Check(path string, stdout, stderr io.Writer) int {
 
 // Run compiles a file and interprets it, returning the program's exit status.
 func Run(path string, stdout, stderr io.Writer) int {
-	f, err := readFile(path)
+	units, err := LoadUnits(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
 		return ExitUsage
 	}
-	prog, ok := Compile(f, stderr)
+	prog, ok := CompilePackage(units, stderr)
 	if !ok {
 		return ExitDiagnostics
 	}
@@ -111,12 +213,12 @@ func Run(path string, stdout, stderr io.Writer) int {
 
 // DumpAST compiles a file and prints its syntax tree.
 func DumpAST(path string, stdout, stderr io.Writer) int {
-	f, err := readFile(path)
+	units, err := LoadUnits(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
 		return ExitUsage
 	}
-	prog, ok := Compile(f, stderr)
+	prog, ok := CompilePackage(units, stderr)
 	if !ok {
 		return ExitDiagnostics
 	}
