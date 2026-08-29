@@ -25,6 +25,7 @@ must be corrected in the same commit that changes behaviour.
 | `08-memory-model.md` | Object model, GC guarantees, concurrency, `Send` |
 | `09-errors.md` | `Result`, `?`, panics, diagnostics requirements |
 | `10-examples.md` | Worked examples with exact expected output |
+| `11-codegen.md` | Native code generation, object files, the runtime, debug info |
 
 ## Design pillars
 
