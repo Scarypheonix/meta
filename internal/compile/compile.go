@@ -19,6 +19,7 @@ import (
 	"github.com/scarypheonix/meta/internal/check"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/layout"
+	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/resolve"
 	"github.com/scarypheonix/meta/internal/types"
 )
@@ -43,15 +44,25 @@ const (
 type Compiler struct {
 	res  *resolve.Result
 	tys  *check.Result
+	mono *mono.Result
 	prog *bytecode.Program
 
-	fnIndex    map[*ast.FnDecl]int
+	// instIndex maps a monomorphized instance to its bytecode function. A non-generic
+	// function has exactly one instance, so it behaves exactly as before ADR-0010's
+	// instances existed; a generic one gets one bytecode function per distinct tuple of
+	// type arguments actually used (docs/spec/06-traits-generics.md).
+	instIndex map[*mono.Instance]int
+	// rootIndex maps a declaration with no generic parameters of its own to its single
+	// instance, for a reference that mono did not resolve because the call itself is
+	// not generic (an ordinary function value or a plain call).
+	rootIndex  map[*ast.FnDecl]*mono.Instance
 	structIdx  map[*ast.StructDecl]int
 	variantIdx map[*ast.Variant]int
 	constIdx   map[constKey]int
 
 	// Per-function state.
 	fn       *bytecode.Fn
+	inst     *mono.Instance
 	slots    map[*resolve.Local]int
 	nextSlot int
 	captures map[*resolve.Local]int
@@ -73,16 +84,22 @@ type loopCtx struct {
 }
 
 // Program lowers a checked program.
-func Program(res *resolve.Result, tys *check.Result, files ...*ast.File) (*bytecode.Program, error) {
+//
+// mo is the instantiation set from internal/mono: which specialized copy of each
+// generic function exists, and which copy every call site reaches. A non-generic
+// program has exactly one instance per declaration and this behaves as it did before
+// ADR-0010 landed.
+func Program(res *resolve.Result, tys *check.Result, mo *mono.Result, files ...*ast.File) (*bytecode.Program, error) {
 	c := &Compiler{
-		res: res, tys: tys,
+		res: res, tys: tys, mono: mo,
 		prog: &bytecode.Program{
 			Types:        layout.NewRegistry(),
 			TupleTypes:   map[int]layout.TypeID{},
 			ClosureTypes: map[int]layout.TypeID{},
 			Entry:        -1,
 		},
-		fnIndex:    map[*ast.FnDecl]int{},
+		instIndex:  map[*mono.Instance]int{},
+		rootIndex:  map[*ast.FnDecl]*mono.Instance{},
 		structIdx:  map[*ast.StructDecl]int{},
 		variantIdx: map[*ast.Variant]int{},
 		constIdx:   map[constKey]int{},
@@ -91,17 +108,34 @@ func Program(res *resolve.Result, tys *check.Result, files ...*ast.File) (*bytec
 		Name: "String", Shape: layout.ByteArray, Kind: layout.ObjBytes, TypeName: "String",
 	})
 
-	// Declarations first, so a call can name a function that appears later and a
-	// constructor can name a type declared in another file.
+	// Struct and enum layout come from the AST directly: they do not depend on which
+	// instantiation is compiling, so one pass over the declarations is enough.
 	for _, f := range files {
-		c.declare(f)
+		c.declareTypes(f)
 	}
-	if c.prog.Entry < 0 {
+	// Every instance mono found gets a bytecode function, indexed in instantiation
+	// order so the result is deterministic. instIndex is filled first, in full, so
+	// that a call from one instance to another compiled later still resolves.
+	for _, inst := range mo.Instances {
+		idx := len(c.prog.Fns)
+		params := len(inst.Decl.Params)
+		if inst.Decl.Self != nil {
+			params++
+		}
+		c.prog.Fns = append(c.prog.Fns, &bytecode.Fn{Name: inst.Name, Params: params, Span: inst.Decl.Span()})
+		c.instIndex[inst] = idx
+		if len(inst.Args) == 0 {
+			c.rootIndex[inst.Decl] = inst
+		}
+	}
+	if mo.Entry == nil {
 		return nil, fmt.Errorf("no `main` function")
 	}
+	c.prog.Entry = c.instIndex[mo.Entry]
+
 	c.recordPreludeVariants()
-	for _, f := range files {
-		if err := c.compileFile(f); err != nil {
+	for _, inst := range mo.Instances {
+		if err := c.compileInstance(inst); err != nil {
 			return nil, err
 		}
 	}
@@ -128,42 +162,14 @@ func (c *Compiler) recordPreludeVariants() {
 	c.prog.Prelude.Found = found == len(want)
 }
 
-func (c *Compiler) declare(f *ast.File) {
+func (c *Compiler) declareTypes(f *ast.File) {
 	for _, it := range f.Items {
 		switch v := it.(type) {
-		case *ast.FnDecl:
-			c.declareFn(v)
 		case *ast.StructDecl:
 			c.declareStruct(v)
 		case *ast.EnumDecl:
 			c.declareEnum(v)
-		case *ast.ImplDecl:
-			for _, m := range v.Methods {
-				c.declareFn(m)
-			}
-		case *ast.TraitDecl:
-			for _, m := range v.Methods {
-				if m.Body != nil {
-					c.declareFn(m)
-				}
-			}
 		}
-	}
-}
-
-func (c *Compiler) declareFn(fn *ast.FnDecl) {
-	if _, ok := c.fnIndex[fn]; ok {
-		return
-	}
-	idx := len(c.prog.Fns)
-	params := len(fn.Params)
-	if fn.Self != nil {
-		params++
-	}
-	c.prog.Fns = append(c.prog.Fns, &bytecode.Fn{Name: fn.Name.Name, Params: params, Span: fn.Span()})
-	c.fnIndex[fn] = idx
-	if fn.Name.Name == "main" && fn.Self == nil {
-		c.prog.Entry = idx
 	}
 }
 

@@ -4,8 +4,8 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Current phase: 4 — intermediate representation and optimizer. Phases 0 through 3 are
-complete** (see `docs/phases/`).
+**Current phase: 5 — native x86-64 backend. Phases 0 through 4 are complete**
+(see `docs/phases/`).
 
 ---
 
@@ -46,7 +46,10 @@ internal/interp/      tree-walking interpreter (Phase 1)
 internal/layout/      object layout and headers: the GC/backend shared contract
 internal/gc/          precise generational moving collector
 internal/bytecode/    the stack instruction set and its disassembler
-internal/compile/     AST -> bytecode
+internal/ir/          the SSA intermediate representation, built from bytecode (ADR-0016)
+internal/opt/         the optimizer: folding, CSE, LICM, escape analysis, inlining, DCE
+internal/mono/        monomorphization of call dispatch (ADR-0010)
+internal/compile/     AST -> bytecode, per monomorphized instance
 internal/vm/          the bytecode virtual machine
 internal/prelude/     Option, Result, Ordering — written in Origin
 internal/driver/      pass ordering and error suppression
@@ -161,29 +164,26 @@ This project outlasts any single context window.
 
 ## Status
 
-**In flight:** nothing. Phase 3 closed.
+**In flight:** nothing. Phase 4 closed.
 
-**Known-broken:** nothing. Five known *incomplete* things, all recorded in
-`docs/deferred.md` against Phase 4, and all consequences of not having an IR yet:
-heap objects use two-word tagged slots because generics are not monomorphized; integer
-arithmetic is 64-bit only in both engines; `u64::MAX` has no run-time representation;
-the bytecode compiler does not lower `for` loops (the interpreter runs them); and
-`match` compiles to a linear chain of arm tests rather than a decision tree.
+**Known-broken:** nothing. Recorded in `docs/deferred.md`, moved forward from Phase 4
+to Phase 5 because they turned out to need the backend's cooperation rather than the
+optimizer's: heap objects still use two-word tagged slots (call dispatch is
+monomorphized per ADR-0010; object *layout* is not yet — see `docs/phases/4-complete.md`
+for why those turned out to be separable); integer arithmetic is 64-bit only in both
+engines; `u64::MAX` has no run-time representation; the bytecode compiler does not lower
+`for` loops (the interpreter runs them); and `match` compiles to a linear chain of arm
+tests rather than a decision tree.
 
-**Next action:** Phase 4 — the SSA intermediate representation and the optimizer. Lower
-the bytecode to SSA with a control-flow graph, then: constant folding and propagation,
-dead code elimination, common subexpression elimination, inlining with a cost model,
-escape analysis, and loop-invariant code motion. Monomorphization (ADR-0010) belongs
-here too, and it is what retires the tagged-slot representation: an instantiated type
-has an exact layout, so `internal/layout` can describe it word by word.
+**Next action:** Phase 5 — the native x86-64 backend. No LLVM, no Cranelift, no
+libgccjit, no C backend (hard constraint): machine code bytes are emitted directly from
+the SSA IR, and object files are written by hand. Two writers — Mach-O for shipping,
+ELF for container-side verification — share one instruction stream (ADR-0003). This is
+also where `internal/layout` gains a second reader beside the GC (process rule 5: one
+shared module, one set of tests) and where exact per-instantiation object layouts can
+finally retire the tagged slots that Phase 3 chose as a staging decision, now that there
+is a backend to agree on the replacement with.
 
-Phase 4 exits when every pass has a snapshot test and the full end-to-end suite produces
-identical output at `-O0`, `-O1` and `-O2`. The harness for that already exists in
-spirit: `tests/e2e` runs every case through two engines and compares them byte for byte,
-so adding optimization levels is adding rows to a table that already works. ADR-0005 and
-ADR-0012 are what make it a real oracle — overflow traps at every level and evaluation
-order is fully specified, so any divergence is a bug rather than a legal difference.
-
-**Awaiting the user:** nothing blocking. Two things only the target machine can
-confirm, both at Phase 5: that a compiled Mach-O binary runs, and that `lldb` breaks on
-an Origin source line.
+**Awaiting the user:** the two things only the target machine can confirm — that a
+compiled Mach-O binary runs, and that `lldb` breaks on an Origin source line — are close
+now that this phase exists to produce one. Nothing else is blocking.

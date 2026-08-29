@@ -27,19 +27,19 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Raw string literals | trivial, but no consumer yet | Phase 7 |
 | `isize` / `usize` | add only if the Mach-O writer needs them in Origin source | Phase 5 |
 | Fixed-size arrays `[T; N]` | needs const generics | Phase 7 |
-| `const fn` / calls in const initializers | needs the const evaluator to run real code | Phase 4 |
+| `const fn` / calls in const initializers | needs the const evaluator to run real code | Phase 5 |
 | The never type `!` written in source | exists in the checker, no syntax for it | Phase 7 |
 | Doc comment capture | needed by LSP hover, not before | Phase 8 |
-| Effect checking for `match` guards | closes the one "unspecified" clause in the spec (§05) | Phase 4 |
+| Effect checking for `match` guards | closes the one "unspecified" clause in the spec (§05) | Phase 5 |
 | Cycle detection in structural `==` | a cyclic graph makes `==` diverge (§04) | Phase 7 |
 | Tuple element access (`t.0`) | found in Phase 1: the grammar's `.` takes an identifier, so a tuple can only be read by pattern. Needs either integer field syntax or a lexer rule for `.0` | Phase 7 |
 | Float formatting in `to_str` | the spec does not fix a rendering; the interpreter uses the shortest round-tripping form and the e2e suite avoids depending on it | Phase 7 |
-| Per-width integer overflow | both engines carry every integer as an i64; giving a value its declared width needs monomorphized layouts | Phase 4 |
-| `u64::MAX` at run time | the same limitation: it has no representation in an i64 value model, so it is rejected rather than returning a wrong number | Phase 4 |
-| Tagged slots in heap objects | two words per field, because a generic field has no statically known shape without monomorphization; exact layouts replace them | Phase 4 |
-| `for` loops in compiled code | the bytecode compiler does not lower the `IntoIterator` desugaring yet; the interpreter runs them | Phase 4 |
-| Decision-tree lowering for `match` | the compiler emits a linear chain of arm tests; the tree belongs on the control-flow graph | Phase 4 |
-| Monomorphization | ADR-0010 is a lowering strategy; Phase 2 type-checks generics, and the instantiation set is built when there is an IR to instantiate into | Phase 4 |
+| Per-width integer overflow | both engines carry every integer as an i64; giving a value its declared width needs exact per-instantiation layouts, which is backend work | Phase 5 |
+| `u64::MAX` at run time | the same limitation: it has no representation in an i64 value model, so it is rejected rather than returning a wrong number | Phase 5 |
+| Exact object layouts from monomorphization | Phase 4 monomorphizes *call dispatch* (ADR-0010): each generic function is compiled once per instantiation, and a call inside its body resolves to the concrete impl. Fields still use the two-word tagged-slot representation, because giving each instantiation its own exact layout is shared work with the backend (`internal/layout`, CLAUDE.md's module-boundary list) | Phase 5 |
+| `for` loops in compiled code | the bytecode compiler does not lower the `IntoIterator` desugaring yet; the interpreter runs them | Phase 5 |
+| Decision-tree lowering for `match` | the compiler emits a linear chain of arm tests; the tree belongs on the control-flow graph | Phase 5 |
+| Instantiation depth diagnostic truncation | E0055's instantiation chain is not shortened past the list level, so a deep chain's note is long: each entry's type name has already grown by the time truncation would apply | Phase 5 |
 | Orphan rule (`E0117`) | cannot be violated while a program is one package; it becomes checkable with the package manager | Phase 8 |
 | Compiler-provided impls in Origin | `Show`, `Ord` and `Int` for the primitives are registered by the checker because their bodies need operations the language does not expose yet | Phase 7 |
 | Static field-mutability check | delivered in Phase 2: assigning a non-`mut` field is now `E0594` at compile time | done |

@@ -1,0 +1,35 @@
+use std::io;
+
+struct Money {
+    cents: i64,
+}
+
+impl Ord for Money {
+    fn cmp(self, other: Money) -> Ordering {
+        self.cents.cmp(other.cents)
+    }
+}
+
+impl Show for Money {
+    fn to_str(self) -> String {
+        self.cents.to_str()
+    }
+}
+
+fn max2[T: Ord](a: T, b: T) -> T {
+    match a.cmp(b) {
+        Ordering::Less => b,
+        _ => a,
+    }
+}
+
+fn show_all[T: Show](x: T) -> String {
+    x.to_str()
+}
+
+fn main() {
+    let a = Money { cents: 120 };
+    let b = Money { cents: 300 };
+    io::println(show_all(max2(a, b)));
+    io::println(show_all(max2(9, 4)));
+}

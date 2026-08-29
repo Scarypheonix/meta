@@ -81,8 +81,80 @@ type Result struct {
 	// Methods maps a method-call node to the declaration it resolves to, so the
 	// interpreter and later the backend do not repeat the search.
 	Methods map[ast.NodeID]*ast.FnDecl
+	// Generics lists the type parameters a function's body may mention: the enclosing
+	// impl's or trait's, then `Self` for a trait method, then the function's own. A
+	// function with none is compiled once; a function with some is compiled once per
+	// instantiation (ADR-0010).
+	Generics map[*ast.FnDecl][]*types.Param
+	// Insts maps a call site to the instantiation of the callee: the generic
+	// parameters its body may mention and the type each was given here. It is what
+	// monomorphization (ADR-0010) reads to decide which specialized copy to emit.
+	//
+	// A recorded argument may still be symbolic. Inside a generic body the arguments
+	// are the *enclosing* function's parameters, so the monomorphizer substitutes its
+	// own instantiation into them before it has a concrete tuple.
+	Insts map[ast.NodeID]*Inst
 	// Defs maps a struct or enum declaration to its type definition.
 	Defs map[ast.Item]*types.Def
+	// Lookup resolves a method on a type after checking is done. Monomorphization
+	// needs it: a trait method called on a type parameter cannot be resolved while the
+	// parameter is symbolic, and can be once the parameter has a type.
+	Lookup *Resolver
+}
+
+// Inst is one instantiation of a callee at a call site.
+type Inst struct {
+	// Decl is the function or method called. For a trait method called on a type
+	// parameter it is the trait's own declaration, which may have no body: the
+	// concrete impl is only known once the parameter is substituted.
+	Decl *ast.FnDecl
+	// Params and Args are parallel: the generic parameters the callee's body may
+	// mention, and the type each was instantiated at.
+	Params []*types.Param
+	Args   []types.Type
+	// Recv is the receiver's type for a method call, nil otherwise.
+	Recv types.Type
+	// Method is the method's name, empty for a plain function call.
+	Method string
+}
+
+// Resolver answers method-resolution questions after checking, over the impl table the
+// checker built. It exists for monomorphization, which resolves a trait method against
+// the concrete type a parameter turned out to be.
+type Resolver struct {
+	c *Checker
+}
+
+// Method resolves a method call on a concrete receiver type, reporting the declaration
+// to call and the generic parameters of the impl that provides it.
+//
+// It returns false when no method is found, which for a well-typed program means the
+// receiver is a primitive whose impl is compiler-provided and has no declaration to
+// call. The caller falls back to the builtin in that case.
+func (r *Resolver) Method(recv types.Type, name string) (*Inst, bool) {
+	cand, _ := r.c.lookupMethod(recv, name)
+	if cand == nil {
+		return nil, false
+	}
+	subst := map[*types.Param]types.Type{}
+	for k, v := range cand.Subst {
+		subst[k] = v
+	}
+	if cand.Trait != nil {
+		subst[cand.Trait.SelfParam] = recv
+	}
+	inst := &Inst{Decl: cand.Decl, Recv: recv, Method: name}
+	for _, p := range r.c.out.Generics[cand.Decl] {
+		arg, known := subst[p]
+		if !known {
+			// A method with generic parameters of its own, called on a type parameter:
+			// nothing at this point says what they were instantiated at.
+			return nil, false
+		}
+		inst.Params = append(inst.Params, p)
+		inst.Args = append(inst.Args, types.Prune(arg))
+	}
+	return inst, true
 }
 
 // Checker holds the state of one program's check.
@@ -147,6 +219,8 @@ func Program(bag *diag.Bag, res *resolve.Result, files ...*ast.File) *Result {
 			PatTypes:   map[ast.NodeID]types.Type{},
 			LocalTypes: map[*resolve.Local]types.Type{},
 			Methods:    map[ast.NodeID]*ast.FnDecl{},
+			Insts:      map[ast.NodeID]*Inst{},
+			Generics:   map[*ast.FnDecl][]*types.Param{},
 			Defs:       map[ast.Item]*types.Def{},
 		},
 		defs:        map[ast.Item]*types.Def{},
@@ -181,6 +255,7 @@ func Program(bag *diag.Bag, res *resolve.Result, files ...*ast.File) *Result {
 		c.checkBodies(f)
 	}
 	c.out.Defs = c.defs
+	c.out.Lookup = &Resolver{c: c}
 	return c.out
 }
 
@@ -325,6 +400,17 @@ func (c *Checker) signature(fn *ast.FnDecl, outerParams []*types.Param, self typ
 	own := c.genericParams(fn.Generics)
 	all := append(append([]*types.Param{}, outerParams...), own...)
 	c.env = envFor(all, self, trait)
+
+	// The generic parameters the body may mention, in one fixed order: the enclosing
+	// declaration's, then `Self` when the enclosing declaration is a trait, then the
+	// function's own. Monomorphization keys an instantiation on exactly this list, and
+	// method resolution builds its argument list from it, so the order lives here and
+	// nowhere else.
+	generics := append([]*types.Param{}, outerParams...)
+	if p, isParam := self.(*types.Param); isParam {
+		generics = append(generics, p)
+	}
+	c.out.Generics[fn] = append(generics, own...)
 
 	sig := &FnSig{Decl: fn, Params: own, Self: self}
 	if fn.Self != nil {

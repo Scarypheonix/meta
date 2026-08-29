@@ -287,6 +287,16 @@ func (c *Checker) instantiateFn(v *ast.PathExpr, fn *ast.FnDecl) types.Type {
 	for _, b := range sig.Bounds {
 		c.requireBound(types.Substitute(b.Type, subst), b.Trait, v.Span())
 	}
+	if len(sig.Params) > 0 {
+		// The arguments are recorded unresolved: inference has not run yet. They are
+		// pruned when monomorphization reads them, which is after the whole program has
+		// been checked.
+		inst := &Inst{Decl: fn, Params: sig.Params}
+		for _, p := range sig.Params {
+			inst.Args = append(inst.Args, subst[p])
+		}
+		c.out.Insts[v.NodeID()] = inst
+	}
 	params := make([]types.Type, 0, len(sig.ParamTypes))
 	for _, p := range sig.ParamTypes {
 		params = append(params, types.Substitute(p, subst))
@@ -1038,6 +1048,7 @@ func (c *Checker) inferMethodCall(v *ast.MethodCall) types.Type {
 	for _, p := range cand.Sig.Params {
 		subst[p] = c.freshFor(v.Span())
 	}
+	c.recordMethodInst(v, cand, recv, subst)
 	if cand.Trait != nil {
 		subst[cand.Trait.SelfParam] = recv
 	}
@@ -1192,3 +1203,22 @@ func outer2(t types.Type) string {
 }
 
 var _ = math.MaxInt64
+
+// recordMethodInst notes which copy of a method a call site needs.
+//
+// The receiver is recorded along with the parameters, because it is what
+// monomorphization resolves against: a trait method called on a type parameter names
+// the trait's own declaration here, and only the substituted receiver says which impl
+// actually runs.
+func (c *Checker) recordMethodInst(v *ast.MethodCall, cand *methodCandidate, recv types.Type, subst map[*types.Param]types.Type) {
+	inst := &Inst{Decl: cand.Decl, Recv: recv, Method: v.Name.Name}
+	for _, p := range c.out.Generics[cand.Decl] {
+		arg, known := subst[p]
+		if !known {
+			return
+		}
+		inst.Params = append(inst.Params, p)
+		inst.Args = append(inst.Args, arg)
+	}
+	c.out.Insts[v.NodeID()] = inst
+}

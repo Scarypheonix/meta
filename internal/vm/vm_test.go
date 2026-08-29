@@ -10,6 +10,7 @@ import (
 	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/gc"
+	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/parse"
 	"github.com/scarypheonix/meta/internal/prelude"
 	"github.com/scarypheonix/meta/internal/resolve"
@@ -37,7 +38,11 @@ func build(t *testing.T, src string) *bytecodeProgram {
 	if bag.HasErrors() {
 		t.Fatalf("check:\n%s", bag)
 	}
-	code, err := compile.Program(res, tys, pre, user)
+	mo := mono.Program(bag, tys, pre, user)
+	if bag.HasErrors() {
+		t.Fatalf("mono:\n%s", bag)
+	}
+	code, err := compile.Program(res, tys, mo, pre, user)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}

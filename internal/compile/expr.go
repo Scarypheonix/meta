@@ -6,47 +6,28 @@ import (
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/diag"
+	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/resolve"
 	"github.com/scarypheonix/meta/internal/types"
 )
 
-func (c *Compiler) compileFile(f *ast.File) error {
-	for _, it := range f.Items {
-		switch v := it.(type) {
-		case *ast.FnDecl:
-			if err := c.compileFn(v); err != nil {
-				return err
-			}
-		case *ast.ImplDecl:
-			for _, m := range v.Methods {
-				if err := c.compileFn(m); err != nil {
-					return err
-				}
-			}
-		case *ast.TraitDecl:
-			for _, m := range v.Methods {
-				if m.Body == nil {
-					continue
-				}
-				if err := c.compileFn(m); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func (c *Compiler) compileFn(decl *ast.FnDecl) error {
+// compileInstance lowers one monomorphized instance's body.
+//
+// A non-generic function has exactly one instance and this is exactly the old
+// per-declaration compilation. A generic one is compiled once per instantiation mono
+// found, because the calls inside its body can differ: `a.cmp(b)` inside `max2[T: Ord]`
+// is `Money::cmp` in one instance and the builtin integer comparison in another
+// (ADR-0010), and only the concrete instance knows which.
+func (c *Compiler) compileInstance(inst *mono.Instance) error {
+	decl := inst.Decl
 	if decl.Body == nil {
 		return nil
 	}
-	idx, ok := c.fnIndex[decl]
-	if !ok {
-		return nil
-	}
-	saved, savedSlots, savedNext, savedCaps, savedLoops := c.fn, c.slots, c.nextSlot, c.captures, c.loops
+	idx := c.instIndex[inst]
+	saved, savedInst, savedSlots, savedNext, savedCaps, savedLoops :=
+		c.fn, c.inst, c.slots, c.nextSlot, c.captures, c.loops
 	c.fn = c.prog.Fns[idx]
+	c.inst = inst
 	c.slots = map[*resolve.Local]int{}
 	c.captures = nil
 	c.nextSlot = 0
@@ -66,8 +47,16 @@ func (c *Compiler) compileFn(decl *ast.FnDecl) error {
 	}
 	c.emit(bytecode.OpReturn, c.fn.Span)
 
-	c.fn, c.slots, c.nextSlot, c.captures, c.loops = saved, savedSlots, savedNext, savedCaps, savedLoops
+	c.fn, c.inst, c.slots, c.nextSlot, c.captures, c.loops =
+		saved, savedInst, savedSlots, savedNext, savedCaps, savedLoops
 	return nil
+}
+
+// callTarget resolves the instance a call or method-call node reaches from the instance
+// currently compiling, reporting false when the node has no concrete target: a call to
+// a compiler-provided impl with no Origin body, which the caller lowers to a builtin.
+func (c *Compiler) callTarget(node ast.NodeID) (*mono.Instance, bool) {
+	return c.mono.Lookup(c.inst, node)
 }
 
 // bindParam gives a parameter its slot. Parameters are irrefutable (spec/05-patterns.md),
@@ -366,11 +355,14 @@ func (c *Compiler) path(v *ast.PathExpr) error {
 		return nil
 
 	case resolve.Fn:
-		idx, ok := c.fnIndex[ref.Fn]
+		inst, ok := c.callTarget(v.NodeID())
+		if !ok {
+			inst, ok = c.rootIndex[ref.Fn], c.rootIndex[ref.Fn] != nil
+		}
 		if !ok {
 			return unsupported("a call to a function with no body", v.Span())
 		}
-		c.emitA(bytecode.OpFunc, idx, v.Span())
+		c.emitA(bytecode.OpFunc, c.instIndex[inst], v.Span())
 		return nil
 
 	case resolve.Const:

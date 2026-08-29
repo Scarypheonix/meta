@@ -296,6 +296,9 @@ type methodCandidate struct {
 	Subst map[*types.Param]types.Type
 	// Trait names the trait the method came from, or nil for an inherent method.
 	Trait *TraitInfo
+	// Impl is the impl block the method was found in, nil when the receiver is a type
+	// parameter and the method came from one of its bounds.
+	Impl *ImplInfo
 }
 
 // lookupMethod implements the resolution order of spec/06-traits-generics.md: inherent
@@ -349,7 +352,7 @@ func (c *Checker) lookupMethod(recv types.Type, name string) (*methodCandidate, 
 		if sig == nil {
 			continue
 		}
-		cand := &methodCandidate{Decl: decl, Sig: sig, Subst: subst, Trait: info.Trait}
+		cand := &methodCandidate{Decl: decl, Sig: sig, Subst: subst, Trait: info.Trait, Impl: info}
 		if info.Trait == nil {
 			inherent = append(inherent, cand)
 		} else {

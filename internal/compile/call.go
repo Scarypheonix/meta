@@ -76,21 +76,23 @@ var builtinMethodCalls = map[string]int{
 }
 
 func (c *Compiler) methodCall(v *ast.MethodCall) error {
-	// A user-declared method resolved by the checker is a direct call.
-	if decl, ok := c.tys.Methods[v.NodeID()]; ok {
-		if idx, known := c.fnIndex[decl]; known && decl.Body != nil {
-			c.emitA(bytecode.OpFunc, idx, v.Span())
-			if err := c.expr(v.Recv); err != nil {
+	// A method resolving to Origin source — a user impl, or a trait's default body —
+	// is a direct call to the instance mono picked for this call site. Which instance
+	// that is depends on the receiver's concrete type, which is why the same source
+	// call `a.cmp(b)` inside a generic body can reach a different callee in each
+	// instantiation (ADR-0010).
+	if inst, ok := c.callTarget(v.NodeID()); ok {
+		c.emitA(bytecode.OpFunc, c.instIndex[inst], v.Span())
+		if err := c.expr(v.Recv); err != nil {
+			return err
+		}
+		for _, a := range v.Args {
+			if err := c.expr(a); err != nil {
 				return err
 			}
-			for _, a := range v.Args {
-				if err := c.expr(a); err != nil {
-					return err
-				}
-			}
-			c.emitA(bytecode.OpCall, len(v.Args)+1, v.Span())
-			return nil
 		}
+		c.emitA(bytecode.OpCall, len(v.Args)+1, v.Span())
+		return nil
 	}
 
 	// Otherwise it is one of the compiler-provided methods on a primitive.

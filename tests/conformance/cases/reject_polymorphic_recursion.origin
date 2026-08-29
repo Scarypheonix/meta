@@ -1,0 +1,15 @@
+// EXPECT: reject E0055
+// spec/06: a generic function that calls itself at a strictly larger type has an
+// infinite instantiation set and is rejected once the chain exceeds the depth limit.
+
+struct Wrap[T] {
+    inner: T,
+}
+
+fn grow[T](x: T) -> i64 {
+    grow(Wrap { inner: x })
+}
+
+fn main() {
+    let a = grow(1);
+}

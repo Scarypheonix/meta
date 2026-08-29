@@ -19,6 +19,7 @@ import (
 	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/interp"
+	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/opt"
 	"github.com/scarypheonix/meta/internal/parse"
 	"github.com/scarypheonix/meta/internal/prelude"
@@ -48,6 +49,9 @@ type Program struct {
 	// AllASTs is every file of the compilation, prelude first. The bytecode compiler
 	// needs them all, because a prelude enum's variants are constructed by user code.
 	AllASTs []*ast.File
+	// Mono is the program's instantiation set (ADR-0010): which specialized copy of
+	// each generic function is needed, and which copy every call site reaches.
+	Mono *mono.Result
 }
 
 // Compile lexes, parses, resolves and type-checks a single file with the prelude.
@@ -113,10 +117,21 @@ func CompilePackage(units []Unit, w io.Writer) (*Program, bool) {
 		bag.Render(w)
 		return nil, false
 	}
+
+	// Monomorphization (ADR-0010) runs as part of checking a program's legality: a
+	// polymorphic-recursion chain that exceeds the instantiation depth (E0055) is
+	// rejected before any code is generated, and `originc check` must reach the same
+	// verdict as `originc run`.
+	mo := mono.Program(bag, tys, asts...)
+	if bag.HasErrors() {
+		bag.Render(w)
+		return nil, false
+	}
+
 	if bag.WarningCount() > 0 {
 		bag.Render(w)
 	}
-	return &Program{File: rootFile, AST: rootAST, Resolved: res, Types: tys, AllASTs: asts}, true
+	return &Program{File: rootFile, AST: rootAST, Resolved: res, Types: tys, AllASTs: asts, Mono: mo}, true
 }
 
 // LoadUnits reads a program from disk. A file is compiled on its own; a directory is
@@ -237,7 +252,7 @@ func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer
 	if engine == Interpreter {
 		return interp.New(prog.Resolved, stdout, stderr).Run()
 	}
-	code, err := compile.Program(prog.Resolved, prog.Types, prog.AllASTs...)
+	code, err := compile.Program(prog.Resolved, prog.Types, prog.Mono, prog.AllASTs...)
 	if err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
 		return ExitDiagnostics
@@ -261,7 +276,7 @@ func RunRoundTrip(path string, stdout, stderr io.Writer) int {
 	if !ok {
 		return ExitDiagnostics
 	}
-	code, err := compile.Program(prog.Resolved, prog.Types, prog.AllASTs...)
+	code, err := compile.Program(prog.Resolved, prog.Types, prog.Mono, prog.AllASTs...)
 	if err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
 		return ExitDiagnostics
@@ -314,7 +329,7 @@ func DumpBytecode(path string, stdout, stderr io.Writer) int {
 	if !ok {
 		return ExitDiagnostics
 	}
-	code, cerr := compile.Program(prog.Resolved, prog.Types, prog.AllASTs...)
+	code, cerr := compile.Program(prog.Resolved, prog.Types, prog.Mono, prog.AllASTs...)
 	if cerr != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", cerr)
 		return ExitDiagnostics
@@ -335,7 +350,7 @@ func DumpIR(path string, level opt.Level, stdout, stderr io.Writer) int {
 	if !ok {
 		return ExitDiagnostics
 	}
-	code, cerr := compile.Program(prog.Resolved, prog.Types, prog.AllASTs...)
+	code, cerr := compile.Program(prog.Resolved, prog.Types, prog.Mono, prog.AllASTs...)
 	if cerr != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", cerr)
 		return ExitDiagnostics
