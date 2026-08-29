@@ -12,8 +12,8 @@ import (
 func testHeap(t *testing.T, cfg Config) (*Heap, layout.TypeID, layout.TypeID, layout.TypeID) {
 	t.Helper()
 	reg := layout.NewRegistry()
-	pair := reg.Add(layout.FixedDescriptor("Pair", []bool{true, true}))
-	leaf := reg.Add(layout.FixedDescriptor("Leaf", []bool{false}))
+	pair := reg.Add(layout.FixedDescriptor("Pair", layout.RefsOnly([]bool{true, true})))
+	leaf := reg.Add(layout.FixedDescriptor("Leaf", layout.RefsOnly([]bool{false})))
 	bytes := reg.Add(&layout.Descriptor{Name: "Bytes", Shape: layout.ByteArray})
 	return New(cfg, reg), pair, leaf, bytes
 }

@@ -186,3 +186,52 @@ func TestModulePathsComeFromTheFilesystem(t *testing.T) {
 		t.Errorf("stdout = %q", stdout)
 	}
 }
+
+// TestBothEnginesRunAPackage checks that the bytecode compiler handles a multi-file
+// package, not just a single file: module paths, cross-module calls and all.
+func TestBothEnginesRunAPackage(t *testing.T) {
+	files := map[string]string{
+		"main.origin": `use std::io;
+use geometry::shape::{Shape, area};
+
+fn main() {
+    io::println(area(Shape::Circle(2.0)).to_str());
+    io::println(area(Shape::Rect { w: 3.0, h: 4.0 }).to_str());
+}
+`,
+		"geometry/shape.origin": `pub enum Shape {
+    Circle(f64),
+    Rect { w: f64, h: f64 },
+}
+
+const PI: f64 = 3.14159;
+
+pub fn area(s: Shape) -> f64 {
+    match s {
+        Shape::Circle(r) => PI * r * r,
+        Shape::Rect { w, h } => w * h,
+    }
+}
+`,
+	}
+	dir := writePackage(t, files)
+
+	var interpOut, interpErr bytes.Buffer
+	interpCode := driver.RunWith(dir, driver.Interpreter, &interpOut, &interpErr)
+
+	var vmOut, vmErr bytes.Buffer
+	vmCode := driver.RunWith(dir, driver.VM, &vmOut, &vmErr)
+
+	if interpCode != 0 {
+		t.Fatalf("interpreter exited %d\n%s", interpCode, interpErr.String())
+	}
+	if vmCode != 0 {
+		t.Fatalf("vm exited %d\n%s", vmCode, vmErr.String())
+	}
+	if interpOut.String() != vmOut.String() {
+		t.Errorf("engines disagree\n--- interpreter ---\n%s\n--- vm ---\n%s", interpOut.String(), vmOut.String())
+	}
+	if got := vmOut.String(); got != "12.56636\n12.0\n" {
+		t.Errorf("stdout = %q", got)
+	}
+}

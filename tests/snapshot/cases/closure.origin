@@ -1,0 +1,11 @@
+struct Cell { mut v: i64 }
+
+fn make() -> fn() -> i64 {
+    let cell = Cell { v: 0 };
+    || { cell.v = cell.v + 1; cell.v }
+}
+
+fn main() {
+    let c = make();
+    let a = c();
+}

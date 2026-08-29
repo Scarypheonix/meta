@@ -21,8 +21,8 @@ func TestTenMillionShortLivedObjects(t *testing.T) {
 	}
 
 	reg := layout.NewRegistry()
-	pair := reg.Add(layout.FixedDescriptor("Pair", []bool{true, true}))
-	leaf := reg.Add(layout.FixedDescriptor("Leaf", []bool{false}))
+	pair := reg.Add(layout.FixedDescriptor("Pair", layout.RefsOnly([]bool{true, true})))
+	leaf := reg.Add(layout.FixedDescriptor("Leaf", layout.RefsOnly([]bool{false})))
 
 	// The old generation is deliberately small: promotions from the live set and the
 	// barrier writes below must overflow it, so that major collections are exercised
@@ -138,9 +138,9 @@ func TestTenMillionShortLivedObjects(t *testing.T) {
 // patterns" means in the phase's exit criteria.
 func TestRandomisedAllocationPatterns(t *testing.T) {
 	reg := layout.NewRegistry()
-	pair := reg.Add(layout.FixedDescriptor("Pair", []bool{true, true}))
-	leaf := reg.Add(layout.FixedDescriptor("Leaf", []bool{false}))
-	big := reg.Add(layout.FixedDescriptor("Big", make([]bool, 64)))
+	pair := reg.Add(layout.FixedDescriptor("Pair", layout.RefsOnly([]bool{true, true})))
+	leaf := reg.Add(layout.FixedDescriptor("Leaf", layout.RefsOnly([]bool{false})))
+	big := reg.Add(layout.FixedDescriptor("Big", make([]layout.WordKind, 64)))
 	bytes := reg.Add(&layout.Descriptor{Name: "Bytes", Shape: layout.ByteArray})
 
 	for seed := int64(0); seed < 8; seed++ {

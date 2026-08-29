@@ -97,6 +97,15 @@ func (h *Heap) scanObject(r layout.Ref) {
 	case layout.ByteArray:
 		return // no references, which is what makes a String cheap to skip
 
+	case layout.Tagged:
+		// Two words per slot: the tag says whether the second is a reference. This is
+		// still precise -- the tag is written by the mutator, not inferred from bits.
+		for i := uint64(0); i+1 < words; i += 2 {
+			if layout.ValueTag(h.mem[base+i]) == layout.TagRef {
+				h.mem[base+i+1] = uint64(h.evacuate(layout.Ref(h.mem[base+i+1])))
+			}
+		}
+
 	case layout.RefArray:
 		n := h.mem[base]
 		for i := uint64(1); i <= n && i < words; i++ {
@@ -215,6 +224,12 @@ func (h *Heap) scanObjectMajor(r layout.Ref, fromStart, fromEnd uint64) {
 	switch desc.Shape {
 	case layout.ByteArray:
 		return
+	case layout.Tagged:
+		for i := uint64(0); i+1 < words; i += 2 {
+			if layout.ValueTag(h.mem[base+i]) == layout.TagRef {
+				h.mem[base+i+1] = uint64(h.evacuateMajor(layout.Ref(h.mem[base+i+1]), fromStart, fromEnd))
+			}
+		}
 	case layout.RefArray:
 		n := h.mem[base]
 		for i := uint64(1); i <= n && i < words; i++ {

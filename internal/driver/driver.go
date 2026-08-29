@@ -16,12 +16,14 @@ import (
 
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/check"
+	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/interp"
 	"github.com/scarypheonix/meta/internal/parse"
 	"github.com/scarypheonix/meta/internal/prelude"
 	"github.com/scarypheonix/meta/internal/resolve"
 	"github.com/scarypheonix/meta/internal/source"
+	"github.com/scarypheonix/meta/internal/vm"
 )
 
 // Exit statuses, per spec/09-errors.md.
@@ -42,6 +44,9 @@ type Program struct {
 	AST      *ast.File
 	Resolved *resolve.Result
 	Types    *check.Result
+	// AllASTs is every file of the compilation, prelude first. The bytecode compiler
+	// needs them all, because a prelude enum's variants are constructed by user code.
+	AllASTs []*ast.File
 }
 
 // Compile lexes, parses, resolves and type-checks a single file with the prelude.
@@ -110,7 +115,7 @@ func CompilePackage(units []Unit, w io.Writer) (*Program, bool) {
 	if bag.WarningCount() > 0 {
 		bag.Render(w)
 	}
-	return &Program{File: rootFile, AST: rootAST, Resolved: res, Types: tys}, true
+	return &Program{File: rootFile, AST: rootAST, Resolved: res, Types: tys, AllASTs: asts}, true
 }
 
 // LoadUnits reads a program from disk. A file is compiled on its own; a directory is
@@ -197,6 +202,42 @@ func Check(path string, stdout, stderr io.Writer) int {
 	return ExitOK
 }
 
+// Engine selects which execution engine `run` uses.
+type Engine int
+
+const (
+	// Interpreter is the Phase 1 tree-walking interpreter.
+	Interpreter Engine = iota
+	// VM is the Phase 3 bytecode virtual machine.
+	VM
+)
+
+// RunWith compiles a program and executes it on the chosen engine.
+//
+// Both engines must produce byte-identical stdout, byte-identical stderr and the same
+// exit status; that differential is Phase 3's exit criterion and tests/e2e runs the
+// whole corpus through both.
+func RunWith(path string, engine Engine, stdout, stderr io.Writer) int {
+	units, err := LoadUnits(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitUsage
+	}
+	prog, ok := CompilePackage(units, stderr)
+	if !ok {
+		return ExitDiagnostics
+	}
+	if engine == Interpreter {
+		return interp.New(prog.Resolved, stdout, stderr).Run()
+	}
+	code, err := compile.Program(prog.Resolved, prog.Types, prog.AllASTs...)
+	if err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitDiagnostics
+	}
+	return vm.New(code, vm.Config{}, stdout, stderr).Run()
+}
+
 // Run compiles a file and interprets it, returning the program's exit status.
 func Run(path string, stdout, stderr io.Writer) int {
 	units, err := LoadUnits(path)
@@ -223,6 +264,27 @@ func DumpAST(path string, stdout, stderr io.Writer) int {
 		return ExitDiagnostics
 	}
 	fmt.Fprint(stdout, ast.Dump(prog.AST))
+	return ExitOK
+}
+
+// DumpBytecode compiles a program and prints its bytecode. It is the snapshot artefact
+// process rule 2 requires for every feature that reaches code generation.
+func DumpBytecode(path string, stdout, stderr io.Writer) int {
+	units, err := LoadUnits(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
+		return ExitUsage
+	}
+	prog, ok := CompilePackage(units, stderr)
+	if !ok {
+		return ExitDiagnostics
+	}
+	code, cerr := compile.Program(prog.Resolved, prog.Types, prog.AllASTs...)
+	if cerr != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", cerr)
+		return ExitDiagnostics
+	}
+	fmt.Fprint(stdout, code.Disassemble())
 	return ExitOK
 }
 

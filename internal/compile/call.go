@@ -1,0 +1,179 @@
+package compile
+
+import (
+	"github.com/scarypheonix/meta/internal/ast"
+	"github.com/scarypheonix/meta/internal/bytecode"
+	"github.com/scarypheonix/meta/internal/resolve"
+	"github.com/scarypheonix/meta/internal/types"
+)
+
+// builtinIndex maps a compiler-provided function's path to its VM index.
+var builtinIndex = map[string]int{
+	"io::print":   BuiltinPrint,
+	"io::println": BuiltinPrintln,
+	"panic":       BuiltinPanic,
+	"ref_eq":      BuiltinRefEq,
+}
+
+func (c *Compiler) call(v *ast.Call) error {
+	// A call to a tuple variant constructs it rather than calling anything.
+	if pe, ok := v.Fn.(*ast.PathExpr); ok {
+		ref, _ := c.res.Ref(pe.NodeID())
+		switch ref.Kind {
+		case resolve.Variant:
+			for _, a := range v.Args {
+				if err := c.expr(a); err != nil {
+					return err
+				}
+			}
+			c.emitAB(bytecode.OpVariant, c.variantIdx[ref.Variant], len(v.Args), v.Span())
+			return nil
+
+		case resolve.Builtin:
+			idx, ok := builtinIndex[ref.Builtin]
+			if !ok {
+				return unsupported("builtin `"+ref.Builtin+"`", v.Span())
+			}
+			for _, a := range v.Args {
+				if err := c.expr(a); err != nil {
+					return err
+				}
+			}
+			c.emitAB(bytecode.OpCallBuiltin, idx, len(v.Args), v.Span())
+			return nil
+		}
+	}
+
+	if err := c.expr(v.Fn); err != nil {
+		return err
+	}
+	for _, a := range v.Args {
+		if err := c.expr(a); err != nil {
+			return err
+		}
+	}
+	c.emitA(bytecode.OpCall, len(v.Args), v.Span())
+	return nil
+}
+
+// builtinMethods are the methods the compiler knows without an impl to call: the
+// prelude declares their signatures, and the VM implements them (see the builtin impl
+// table in internal/check). Phase 7 replaces them with Origin source.
+var builtinMethodOps = map[string]bytecode.Op{
+	"wrapping_add": bytecode.OpWrapAdd,
+	"wrapping_sub": bytecode.OpWrapSub,
+	"wrapping_mul": bytecode.OpWrapMul,
+}
+
+var builtinMethodCalls = map[string]int{
+	"cmp":            BuiltinCmp,
+	"checked_add":    BuiltinCheckedAdd,
+	"checked_sub":    BuiltinCheckedSub,
+	"checked_mul":    BuiltinCheckedMul,
+	"saturating_add": BuiltinSaturatingAdd,
+	"saturating_sub": BuiltinSaturatingSub,
+	"saturating_mul": BuiltinSaturatingMul,
+}
+
+func (c *Compiler) methodCall(v *ast.MethodCall) error {
+	// A user-declared method resolved by the checker is a direct call.
+	if decl, ok := c.tys.Methods[v.NodeID()]; ok {
+		if idx, known := c.fnIndex[decl]; known && decl.Body != nil {
+			c.emitA(bytecode.OpFunc, idx, v.Span())
+			if err := c.expr(v.Recv); err != nil {
+				return err
+			}
+			for _, a := range v.Args {
+				if err := c.expr(a); err != nil {
+					return err
+				}
+			}
+			c.emitA(bytecode.OpCall, len(v.Args)+1, v.Span())
+			return nil
+		}
+	}
+
+	// Otherwise it is one of the compiler-provided methods on a primitive.
+	if v.Name.Name == "to_str" && len(v.Args) == 0 {
+		if err := c.expr(v.Recv); err != nil {
+			return err
+		}
+		c.emit(bytecode.OpToStr, v.Span())
+		return nil
+	}
+	if op, ok := builtinMethodOps[v.Name.Name]; ok && len(v.Args) == 1 {
+		if err := c.expr(v.Recv); err != nil {
+			return err
+		}
+		if err := c.expr(v.Args[0]); err != nil {
+			return err
+		}
+		c.emit(op, v.Span())
+		return nil
+	}
+	if idx, ok := builtinMethodCalls[v.Name.Name]; ok {
+		if err := c.expr(v.Recv); err != nil {
+			return err
+		}
+		for _, a := range v.Args {
+			if err := c.expr(a); err != nil {
+				return err
+			}
+		}
+		c.emitAB(bytecode.OpCallBuiltin, idx, len(v.Args)+1, v.Span())
+		return nil
+	}
+	return unsupported("method `"+v.Name.Name+"`", v.Span())
+}
+
+// tryExpr compiles `?`: unwrap `Ok`, or return `Err` from the enclosing function.
+func (c *Compiler) tryExpr(v *ast.Try) error {
+	if err := c.expr(v.X); err != nil {
+		return err
+	}
+	inner := c.typeOf(v.X)
+	okVariant, errVariant, found := c.resultVariants(inner)
+	if !found {
+		return unsupported("`?` on something that is not a Result", v.Span())
+	}
+
+	slot := c.temp()
+	c.emitA(bytecode.OpStore, slot, v.Span())
+	c.emitA(bytecode.OpLoad, slot, v.Span())
+	c.emitA(bytecode.OpIsVariant, okVariant, v.Span())
+	toErr := c.emitA(bytecode.OpJumpIfFalse, 0, v.Span())
+
+	c.emitA(bytecode.OpLoad, slot, v.Span())
+	c.emitA(bytecode.OpGetPayload, 0, v.Span())
+	toEnd := c.emitA(bytecode.OpJump, 0, v.Span())
+
+	c.patch(toErr)
+	c.emitA(bytecode.OpLoad, slot, v.Span())
+	c.emit(bytecode.OpReturn, v.Span())
+	c.emit(bytecode.OpUnit, v.Span())
+	_ = errVariant
+
+	c.patch(toEnd)
+	return nil
+}
+
+// resultVariants finds the constant indices of `Ok` and `Err` for a Result type.
+func (c *Compiler) resultVariants(t types.Type) (ok, errIdx int, found bool) {
+	n, isNamed := types.AsNamed(t)
+	if !isNamed || n.Def.Enum == nil {
+		return 0, 0, false
+	}
+	for _, v := range n.Def.Enum.Variants {
+		idx, known := c.variantIdx[v]
+		if !known {
+			continue
+		}
+		switch v.Name.Name {
+		case "Ok":
+			ok, found = idx, true
+		case "Err":
+			errIdx = idx
+		}
+	}
+	return ok, errIdx, found
+}

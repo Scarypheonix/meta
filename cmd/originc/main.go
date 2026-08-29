@@ -23,7 +23,9 @@ usage:
   originc version            print the compiler version
   originc check <file>       parse and resolve, emit diagnostics only
   originc run <file>         run a program with the tree-walking interpreter
+  originc run --vm <file>    run it on the bytecode virtual machine instead
   originc dump-ast <file>    print the parsed syntax tree
+  originc dump-bytecode <f>  print the compiled bytecode
   originc build <file>       compile to a native executable
 
 exit status:
@@ -80,18 +82,26 @@ func run(args []string) int {
 	case "help", "--help", "-h":
 		fmt.Fprint(os.Stdout, usage)
 		return driver.ExitOK
-	case "check", "run", "dump-ast":
-		if len(args) != 2 {
-			fmt.Fprintf(os.Stderr, "originc: `%s` takes exactly one file\n", args[0])
+	case "check", "run", "dump-ast", "dump-bytecode":
+		engine := driver.Interpreter
+		rest := args[1:]
+		if len(rest) > 0 && rest[0] == "--vm" {
+			engine = driver.VM
+			rest = rest[1:]
+		}
+		if len(rest) != 1 {
+			fmt.Fprintf(os.Stderr, "originc: `%s` takes exactly one file or directory\n", args[0])
 			return driver.ExitUsage
 		}
 		switch args[0] {
 		case "check":
-			return driver.Check(args[1], os.Stdout, os.Stderr)
+			return driver.Check(rest[0], os.Stdout, os.Stderr)
 		case "run":
-			return driver.Run(args[1], os.Stdout, os.Stderr)
+			return driver.RunWith(rest[0], engine, os.Stdout, os.Stderr)
+		case "dump-bytecode":
+			return driver.DumpBytecode(rest[0], os.Stdout, os.Stderr)
 		default:
-			return driver.DumpAST(args[1], os.Stdout, os.Stderr)
+			return driver.DumpAST(rest[0], os.Stdout, os.Stderr)
 		}
 	case "build":
 		panic("unimplemented: originc build (Phase 5: native x86-64 backend)")

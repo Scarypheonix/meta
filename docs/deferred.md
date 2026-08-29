@@ -34,8 +34,11 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Cycle detection in structural `==` | a cyclic graph makes `==` diverge (§04) | Phase 7 |
 | Tuple element access (`t.0`) | found in Phase 1: the grammar's `.` takes an identifier, so a tuple can only be read by pattern. Needs either integer field syntax or a lexer rule for `.0` | Phase 7 |
 | Float formatting in `to_str` | the spec does not fix a rendering; the interpreter uses the shortest round-tripping form and the e2e suite avoids depending on it | Phase 7 |
-| Per-width integer overflow | the checker knows the width, but the interpreter's value model still carries every integer as an i64; real widths arrive with the bytecode VM | Phase 3 |
-| `u64::MAX` at run time | the same limitation: it has no representation in an i64 value model, so it traps rather than returning a wrong number | Phase 3 |
+| Per-width integer overflow | both engines carry every integer as an i64; giving a value its declared width needs monomorphized layouts | Phase 4 |
+| `u64::MAX` at run time | the same limitation: it has no representation in an i64 value model, so it is rejected rather than returning a wrong number | Phase 4 |
+| Tagged slots in heap objects | two words per field, because a generic field has no statically known shape without monomorphization; exact layouts replace them | Phase 4 |
+| `for` loops in compiled code | the bytecode compiler does not lower the `IntoIterator` desugaring yet; the interpreter runs them | Phase 4 |
+| Decision-tree lowering for `match` | the compiler emits a linear chain of arm tests; the tree belongs on the control-flow graph | Phase 4 |
 | Monomorphization | ADR-0010 is a lowering strategy; Phase 2 type-checks generics, and the instantiation set is built when there is an IR to instantiate into | Phase 4 |
 | Orphan rule (`E0117`) | cannot be violated while a program is one package; it becomes checkable with the package manager | Phase 8 |
 | Compiler-provided impls in Origin | `Show`, `Ord` and `Int` for the primitives are registered by the checker because their bodies need operations the language does not expose yet | Phase 7 |

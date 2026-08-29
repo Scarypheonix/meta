@@ -1,0 +1,47 @@
+fn 0 classify(params=1 locals=1 captures=0)
+     0  load 0
+     1  const 0  ; 0
+     2  lt
+     3  jump_if_false 8
+     4  const 0  ; 0
+     5  const 1  ; 1
+     6  sub
+     7  jump 15
+     8  load 0
+     9  const 0  ; 0
+    10  eq
+    11  jump_if_false 14
+    12  const 0  ; 0
+    13  jump 15
+    14  const 1  ; 1
+    15  return
+
+fn 1 main(params=0 locals=2 captures=0)
+     0  const 0  ; 0
+     1  store 0
+     2  const 0  ; 0
+     3  store 1
+     4  load 0
+     5  const 2  ; 3
+     6  lt
+     7  jump_if_false 25
+     8  load 1
+     9  func 0
+    10  load 0
+    11  call 1 0
+    12  add
+    13  store 1
+    14  unit
+    15  pop
+    16  load 0
+    17  const 1  ; 1
+    18  add
+    19  store 0
+    20  unit
+    21  pop
+    22  unit
+    23  pop
+    24  jump 4
+    25  unit
+    26  return
+

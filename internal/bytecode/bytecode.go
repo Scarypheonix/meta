@@ -1,0 +1,331 @@
+// Package bytecode defines Origin's stack bytecode: the instruction set, the chunk that
+// holds a compiled program, and a disassembler.
+//
+// The instruction set is a stack machine, which spec/03 of the phase plan permits
+// ("stack or register bytecode"). A stack machine was chosen for one reason: Phase 4
+// lowers this to an SSA IR anyway, so the register allocation problem is solved there,
+// on a representation designed for it, rather than twice.
+//
+// Every instruction that can trap carries the source span it would trap at, so a trap
+// message names a line and column without the VM keeping a shadow stack of positions.
+package bytecode
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/scarypheonix/meta/internal/diag"
+	"github.com/scarypheonix/meta/internal/layout"
+)
+
+// Op is an opcode.
+type Op uint8
+
+// The instruction set. Operands are in the instruction's A and B fields; the stack
+// supplies everything else.
+const (
+	// OpNop does nothing. It exists so that a jump target can be patched safely.
+	OpNop Op = iota
+
+	// --- constants and locals ---
+
+	// OpConst pushes constant A.
+	OpConst
+	// OpUnit pushes the unit value.
+	OpUnit
+	// OpTrue and OpFalse push their booleans.
+	OpTrue
+	OpFalse
+	// OpLoad pushes local slot A.
+	OpLoad
+	// OpStore pops into local slot A.
+	OpStore
+	// OpLoadCapture pushes capture slot A of the running closure.
+	OpLoadCapture
+	// OpPop discards the top of the stack.
+	OpPop
+
+	// --- arithmetic, all trapping per ADR-0005 ---
+
+	OpAdd
+	OpSub
+	OpMul
+	OpDiv
+	OpRem
+	OpNeg
+	// OpAddF and friends are the float forms, which never trap.
+	OpAddF
+	OpSubF
+	OpMulF
+	OpDivF
+	OpRemF
+	OpNegF
+	// OpWrapAdd and friends are the explicit non-trapping integer forms.
+	OpWrapAdd
+	OpWrapSub
+	OpWrapMul
+
+	// --- bitwise and shifts ---
+
+	OpAnd
+	OpOr
+	OpXor
+	OpShl
+	OpShr
+
+	// --- comparison ---
+
+	// OpEq compares structurally (spec/04-expressions.md).
+	OpEq
+	OpNe
+	OpLt
+	OpLe
+	OpGt
+	OpGe
+	OpNot
+
+	// --- control flow ---
+
+	// OpJump jumps to A.
+	OpJump
+	// OpJumpIfFalse pops a bool and jumps to A when it is false.
+	OpJumpIfFalse
+	// OpJumpIfTrue pops a bool and jumps to A when it is true.
+	OpJumpIfTrue
+	// OpReturn returns the top of the stack from the current function.
+	OpReturn
+
+	// --- calls ---
+
+	// OpCall calls the callee beneath A arguments.
+	OpCall
+	// OpCallBuiltin calls builtin A with B arguments.
+	OpCallBuiltin
+	// OpClosure builds a closure over function A, capturing B values from the stack.
+	OpClosure
+	// OpFunc pushes the top-level function A as a value.
+	OpFunc
+
+	// --- aggregates ---
+
+	// OpStruct builds struct type A from B values on the stack.
+	OpStruct
+	// OpTuple builds a tuple from A values on the stack.
+	OpTuple
+	// OpVariant builds enum variant A (constant index) from B payload values.
+	OpVariant
+	// OpGetField pushes field A of the object on top.
+	OpGetField
+	// OpSetField pops a value and stores it into field A of the object beneath it.
+	OpSetField
+	// OpIsVariant pushes whether the object on top is variant A of its enum.
+	OpIsVariant
+	// OpGetPayload pushes payload word A of the variant on top.
+	OpGetPayload
+	// OpGetTupleElem pushes element A of the tuple on top.
+	OpGetTupleElem
+
+	// --- primitive conversions ---
+
+	// OpCast converts the top of the stack, with A naming the conversion.
+	OpCast
+	// OpToStr renders the top of the stack as a String.
+	OpToStr
+
+	// OpTrap stops with the message in constant A. It is how `panic` and an
+	// unreachable match arm are emitted.
+	OpTrap
+
+	// OpHalt ends the program.
+	OpHalt
+
+	numOps
+)
+
+var opNames = [...]string{
+	OpNop: "nop", OpConst: "const", OpUnit: "unit", OpTrue: "true", OpFalse: "false",
+	OpLoad: "load", OpStore: "store", OpLoadCapture: "load_capture", OpPop: "pop",
+	OpAdd: "add", OpSub: "sub", OpMul: "mul", OpDiv: "div", OpRem: "rem", OpNeg: "neg",
+	OpAddF: "addf", OpSubF: "subf", OpMulF: "mulf", OpDivF: "divf", OpRemF: "remf", OpNegF: "negf",
+	OpWrapAdd: "wrap_add", OpWrapSub: "wrap_sub", OpWrapMul: "wrap_mul",
+	OpAnd: "and", OpOr: "or", OpXor: "xor", OpShl: "shl", OpShr: "shr",
+	OpEq: "eq", OpNe: "ne", OpLt: "lt", OpLe: "le", OpGt: "gt", OpGe: "ge", OpNot: "not",
+	OpJump: "jump", OpJumpIfFalse: "jump_if_false", OpJumpIfTrue: "jump_if_true", OpReturn: "return",
+	OpCall: "call", OpCallBuiltin: "call_builtin", OpClosure: "closure", OpFunc: "func",
+	OpStruct: "struct", OpTuple: "tuple", OpVariant: "variant",
+	OpGetField: "get_field", OpSetField: "set_field",
+	OpIsVariant: "is_variant", OpGetPayload: "get_payload", OpGetTupleElem: "get_tuple_elem",
+	OpCast: "cast", OpToStr: "to_str", OpTrap: "trap", OpHalt: "halt",
+}
+
+func (o Op) String() string {
+	if int(o) < len(opNames) && opNames[o] != "" {
+		return opNames[o]
+	}
+	return fmt.Sprintf("op(%d)", int(o))
+}
+
+// Instr is one instruction. It is a struct rather than packed bytes because the VM is
+// stage0: the packed encoding belongs to the native backend, and an explicit struct
+// keeps the disassembler honest and the compiler readable.
+type Instr struct {
+	Op Op
+	A  int32
+	B  int32
+	// Span is where this instruction came from, so a trap names a source location.
+	Span diag.Span
+}
+
+// ConstKind says what a constant holds.
+type ConstKind uint8
+
+const (
+	// ConstInt is an integer.
+	ConstInt ConstKind = iota
+	// ConstFloat is a float, stored as its IEEE bits.
+	ConstFloat
+	// ConstChar is a Unicode scalar value.
+	ConstChar
+	// ConstString is text, interned into the heap on first use.
+	ConstString
+)
+
+// Const is a constant-pool entry.
+type Const struct {
+	Kind ConstKind
+	Bits uint64
+	Str  string
+}
+
+// CastKind names a primitive conversion, resolved at compile time from the `as` matrix
+// in spec/04-expressions.md.
+type CastKind uint8
+
+const (
+	// CastIntTrunc truncates an integer to a narrower width; it never traps.
+	CastIntTrunc CastKind = iota
+	// CastIntToFloat converts an integer to a float.
+	CastIntToFloat
+	// CastFloatToInt truncates toward zero and traps when out of range or NaN.
+	CastFloatToInt
+	// CastFloatNarrow rounds f64 to f32.
+	CastFloatNarrow
+	// CastFloatWiden is exact.
+	CastFloatWiden
+	// CastBoolToInt yields 0 or 1.
+	CastBoolToInt
+	// CastCharToInt yields the scalar value.
+	CastCharToInt
+)
+
+// Fn is a compiled function.
+type Fn struct {
+	Name string
+	// Params is how many arguments the function takes.
+	Params int
+	// Locals is how many local slots the frame needs, including parameters.
+	Locals int
+	// Captures is how many captured values a closure over this function holds.
+	Captures int
+	Code     []Instr
+	// Span is the declaration's span, used when a trap has no better location.
+	Span diag.Span
+}
+
+// Program is a whole compiled program.
+type Program struct {
+	Fns    []*Fn
+	Consts []Const
+	// Types is the layout registry the heap and this program share.
+	Types *layout.Registry
+	// Entry is the index of `main`.
+	Entry int
+	// VariantTags maps a variant constant index to its enum's type id and tag.
+	Variants []VariantInfo
+	// Structs maps a struct constant index to its type id.
+	Structs []layout.TypeID
+	// StringType is the descriptor id for `String`.
+	StringType layout.TypeID
+	// TupleTypes maps an arity to the descriptor for a tuple of that arity.
+	TupleTypes map[int]layout.TypeID
+	// ClosureTypes maps a capture count to the descriptor for a closure with that many.
+	ClosureTypes map[int]layout.TypeID
+	// Prelude records the variant indices the VM needs to build values of its own:
+	// `Option` for the checked-arithmetic methods, `Ordering` for `cmp`. They are
+	// resolved at compile time so the VM never looks anything up by name.
+	Prelude PreludeVariants
+}
+
+// PreludeVariants names the prelude variants the VM constructs directly.
+type PreludeVariants struct {
+	OptionSome int
+	OptionNone int
+	Less       int
+	Equal      int
+	Greater    int
+	// Found reports whether the prelude supplied all of them.
+	Found bool
+}
+
+// VariantInfo describes one enum variant to the VM.
+type VariantInfo struct {
+	Type layout.TypeID
+	// Tag is the variant's index within its enum.
+	Tag int
+	// Payload is how many payload values the variant carries.
+	Payload int
+	// Name is used in diagnostics and disassembly.
+	Name string
+	// RefPayload says, per payload slot, whether it holds a heap reference.
+	RefPayload []bool
+}
+
+// Disassemble renders a program as text. Snapshot tests compare its output, which is
+// the "snapshot test of the generated IR" process rule 2 requires.
+func (p *Program) Disassemble() string {
+	var sb strings.Builder
+	for i, fn := range p.Fns {
+		fmt.Fprintf(&sb, "fn %d %s(params=%d locals=%d captures=%d)\n",
+			i, fn.Name, fn.Params, fn.Locals, fn.Captures)
+		for pc, in := range fn.Code {
+			fmt.Fprintf(&sb, "  %4d  %s", pc, in.Op)
+			switch in.Op {
+			case OpConst:
+				fmt.Fprintf(&sb, " %d  ; %s", in.A, p.constText(int(in.A)))
+			case OpVariant:
+				if int(in.A) < len(p.Variants) {
+					fmt.Fprintf(&sb, " %d %d  ; %s", in.A, in.B, p.Variants[in.A].Name)
+				}
+			case OpIsVariant:
+				if int(in.A) < len(p.Variants) {
+					fmt.Fprintf(&sb, " %d  ; %s", in.A, p.Variants[in.A].Name)
+				}
+			case OpCall, OpStruct, OpTuple, OpCallBuiltin, OpClosure:
+				fmt.Fprintf(&sb, " %d %d", in.A, in.B)
+			case OpLoad, OpStore, OpLoadCapture, OpJump, OpJumpIfFalse, OpJumpIfTrue,
+				OpGetField, OpSetField, OpGetPayload, OpGetTupleElem, OpFunc, OpCast, OpTrap:
+				fmt.Fprintf(&sb, " %d", in.A)
+			}
+			sb.WriteByte('\n')
+		}
+		sb.WriteByte('\n')
+	}
+	return sb.String()
+}
+
+func (p *Program) constText(i int) string {
+	if i < 0 || i >= len(p.Consts) {
+		return "?"
+	}
+	c := p.Consts[i]
+	switch c.Kind {
+	case ConstString:
+		return fmt.Sprintf("%q", c.Str)
+	case ConstFloat:
+		return "float"
+	case ConstChar:
+		return fmt.Sprintf("%q", rune(c.Bits))
+	default:
+		return fmt.Sprint(int64(c.Bits))
+	}
+}

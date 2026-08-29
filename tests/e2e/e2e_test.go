@@ -80,8 +80,13 @@ func loadCases(t *testing.T) []caseFile {
 	return out
 }
 
-// TestPrograms is the end-to-end suite: compile and run each case, then compare stdout,
-// stderr and exit status byte for byte.
+// TestPrograms is the end-to-end suite: compile and run each case on each engine, then
+// compare stdout, stderr and exit status byte for byte against the expected files.
+//
+// Running both engines against the same expectations is Phase 3's exit criterion. It is
+// a real oracle rather than a smoke test: the expectations come from
+// docs/spec/10-examples.md, so a divergence means one of the two engines disagrees with
+// the specification, and the suite says which.
 func TestPrograms(t *testing.T) {
 	cases := loadCases(t)
 	if len(cases) == 0 {
@@ -89,42 +94,83 @@ func TestPrograms(t *testing.T) {
 	}
 	root := testutil.RepoRoot(t)
 
+	engines := []struct {
+		name   string
+		engine driver.Engine
+	}{
+		{"interpreter", driver.Interpreter},
+		{"vm", driver.VM},
+	}
+
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
-			// Run from the repository root so diagnostics name the case by its
-			// repo-relative path, matching the expected stderr.
-			wd, err := os.Getwd()
-			if err != nil {
-				t.Fatalf("getwd: %v", err)
-			}
-			if err := os.Chdir(root); err != nil {
-				t.Fatalf("chdir: %v", err)
-			}
-			defer func() { _ = os.Chdir(wd) }()
+			for _, e := range engines {
+				t.Run(e.name, func(t *testing.T) {
+					stdout, stderr, code := runCase(t, root, c, e.engine)
 
-			var stdout, stderr bytes.Buffer
-			code := driver.Run(c.RelPath, &stdout, &stderr)
-
-			if got := stdout.String(); got != c.WantOut {
-				t.Errorf("stdout mismatch\n--- want ---\n%s\n--- got ---\n%s", c.WantOut, got)
-			}
-			wantErr := ""
-			if c.HasErr {
-				wantErr = c.WantErr
-			}
-			if got := stderr.String(); got != wantErr {
-				t.Errorf("stderr mismatch\n--- want ---\n%s\n--- got ---\n%s", wantErr, got)
-			}
-			if code != c.WantExit {
-				t.Errorf("exit status = %d, want %d", code, c.WantExit)
+					if stdout != c.WantOut {
+						t.Errorf("stdout mismatch\n--- want ---\n%s\n--- got ---\n%s", c.WantOut, stdout)
+					}
+					wantErr := ""
+					if c.HasErr {
+						wantErr = c.WantErr
+					}
+					if stderr != wantErr {
+						t.Errorf("stderr mismatch\n--- want ---\n%s\n--- got ---\n%s", wantErr, stderr)
+					}
+					if code != c.WantExit {
+						t.Errorf("exit status = %d, want %d", code, c.WantExit)
+					}
+				})
 			}
 		})
 	}
 }
 
-// TestEveryCaseHasItsCompanions is folded into loadCases, which reports a missing
-// companion as a test failure. This test exists so a case directory with no cases at
-// all is caught rather than passing vacuously.
+// TestEnginesAgree states the differential directly: whatever the two engines produce,
+// they must produce the same thing. It is deliberately separate from the comparison
+// against the expected files, so that a case whose expectations are wrong still reports
+// "the engines disagree" rather than two identical-looking failures.
+func TestEnginesAgree(t *testing.T) {
+	root := testutil.RepoRoot(t)
+	for _, c := range loadCases(t) {
+		t.Run(c.Name, func(t *testing.T) {
+			iOut, iErr, iCode := runCase(t, root, c, driver.Interpreter)
+			vOut, vErr, vCode := runCase(t, root, c, driver.VM)
+
+			if iOut != vOut {
+				t.Errorf("stdout differs between engines\n--- interpreter ---\n%s\n--- vm ---\n%s", iOut, vOut)
+			}
+			if iErr != vErr {
+				t.Errorf("stderr differs between engines\n--- interpreter ---\n%s\n--- vm ---\n%s", iErr, vErr)
+			}
+			if iCode != vCode {
+				t.Errorf("exit status differs: interpreter %d, vm %d", iCode, vCode)
+			}
+		})
+	}
+}
+
+// runCase executes one case from the repository root, so that diagnostics name the case
+// by its repo-relative path and the expected stderr is stable wherever the test runs.
+func runCase(t *testing.T, root string, c caseFile, engine driver.Engine) (string, string, int) {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer func() { _ = os.Chdir(wd) }()
+
+	var stdout, stderr bytes.Buffer
+	code := driver.RunWith(c.RelPath, engine, &stdout, &stderr)
+	return stdout.String(), stderr.String(), code
+}
+
+// TestSuiteIsNotEmpty catches a case directory with no cases, which would otherwise let
+// the whole suite pass vacuously.
 func TestSuiteIsNotEmpty(t *testing.T) {
 	if n := len(loadCases(t)); n < 5 {
 		t.Errorf("only %d end-to-end cases; the suite is too thin to be meaningful", n)

@@ -4,7 +4,7 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Current phase: 3 — bytecode VM and garbage collector. Phases 0, 1 and 2 are
+**Current phase: 4 — intermediate representation and optimizer. Phases 0 through 3 are
 complete** (see `docs/phases/`).
 
 ---
@@ -14,6 +14,8 @@ complete** (see `docs/phases/`).
 ```bash
 ./check              # THE gate: gofmt + go vet + go build + full test suite
 go run ./cmd/originc run  path.origin     # run a file, or a package directory
+go run ./cmd/originc run --vm path.origin # run it on the bytecode VM instead
+go run ./cmd/originc dump-bytecode p.origin
 go run ./cmd/originc check path.origin    # diagnostics only
 go run ./cmd/originc dump-ast path.origin # print the syntax tree
 go test -run xxx -fuzz FuzzParse ./tests/fuzz/   # fuzz the parser
@@ -41,6 +43,11 @@ internal/resolve/     name resolution, modules, visibility; owns the name side t
 internal/types/       the shared type language: terms, unification, generalization
 internal/check/       the type checker: inference, exhaustiveness, traits, coherence
 internal/interp/      tree-walking interpreter (Phase 1)
+internal/layout/      object layout and headers: the GC/backend shared contract
+internal/gc/          precise generational moving collector
+internal/bytecode/    the stack instruction set and its disassembler
+internal/compile/     AST -> bytecode
+internal/vm/          the bytecode virtual machine
 internal/prelude/     Option, Result, Ordering — written in Origin
 internal/driver/      pass ordering and error suppression
 tests/conformance/    type-system accept/reject corpus, one file per case
@@ -89,8 +96,9 @@ RAM, macOS Monterey 12.7.6, x86-64. Development happens in a Linux x86-64 contai
 5. **Module boundaries are contracts.** Narrow documented interfaces; no reaching into
    another subsystem's internals. When two subsystems must agree on a representation,
    that agreement lives in **one** shared module with its own tests — never duplicated.
-   Current shared-agreement modules: `internal/layout` will own object layout, stack
-   maps and safepoint placement for both the GC and the backend (spec §08).
+   Current shared-agreement modules: `internal/layout` owns object layout and headers
+   for the GC and, from Phase 5, the backend; stack maps and safepoint placement join
+   it there (spec §08).
 6. **ADRs for irreversible choices.** Numbered file in `docs/adr/`: context, options
    considered, decision, consequences. If you cannot remember why something is the way
    it is, the ADR was missing — write it retroactively and say so in the file.
@@ -153,27 +161,28 @@ This project outlasts any single context window.
 
 ## Status
 
-**In flight:** nothing. Phase 2 closed.
+**In flight:** nothing. Phase 3 closed.
 
-**Known-broken:** nothing. Two known *incomplete* things, both recorded in
-`docs/deferred.md` against Phase 3: the interpreter's value model carries every integer
-as an `i64`, so per-width overflow does not trap and `u64::MAX` traps rather than
-returning a wrong number.
+**Known-broken:** nothing. Five known *incomplete* things, all recorded in
+`docs/deferred.md` against Phase 4, and all consequences of not having an IR yet:
+heap objects use two-word tagged slots because generics are not monomorphized; integer
+arithmetic is 64-bit only in both engines; `u64::MAX` has no run-time representation;
+the bytecode compiler does not lower `for` loops (the interpreter runs them); and
+`match` compiles to a linear chain of arm tests rather than a decision tree.
 
-**Next action:** Phase 3 — the bytecode VM and the garbage collector. In order: lower
-the AST to a register bytecode; write the VM; then the precise generational moving
-collector — bump allocation in the nursery, copying collection, write barriers, a card
-table for old-to-young references, and stack maps for precise root finding. The
-representation the GC and the backend must agree on lives in `internal/layout`, which
-does not exist yet and which spec §08 already specifies (object layout, stack maps,
-safepoint placement).
+**Next action:** Phase 4 — the SSA intermediate representation and the optimizer. Lower
+the bytecode to SSA with a control-flow graph, then: constant folding and propagation,
+dead code elimination, common subexpression elimination, inlining with a cost model,
+escape analysis, and loop-invariant code motion. Monomorphization (ADR-0010) belongs
+here too, and it is what retires the tagged-slot representation: an instantiated type
+has an exact layout, so `internal/layout` can describe it word by word.
 
-Phase 3 exits when the GC survives 10 million short-lived allocations with a live set
-held across collections — no leaks, no premature collection, no crashes under randomized
-allocation patterns — and when the interpreter and the VM produce identical output on
-every Phase 1 and Phase 2 test. That differential is the point: `tests/e2e/` already
-asserts exact stdout, stderr and exit status, so running the same corpus through both
-engines is a real oracle.
+Phase 4 exits when every pass has a snapshot test and the full end-to-end suite produces
+identical output at `-O0`, `-O1` and `-O2`. The harness for that already exists in
+spirit: `tests/e2e` runs every case through two engines and compares them byte for byte,
+so adding optimization levels is adding rows to a table that already works. ADR-0005 and
+ADR-0012 are what make it a real oracle — overflow traps at every level and evaluation
+order is fully specified, so any divergence is a bug rather than a legal difference.
 
 **Awaiting the user:** nothing blocking. Two things only the target machine can
 confirm, both at Phase 5: that a compiled Mach-O binary runs, and that `lldb` breaks on

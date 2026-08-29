@@ -83,40 +83,117 @@ const (
 	// bytes, and the bytes follow. It holds no references, which is what makes a
 	// `String` cheap for the collector to skip.
 	ByteArray
+	// Tagged is a run of slots, each two words: a ValueTag and its payload.
+	//
+	// It exists because Origin 0.1 does not monomorphize yet (ADR-0010, deferred to
+	// Phase 4), so the field of a generic struct has no statically known shape: the
+	// payload of `Option[T]` is a reference for `T = String` and a raw word for
+	// `T = i64`. A tag written beside each slot answers that at run time while keeping
+	// the collector precise -- it reads the tag, it does not guess from the bits.
+	//
+	// The cost is two words per slot. Phase 4 replaces it with exact layouts once
+	// monomorphization gives every instantiation its own descriptor.
+	Tagged
 )
 
-// Descriptor describes one object shape to the collector.
+// ValueTag identifies what a Tagged slot holds. The collector reads it to decide
+// whether the word beside it is a reference, so this is part of the shared contract and
+// not a detail of the VM.
+type ValueTag uint64
+
+const (
+	// TagUnit is the unit value; its payload word is unused.
+	TagUnit ValueTag = iota
+	// TagInt is an integer, held as its two's-complement bits.
+	TagInt
+	// TagFloat is a float, held as its IEEE bits.
+	TagFloat
+	// TagBool is a boolean, 0 or 1.
+	TagBool
+	// TagChar is a Unicode scalar value.
+	TagChar
+	// TagRef is a heap reference: the collector traces and rewrites the payload word.
+	TagRef
+	// TagFn is a top-level function index.
+	TagFn
+	// TagBuiltin is a compiler-provided function index.
+	TagBuiltin
+)
+
+// ObjKind says what an object is, for structural equality and for rendering. The
+// collector ignores it; the VM cannot, because `Point { x: 1 }` and a two-element tuple
+// have the same shape and must not print or compare the same way.
+type ObjKind uint8
+
+const (
+	// ObjStruct is a struct instance.
+	ObjStruct ObjKind = iota
+	// ObjEnum is one variant of an enum. Each variant has its own descriptor, so a
+	// variant test is a type-id comparison and needs no tag slot.
+	ObjEnum
+	// ObjTuple is a tuple.
+	ObjTuple
+	// ObjClosure is a function value: slot 0 is the function index, the rest are its
+	// captures.
+	ObjClosure
+	// ObjBytes is a String.
+	ObjBytes
+)
+
+// WordKind says how one payload word is to be read.
+//
+// The collector only needs to know which words are references. The VM needs more: it
+// compares aggregates structurally (spec/04-expressions.md), and a float compares by
+// IEEE rules rather than by bits, so `NaN != NaN` and `0.0 == -0.0` hold inside a struct
+// exactly as they do outside one. Both readings come from this one table, so the two
+// cannot drift apart.
+type WordKind uint8
+
+const (
+	// WordRaw is an integer, bool, char or unit: compared by bits.
+	WordRaw WordKind = iota
+	// WordRef is a reference the collector must trace and rewrite.
+	WordRef
+	// WordFloat holds IEEE bits and is compared as a float.
+	WordFloat
+)
+
+// Descriptor describes one object shape.
 type Descriptor struct {
 	// Name is used in diagnostics and heap dumps.
 	Name string
-	// Shape selects how Payload words are interpreted.
+	// Shape selects how the payload words are interpreted.
 	Shape Shape
 	// Words is the payload size for a Fixed shape, in words.
 	Words uint64
-	// RefBits is a bitmap over payload words for a Fixed shape: bit i is set when
-	// payload word i holds a reference.
-	RefBits []uint64
+	// Kinds gives the kind of each payload word for a Fixed shape.
+	Kinds []WordKind
+	// Slots is the number of tagged slots for a Tagged shape.
+	Slots int
+	// Kind says what the object is, for equality and rendering.
+	Kind ObjKind
+	// FieldNames names a struct's or a struct variant's slots, in declaration order.
+	// It is empty for a tuple variant, a tuple or a closure.
+	FieldNames []string
+	// TypeName is the enum's or struct's declared name; VariantName is the variant's,
+	// for an ObjEnum descriptor.
+	TypeName    string
+	VariantName string
 }
 
-// IsRef reports whether payload word i of a Fixed object holds a reference.
+// TaggedDescriptor builds a descriptor for an object of n tagged slots.
+func TaggedDescriptor(name string, kind ObjKind, slots int) *Descriptor {
+	return &Descriptor{Name: name, Shape: Tagged, Words: uint64(slots) * 2, Slots: slots, Kind: kind}
+}
+
+// IsRef reports whether payload word i holds a reference.
 func (d *Descriptor) IsRef(i uint64) bool {
-	if d.Shape != Fixed {
-		return false
-	}
-	word := i / 64
-	if word >= uint64(len(d.RefBits)) {
-		return false
-	}
-	return d.RefBits[word]&(1<<(i%64)) != 0
+	return d.Shape == Fixed && i < uint64(len(d.Kinds)) && d.Kinds[i] == WordRef
 }
 
-// SetRef marks payload word i of a Fixed object as holding a reference.
-func (d *Descriptor) SetRef(i uint64) {
-	word := i / 64
-	for uint64(len(d.RefBits)) <= word {
-		d.RefBits = append(d.RefBits, 0)
-	}
-	d.RefBits[word] |= 1 << (i % 64)
+// IsFloat reports whether payload word i holds IEEE float bits.
+func (d *Descriptor) IsFloat(i uint64) bool {
+	return d.Shape == Fixed && i < uint64(len(d.Kinds)) && d.Kinds[i] == WordFloat
 }
 
 // Registry maps TypeIDs to descriptors. One registry serves one program: descriptors
@@ -166,14 +243,20 @@ func (r *Registry) Lookup(name string) (TypeID, bool) {
 // Len reports how many descriptors are registered, including the reserved zero.
 func (r *Registry) Len() int { return len(r.descs) }
 
-// FixedDescriptor builds a Fixed descriptor from a list saying which fields are
-// references, in declaration order.
-func FixedDescriptor(name string, isRef []bool) *Descriptor {
-	d := &Descriptor{Name: name, Shape: Fixed, Words: uint64(len(isRef))}
+// FixedDescriptor builds a Fixed descriptor from the kind of each field, in declaration
+// order.
+func FixedDescriptor(name string, kinds []WordKind) *Descriptor {
+	return &Descriptor{Name: name, Shape: Fixed, Words: uint64(len(kinds)), Kinds: kinds}
+}
+
+// RefsOnly builds the kind list for an object whose fields are all references, or all
+// raw, according to isRef.
+func RefsOnly(isRef []bool) []WordKind {
+	kinds := make([]WordKind, len(isRef))
 	for i, r := range isRef {
 		if r {
-			d.SetRef(uint64(i))
+			kinds[i] = WordRef
 		}
 	}
-	return d
+	return kinds
 }

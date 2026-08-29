@@ -1,0 +1,37 @@
+fn 0 make(params=0 locals=2 captures=0)
+     0  const 0  ; 0
+     1  store 0
+     2  load 0
+     3  struct 0 1
+     4  store 1
+     5  load 1
+     6  closure 2 1
+     7  return
+
+fn 1 main(params=0 locals=2 captures=0)
+     0  func 0
+     1  call 0 0
+     2  store 0
+     3  load 0
+     4  call 0 0
+     5  store 1
+     6  unit
+     7  return
+
+fn 2 <lambda>(params=0 locals=2 captures=1)
+     0  load_capture 0
+     1  store 0
+     2  load_capture 0
+     3  get_field 0
+     4  const 1  ; 1
+     5  add
+     6  store 1
+     7  load 0
+     8  load 1
+     9  set_field 0
+    10  unit
+    11  pop
+    12  load_capture 0
+    13  get_field 0
+    14  return
+
