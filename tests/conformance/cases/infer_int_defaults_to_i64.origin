@@ -1,0 +1,9 @@
+// EXPECT: accept
+// spec/03: an unconstrained integer literal defaults to i64.
+
+fn takes_i64(n: i64) -> i64 { n }
+
+fn main() {
+    let x = 1;
+    let y = takes_i64(x);
+}

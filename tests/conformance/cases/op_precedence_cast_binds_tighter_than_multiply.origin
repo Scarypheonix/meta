@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/02: `a * b as i64` is `a * (b as i64)`.
+
+fn main() {
+    let a: i64 = 2;
+    let b: i32 = 3;
+    let c = a * b as i64;
+}

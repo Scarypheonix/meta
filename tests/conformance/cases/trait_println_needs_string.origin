@@ -1,0 +1,8 @@
+// EXPECT: reject E0308
+// spec/06: `io::println` takes a String.
+
+use std::io;
+
+fn main() {
+    io::println(1);
+}

@@ -1,0 +1,6 @@
+// EXPECT: reject E0433
+// spec/07: the cast's target type must resolve.
+
+fn main() {
+    let x = 1 as Nonexistent;
+}

@@ -1,0 +1,7 @@
+// EXPECT: accept
+// ADR-0004: `mut` on a binding permits reassignment.
+
+fn main() {
+    let mut x = 1;
+    x = 2;
+}

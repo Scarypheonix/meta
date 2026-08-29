@@ -1,0 +1,8 @@
+// EXPECT: reject E0594
+// spec/04: a place is a `mut` binding or a `mut` field.
+
+fn f() -> i64 { 1 }
+
+fn main() {
+    f() = 2;
+}

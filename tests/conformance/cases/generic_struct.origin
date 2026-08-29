@@ -1,0 +1,9 @@
+// EXPECT: accept
+// spec/03: a struct may be generic in its fields.
+
+struct Pair[A, B] { first: A, second: B }
+
+fn main() {
+    let p = Pair { first: 1, second: "s" };
+    let q: Pair[bool, char] = Pair { first: true, second: 'c' };
+}

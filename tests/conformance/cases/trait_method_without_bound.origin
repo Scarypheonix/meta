@@ -1,0 +1,6 @@
+// EXPECT: reject E0599
+// spec/06: a type parameter has only the methods its bounds give it.
+
+fn f[T](x: T) -> i64 {
+    x.mark()
+}

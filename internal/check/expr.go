@@ -58,7 +58,9 @@ func (c *Checker) inferUncached(e ast.Expr) types.Type {
 	case *ast.SelfExpr:
 		if c.env.self == nil {
 			c.bag.Errorf("E0424", v.Span(), "`self` is not available here").
-				Label("only a method's body may use `self`")
+				Label("only a method's body may use `self`").
+				Note("a method is a function declared inside an `impl` or a `trait` that takes `self`").
+				Help("add a `self` parameter, or take the value as an ordinary parameter")
 			return types.Error
 		}
 		return c.env.self
@@ -162,10 +164,13 @@ func (c *Checker) checkLiteralRanges() {
 			continue
 		}
 		if use.lit.Overflow || !fitsIn(use.lit.Value, p.Kind) {
-			c.bag.Errorf("E0308", use.lit.Span(),
+			d := c.bag.Errorf("E0308", use.lit.Span(),
 				"literal out of range for `%s`", p.Kind).
 				Label("this value does not fit").
 				Note("`%s` holds %s", p.Kind, rangeText(p.Kind))
+			if p.Kind.IsSigned() && !use.lit.Overflow && use.lit.Value == uint64(1)<<(p.Kind.Bits()-1) {
+				d.Help("the most negative value of `%s` is written `%s::MIN`", p.Kind, p.Kind)
+			}
 		}
 	}
 }
@@ -176,11 +181,10 @@ func fitsIn(v uint64, k types.PrimKind) bool {
 		return true
 	}
 	if k.IsSigned() {
-		// Negation is a separate operator, so a signed literal's magnitude may reach the
-		// type's minimum: `-128i8` is `-(128i8)`, and 128 is representable here so that
-		// the negation can produce -128.
-		limit := uint64(1) << (bits - 1)
-		return v <= limit
+		// Negation is a separate operator, so the literal itself must fit the positive
+		// range: `-128i8` is `-(128i8)`, and `128` does not fit `i8`. The minimum is
+		// written `i8::MIN` (spec/01-lexical.md).
+		return v <= uint64(1)<<(bits-1)-1
 	}
 	if bits >= 64 {
 		return true
@@ -235,9 +239,28 @@ func (c *Checker) inferPath(v *ast.PathExpr) types.Type {
 	case resolve.Builtin:
 		return c.builtinType(ref.Builtin, v.Span())
 
+	case resolve.PrimConst:
+		k, ok := primKinds[ref.Name]
+		if !ok || !k.IsInteger() {
+			c.bag.Errorf("E0599", v.Span(), "`%s` has no associated constant `%s`", ref.Name, ref.Member).
+				Label("associated constants exist on the integer types").
+				Note("`MIN`, `MAX` and `BITS` are declared for `i8` through `u64`")
+			return types.Error
+		}
+		if ref.Member == "BITS" {
+			return types.P(types.U32)
+		}
+		return types.P(k)
+
 	case resolve.Struct, resolve.Enum, resolve.Trait, resolve.TypeAlias, resolve.Prim:
-		c.bag.Errorf("E0423", v.Span(), "`%s` is a type, not a value", v.Path).
+		d := c.bag.Errorf("E0423", v.Span(), "`%s` is a type, not a value", v.Path).
 			Label("expected a value here")
+		if ref.Kind == resolve.Struct {
+			d.Note("a struct is built with a literal, not called")
+			d.Help("write `%s { field: value, .. }`", v.Path)
+		} else {
+			d.Note("a type names a set of values; it is not one of them")
+		}
 		return types.Error
 	}
 	return types.Error
@@ -278,7 +301,9 @@ func (c *Checker) instantiateParams(params []*types.Param, args []ast.Type, span
 	if len(args) > 0 && len(args) != len(params) {
 		c.bag.Errorf("E0107", span,
 			"`%s` takes %d type argument(s) but %d were supplied", what, len(params), len(args)).
-			Label("wrong number of type arguments")
+			Label("wrong number of type arguments").
+			Note("`%s` declares %s", what, paramNames(params)).
+			Help("supply every argument, or omit them all and let inference choose")
 		args = nil
 	}
 	for i, p := range params {
@@ -691,7 +716,8 @@ func (c *Checker) inferUnary(v *ast.Unary) types.Type {
 			return got // defaulting will settle it
 		}
 		c.bag.Errorf("E0600", v.Span(), "cannot negate `%s`", got).
-			Label("`-` applies to signed integers and floats")
+			Label("`-` applies to signed integers and floats").
+			Note("Origin 0.1 has no operator overloading, so `-` is defined on primitives only")
 		return types.Error
 	}
 }
@@ -731,13 +757,33 @@ func (c *Checker) rejectFunctionEquality(v *ast.Binary, t types.Type) {
 	}
 }
 
-// checkOperand verifies the operand type supports the operator.
+// operandCheck is an operator application waiting for its operand type to settle.
+type operandCheck struct {
+	expr *ast.Binary
+	ty   types.Type
+}
+
+// checkOperand records an operator application for verification after defaulting.
+//
+// It cannot run immediately: `1.0 & 2.0` has an unsolved float variable at this point,
+// and `let x: u8 = 1 + 2;` would be broken by defaulting the literals early.
 func (c *Checker) checkOperand(v *ast.Binary, t types.Type) {
+	c.opChecks = append(c.opChecks, operandCheck{expr: v, ty: t})
+}
+
+func (c *Checker) runOperandChecks() {
+	for _, oc := range c.opChecks {
+		c.verifyOperand(oc.expr, oc.ty)
+	}
+}
+
+func (c *Checker) verifyOperand(v *ast.Binary, t types.Type) {
 	if types.IsError(t) || types.IsNever(t) {
 		return
 	}
+	types.ApplyDefaults(t)
 	if _, unsolved := types.Prune(t).(*types.Var); unsolved {
-		return // defaulting will settle it, and the range check runs afterwards
+		return // reported as an uninferred type instead
 	}
 	p, isPrim := types.AsPrim(t)
 
@@ -898,11 +944,21 @@ func (c *Checker) inferCall(v *ast.Call) types.Type {
 		return types.Error
 	}
 
+	// Settle a literal's type first, so that calling a number reports "not callable"
+	// rather than a mismatch against an invented function type.
+	types.ApplyDefaults(callee)
+
 	fn, ok := types.Prune(callee).(*types.FnT)
 	if !ok {
 		if _, unsolved := types.Prune(callee).(*types.Var); unsolved {
-			ret := c.freshFor(v.Span())
-			c.unify(&types.FnT{Params: args, Ret: ret}, callee, v.Fn.Span(), "this is called as a function")
+			// The callee's type is still open: constrain it to a function rather than
+			// guessing. The result variable is only registered once that succeeds, so a
+			// failure produces one diagnostic and not a second about an unsolved type.
+			ret := c.ctx.Fresh()
+			if !c.unify(&types.FnT{Params: args, Ret: ret}, callee, v.Fn.Span(), "this is called as a function") {
+				return types.Error
+			}
+			c.bodyVars = append(c.bodyVars, pendingVar{ty: ret, span: v.Span()})
 			return ret
 		}
 		c.bag.Errorf("E0618", v.Fn.Span(), "`%s` is not callable", callee).
@@ -956,6 +1012,17 @@ func (c *Checker) inferMethodCall(v *ast.MethodCall) types.Type {
 	// An unsolved receiver has no methods to look up yet; defaulting it here is what
 	// makes `1.to_str()` work without an annotation.
 	types.ApplyDefaults(recv)
+
+	// A receiver whose type is still unknown has no methods to search. Saying "no
+	// method `to_str` on `_`" would be both unhelpful and, with the note that follows
+	// it, self-contradictory.
+	if _, unsolved := types.Prune(recv).(*types.Var); unsolved {
+		c.bag.Errorf("E0309", v.Recv.Span(), "cannot infer the type of this value").
+			Label("its type must be known to look up `%s`", v.Name.Name).
+			Note("Origin has no autoref or autoderef, so a method is found on one exact type").
+			Help("annotate the binding or the parameter that produces it")
+		return types.Error
+	}
 
 	cand, ambiguous := c.lookupMethod(recv, v.Name.Name)
 	if cand == nil {
@@ -1030,7 +1097,14 @@ func (c *Checker) reportNoMethod(v *ast.MethodCall, recv types.Type, ambiguous [
 	}
 	if _, isPrim := types.AsPrim(recv); isPrim {
 		d.Note("Origin has no autoref or autoderef: the receiver's type must match exactly")
+		return
 	}
+	if p, isParam := types.Prune(recv).(*types.Param); isParam {
+		d.Note("`%s` is a type parameter, so it has only the methods its bounds give it", p.Name)
+		d.Help("add a bound that declares `%s`", v.Name.Name)
+		return
+	}
+	d.Note("a method comes from an inherent `impl` on the type, or from a trait it implements")
 }
 
 func (c *Checker) inferField(v *ast.FieldAccess) types.Type {
@@ -1038,6 +1112,9 @@ func (c *Checker) inferField(v *ast.FieldAccess) types.Type {
 	if types.IsError(recv) {
 		return types.Error
 	}
+	// Settle a literal's type before looking for the field, so that `1.field` reports
+	// "`i64` has no fields" rather than "cannot infer this type".
+	types.ApplyDefaults(recv)
 	n, ok := types.AsNamed(recv)
 	if !ok {
 		if _, unsolved := types.Prune(recv).(*types.Var); unsolved {
@@ -1047,7 +1124,8 @@ func (c *Checker) inferField(v *ast.FieldAccess) types.Type {
 			return types.Error
 		}
 		c.bag.Errorf("E0609", v.Span(), "`%s` has no fields", recv).
-			Label("not a struct")
+			Label("not a struct").
+			Note("only a struct has named fields; a tuple is read by destructuring it in a pattern")
 		return types.Error
 	}
 	if n.Def.Struct == nil {

@@ -1,0 +1,6 @@
+// EXPECT: reject E0433
+// spec/07: every path in a type must resolve.
+
+fn main() {
+    let x: NoSuchType = 1;
+}

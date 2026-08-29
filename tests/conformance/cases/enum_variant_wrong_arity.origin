@@ -1,0 +1,8 @@
+// EXPECT: reject E0061
+// spec/03: a tuple variant takes its declared payload.
+
+enum E { A(i64, i64) }
+
+fn main() {
+    let x = E::A(1);
+}

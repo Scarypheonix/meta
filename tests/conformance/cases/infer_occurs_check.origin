@@ -1,0 +1,6 @@
+// EXPECT: reject E0310
+// spec/03: a type may not contain itself.
+
+fn main() {
+    let f = |x| x(x);
+}

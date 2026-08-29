@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/09: `panic` has the never type, so it fits anywhere.
+
+fn f(c: bool) -> i64 {
+    if c { 1 } else { panic("no value") }
+}
+
+fn main() { let x = f(true); }

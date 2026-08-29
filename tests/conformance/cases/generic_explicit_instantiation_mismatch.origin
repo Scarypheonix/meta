@@ -1,0 +1,8 @@
+// EXPECT: reject E0308
+// spec/03: an explicit instantiation is checked like any other type.
+
+fn id[T](x: T) -> T { x }
+
+fn main() {
+    let a = id[i64]("s");
+}

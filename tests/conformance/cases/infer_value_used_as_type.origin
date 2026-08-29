@@ -1,0 +1,8 @@
+// EXPECT: reject E0573
+// spec/03: a function is not a type.
+
+fn helper() -> i64 { 1 }
+
+fn main() {
+    let x: helper = 1;
+}

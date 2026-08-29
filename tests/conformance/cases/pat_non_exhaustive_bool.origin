@@ -1,0 +1,8 @@
+// EXPECT: reject E0004
+// spec/05: bool has a finite constructor space, so both values are needed.
+
+fn f(b: bool) -> i64 {
+    match b {
+        true => 1,
+    }
+}

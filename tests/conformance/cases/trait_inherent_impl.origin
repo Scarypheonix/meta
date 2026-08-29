@@ -1,0 +1,13 @@
+// EXPECT: accept
+// spec/06: an inherent impl needs no trait.
+
+struct Point { x: f64, y: f64 }
+
+impl Point {
+    fn sum(self) -> f64 { self.x + self.y }
+}
+
+fn main() {
+    let p = Point { x: 1.0, y: 2.0 };
+    let s = p.sum();
+}

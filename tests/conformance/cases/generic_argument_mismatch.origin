@@ -1,0 +1,8 @@
+// EXPECT: reject E0308
+// spec/03: type arguments must agree.
+
+enum Either[L, R] { Left(L), Right(R) }
+
+fn main() {
+    let a: Either[i64, String] = Either::Left("wrong");
+}

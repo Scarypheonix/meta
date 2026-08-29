@@ -1,0 +1,9 @@
+// EXPECT: reject E0369
+// spec/04: function values cannot be compared.
+
+fn f() -> i64 { 1 }
+fn g() -> i64 { 2 }
+
+fn main() {
+    let x = f == g;
+}

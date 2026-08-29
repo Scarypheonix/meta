@@ -1,0 +1,7 @@
+// EXPECT: reject E0600
+// spec/04: unsigned types have no negative values.
+
+fn main() {
+    let a: u8 = 1;
+    let b = -a;
+}

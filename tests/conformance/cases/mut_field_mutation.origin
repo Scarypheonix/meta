@@ -1,0 +1,9 @@
+// EXPECT: accept
+// ADR-0004: a `mut` field is mutable through any reference.
+
+struct Counter { mut n: i64 }
+
+fn main() {
+    let c = Counter { n: 0 };
+    c.n = 1;
+}

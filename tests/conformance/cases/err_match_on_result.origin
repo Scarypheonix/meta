@@ -1,0 +1,11 @@
+// EXPECT: accept
+// spec/09: a Result is handled by matching on it.
+
+fn g() -> Result[i64, String] { Result::Ok(1) }
+
+fn main() {
+    let n = match g() {
+        Result::Ok(v) => v,
+        Result::Err(e) => 0,
+    };
+}

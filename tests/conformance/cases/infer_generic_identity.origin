@@ -1,0 +1,10 @@
+// EXPECT: accept
+// spec/03: an unbounded type parameter supports what every type does.
+
+fn id[T](x: T) -> T { x }
+
+fn main() {
+    let a = id(1);
+    let b = id("s");
+    let c = id(true);
+}

@@ -1,0 +1,8 @@
+// EXPECT: reject E0107
+// spec/03: an explicit instantiation must supply every parameter.
+
+fn pair[A, B](a: A, b: B) -> A { a }
+
+fn main() {
+    let x = pair[i64](1, 2);
+}

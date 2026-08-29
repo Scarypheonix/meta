@@ -1,0 +1,9 @@
+// EXPECT: reject E0004
+// spec/05: a guarded arm never contributes coverage.
+
+fn f(b: bool) -> i64 {
+    match b {
+        true if b => 1,
+        false => 0,
+    }
+}

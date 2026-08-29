@@ -1,0 +1,6 @@
+// EXPECT: reject E0433
+// spec/04: `break` binds to the innermost enclosing loop.
+
+fn main() {
+    break;
+}

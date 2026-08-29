@@ -1,0 +1,6 @@
+// EXPECT: reject E0309
+// spec/03: an unsolved type that no rule defaults is rejected, not guessed.
+
+fn main() {
+    let f = |x| x.to_str();
+}

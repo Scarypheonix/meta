@@ -1,0 +1,6 @@
+// EXPECT: reject E0308
+// spec/01: a literal beyond 64 bits is rejected.
+
+fn main() {
+    let x: u64 = 18446744073709551616;
+}

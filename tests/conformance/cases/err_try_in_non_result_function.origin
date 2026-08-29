@@ -1,0 +1,8 @@
+// EXPECT: reject E0277
+// spec/09: `?` is only allowed in a function returning Result.
+
+fn g() -> Result[i64, String] { Result::Ok(1) }
+
+fn f() -> i64 {
+    g()?
+}

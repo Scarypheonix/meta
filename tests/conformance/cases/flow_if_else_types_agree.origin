@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/04: both branches of an `if` have the same type.
+
+fn f(c: bool) -> i64 {
+    if c { 1 } else { 2 }
+}
+
+fn main() { let x = f(true); }

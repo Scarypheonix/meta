@@ -1,0 +1,6 @@
+// EXPECT: reject E0308
+// spec/04: both operands of `==` must have the same type.
+
+fn main() {
+    let x = 1 == "one";
+}

@@ -1,0 +1,8 @@
+// EXPECT: reject E0308
+// spec/04: both sides of a compound assignment must agree.
+
+fn main() {
+    let mut x: i32 = 1;
+    let y: i64 = 2;
+    x += y;
+}

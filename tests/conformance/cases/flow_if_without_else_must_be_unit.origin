@@ -1,0 +1,6 @@
+// EXPECT: reject E0308
+// spec/04: an `if` with no `else` has type `()`.
+
+fn f(c: bool) -> i64 {
+    if c { 1 }
+}

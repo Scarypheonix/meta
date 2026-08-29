@@ -1,0 +1,12 @@
+// EXPECT: reject E0034
+// spec/06: one type may not have two inherent methods with one name.
+
+struct Point { x: f64 }
+
+impl Point {
+    fn get(self) -> f64 { self.x }
+}
+
+impl Point {
+    fn get(self) -> f64 { 0.0 }
+}

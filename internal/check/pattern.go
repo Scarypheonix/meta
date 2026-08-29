@@ -139,7 +139,9 @@ func (c *Checker) bindVariantPattern(span diag.Span, ref resolve.Ref, want types
 			c.bag.Errorf("E0023", span,
 				"`%s` carries %d value%s but this pattern has %d",
 				ref.Variant.Name.Name, len(payload), plural(len(payload)), len(elems)).
-				Label("wrong number of values")
+				Label("wrong number of values").
+				Secondary(ref.Variant.Name.Loc, "declared with %d", len(payload)).
+				Help("use `_` for the values the arm does not need")
 			return
 		}
 		for i, e := range elems {

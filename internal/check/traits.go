@@ -80,7 +80,7 @@ func (c *Checker) registerBuiltinImpls() {
 func (c *Checker) checkCoherence() {
 	for i := 0; i < len(c.impls); i++ {
 		a := c.impls[i]
-		if a.Trait == nil || a.Builtin {
+		if a.Trait == nil {
 			continue
 		}
 		for j := i + 1; j < len(c.impls); j++ {
@@ -88,22 +88,31 @@ func (c *Checker) checkCoherence() {
 			if b.Trait != a.Trait {
 				continue
 			}
+			if a.Builtin && b.Builtin {
+				continue // the compiler's own impls are disjoint by construction
+			}
 			if !c.implsOverlap(a, b) {
 				continue
 			}
-			span, other := a.Decl.Span(), b.Decl.Span()
-			if b.Builtin {
-				c.bag.Errorf("E0119", span,
-					"conflicting implementations of trait `%s` for `%s`", a.Trait.Decl.Name.Name, a.Self).
+			// Report against the impl the programmer wrote, whichever side it is on.
+			user, other := a, b
+			if a.Builtin {
+				user, other = b, a
+			}
+			if other.Builtin {
+				c.bag.Errorf("E0119", user.Decl.Span(),
+					"conflicting implementations of trait `%s` for `%s`",
+					user.Trait.Decl.Name.Name, user.Self).
 					Label("this impl conflicts with a built-in one").
-					Note("`%s` is implemented for `%s` by the compiler", a.Trait.Decl.Name.Name, a.Self)
+					Note("`%s` is implemented for `%s` by the compiler", user.Trait.Decl.Name.Name, user.Self).
+					Help("the primitive impls arrive as Origin source in Phase 7; until then they cannot be replaced")
 				continue
 			}
-			c.bag.Errorf("E0119", span,
-				"conflicting implementations of trait `%s`", a.Trait.Decl.Name.Name).
+			c.bag.Errorf("E0119", user.Decl.Span(),
+				"conflicting implementations of trait `%s`", user.Trait.Decl.Name.Name).
 				Label("first implementation").
-				Secondary(other, "conflicting implementation here").
-				Note("both apply to `%s`", a.Self)
+				Secondary(other.Decl.Span(), "conflicting implementation here").
+				Note("both apply to `%s`", user.Self)
 		}
 	}
 	c.checkInherentMethodClashes()
@@ -245,7 +254,12 @@ func (c *Checker) solveObligations() {
 			d.Help("add a bound: `%s: %s`", b.Type, b.Trait.Decl.Name.Name)
 		} else if impls := c.implementorsOf(b.Trait); impls != "" {
 			d.Note("`%s` is implemented for %s", b.Trait.Decl.Name.Name, impls)
+			d.Help("write `impl %s for %s { .. }`", b.Trait.Decl.Name.Name, b.Type)
+		} else {
+			d.Note("nothing implements `%s` yet", b.Trait.Decl.Name.Name)
+			d.Help("write `impl %s for %s { .. }`", b.Trait.Decl.Name.Name, b.Type)
 		}
+		d.Secondary(b.Trait.Decl.Name.Loc, "trait declared here")
 	}
 	c.obligations = nil
 }

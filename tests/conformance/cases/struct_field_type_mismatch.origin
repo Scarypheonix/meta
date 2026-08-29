@@ -1,0 +1,8 @@
+// EXPECT: reject E0308
+// spec/03: a field's value must have its declared type.
+
+struct Point { x: f64 }
+
+fn main() {
+    let p = Point { x: "text" };
+}

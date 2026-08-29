@@ -1,0 +1,15 @@
+// EXPECT: accept
+// spec/06: an impl may be generic in the type it is for.
+
+struct Wrapper[T] { inner: T }
+
+trait Peek { fn peek(self) -> i64; }
+
+impl[T] Peek for Wrapper[T] {
+    fn peek(self) -> i64 { 1 }
+}
+
+fn main() {
+    let w = Wrapper { inner: "s" };
+    let n = w.peek();
+}

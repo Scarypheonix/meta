@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/04: `&&` and `||` are short-circuiting on bool.
+
+fn main() {
+    let a = true && false;
+    let b = true || false;
+    let c = !true;
+}

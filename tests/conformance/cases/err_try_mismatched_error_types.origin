@@ -1,0 +1,12 @@
+// EXPECT: reject E0308
+// spec/09: in 0.1 the error types must match exactly.
+
+enum A { X }
+enum B { Y }
+
+fn g() -> Result[i64, B] { Result::Err(B::Y) }
+
+fn f() -> Result[i64, A] {
+    let x = g()?;
+    Result::Ok(x)
+}

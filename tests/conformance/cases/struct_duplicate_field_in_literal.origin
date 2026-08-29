@@ -1,0 +1,8 @@
+// EXPECT: reject E0062
+// spec/03: a field may be initialized once.
+
+struct Point { x: f64 }
+
+fn main() {
+    let p = Point { x: 1.0, x: 2.0 };
+}

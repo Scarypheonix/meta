@@ -1,0 +1,10 @@
+// EXPECT: reject E0004
+// spec/05: non-exhaustiveness is an error, with a witness.
+
+enum Shape { Circle(f64), Rect { w: f64, h: f64 } }
+
+fn area(s: Shape) -> f64 {
+    match s {
+        Shape::Circle(r) => 3.14159 * r * r,
+    }
+}

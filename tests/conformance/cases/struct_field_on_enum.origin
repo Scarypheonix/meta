@@ -1,0 +1,9 @@
+// EXPECT: reject E0609
+// spec/05: an enum's payload is reached by matching, not by field access.
+
+enum E { A { x: i64 } }
+
+fn main() {
+    let e = E::A { x: 1 };
+    let v = e.x;
+}

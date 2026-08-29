@@ -1,0 +1,15 @@
+// EXPECT: reject E0046
+// spec/06: an impl cannot define an associated type the trait does not declare.
+
+trait Container {
+    type Item;
+    fn first(self) -> Option[Self::Item];
+}
+
+struct Numbers { head: i64 }
+
+impl Container for Numbers {
+    type Item = i64;
+    type Extra = bool;
+    fn first(self) -> Option[i64] { Option::Some(self.head) }
+}

@@ -1,0 +1,11 @@
+// EXPECT: accept
+// spec/03: a diverging branch has type `!` and unifies with anything.
+
+fn f(c: bool) -> i64 {
+    let x = if c { 1 } else { return 0 };
+    x
+}
+
+fn main() {
+    let y = f(true);
+}

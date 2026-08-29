@@ -1,0 +1,6 @@
+// EXPECT: reject E0594
+// spec/04: a literal is not a place.
+
+fn main() {
+    1 = 2;
+}

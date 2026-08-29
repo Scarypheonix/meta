@@ -1,0 +1,7 @@
+// EXPECT: reject E0609
+// spec/03: primitives have no fields.
+
+fn main() {
+    let n = 1;
+    let x = n.field;
+}

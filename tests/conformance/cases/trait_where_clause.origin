@@ -1,0 +1,16 @@
+// EXPECT: accept
+// spec/06: a `where` clause is equivalent to an inline bound.
+
+trait Special { fn mark(self) -> i64; }
+
+struct Thing { }
+
+impl Special for Thing {
+    fn mark(self) -> i64 { 7 }
+}
+
+fn needs_special[T](x: T) -> i64 where T: Special { x.mark() }
+
+fn main() {
+    let n = needs_special(Thing { });
+}

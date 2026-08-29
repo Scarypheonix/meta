@@ -1,0 +1,6 @@
+// EXPECT: reject E0308
+// spec/04: a condition is a bool.
+
+fn main() {
+    if 1 { }
+}

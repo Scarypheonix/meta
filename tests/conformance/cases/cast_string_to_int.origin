@@ -1,0 +1,6 @@
+// EXPECT: reject E0605
+// spec/04: `as` does not parse.
+
+fn main() {
+    let x = "1" as i64;
+}

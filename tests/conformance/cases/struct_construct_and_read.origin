@@ -1,0 +1,9 @@
+// EXPECT: accept
+// spec/03: every field is supplied at construction and read by name.
+
+struct Point { x: f64, y: f64 }
+
+fn main() {
+    let p = Point { x: 1.0, y: 2.0 };
+    let sum = p.x + p.y;
+}

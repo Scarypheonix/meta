@@ -1,0 +1,10 @@
+// EXPECT: reject E0007
+// spec/05: every alternative must bind the same names.
+
+enum E { A(i64), B }
+
+fn f(e: E) -> i64 {
+    match e {
+        E::A(x) | E::B => 1,
+    }
+}

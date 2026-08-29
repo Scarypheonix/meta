@@ -1,0 +1,8 @@
+// EXPECT: reject E0308
+// spec/03: Origin has no implicit widening.
+
+fn main() {
+    let a: i32 = 1;
+    let b: i64 = 2;
+    let c = a + b;
+}

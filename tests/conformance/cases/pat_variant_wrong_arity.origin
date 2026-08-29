@@ -1,0 +1,10 @@
+// EXPECT: reject E0023
+// spec/05: a tuple-variant pattern must match the payload's arity.
+
+enum E { A(i64, i64) }
+
+fn f(e: E) -> i64 {
+    match e {
+        E::A(x) => x,
+    }
+}

@@ -1,0 +1,6 @@
+// EXPECT: reject E0308
+// spec/09: `panic` takes a String.
+
+fn main() {
+    panic(1);
+}

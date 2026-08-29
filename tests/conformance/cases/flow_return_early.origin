@@ -1,0 +1,9 @@
+// EXPECT: accept
+// spec/04: `return` exits with a value of the function's type.
+
+fn f(c: bool) -> i64 {
+    if c { return 1; }
+    2
+}
+
+fn main() { let x = f(true); }

@@ -232,19 +232,24 @@ impl S {
 	}
 }
 
-func TestDuplicateMethodIsReported(t *testing.T) {
-	_, _, bag := resolveSrc(t, `
+// Whether two methods with one name clash depends on which traits their impls are for,
+// which only the checker knows. The resolver just collects them for the interpreter's
+// runtime dispatch; the rejection is a conformance case (trait_duplicate_inherent_method).
+func TestMethodTableCollectsEveryImplMethod(t *testing.T) {
+	_, res, bag := resolveSrc(t, `
 struct S { x: i64 }
 impl S {
     fn get(self) -> i64 { 0 }
-    fn get(self) -> i64 { 1 }
+}
+impl S {
+    fn other(self) -> i64 { 1 }
 }
 `)
-	if !bag.HasErrors() {
-		t.Fatal("two methods with the same name must be rejected")
+	if bag.HasErrors() {
+		t.Fatalf("unexpected errors:\n%s", bag)
 	}
-	if !strings.Contains(bag.String(), "E0034") {
-		t.Errorf("expected E0034:\n%s", bag)
+	if m := res.Methods["S"]; m["get"] == nil || m["other"] == nil {
+		t.Errorf("methods from separate impls should all be collected, got %d", len(m))
 	}
 }
 

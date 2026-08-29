@@ -1,0 +1,13 @@
+// EXPECT: accept
+// spec/02: a bare name that resolves to a constant matches its value.
+
+const LIMIT: i64 = 10;
+
+fn f(n: i64) -> String {
+    match n {
+        LIMIT => "at the limit",
+        _ => "below",
+    }
+}
+
+fn main() { let x = f(10); }

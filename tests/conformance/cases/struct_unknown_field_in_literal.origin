@@ -1,0 +1,8 @@
+// EXPECT: reject E0560
+// spec/03: a literal cannot name a field the type does not have.
+
+struct Point { x: f64 }
+
+fn main() {
+    let p = Point { x: 1.0, z: 2.0 };
+}

@@ -1,0 +1,6 @@
+// EXPECT: reject E0308
+// spec/03: both branches of an `if` must have the same type.
+
+fn main() {
+    let x = if true { 1 } else { "a" };
+}

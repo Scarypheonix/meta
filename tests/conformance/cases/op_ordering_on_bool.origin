@@ -1,0 +1,6 @@
+// EXPECT: reject E0369
+// spec/04: bool is not ordered; `Ord` is for user types.
+
+fn main() {
+    let x = true < false;
+}

@@ -1,0 +1,12 @@
+// EXPECT: accept
+// spec/05: a guarded arm is fine when an unguarded one still covers the case.
+
+fn f(n: i64) -> String {
+    match n {
+        x if x > 0 => "positive",
+        x if x < 0 => "negative",
+        _ => "zero",
+    }
+}
+
+fn main() { let x = f(1); }

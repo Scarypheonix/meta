@@ -1,0 +1,6 @@
+// EXPECT: reject E0308
+// spec/01: a literal that does not fit its resolved type is rejected.
+
+fn main() {
+    let x: u8 = 256;
+}

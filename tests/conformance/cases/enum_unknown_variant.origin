@@ -1,0 +1,8 @@
+// EXPECT: reject E0433
+// spec/07: a variant must exist on its enum.
+
+enum E { A, B }
+
+fn main() {
+    let x = E::C;
+}

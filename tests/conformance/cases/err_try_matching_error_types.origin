@@ -1,0 +1,13 @@
+// EXPECT: accept
+// spec/09: matching error types propagate cleanly.
+
+enum E { X }
+
+fn g() -> Result[i64, E] { Result::Err(E::X) }
+
+fn f() -> Result[i64, E] {
+    let x = g()?;
+    Result::Ok(x)
+}
+
+fn main() { let r = f(); }

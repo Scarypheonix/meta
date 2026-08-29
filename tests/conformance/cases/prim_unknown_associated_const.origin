@@ -1,0 +1,6 @@
+// EXPECT: reject E0433
+// spec/07: only MIN, MAX and BITS exist on an integer type.
+
+fn main() {
+    let x = i64::HUGE;
+}

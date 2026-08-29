@@ -1,0 +1,9 @@
+// EXPECT: accept
+// spec/01 and spec/07: the most negative value is written `i8::MIN`.
+
+fn main() {
+    let x: i8 = i8::MIN;
+    let y: i64 = i64::MAX;
+    let z: u32 = u32::MAX;
+    let bits = i32::BITS;
+}

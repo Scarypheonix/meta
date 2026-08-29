@@ -1,0 +1,16 @@
+// EXPECT: accept
+// spec/05: unit, tuple and struct variants each have their pattern form.
+
+enum Shape { Empty, Circle(f64), Rect { w: f64, h: f64 } }
+
+fn area(s: Shape) -> f64 {
+    match s {
+        Shape::Empty => 0.0,
+        Shape::Circle(r) => r * r,
+        Shape::Rect { w, h } => w * h,
+    }
+}
+
+fn main() {
+    let a = area(Shape::Empty);
+}

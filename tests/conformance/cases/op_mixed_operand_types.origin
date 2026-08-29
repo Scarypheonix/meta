@@ -1,0 +1,8 @@
+// EXPECT: reject E0308
+// spec/04: both operands must have the same type.
+
+fn main() {
+    let a: i32 = 1;
+    let b: i64 = 2;
+    let c = a * b;
+}

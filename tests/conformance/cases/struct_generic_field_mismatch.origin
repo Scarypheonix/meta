@@ -1,0 +1,9 @@
+// EXPECT: reject E0308
+// spec/03: substitution is checked.
+
+struct Wrapper[T] { inner: T }
+
+fn main() {
+    let w = Wrapper { inner: 1 };
+    let s: String = w.inner;
+}

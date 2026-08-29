@@ -1,0 +1,6 @@
+// EXPECT: reject E0220
+// spec/06: a projection needs a bound that declares the member.
+
+fn f[T](x: T) -> T::Item {
+    x
+}

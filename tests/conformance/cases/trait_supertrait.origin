@@ -1,0 +1,16 @@
+// EXPECT: accept
+// spec/06: a supertrait's methods are callable on a bounded parameter.
+
+trait Base { fn base(self) -> i64; }
+trait Derived: Base { fn derived(self) -> i64; }
+
+struct S { }
+
+impl Base for S { fn base(self) -> i64 { 1 } }
+impl Derived for S { fn derived(self) -> i64 { 2 } }
+
+fn use_it[T: Derived](x: T) -> i64 { x.base() + x.derived() }
+
+fn main() {
+    let n = use_it(S { });
+}

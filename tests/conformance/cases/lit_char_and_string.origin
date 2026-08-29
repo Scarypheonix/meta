@@ -1,0 +1,10 @@
+// EXPECT: accept
+// spec/01: character and string literals, with escapes.
+
+fn main() {
+    let a = 'a';
+    let b = '\n';
+    let c = '\u{1F600}';
+    let d = "text";
+    let e = "with\ttabs";
+}

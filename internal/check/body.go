@@ -75,17 +75,23 @@ func (c *Checker) beginBody(ret types.Type) {
 	c.bodyVars = nil
 	c.loopValues = nil
 	c.intLits = nil
+	c.opChecks = nil
 }
 
 // endBody finishes a body: solve bounds, apply literal defaults, then report anything
 // still unsolved. The order matters — defaulting happens once, after all constraints
 // are solved (spec/03-types.md).
 func (c *Checker) endBody() {
-	c.solveObligations()
+	// Defaulting first: a bound on an integer literal's type cannot be judged while the
+	// type is still an unsolved variable, and `needs_ord(1)` must know it means i64.
 	for _, lit := range c.intLits {
 		types.ApplyDefaults(lit.ty)
 	}
+	c.solveObligations()
 	for _, v := range c.bodyVars {
+		if pv, isVar := types.Prune(v.ty).(*types.Var); isVar && c.generalized[pv] {
+			continue
+		}
 		if !types.ApplyDefaults(v.ty) {
 			c.bag.Errorf("E0309", v.span, "cannot infer this type").
 				Label("the type of this expression is not determined by anything").
@@ -93,8 +99,10 @@ func (c *Checker) endBody() {
 		}
 	}
 	c.checkLiteralRanges()
+	c.runOperandChecks()
 	c.bodyVars = nil
 	c.intLits = nil
+	c.opChecks = nil
 }
 
 // checkFn checks one function body against its declared signature.
@@ -173,8 +181,13 @@ func (c *Checker) unify(want, got types.Type, span diag.Span, context string) bo
 		return false
 	}
 	if err.Detail != "" {
-		c.bag.Errorf("E0308", span, "%s", err.Detail).
+		d := c.bag.Errorf("E0308", span, "%s", err.Detail).
 			Label("%s", context)
+		if err.Help != "" {
+			d.Help("%s", err.Help)
+		} else {
+			c.explainMismatch(d, err.Want, err.Got)
+		}
 		return false
 	}
 	d := c.bag.Errorf("E0308", span, "expected `%s`, found `%s`", err.Want, err.Got).
@@ -185,7 +198,8 @@ func (c *Checker) unify(want, got types.Type, span diag.Span, context string) bo
 
 // explainMismatch adds the note that turns "expected X, found Y" into something
 // actionable. Phase 2's exit criterion is that a type error explains the conflict in
-// plain language, so the common confusions each get their own sentence.
+// plain language, so every mismatch ends with a sentence a reader can act on — the
+// common confusions get a specific one, and everything else gets the rule it broke.
 func (c *Checker) explainMismatch(d *diag.Builder, want, got types.Type) {
 	wp, wok := types.AsPrim(want)
 	gp, gok := types.AsPrim(got)
@@ -194,18 +208,65 @@ func (c *Checker) explainMismatch(d *diag.Builder, want, got types.Type) {
 	case wok && gok && wp.Kind.IsInteger() && gp.Kind.IsInteger():
 		d.Note("Origin has no implicit numeric conversion, not even widening")
 		d.Help("write the conversion: `x as %s`", wp.Kind)
+		return
 	case wok && gok && wp.Kind.IsFloat() && gp.Kind.IsInteger():
 		d.Note("an integer is not a float in Origin")
 		d.Help("write the conversion: `x as %s`", wp.Kind)
-	case wok && gok && wp.Kind == types.String && gp.Kind.IsNumeric():
-		d.Help("call `.to_str()` to render a number as text")
+		return
+	case wok && gok && wp.Kind.IsInteger() && gp.Kind.IsFloat():
+		d.Note("a float is not an integer in Origin")
+		d.Help("write the conversion: `x as %s`, which truncates toward zero", wp.Kind)
+		return
+	case wok && wp.Kind == types.String && gok && gp.Kind.IsNumeric():
+		d.Note("Origin does not render values as text implicitly")
+		d.Help("call `.to_str()` on it")
+		return
+	case wok && wp.Kind == types.String:
+		d.Note("`String` is a distinct type; nothing converts to it implicitly")
+		d.Help("implement `Show` for it and call `.to_str()`")
+		return
+	case wok && wp.Kind == types.Bool:
+		d.Note("a condition and a logical operator both need a `bool`")
+		d.Help("compare instead, as in `x != 0`")
+		return
 	case wok && wp.Kind == types.UnitKind:
 		d.Note("this expression produces a value, but nothing here uses it")
-		d.Help("end the block with `;` to discard the value")
+		d.Help("end the statement with `;` to discard the value")
+		return
 	case gok && gp.Kind == types.UnitKind:
 		d.Note("this expression produces no value")
 		d.Help("a block's value is its last expression, written without a `;`")
+		return
 	}
+
+	if p, ok := types.Prune(want).(*types.Param); ok {
+		d.Note("`%s` is a type parameter: the caller chooses it, so the body must work for every type", p.Name)
+		d.Help("return a value built from the parameters, or add a bound that produces one")
+		return
+	}
+	if p, ok := types.Prune(got).(*types.Param); ok {
+		d.Note("`%s` is a type parameter and is not known to be `%s` here", p.Name, want)
+		d.Help("add a bound on `%s`, or accept `%s` directly", p.Name, want)
+		return
+	}
+
+	wn, wIsNamed := types.AsNamed(want)
+	gn, gIsNamed := types.AsNamed(got)
+	if wIsNamed && gIsNamed && wn.Def == gn.Def {
+		d.Note("both are `%s`, but at different type arguments", wn.Def.Name)
+		return
+	}
+	if wIsNamed && gIsNamed {
+		d.Note("`%s` and `%s` are different declarations, so they are different types", wn.Def.Name, gn.Def.Name)
+		return
+	}
+	if _, ok := types.Prune(want).(*types.FnT); ok {
+		d.Note("function types are structural: the parameters and the result must all match")
+		return
+	}
+
+	// The general rule, which is what every remaining case comes down to.
+	d.Note("Origin has no implicit conversions: a value of one type is never silently a value of another")
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +350,9 @@ func (c *Checker) checkLet(v *ast.LetStmt) {
 		// Only a syntactic value generalizes. `let v = Vec::new();` must stay
 		// monomorphic, or pushing an i64 and reading back a String would type-check.
 		scheme = c.ctx.Generalize(got)
+		for _, v := range scheme.Vars {
+			c.generalized[v] = true
+		}
 	}
 	c.bindPatternScheme(v.Pat, scheme, true)
 }

@@ -1,0 +1,7 @@
+// EXPECT: reject E0308
+// spec/04: a call's arguments are checked.
+
+fn main() {
+    let f = |x: i64| x;
+    let y = f("s");
+}

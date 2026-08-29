@@ -1,0 +1,11 @@
+// EXPECT: accept
+// spec/04: a lambda captures each free variable by value at creation.
+
+struct Cell { mut v: i64 }
+
+fn main() {
+    let cell = Cell { v: 0 };
+    let bump = || { cell.v = cell.v + 1; cell.v };
+    let a = bump();
+    let b = bump();
+}

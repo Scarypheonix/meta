@@ -1,0 +1,16 @@
+// EXPECT: accept
+// spec/06: the prelude's `Ord` is implemented for the primitives.
+
+fn max2[T: Ord](a: T, b: T) -> T {
+    match a.cmp(b) {
+        Ordering::Less => b,
+        Ordering::Equal => a,
+        Ordering::Greater => a,
+    }
+}
+
+fn main() {
+    let a = max2(1, 2);
+    let b = max2("x", "y");
+    let c = max2('a', 'b');
+}

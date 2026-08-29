@@ -1,0 +1,18 @@
+// EXPECT: accept
+// spec/06: a default body is inherited by every impl.
+
+trait Greet {
+    fn greeting(self) -> String;
+    fn twice(self) -> String { self.greeting() }
+}
+
+struct Cat { name: String }
+
+impl Greet for Cat {
+    fn greeting(self) -> String { "meow" }
+}
+
+fn main() {
+    let c = Cat { name: "tom" };
+    let g = c.twice();
+}

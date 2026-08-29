@@ -1,0 +1,10 @@
+// EXPECT: reject E0004
+// spec/05: both variants of Result must be handled.
+
+fn g() -> Result[i64, String] { Result::Ok(1) }
+
+fn main() {
+    let n = match g() {
+        Result::Ok(v) => v,
+    };
+}

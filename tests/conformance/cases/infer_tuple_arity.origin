@@ -1,0 +1,6 @@
+// EXPECT: reject E0308
+// spec/03: tuples of different arity do not unify.
+
+fn main() {
+    let pair: (i64, bool) = (1, true, false);
+}

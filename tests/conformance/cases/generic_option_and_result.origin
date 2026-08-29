@@ -1,0 +1,9 @@
+// EXPECT: accept
+// spec/03: the prelude's generic enums behave like any other.
+
+fn main() {
+    let a: Option[i64] = Option::Some(1);
+    let b: Option[i64] = Option::None;
+    let c: Result[i64, String] = Result::Ok(1);
+    let d: Result[i64, String] = Result::Err("bad");
+}

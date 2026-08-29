@@ -1,0 +1,7 @@
+// EXPECT: reject E0005
+// spec/05: `let` requires an irrefutable pattern.
+
+fn main() {
+    let opt = Option::Some(1);
+    let Option::Some(x) = opt;
+}

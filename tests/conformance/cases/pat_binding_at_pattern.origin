@@ -1,0 +1,13 @@
+// EXPECT: accept
+// spec/05: `x @ p` binds the whole value as well as matching it.
+
+enum E { A(i64), B }
+
+fn f(e: E) -> i64 {
+    match e {
+        whole @ E::A(n) => n,
+        E::B => 0,
+    }
+}
+
+fn main() { let x = f(E::B); }

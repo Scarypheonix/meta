@@ -1,0 +1,7 @@
+// EXPECT: accept
+// spec/04: `-` applies to signed integers and floats.
+
+fn main() {
+    let a: i32 = -1;
+    let b = -1.5;
+}

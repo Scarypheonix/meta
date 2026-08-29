@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/02: parenthesizing makes the grouping explicit.
+
+fn main() {
+    let a = 1;
+    let b = 2;
+    let x = (a < b) == true;
+}

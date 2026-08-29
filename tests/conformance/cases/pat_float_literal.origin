@@ -1,0 +1,9 @@
+// EXPECT: reject E0658
+// spec/05: floats have no usable equality for matching.
+
+fn f(x: f64) -> i64 {
+    match x {
+        1.0 => 1,
+        _ => 0,
+    }
+}

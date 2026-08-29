@@ -1,0 +1,13 @@
+// EXPECT: reject E0407
+// spec/06: an impl may only define methods the trait declares.
+
+trait Greet {
+    fn greeting(self) -> String;
+}
+
+struct Cat { name: String }
+
+impl Greet for Cat {
+    fn greeting(self) -> String { "meow" }
+    fn extra(self) -> i64 { 1 }
+}

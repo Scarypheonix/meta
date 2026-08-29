@@ -1,0 +1,29 @@
+// EXPECT: accept
+// spec/04: `for` desugars through IntoIterator and Iterator, binding each element.
+
+struct Counter { mut n: i64 }
+
+impl IntoIterator for Counter {
+    type Item = i64;
+    type Iter = Counter;
+    fn into_iter(self) -> Counter { self }
+}
+
+impl Iterator for Counter {
+    type Item = i64;
+    fn next(mut self) -> Option[i64] {
+        if self.n > 0 {
+            self.n = self.n - 1;
+            Option::Some(self.n)
+        } else {
+            Option::None
+        }
+    }
+}
+
+fn main() {
+    let mut total = 0;
+    for v in (Counter { n: 3 }) {
+        total = total + v;
+    }
+}

@@ -1,0 +1,9 @@
+// EXPECT: reject E0006
+// spec/05: nothing is reachable after a wildcard.
+
+fn f(n: i64) -> i64 {
+    match n {
+        _ => 1,
+        0 => 2,
+    }
+}

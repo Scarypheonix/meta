@@ -1,0 +1,9 @@
+// EXPECT: accept
+// ADR-0004: a parameter may be declared `mut`.
+
+fn f(mut n: i64) -> i64 {
+    n = n + 1;
+    n
+}
+
+fn main() { let x = f(1); }

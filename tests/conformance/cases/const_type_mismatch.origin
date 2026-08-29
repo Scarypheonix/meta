@@ -1,0 +1,4 @@
+// EXPECT: reject E0308
+// spec/03: a constant's value must have its declared type.
+
+const LIMIT: i64 = "ten";

@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/04: numeric casts go both ways.
+
+fn main() {
+    let a = 1 as f64;
+    let b = 1.9 as i64;
+    let c = 1.0f64 as f32;
+}

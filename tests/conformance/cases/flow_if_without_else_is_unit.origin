@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/04: a unit-valued `if` needs no `else`.
+
+fn f(c: bool) {
+    if c { }
+}
+
+fn main() { f(true); }

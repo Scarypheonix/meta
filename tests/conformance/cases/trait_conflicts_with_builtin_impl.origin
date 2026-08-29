@@ -1,0 +1,6 @@
+// EXPECT: reject E0119
+// spec/06: the compiler already implements `Show` for the primitives.
+
+impl Show for i64 {
+    fn to_str(self) -> String { "no" }
+}

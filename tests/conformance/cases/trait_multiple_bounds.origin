@@ -1,0 +1,16 @@
+// EXPECT: accept
+// spec/06: bounds are unioned across inline and where forms.
+
+trait A { fn a(self) -> i64; }
+trait B { fn b(self) -> i64; }
+
+struct T2 { }
+
+impl A for T2 { fn a(self) -> i64 { 1 } }
+impl B for T2 { fn b(self) -> i64 { 2 } }
+
+fn both[X: A + B](x: X) -> i64 { x.a() + x.b() }
+
+fn main() {
+    let n = both(T2 { });
+}

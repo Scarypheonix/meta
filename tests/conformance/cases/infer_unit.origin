@@ -1,0 +1,9 @@
+// EXPECT: accept
+// spec/03: `()` is a type with one value.
+
+fn nothing() { }
+
+fn main() {
+    let u: () = ();
+    let v = nothing();
+}

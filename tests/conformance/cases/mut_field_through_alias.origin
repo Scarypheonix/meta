@@ -1,0 +1,11 @@
+// EXPECT: accept
+// spec/08: aliasing is observable and specified.
+
+struct Counter { mut n: i64 }
+
+fn main() {
+    let a = Counter { n: 0 };
+    let b = a;
+    b.n = 5;
+    let seen = a.n;
+}

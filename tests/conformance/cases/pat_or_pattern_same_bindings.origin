@@ -1,0 +1,12 @@
+// EXPECT: accept
+// spec/05: alternatives that bind the same names are fine.
+
+enum E { A(i64), B(i64) }
+
+fn f(e: E) -> i64 {
+    match e {
+        E::A(x) | E::B(x) => x,
+    }
+}
+
+fn main() { let y = f(E::A(1)); }

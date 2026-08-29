@@ -1,0 +1,9 @@
+// EXPECT: reject E0002
+// spec/02 restriction 1: the same rule holds for an `if` condition.
+
+struct Flag { on: bool }
+
+fn main() {
+    if Flag { on: true }.on {
+    }
+}

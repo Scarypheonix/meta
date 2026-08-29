@@ -1,0 +1,9 @@
+// EXPECT: accept
+// ADR-0013: `f[T](x)` needs no turbofish.
+
+fn id[T](x: T) -> T { x }
+
+fn main() {
+    let a = id[i64](1);
+    let b = id[String]("s");
+}

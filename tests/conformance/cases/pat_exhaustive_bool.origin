@@ -1,0 +1,11 @@
+// EXPECT: accept
+// spec/05: `true` and `false` together are exhaustive.
+
+fn f(b: bool) -> i64 {
+    match b {
+        true => 1,
+        false => 0,
+    }
+}
+
+fn main() { let x = f(true); }

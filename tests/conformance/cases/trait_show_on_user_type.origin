@@ -1,0 +1,15 @@
+// EXPECT: accept
+// spec/06: a user type reaches `io::println` through `Show`.
+
+use std::io;
+
+struct Point { x: i64 }
+
+impl Show for Point {
+    fn to_str(self) -> String { "a point" }
+}
+
+fn main() {
+    let p = Point { x: 1 };
+    io::println(p.to_str());
+}

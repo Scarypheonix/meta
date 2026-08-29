@@ -1,0 +1,6 @@
+// EXPECT: reject E0001
+// spec/01: a digit separator may not be the last character.
+
+fn main() {
+    let x = 1_;
+}

@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/05: a single-variant enum is irrefutable.
+
+enum Only { Just(i64) }
+
+fn main() {
+    let Only::Just(x) = Only::Just(1);
+}

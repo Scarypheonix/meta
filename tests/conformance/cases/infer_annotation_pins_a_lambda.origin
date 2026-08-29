@@ -1,0 +1,7 @@
+// EXPECT: accept
+// spec/03: an annotation supplies what inference cannot.
+
+fn main() {
+    let f: fn(i64) -> i64 = |x| x;
+    let y = f(1);
+}

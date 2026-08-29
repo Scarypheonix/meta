@@ -1,0 +1,8 @@
+// EXPECT: reject E0571
+// spec/04: `while` and `for` produce no value.
+
+fn main() {
+    while true {
+        break 1;
+    }
+}

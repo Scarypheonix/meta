@@ -1,0 +1,8 @@
+// EXPECT: reject E0308
+// spec/04: `a = b = c` assigns `()` to `a`.
+
+fn main() {
+    let mut a = 1;
+    let mut b = 2;
+    a = b = 3;
+}

@@ -1,0 +1,9 @@
+// EXPECT: reject E0308
+// spec/04: every `break` in a loop carries the same type.
+
+fn main() {
+    let x = loop {
+        if true { break 1; }
+        break "s";
+    };
+}

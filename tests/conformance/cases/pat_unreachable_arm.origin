@@ -1,0 +1,12 @@
+// EXPECT: reject E0006
+// spec/05: an arm subsumed by those above it is unreachable.
+
+enum E { A, B }
+
+fn f(e: E) -> i64 {
+    match e {
+        E::A => 1,
+        _ => 2,
+        E::B => 3,
+    }
+}

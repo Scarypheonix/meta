@@ -1,0 +1,11 @@
+// EXPECT: accept
+// spec/03: instantiation composes.
+
+struct Wrapper[T] { inner: T }
+
+fn wrap[T](x: T) -> Wrapper[T] { Wrapper { inner: x } }
+
+fn main() {
+    let a = wrap(wrap(1));
+    let b: Wrapper[Wrapper[i64]] = a;
+}

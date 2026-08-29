@@ -1,0 +1,9 @@
+// EXPECT: reject E0004
+// spec/05: literal String arms never form a complete signature.
+
+fn f(s: String) -> i64 {
+    match s {
+        "yes" => 1,
+        "no" => 0,
+    }
+}

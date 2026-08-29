@@ -1,0 +1,6 @@
+// EXPECT: reject E0369
+// spec/04: `+` does not concatenate; Origin has no operator overloading.
+
+fn main() {
+    let x = "a" + "b";
+}

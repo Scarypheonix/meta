@@ -1,0 +1,9 @@
+// EXPECT: accept
+// spec/04: ordering is built in for integers, floats, char and String.
+
+fn main() {
+    let a = 1 < 2;
+    let b = 1.0 <= 2.0;
+    let c = 'a' > 'b';
+    let d = "a" >= "b";
+}

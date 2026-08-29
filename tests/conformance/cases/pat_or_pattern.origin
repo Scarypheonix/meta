@@ -1,0 +1,13 @@
+// EXPECT: accept
+// spec/05: an or-pattern matches any of its alternatives.
+
+enum E { A, B, C }
+
+fn f(e: E) -> i64 {
+    match e {
+        E::A | E::B => 1,
+        E::C => 2,
+    }
+}
+
+fn main() { let x = f(E::A); }

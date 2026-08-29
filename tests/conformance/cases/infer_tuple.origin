@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/03: tuples are structural.
+
+fn main() {
+    let pair: (i64, bool) = (1, true);
+    let nested: (i64, (bool, String)) = (1, (true, "s"));
+    let one: (i64,) = (1,);
+}

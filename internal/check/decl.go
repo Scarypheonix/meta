@@ -113,8 +113,15 @@ type Checker struct {
 	// intLits are the integer literals in the current body, range-checked once their
 	// types are settled.
 	intLits []literalUse
+	// opChecks are operator applications whose operand type is not settled yet. They
+	// are verified after defaulting, because `1.0 & 2.0` and `let x: u8 = 1 + 2;` both
+	// depend on what the literals turn out to be.
+	opChecks []operandCheck
 	// schemes holds the generalized type of each `let` binding that generalized.
 	schemes map[*resolve.Local]*types.Scheme
+	// generalized records the variables a `let` quantified over. They are deliberately
+	// unsolved -- that is what polymorphism is -- so the end-of-body check skips them.
+	generalized map[*types.Var]bool
 	// loopValues stacks the type each enclosing `loop` breaks with.
 	loopValues []types.Type
 }
@@ -148,6 +155,7 @@ func Program(bag *diag.Bag, res *resolve.Result, files ...*ast.File) *Result {
 		aliases:     map[*ast.TypeAliasDecl]types.Type{},
 		implsBySelf: map[string][]*ImplInfo{},
 		schemes:     map[*resolve.Local]*types.Scheme{},
+		generalized: map[*types.Var]bool{},
 	}
 
 	// Declarations are collected in dependency order: nominal shells first (so a type
@@ -322,6 +330,12 @@ func (c *Checker) signature(fn *ast.FnDecl, outerParams []*types.Param, self typ
 	if fn.Self != nil {
 		sig.Self = self
 	}
+	// Bounds are collected before the parameter and return types are converted: an
+	// associated-type projection such as `T::Item` finds the trait that declares
+	// `Item` by looking at the bounds in scope.
+	sig.Bounds = c.collectBounds(fn.Generics, fn.Where, own)
+	c.env.bounds = sig.Bounds
+
 	for _, p := range fn.Params {
 		sig.ParamTypes = append(sig.ParamTypes, c.toType(p.Type))
 	}
@@ -329,7 +343,6 @@ func (c *Checker) signature(fn *ast.FnDecl, outerParams []*types.Param, self typ
 	if fn.Ret != nil {
 		sig.Ret = c.toType(fn.Ret)
 	}
-	sig.Bounds = c.collectBounds(fn.Generics, fn.Where, own)
 	return sig
 }
 
@@ -470,7 +483,9 @@ func (c *Checker) checkImplCompleteness(info *ImplInfo) {
 	for name := range info.Assoc {
 		if !containsString(ti.AssocTypes, name) {
 			c.bag.Errorf("E0046", info.Decl.Span(), "trait `%s` has no associated type `%s`", ti.Decl.Name.Name, name).
-				Label("not declared by the trait")
+				Label("not declared by the trait").
+				Secondary(ti.Decl.Name.Loc, "`%s` is declared here", ti.Decl.Name.Name).
+				Note("an impl may only define the associated types its trait declares")
 		}
 	}
 	for name, decl := range ti.Methods {

@@ -1,0 +1,9 @@
+// EXPECT: reject E0594
+// spec/08: a field is fixed at construction unless declared `mut`.
+
+struct Point { x: f64 }
+
+fn main() {
+    let p = Point { x: 1.0 };
+    p.x = 2.0;
+}

@@ -1,0 +1,11 @@
+// EXPECT: accept
+// spec/05: char behaves like the other literal spaces.
+
+fn f(c: char) -> i64 {
+    match c {
+        'a' => 1,
+        _ => 0,
+    }
+}
+
+fn main() { let x = f('a'); }

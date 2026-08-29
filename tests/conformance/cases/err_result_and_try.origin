@@ -1,0 +1,22 @@
+// EXPECT: accept
+// spec/09: `?` unwraps `Ok` and returns early on `Err`.
+
+enum ParseError { Empty, BadDigit(char) }
+
+fn parse_digit(c: char) -> Result[i64, ParseError] {
+    if c >= '0' && c <= '9' {
+        Result::Ok(c as u32 as i64 - 48)
+    } else {
+        Result::Err(ParseError::BadDigit(c))
+    }
+}
+
+fn parse_two(a: char, b: char) -> Result[i64, ParseError] {
+    let x = parse_digit(a)?;
+    let y = parse_digit(b)?;
+    Result::Ok(x * 10 + y)
+}
+
+fn main() {
+    let r = parse_two('4', '2');
+}

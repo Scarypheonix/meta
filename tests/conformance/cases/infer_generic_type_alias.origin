@@ -1,0 +1,10 @@
+// EXPECT: accept
+// spec/03: an alias may be generic.
+
+struct Wrapper[T] { inner: T }
+
+type IntWrapper = Wrapper[i64];
+
+fn main() {
+    let w: IntWrapper = Wrapper { inner: 1 };
+}

@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/03: a lambda is a syntactic value, so its `let` generalizes.
+
+fn main() {
+    let f = |x| x;
+    let a = f(1);
+    let b = f("s");
+}

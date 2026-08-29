@@ -1,0 +1,7 @@
+// EXPECT: accept
+// spec/04: a char converts to any integer type.
+
+fn main() {
+    let a = 'a' as u8;
+    let b = 'a' as i64;
+}

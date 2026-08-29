@@ -1,0 +1,7 @@
+// EXPECT: accept
+// spec/05: tuples match element-wise.
+
+fn main() {
+    let (a, b) = (1, true);
+    let ((c, d), e) = ((1, 2), 3);
+}

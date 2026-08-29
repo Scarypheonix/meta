@@ -424,9 +424,52 @@ func (in *Interp) evalPath(p *ast.PathExpr) (Value, ctrl) {
 	case resolve.Const:
 		val, c := in.evalExpr(ref.Const.Value)
 		return val, c
+
+	case resolve.PrimConst:
+		return in.primConst(ref, p.Span()), normal
 	}
 	in.trap(p.Span(), "`%s` is not a value", p.Path)
 	return Unit{}, normal
+}
+
+// primConstBits maps an integer type name to its width and signedness.
+var primConstBits = map[string]struct {
+	bits   uint
+	signed bool
+}{
+	"i8": {8, true}, "i16": {16, true}, "i32": {32, true}, "i64": {64, true},
+	"u8": {8, false}, "u16": {16, false}, "u32": {32, false}, "u64": {64, false},
+}
+
+// primConst evaluates `i64::MAX` and friends.
+//
+// Phase 1's value model carries every integer as an i64, so `u64::MAX` has no
+// representation yet; it traps rather than returning a plausible wrong number. Real
+// integer widths arrive with the bytecode VM (docs/deferred.md, Phase 3).
+func (in *Interp) primConst(ref resolve.Ref, span diag.Span) Value {
+	info, ok := primConstBits[ref.Name]
+	if !ok {
+		in.trap(span, "`%s` has no associated constant `%s`", ref.Name, ref.Member)
+	}
+	switch ref.Member {
+	case "BITS":
+		return Int(int64(info.bits))
+	case "MIN":
+		if !info.signed {
+			return Int(0)
+		}
+		return Int(-(int64(1) << (info.bits - 1)))
+	case "MAX":
+		if info.signed {
+			return Int(int64(1)<<(info.bits-1) - 1)
+		}
+		if info.bits >= 64 {
+			in.trap(span, "unimplemented: `u64::MAX` needs real integer widths (Phase 3)")
+		}
+		return Int(int64(1)<<info.bits - 1)
+	}
+	in.trap(span, "`%s` has no associated constant `%s`", ref.Name, ref.Member)
+	return Unit{}
 }
 
 func (in *Interp) evalStructLit(lit *ast.StructLit) (Value, ctrl) {

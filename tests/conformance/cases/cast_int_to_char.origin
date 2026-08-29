@@ -1,0 +1,6 @@
+// EXPECT: reject E0605
+// spec/04: not every integer is a scalar value.
+
+fn main() {
+    let x = 65 as char;
+}

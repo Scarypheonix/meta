@@ -1,0 +1,7 @@
+// EXPECT: accept
+// spec/04: an assignment's value is `()`.
+
+fn main() {
+    let mut x = 1;
+    let u: () = x = 2;
+}

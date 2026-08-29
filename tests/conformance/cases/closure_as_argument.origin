@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/03: a function type is an ordinary type.
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 { f(x) }
+
+fn main() {
+    let y = apply(|n| n + 1, 1);
+}

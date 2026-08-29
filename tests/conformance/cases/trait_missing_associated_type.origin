@@ -1,0 +1,13 @@
+// EXPECT: reject E0046
+// spec/06: an impl must define every associated type.
+
+trait Container {
+    type Item;
+    fn first(self) -> Option[Self::Item];
+}
+
+struct Numbers { head: i64 }
+
+impl Container for Numbers {
+    fn first(self) -> Option[i64] { Option::Some(self.head) }
+}

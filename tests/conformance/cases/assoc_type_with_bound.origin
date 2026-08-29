@@ -1,0 +1,19 @@
+// EXPECT: accept
+// spec/06: the bound supplies the projection.
+
+fn first[T: Iterator](mut it: T) -> Option[T::Item] {
+    it.next()
+}
+
+struct Once { mut done: bool }
+
+impl Iterator for Once {
+    type Item = i64;
+    fn next(mut self) -> Option[i64] {
+        if self.done { Option::None } else { self.done = true; Option::Some(1) }
+    }
+}
+
+fn main() {
+    let x = first(Once { done: false });
+}

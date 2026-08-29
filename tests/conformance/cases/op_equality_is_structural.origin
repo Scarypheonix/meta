@@ -1,0 +1,12 @@
+// EXPECT: accept
+// spec/04: `==` is structural and total for every non-function type.
+
+struct Point { x: f64, y: f64 }
+enum Shape { Circle(f64), Empty }
+
+fn main() {
+    let a = Point { x: 1.0, y: 2.0 } == Point { x: 1.0, y: 2.0 };
+    let b = Shape::Circle(1.0) == Shape::Empty;
+    let c = (1, "s") == (1, "s");
+    let d = 1.0 == 1.0;
+}

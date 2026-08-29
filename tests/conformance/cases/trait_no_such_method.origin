@@ -1,0 +1,9 @@
+// EXPECT: reject E0599
+// spec/06: method resolution needs the method to exist.
+
+struct Point { x: f64 }
+
+fn main() {
+    let p = Point { x: 1.0 };
+    let n = p.nope();
+}

@@ -1,0 +1,9 @@
+// EXPECT: reject E0004
+// spec/05: a match with no arms handles nothing.
+
+enum E { A }
+
+fn f(e: E) -> i64 {
+    match e {
+    }
+}

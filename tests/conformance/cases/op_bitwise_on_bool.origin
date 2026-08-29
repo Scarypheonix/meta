@@ -1,0 +1,6 @@
+// EXPECT: reject E0369
+// spec/04: `&` is bitwise on integers, not logical on bools.
+
+fn main() {
+    let x = true & false;
+}

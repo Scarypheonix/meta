@@ -1,0 +1,7 @@
+// EXPECT: reject E0618
+// spec/04: only a function value can be called.
+
+fn main() {
+    let n = 1;
+    let x = n();
+}

@@ -1,0 +1,9 @@
+// EXPECT: accept
+// spec/03: an enum may be generic in its payloads.
+
+enum Either[L, R] { Left(L), Right(R) }
+
+fn main() {
+    let a: Either[i64, String] = Either::Left(1);
+    let b: Either[i64, String] = Either::Right("s");
+}

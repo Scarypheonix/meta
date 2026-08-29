@@ -1,0 +1,10 @@
+// EXPECT: accept
+// spec/01: float literals with fractions, exponents and suffixes.
+
+fn main() {
+    let a = 1.5;
+    let b = 1.5e-3;
+    let c = 1e10;
+    let d = 3.14f32;
+    let e = 2.0f64;
+}

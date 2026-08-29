@@ -1,0 +1,11 @@
+// EXPECT: accept
+// spec/03: a generic struct's field type is substituted at the use site.
+
+struct Wrapper[T] { inner: T }
+
+fn main() {
+    let w = Wrapper { inner: 1 };
+    let n: i64 = w.inner;
+    let s = Wrapper { inner: "text" };
+    let t: String = s.inner;
+}

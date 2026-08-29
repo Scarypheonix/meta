@@ -1,0 +1,13 @@
+// EXPECT: accept
+// spec/05: `_` matches anything and binds nothing.
+
+fn main() {
+    let v = 1;
+    let x = match v {
+        0 => "zero",
+        _ => "other",
+    };
+    let y = match v {
+        n => n,
+    };
+}

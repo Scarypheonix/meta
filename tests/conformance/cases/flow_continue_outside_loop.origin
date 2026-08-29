@@ -1,0 +1,6 @@
+// EXPECT: reject E0433
+// spec/04: so does `continue`.
+
+fn main() {
+    continue;
+}

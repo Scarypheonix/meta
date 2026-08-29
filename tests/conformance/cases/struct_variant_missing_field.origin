@@ -1,0 +1,8 @@
+// EXPECT: reject E0063
+// spec/03: a struct variant needs every field too.
+
+enum Shape { Rect { w: f64, h: f64 } }
+
+fn main() {
+    let r = Shape::Rect { w: 1.0 };
+}

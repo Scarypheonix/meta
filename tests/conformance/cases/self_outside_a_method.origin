@@ -1,0 +1,6 @@
+// EXPECT: reject E0424
+// spec/06: only a method's body may use `self`.
+
+fn f() -> i64 {
+    self
+}

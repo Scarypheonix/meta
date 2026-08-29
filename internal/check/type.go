@@ -72,7 +72,8 @@ func (c *Checker) pathType(v *ast.PathType) types.Type {
 	case resolve.Prim:
 		if len(args) > 0 {
 			c.bag.Errorf("E0109", v.Span(), "`%s` takes no type arguments", ref.Name).
-				Label("primitive types are not generic")
+				Label("primitive types are not generic").
+				Note("only a declared struct, enum or alias with parameters can be applied")
 		}
 		return types.P(primKinds[ref.Name])
 
@@ -128,7 +129,8 @@ func (c *Checker) applyDef(v *ast.PathType, def *types.Def, args []types.Type) t
 	if len(args) != len(def.Params) {
 		c.bag.Errorf("E0107", v.Span(),
 			"`%s` takes %d type argument(s) but %d were supplied", def.Name, len(def.Params), len(args)).
-			Label("wrong number of type arguments")
+			Label("wrong number of type arguments").
+			Note("`%s` declares %s", def.Name, paramNames(def.Params))
 		// Recover with fresh variables so one arity mistake does not cascade.
 		args = make([]types.Type, len(def.Params))
 		for i := range args {
@@ -208,4 +210,16 @@ func describeRef(ref resolve.Ref) string {
 		return "a builtin"
 	}
 	return "something that is not a type"
+}
+
+// paramNames renders a declaration's generic parameters for a diagnostic.
+func paramNames(params []*types.Param) string {
+	if len(params) == 0 {
+		return "no type parameters"
+	}
+	var names []string
+	for _, p := range params {
+		names = append(names, "`"+p.Name+"`")
+	}
+	return joinNames(names)
 }

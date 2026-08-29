@@ -1,0 +1,6 @@
+// EXPECT: reject E0002
+// spec/01: a float literal needs digits on both sides of the point.
+
+fn main() {
+    let x = 1.;
+}

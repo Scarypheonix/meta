@@ -1,0 +1,15 @@
+// EXPECT: accept
+// spec/05: a product of finite spaces is finite.
+
+enum E { A, B }
+
+fn f(p: (E, E)) -> i64 {
+    match p {
+        (E::A, E::A) => 0,
+        (E::A, E::B) => 1,
+        (E::B, E::A) => 2,
+        (E::B, E::B) => 3,
+    }
+}
+
+fn main() { let x = f((E::A, E::B)); }

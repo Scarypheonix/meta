@@ -1,0 +1,6 @@
+// EXPECT: reject E0369
+// spec/04: `+` is not defined on bool.
+
+fn main() {
+    let x = true + false;
+}

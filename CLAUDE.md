@@ -4,8 +4,8 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Current phase: 2 — type system. Phases 0 and 1 are complete** (see
-`docs/phases/`).
+**Current phase: 3 — bytecode VM and garbage collector. Phases 0, 1 and 2 are
+complete** (see `docs/phases/`).
 
 ---
 
@@ -13,7 +13,7 @@ for how to work in this repository. The project origin prompt is superseded by i
 
 ```bash
 ./check              # THE gate: gofmt + go vet + go build + full test suite
-go run ./cmd/originc run  path.origin     # run a program
+go run ./cmd/originc run  path.origin     # run a file, or a package directory
 go run ./cmd/originc check path.origin    # diagnostics only
 go run ./cmd/originc dump-ast path.origin # print the syntax tree
 go test -run xxx -fuzz FuzzParse ./tests/fuzz/   # fuzz the parser
@@ -37,7 +37,9 @@ internal/diag/        spans, codes, diagnostic rendering
 internal/lex/         tokens
 internal/ast/         the AST (sealed interface, ADR-0015) and its dumper
 internal/parse/       the grammar, with multi-error recovery
-internal/resolve/     name resolution, closure capture; owns the name side tables
+internal/resolve/     name resolution, modules, visibility; owns the name side tables
+internal/types/       the shared type language: terms, unification, generalization
+internal/check/       the type checker: inference, exhaustiveness, traits, coherence
 internal/interp/      tree-walking interpreter (Phase 1)
 internal/prelude/     Option, Result, Ordering — written in Origin
 internal/driver/      pass ordering and error suppression
@@ -151,24 +153,27 @@ This project outlasts any single context window.
 
 ## Status
 
-**In flight:** nothing. Phase 1 closed.
+**In flight:** nothing. Phase 2 closed.
 
-**Known-broken:** nothing. Three known *incomplete* things, all recorded in
-`docs/deferred.md` against Phase 2: no tuple element access (`t.0`), integer arithmetic
-is 64-bit only, and field mutability is checked when it happens rather than at compile
-time. Each stops rather than producing a wrong answer.
+**Known-broken:** nothing. Two known *incomplete* things, both recorded in
+`docs/deferred.md` against Phase 3: the interpreter's value model carries every integer
+as an `i64`, so per-width overflow does not trap and `u64::MAX` traps rather than
+returning a wrong number.
 
-**Next action:** Phase 2 — the type system. In order: a shared type representation;
-Hindley–Milner inference with mandatory signatures and the value restriction (ADR-0009);
-algebraic data types and Maranget exhaustiveness (spec §05); traits with associated
-types and coherence (spec §06, ADR-0011); generics with monomorphization (ADR-0010); and
-the module system (spec §07), which Phase 1 stubbed at one file plus the prelude.
+**Next action:** Phase 3 — the bytecode VM and the garbage collector. In order: lower
+the AST to a register bytecode; write the VM; then the precise generational moving
+collector — bump allocation in the nursery, copying collection, write barriers, a card
+table for old-to-young references, and stack maps for precise root finding. The
+representation the GC and the backend must agree on lives in `internal/layout`, which
+does not exist yet and which spec §08 already specifies (object layout, stack maps,
+safepoint placement).
 
-Phase 2 exits when `tests/conformance/` has 200+ cases with correct verdicts and type
-errors name the source span and explain the conflict in plain language. The harness is
-already wired: add the code to `implementedCodes` in
-`tests/conformance/conformance_test.go` in the same commit that starts emitting it, and
-the three skipped cases turn themselves on.
+Phase 3 exits when the GC survives 10 million short-lived allocations with a live set
+held across collections — no leaks, no premature collection, no crashes under randomized
+allocation patterns — and when the interpreter and the VM produce identical output on
+every Phase 1 and Phase 2 test. That differential is the point: `tests/e2e/` already
+asserts exact stdout, stderr and exit status, so running the same corpus through both
+engines is a real oracle.
 
 **Awaiting the user:** nothing blocking. Two things only the target machine can
 confirm, both at Phase 5: that a compiled Mach-O binary runs, and that `lldb` breaks on

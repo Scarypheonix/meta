@@ -1,0 +1,10 @@
+// EXPECT: accept
+// spec/02: `Point { x, y }` is shorthand for `x: x, y: y`.
+
+struct Point { x: f64, y: f64 }
+
+fn main() {
+    let x = 1.0;
+    let y = 2.0;
+    let p = Point { x, y };
+}

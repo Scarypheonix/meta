@@ -16,7 +16,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/scarypheonix/meta/internal/ast"
+	"github.com/scarypheonix/meta/internal/check"
+	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/driver"
+	"github.com/scarypheonix/meta/internal/parse"
+	"github.com/scarypheonix/meta/internal/prelude"
+	"github.com/scarypheonix/meta/internal/resolve"
 	"github.com/scarypheonix/meta/internal/source"
 	"github.com/scarypheonix/meta/internal/testutil"
 )
@@ -151,4 +157,99 @@ func registeredCodes(t *testing.T) map[string]bool {
 		t.Fatal("codes.md registered no diagnostic codes; the table format probably changed")
 	}
 	return out
+}
+
+// TestDiagnosticQuality enforces the half of Phase 2's exit criterion that is about the
+// messages rather than the verdicts: a type error must name a source span and explain
+// the conflict in plain language.
+//
+// It runs over the whole reject corpus, so a new diagnostic that is merely correct but
+// unhelpful fails here rather than reaching a user.
+func TestDiagnosticQuality(t *testing.T) {
+	// Phrasings that mean the compiler leaked its own bookkeeping into a message.
+	internal := regexp.MustCompile(`\bt[0-9]+\b|\?[0-9]+|0x[0-9a-f]{8}|NodeID|\*types\.|\*ast\.`)
+
+	// Codes whose message is a statement of fact that needs no further explanation.
+	selfExplanatory := map[string]bool{
+		"E0002": true, // syntax errors quote the expected token
+		"E0001": true, // lexical errors name the character or literal
+	}
+
+	checked := 0
+	for _, path := range caseFiles(t) {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading case: %v", err)
+		}
+		exp, err := testutil.ParseExpectation(string(raw))
+		if err != nil || exp.Verdict != testutil.Reject {
+			continue
+		}
+		skip := false
+		for _, code := range exp.Codes {
+			if implementedCodes[code] != "" {
+				skip = true
+			}
+		}
+		if skip {
+			continue
+		}
+
+		rel, relErr := filepath.Rel(testutil.RepoRoot(t), path)
+		if relErr != nil {
+			rel = path
+		}
+		name := filepath.Base(path)
+
+		bag := diag.New()
+		f := source.NewFile(rel, string(raw))
+		ids := ast.NewIDGen()
+		preludeAST := parse.FileWith(prelude.Source(), diag.New(), ids)
+		userAST := parse.FileWith(f, bag, ids)
+		if !bag.HasErrors() {
+			res := resolve.Program(bag,
+				resolve.Input{File: preludeAST, Prelude: true},
+				resolve.Input{File: userAST})
+			if !bag.HasErrors() {
+				check.Program(bag, res, preludeAST, userAST)
+			}
+		}
+		if !bag.HasErrors() {
+			continue // TestCompilationVerdicts already reports this
+		}
+		checked++
+
+		for _, d := range bag.All() {
+			if d.Severity != diag.Error {
+				continue
+			}
+			where := name + " " + d.Code
+
+			if !d.Primary.Span.Valid() {
+				t.Errorf("%s: diagnostic has no span", where)
+				continue
+			}
+			if d.Primary.Span.File != f {
+				continue // a diagnostic about the prelude is a compiler bug reported elsewhere
+			}
+			if m := internal.FindString(d.Msg + " " + d.Primary.Msg); m != "" {
+				t.Errorf("%s: message contains the internal identifier %q: %s", where, m, d.Msg)
+			}
+			for _, n := range append(append([]string{}, d.Notes...), d.Helps...) {
+				if m := internal.FindString(n); m != "" {
+					t.Errorf("%s: note contains the internal identifier %q", where, m)
+				}
+			}
+			if d.Primary.Msg == "" {
+				t.Errorf("%s: the primary span has no label saying what is wrong", where)
+			}
+			if !selfExplanatory[d.Code] && len(d.Notes) == 0 && len(d.Helps) == 0 && len(d.Secondary) == 0 {
+				t.Errorf("%s: %q has no note, help or second span; it states the problem but does not explain it",
+					where, d.Msg)
+			}
+		}
+	}
+	if checked < 100 {
+		t.Errorf("only %d rejected cases were examined; the corpus should be larger", checked)
+	}
 }

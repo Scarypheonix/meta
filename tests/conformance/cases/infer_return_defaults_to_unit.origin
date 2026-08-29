@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/02: a missing `->` means `-> ()`.
+
+fn f() { }
+
+fn main() {
+    let x: () = f();
+}

@@ -46,6 +46,8 @@ const (
 	SelfTy
 	// ModuleRef names a module in the package's module tree.
 	ModuleRef
+	// PrimConst is an associated constant on a primitive type, such as `i64::MAX`.
+	PrimConst
 	// Assoc is an associated-type projection such as `Self::Item` or `T::Item`. The
 	// resolver records the base and the member; deciding which trait provides the
 	// member needs types, so it belongs to the checker.
@@ -378,13 +380,10 @@ func (r *resolver) declareItem(it ast.Item) {
 		if r.out.Methods[name] == nil {
 			r.out.Methods[name] = map[string]*ast.FnDecl{}
 		}
+		// Duplicates are not diagnosed here: whether two methods clash depends on which
+		// traits their impls are for, which only the checker knows. This table exists
+		// for the interpreter's runtime dispatch.
 		for _, m := range v.Methods {
-			if prev, dup := r.out.Methods[name][m.Name.Name]; dup {
-				r.bag.Errorf("E0034", m.Name.Loc, "`%s` has two methods named `%s`", name, m.Name.Name).
-					Label("duplicate method").
-					Secondary(prev.Name.Loc, "first defined here")
-				continue
-			}
 			r.out.Methods[name][m.Name.Name] = m
 		}
 	case *ast.ErrorItem:
@@ -848,6 +847,10 @@ func (r *resolver) resolvePathIn(path *ast.Path, nodeID ast.NodeID, inPattern bo
 			r.resolveVariant(base, segs[1], nodeID)
 			return
 		}
+		if base.Kind == Prim {
+			r.resolvePrimConst(base.Name, segs[1], nodeID)
+			return
+		}
 	}
 
 	// Otherwise the prefix must name a module.
@@ -897,6 +900,23 @@ func (r *resolver) resolvePathIn(path *ast.Path, nodeID ast.NodeID, inPattern bo
 	r.out.Refs[nodeID] = Ref{Kind: Unresolved}
 }
 
+// PrimConsts are the associated constants every integer type carries. They exist so
+// that the most negative value of a signed type can be written at all: a literal must
+// fit the positive range, so `-128i8` is rejected and `i8::MIN` is how you say it
+// (spec/01-lexical.md).
+var PrimConsts = map[string]bool{"MIN": true, "MAX": true, "BITS": true}
+
+func (r *resolver) resolvePrimConst(prim string, member ast.Ident, nodeID ast.NodeID) {
+	if !PrimConsts[member.Name] {
+		r.bag.Errorf("E0433", member.Loc, "`%s` has no associated constant `%s`", prim, member.Name).
+			Label("no such constant").
+			Note("every integer type has `MIN`, `MAX` and `BITS`")
+		r.out.Refs[nodeID] = Ref{Kind: Unresolved}
+		return
+	}
+	r.out.Refs[nodeID] = Ref{Kind: PrimConst, Name: prim, Member: member.Name}
+}
+
 // resolveVariant records a reference to one variant of an enum.
 func (r *resolver) resolveVariant(enumRef Ref, want ast.Ident, nodeID ast.NodeID) {
 	for _, va := range enumRef.Enum.Variants {
@@ -933,6 +953,8 @@ func (r *resolver) reportUnresolved(path *ast.Path, first ast.Ident, inPattern b
 		Label("not found")
 	if inPattern {
 		b.Note("a name in a pattern binds a new variable unless it names a unit variant or a constant")
+	} else {
+		b.Note("a name must be declared in this module, imported with `use`, or come from the prelude")
 	}
 	_ = path
 }
@@ -999,7 +1021,7 @@ func (r *resolver) resolveExpr(e ast.Expr) {
 	case nil:
 		return
 	case *ast.IntLit, *ast.FloatLit, *ast.StrLit, *ast.CharLit, *ast.BoolLit,
-		*ast.SelfExpr, *ast.ErrorExpr, *ast.Continue:
+		*ast.SelfExpr, *ast.ErrorExpr:
 		return
 
 	case *ast.PathExpr:
@@ -1070,9 +1092,17 @@ func (r *resolver) resolveExpr(e ast.Expr) {
 	case *ast.Break:
 		if r.loopDepth == 0 {
 			r.bag.Errorf("E0433", v.Span(), "`break` outside of a loop").
-				Label("not inside a loop")
+				Label("not inside a loop").
+				Note("`break` and `continue` bind to the innermost enclosing loop")
 		}
 		r.resolveExpr(v.Value)
+
+	case *ast.Continue:
+		if r.loopDepth == 0 {
+			r.bag.Errorf("E0433", v.Span(), "`continue` outside of a loop").
+				Label("not inside a loop").
+				Note("`break` and `continue` bind to the innermost enclosing loop")
+		}
 
 	case *ast.Return:
 		r.resolveExpr(v.Value)

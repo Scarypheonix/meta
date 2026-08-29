@@ -1,0 +1,6 @@
+// EXPECT: reject E0308
+// spec/04: `return` is checked against the signature.
+
+fn f() -> i64 {
+    return "s";
+}

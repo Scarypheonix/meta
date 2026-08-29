@@ -1,0 +1,12 @@
+// EXPECT: reject E0004
+// spec/05: one missing combination is enough.
+
+enum E { A, B }
+
+fn f(p: (E, E)) -> i64 {
+    match p {
+        (E::A, E::A) => 0,
+        (E::A, E::B) => 1,
+        (E::B, E::A) => 2,
+    }
+}

@@ -1,0 +1,6 @@
+// EXPECT: accept
+// spec/02: a block's value is its trailing expression.
+
+fn main() {
+    let x: i64 = { let a = 1; a + 1 };
+}

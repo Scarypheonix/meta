@@ -1,0 +1,9 @@
+// EXPECT: reject E0002
+// spec/02 restriction 1: a struct literal in iterable position must be parenthesized.
+
+struct Counter { n: i64 }
+
+fn main() {
+    for v in Counter { n: 3 } {
+    }
+}

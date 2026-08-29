@@ -1,0 +1,12 @@
+// EXPECT: reject E0004
+// spec/05: exhaustiveness looks through nesting.
+
+enum Inner { Yes(i64), No }
+enum Outer { Wrap(Inner), Empty }
+
+fn f(o: Outer) -> i64 {
+    match o {
+        Outer::Wrap(Inner::Yes(n)) => n,
+        Outer::Empty => -1,
+    }
+}

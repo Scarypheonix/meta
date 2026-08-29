@@ -1,0 +1,13 @@
+// EXPECT: reject E0046
+// spec/06: an impl must define every required method.
+
+trait Greet {
+    fn greeting(self) -> String;
+    fn loud(self) -> String;
+}
+
+struct Cat { name: String }
+
+impl Greet for Cat {
+    fn greeting(self) -> String { "meow" }
+}

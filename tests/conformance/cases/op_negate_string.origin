@@ -1,0 +1,6 @@
+// EXPECT: reject E0600
+// spec/04: `-` does not apply to text.
+
+fn main() {
+    let x = -"s";
+}

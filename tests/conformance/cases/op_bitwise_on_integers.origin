@@ -1,0 +1,10 @@
+// EXPECT: accept
+// spec/04: bitwise operators apply to integers.
+
+fn main() {
+    let a = 6 & 3;
+    let b = 6 | 3;
+    let c = 6 ^ 3;
+    let d = 1 << 4;
+    let e = 16 >> 2;
+}

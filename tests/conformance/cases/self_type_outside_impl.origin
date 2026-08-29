@@ -1,0 +1,6 @@
+// EXPECT: reject E0411
+// spec/06: `Self` names the implementing type.
+
+fn f() -> Self {
+    1
+}

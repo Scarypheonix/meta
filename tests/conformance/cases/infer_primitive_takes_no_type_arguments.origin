@@ -1,0 +1,6 @@
+// EXPECT: reject E0109
+// spec/03: primitives are not generic.
+
+fn main() {
+    let x: i64[bool] = 1;
+}

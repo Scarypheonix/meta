@@ -1,0 +1,7 @@
+// EXPECT: reject E0594
+// ADR-0004: an immutable binding cannot be reassigned.
+
+fn main() {
+    let x = 1;
+    x = 2;
+}

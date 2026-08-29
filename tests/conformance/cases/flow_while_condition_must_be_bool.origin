@@ -1,0 +1,6 @@
+// EXPECT: reject E0308
+// spec/04: the same holds for `while`.
+
+fn main() {
+    while 1 { }
+}

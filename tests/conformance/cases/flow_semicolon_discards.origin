@@ -1,0 +1,6 @@
+// EXPECT: accept
+// spec/02: a trailing `;` means the block has no value.
+
+fn main() {
+    let x: () = { 1; };
+}

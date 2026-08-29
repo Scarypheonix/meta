@@ -1,0 +1,19 @@
+// EXPECT: accept
+// spec/06: an associated type is determined by the implementing type.
+
+trait Container {
+    type Item;
+    fn first(self) -> Option[Self::Item];
+}
+
+struct Numbers { head: i64 }
+
+impl Container for Numbers {
+    type Item = i64;
+    fn first(self) -> Option[i64] { Option::Some(self.head) }
+}
+
+fn main() {
+    let n = Numbers { head: 1 };
+    let f = n.first();
+}

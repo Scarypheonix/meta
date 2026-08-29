@@ -1,0 +1,6 @@
+// EXPECT: reject E0308
+// spec/05: a tuple pattern must have the scrutinee's arity.
+
+fn main() {
+    let (a, b, c) = (1, 2);
+}

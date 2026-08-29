@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/03: a struct variant is built with braces.
+
+enum Shape { Rect { w: f64, h: f64 } }
+
+fn main() {
+    let r = Shape::Rect { w: 1.0, h: 2.0 };
+}

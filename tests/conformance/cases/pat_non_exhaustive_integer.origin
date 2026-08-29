@@ -1,0 +1,9 @@
+// EXPECT: reject E0004
+// spec/05: integers have no enumerable signature, so `_` is required.
+
+fn f(n: i64) -> String {
+    match n {
+        0 => "zero",
+        1 => "one",
+    }
+}

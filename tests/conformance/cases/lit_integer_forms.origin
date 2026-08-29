@@ -1,0 +1,10 @@
+// EXPECT: accept
+// spec/01: decimal, hex, octal and binary literals with separators.
+
+fn main() {
+    let a = 1_000;
+    let b = 0xFF;
+    let c = 0o17;
+    let d = 0b1010;
+    let e = 0xFFu8;
+}

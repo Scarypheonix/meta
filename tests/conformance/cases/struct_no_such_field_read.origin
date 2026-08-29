@@ -1,0 +1,9 @@
+// EXPECT: reject E0609
+// spec/03: reading a field that does not exist is an error.
+
+struct Point { x: f64 }
+
+fn main() {
+    let p = Point { x: 1.0 };
+    let z = p.z;
+}

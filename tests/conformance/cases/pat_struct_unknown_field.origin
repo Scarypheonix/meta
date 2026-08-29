@@ -1,0 +1,10 @@
+// EXPECT: reject E0026
+// spec/05: a pattern cannot name a field the type does not have.
+
+struct P { x: i64 }
+
+fn f(p: P) -> i64 {
+    match p {
+        P { x, w } => x,
+    }
+}

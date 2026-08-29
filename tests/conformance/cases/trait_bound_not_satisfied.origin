@@ -1,0 +1,10 @@
+// EXPECT: reject E0277
+// spec/06: a bound must hold at the call site.
+
+trait Special { fn mark(self) -> i64; }
+
+fn needs_special[T: Special](x: T) -> i64 { x.mark() }
+
+fn main() {
+    let n = needs_special(1);
+}

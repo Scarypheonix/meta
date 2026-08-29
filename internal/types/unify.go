@@ -52,6 +52,8 @@ type UnifyError struct {
 	Want, Got Type
 	// Detail names a more specific cause when there is one, such as an arity mismatch.
 	Detail string
+	// Help is a suggested fix, set when the cause implies one.
+	Help string
 	// Infinite reports that the failure was the occurs check.
 	Infinite bool
 }
@@ -85,9 +87,15 @@ func Unify(want, got Type) *UnifyError {
 	}
 
 	if v, ok := want.(*Var); ok {
+		if e := literalConstraint(v, got, true); e != nil {
+			return e
+		}
 		return bind(v, got)
 	}
 	if v, ok := got.(*Var); ok {
+		if e := literalConstraint(v, want, false); e != nil {
+			return e
+		}
 		return bind(v, want)
 	}
 
@@ -165,6 +173,50 @@ func Unify(want, got Type) *UnifyError {
 		return Unify(w.Ret, g.Ret)
 	}
 	return &UnifyError{Want: want, Got: got}
+}
+
+// literalConstraint stops a numeric literal's inference variable from taking a type it
+// could never have had.
+//
+// Without it, `let x: f64 = 1;` binds the integer literal's variable straight to `f64`
+// and Origin silently grows the implicit int-to-float conversion that ADR-0012 rules
+// out. wantSide says which side of the mismatch the variable was on, so the message
+// reads in the direction the programmer wrote.
+func literalConstraint(v *Var, other Type, wantSide bool) *UnifyError {
+	if v.Default == NoDefault {
+		return nil
+	}
+	p, ok := Prune(other).(*Prim)
+	if !ok {
+		if _, isVar := Prune(other).(*Var); isVar {
+			return nil // two variables: the constraint carries across in bind
+		}
+		return literalError(v, other, wantSide)
+	}
+	if v.Default == IntDefault && p.Kind.IsInteger() {
+		return nil
+	}
+	if v.Default == FloatDefault && p.Kind.IsFloat() {
+		return nil
+	}
+	return literalError(v, other, wantSide)
+}
+
+func literalError(v *Var, other Type, wantSide bool) *UnifyError {
+	kind, alt := "an integer literal", "a float"
+	if v.Default == FloatDefault {
+		kind, alt = "a float literal", "an integer"
+	}
+	e := &UnifyError{Want: v, Got: other}
+	if wantSide {
+		e.Detail = fmt.Sprintf("expected %s, found `%s`", kind, other)
+	} else {
+		e.Detail = fmt.Sprintf("expected `%s`, found %s", other, kind)
+	}
+	if p, ok := Prune(other).(*Prim); ok && p.Kind.IsNumeric() {
+		e.Help = fmt.Sprintf("write the literal as %s, or convert with `as %s`", alt, p.Kind)
+	}
+	return e
 }
 
 // bind points an unbound variable at a type, after the occurs check.

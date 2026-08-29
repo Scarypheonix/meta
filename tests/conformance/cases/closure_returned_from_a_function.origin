@@ -1,0 +1,14 @@
+// EXPECT: accept
+// spec/03: a function value has a function type.
+
+struct Cell { mut v: i64 }
+
+fn make_counter() -> fn() -> i64 {
+    let cell = Cell { v: 0 };
+    || { cell.v = cell.v + 1; cell.v }
+}
+
+fn main() {
+    let c = make_counter();
+    let a = c();
+}

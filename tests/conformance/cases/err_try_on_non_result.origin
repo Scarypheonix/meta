@@ -1,0 +1,7 @@
+// EXPECT: reject E0277
+// spec/09: `?` applies to a Result.
+
+fn f() -> Result[i64, String] {
+    let x = 1?;
+    Result::Ok(x)
+}

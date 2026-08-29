@@ -1,0 +1,8 @@
+// EXPECT: reject E0277
+// spec/06: `Ord` is not implemented for bool.
+
+fn max2[T: Ord](a: T, b: T) -> T { a }
+
+fn main() {
+    let x = max2(true, false);
+}

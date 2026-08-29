@@ -1,0 +1,6 @@
+// EXPECT: reject E0001
+// spec/01: reserved words are rejected as identifiers.
+
+fn main() {
+    let unsafe = 1;
+}

@@ -1,0 +1,6 @@
+// EXPECT: reject E0001
+// spec/01: a surrogate is not a Unicode scalar value.
+
+fn main() {
+    let x = '\u{D800}';
+}

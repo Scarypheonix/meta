@@ -1,0 +1,6 @@
+// EXPECT: reject E0005
+// spec/05: a lambda parameter binds every value it is given.
+
+fn main() {
+    let f = |Option::Some(x)| x;
+}

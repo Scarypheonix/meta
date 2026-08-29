@@ -1,0 +1,8 @@
+// EXPECT: reject E0308
+// spec/03: function types are structural.
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 { f(x) }
+
+fn main() {
+    let y = apply(|n: String| n, 1);
+}

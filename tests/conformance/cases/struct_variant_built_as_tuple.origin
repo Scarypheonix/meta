@@ -1,0 +1,8 @@
+// EXPECT: reject E0533
+// spec/03: a struct variant is not called.
+
+enum Shape { Rect { w: f64, h: f64 } }
+
+fn main() {
+    let r = Shape::Rect(1.0, 2.0);
+}

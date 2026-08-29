@@ -1,0 +1,9 @@
+// EXPECT: reject E0119
+// spec/06: no two impls of one trait may apply to the same type.
+
+trait Marker { fn m(self) -> i64; }
+
+struct S { }
+
+impl Marker for S { fn m(self) -> i64 { 1 } }
+impl Marker for S { fn m(self) -> i64 { 2 } }

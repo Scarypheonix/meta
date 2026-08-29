@@ -1,0 +1,15 @@
+// EXPECT: accept
+// spec/06: a method receives `self`.
+
+struct Point { x: i64 }
+
+impl Point {
+    fn get(self) -> i64 { self.x }
+    fn same(self) -> Self { self }
+}
+
+fn main() {
+    let p = Point { x: 1 };
+    let a = p.get();
+    let b = p.same();
+}

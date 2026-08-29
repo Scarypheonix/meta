@@ -1,0 +1,6 @@
+// EXPECT: reject E0308
+// spec/01: 128 does not fit i8; only -128 does, via negation.
+
+fn main() {
+    let x: i8 = 128;
+}

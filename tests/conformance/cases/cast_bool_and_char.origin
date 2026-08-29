@@ -1,0 +1,7 @@
+// EXPECT: accept
+// spec/04: bool and char convert to integers.
+
+fn main() {
+    let a = true as i64;
+    let b = 'A' as u32;
+}

@@ -1,0 +1,7 @@
+// EXPECT: reject E0308
+// spec/02: a discarded value is not the block's value.
+
+fn f() -> i64 {
+    let x = 1;
+    x;
+}

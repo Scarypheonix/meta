@@ -1,0 +1,8 @@
+// EXPECT: reject E0423
+// spec/03: a type is not a value.
+
+struct Point { x: i64 }
+
+fn main() {
+    let p = Point(1);
+}

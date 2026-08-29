@@ -1,0 +1,4 @@
+// EXPECT: reject E0308
+// ADR-0009: a body is checked against its declared signature.
+
+fn f() -> i64 { "not an integer" }

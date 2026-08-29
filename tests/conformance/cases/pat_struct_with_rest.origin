@@ -1,0 +1,12 @@
+// EXPECT: accept
+// spec/05: `..` ignores the fields a pattern does not list.
+
+struct P { x: i64, y: i64, z: i64 }
+
+fn f(p: P) -> i64 {
+    match p {
+        P { x, .. } => x,
+    }
+}
+
+fn main() { let v = f(P { x: 1, y: 2, z: 3 }); }

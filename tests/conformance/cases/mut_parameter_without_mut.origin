@@ -1,0 +1,7 @@
+// EXPECT: reject E0594
+// ADR-0004: a plain parameter is immutable.
+
+fn f(n: i64) -> i64 {
+    n = n + 1;
+    n
+}

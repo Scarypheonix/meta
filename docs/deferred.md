@@ -9,7 +9,7 @@ silently dropped. An item may move phases; it may not vanish without a line in
 
 | Item | Why deferred | Phase |
 |---|---|---|
-| `if let` / `while let` | pure sugar over a two-arm `match`; needs the match lowering first | Phase 2 |
+| `if let` / `while let` | pure sugar over a two-arm `match`; needs the match lowering first | Phase 3 |
 | `?` on `Option[T]` | needs a shared "try" abstraction or a second desugaring rule | Phase 7 |
 | Error conversion in `?` via `Into` | needs a blanket-impl story that interacts with coherence (ADR-0011) | Phase 7 |
 | Trait objects / `dyn` | needs the uniform value representation monomorphization avoids (ADR-0010) | Phase 7 |
@@ -20,7 +20,7 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Index syntax `v[i]` | must not reintroduce parse ambiguity (ADR-0013); likely spelled `v.[i]` | Phase 7 |
 | Collection literals | same ambiguity constraint as index syntax | Phase 7 |
 | Attributes and `derive` | mostly unnecessary because `==` is compiler-generated (ADR-0011) | Phase 7 |
-| Range patterns (`1..=9`) | exhaustiveness over integer ranges needs interval splitting in Maranget | Phase 2 |
+| Range patterns (`1..=9`) | exhaustiveness over integer ranges needs interval splitting in Maranget | Phase 7 |
 | Labelled `break` / `continue` | needs loop labels in the resolver | Phase 7 |
 | Glob imports, `use ... as` | ambiguity rules and rename bookkeeping | Phase 7 |
 | String interpolation | needs a formatting trait and a lexer mode | Phase 7 |
@@ -32,10 +32,14 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Doc comment capture | needed by LSP hover, not before | Phase 8 |
 | Effect checking for `match` guards | closes the one "unspecified" clause in the spec (§05) | Phase 4 |
 | Cycle detection in structural `==` | a cyclic graph makes `==` diverge (§04) | Phase 7 |
-| Tuple element access (`t.0`) | found in Phase 1: the grammar's `.` takes an identifier, so a tuple can only be read by pattern. Needs either integer field syntax or a lexer rule for `.0` | Phase 2 |
+| Tuple element access (`t.0`) | found in Phase 1: the grammar's `.` takes an identifier, so a tuple can only be read by pattern. Needs either integer field syntax or a lexer rule for `.0` | Phase 7 |
 | Float formatting in `to_str` | the spec does not fix a rendering; the interpreter uses the shortest round-tripping form and the e2e suite avoids depending on it | Phase 7 |
-| Per-width integer overflow | Phase 1 is dynamically typed and computes every integer at 64 bits; `255u8 + 1` needs the type checker to know the width | Phase 2 |
-| Static field-mutability check | assigning a non-`mut` field is caught when it happens rather than at compile time, because Phase 1 has no types | Phase 2 |
+| Per-width integer overflow | the checker knows the width, but the interpreter's value model still carries every integer as an i64; real widths arrive with the bytecode VM | Phase 3 |
+| `u64::MAX` at run time | the same limitation: it has no representation in an i64 value model, so it traps rather than returning a wrong number | Phase 3 |
+| Monomorphization | ADR-0010 is a lowering strategy; Phase 2 type-checks generics, and the instantiation set is built when there is an IR to instantiate into | Phase 4 |
+| Orphan rule (`E0117`) | cannot be violated while a program is one package; it becomes checkable with the package manager | Phase 8 |
+| Compiler-provided impls in Origin | `Show`, `Ord` and `Int` for the primitives are registered by the checker because their bodies need operations the language does not expose yet | Phase 7 |
+| Static field-mutability check | delivered in Phase 2: assigning a non-`mut` field is now `E0594` at compile time | done |
 
 ## Runtime
 

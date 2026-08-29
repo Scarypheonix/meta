@@ -1,0 +1,10 @@
+// EXPECT: accept
+// spec/03: a constant has a declared type and a compile-time value.
+
+const LIMIT: i64 = 10;
+const NAME: String = "origin";
+
+fn main() {
+    let x = LIMIT + 1;
+    let s = NAME;
+}

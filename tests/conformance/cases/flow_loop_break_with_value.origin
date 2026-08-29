@@ -1,0 +1,11 @@
+// EXPECT: accept
+// spec/04: a `loop` evaluates to the value of its breaks.
+
+fn main() {
+    let mut i = 0;
+    let found = loop {
+        i = i + 1;
+        if i == 5 { break i; }
+    };
+    let n: i64 = found;
+}

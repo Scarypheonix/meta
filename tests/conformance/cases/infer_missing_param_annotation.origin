@@ -1,0 +1,4 @@
+// EXPECT: reject E0002
+// ADR-0009: every function parameter must be annotated.
+
+fn f(x) -> i64 { x }

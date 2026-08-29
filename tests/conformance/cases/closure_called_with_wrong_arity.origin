@@ -1,0 +1,7 @@
+// EXPECT: reject E0061
+// spec/04: a call must supply every argument.
+
+fn main() {
+    let f = |x: i64, y: i64| x + y;
+    let z = f(1);
+}

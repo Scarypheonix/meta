@@ -1,0 +1,12 @@
+// EXPECT: accept
+// spec/06: `Show` is implemented for every primitive.
+
+use std::io;
+
+fn main() {
+    io::println(1.to_str());
+    io::println(true.to_str());
+    io::println('c'.to_str());
+    io::println(1.5.to_str());
+    io::println("s".to_str());
+}

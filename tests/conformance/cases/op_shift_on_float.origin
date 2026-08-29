@@ -1,0 +1,6 @@
+// EXPECT: reject E0369
+// spec/04: shifts apply to integers.
+
+fn main() {
+    let x = 1.0 << 2.0;
+}

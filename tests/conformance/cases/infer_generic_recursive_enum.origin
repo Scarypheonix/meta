@@ -1,0 +1,15 @@
+// EXPECT: accept
+// spec/03: a generic recursive enum is well-formed.
+
+enum Tree[T] { Leaf, Node(Tree[T], T, Tree[T]) }
+
+fn depth[T](t: Tree[T]) -> i64 {
+    match t {
+        Tree::Leaf => 0,
+        Tree::Node(l, v, r) => 1 + depth(l),
+    }
+}
+
+fn main() {
+    let d = depth(Tree::Node(Tree::Leaf, 1, Tree::Leaf));
+}

@@ -1,0 +1,17 @@
+// EXPECT: accept
+// spec/06: an impl supplies every required method.
+
+trait Greet {
+    fn greeting(self) -> String;
+}
+
+struct Cat { name: String }
+
+impl Greet for Cat {
+    fn greeting(self) -> String { "meow" }
+}
+
+fn main() {
+    let c = Cat { name: "tom" };
+    let g = c.greeting();
+}

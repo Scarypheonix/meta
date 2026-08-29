@@ -1,0 +1,7 @@
+// EXPECT: reject E0308
+// spec/03: assigning i64 to u8 needs a cast.
+
+fn main() {
+    let a: i64 = 1;
+    let b: u8 = a;
+}

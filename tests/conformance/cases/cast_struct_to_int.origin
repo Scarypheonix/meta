@@ -1,0 +1,9 @@
+// EXPECT: reject E0605
+// spec/04: `as` converts primitives only.
+
+struct Point { x: f64 }
+
+fn main() {
+    let p = Point { x: 1.0 };
+    let n = p as i64;
+}

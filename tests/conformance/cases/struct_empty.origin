@@ -1,0 +1,8 @@
+// EXPECT: accept
+// spec/02: a struct may have no fields.
+
+struct Marker { }
+
+fn main() {
+    let m = Marker { };
+}

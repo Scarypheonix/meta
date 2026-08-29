@@ -1,0 +1,10 @@
+// EXPECT: reject E0369
+// spec/04 and docs/deferred.md: operator overloading is not in 0.1.
+
+struct Point { x: f64, y: f64 }
+
+fn main() {
+    let a = Point { x: 1.0, y: 2.0 };
+    let b = Point { x: 3.0, y: 4.0 };
+    let c = a + b;
+}

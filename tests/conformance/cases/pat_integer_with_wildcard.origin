@@ -1,0 +1,12 @@
+// EXPECT: accept
+// spec/05: a wildcard closes an integer match.
+
+fn f(n: i64) -> String {
+    match n {
+        0 => "zero",
+        1 => "one",
+        _ => "many",
+    }
+}
+
+fn main() { let x = f(2); }

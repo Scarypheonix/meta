@@ -1,0 +1,10 @@
+// EXPECT: reject E0027
+// spec/05: a struct pattern must list every field or end in `..`.
+
+struct P { x: i64, y: i64 }
+
+fn f(p: P) -> i64 {
+    match p {
+        P { x } => x,
+    }
+}
