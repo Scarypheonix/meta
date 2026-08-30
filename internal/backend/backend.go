@@ -120,6 +120,14 @@ type emitter struct {
 	// renders as.
 	literals map[string]staticStr
 
+	// typeTableAddr is the base of the per-TypeID layout table equal_objects reads
+	// (equal.go). `bytecode.Kind` widens OpEq/OpNe enough to say "this is some
+	// aggregate" (KindRef) but not which one -- unlike OpToStr and the comparison
+	// operators, it carries no further type identity -- so structural `==` resolves
+	// the concrete shape at run time from the operand's own header, the same way
+	// internal/vm's equalObjects does, rather than needing compile.go widened again.
+	typeTableAddr uint64
+
 	fnLabels []x86.Label
 
 	// Per-function state.
@@ -153,6 +161,7 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 	e.roData = append(e.roData, '\n')
 	e.outOfMemoryMsg = e.rawString("origin: out of memory at <runtime>\n")
 	e.panicPrefix = e.rawString("origin: ")
+	e.emitTypeTable()
 
 	if prog.Entry < 0 || prog.Entry >= len(funcs) || funcs[prog.Entry] == nil {
 		return nil, fmt.Errorf("the program has no `main` to start at")

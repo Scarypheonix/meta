@@ -1,0 +1,43 @@
+use std::io;
+
+struct Point { x: i64, y: i64 }
+struct Wrapper { inner: Point, tag: String }
+
+fn main() {
+    let a = Point { x: 1, y: 2 };
+    let b = Point { x: 1, y: 2 };
+    let c = Point { x: 1, y: 3 };
+    io::println((a == b).to_str());
+    io::println((a == c).to_str());
+    io::println((a != c).to_str());
+
+    let w1 = Wrapper { inner: Point { x: 5, y: 6 }, tag: "hi" };
+    let w2 = Wrapper { inner: Point { x: 5, y: 6 }, tag: "hi" };
+    let w3 = Wrapper { inner: Point { x: 5, y: 6 }, tag: "bye" };
+    io::println((w1 == w2).to_str());
+    io::println((w1 == w3).to_str());
+
+    io::println(("hello" == "hello").to_str());
+    io::println(("hello" == "world").to_str());
+    io::println(("" == "").to_str());
+    io::println(("a" == "ab").to_str());
+
+    let nan = 0.0 / 0.0;
+    let fa = Pair { first: nan, second: 0 };
+    let fb = Pair { first: nan, second: 0 };
+    io::println((fa == fb).to_str());
+    let fc = Pair { first: 1.0, second: 0 };
+    let fd = Pair { first: 1.0, second: 0 };
+    io::println((fc == fd).to_str());
+    let fe = Pair { first: 0.0, second: 0 };
+    let ff = Pair { first: -0.0, second: 0 };
+    io::println((fe == ff).to_str());
+
+    let t1 = (1, "x", 2.5);
+    let t2 = (1, "x", 2.5);
+    let t3 = (1, "y", 2.5);
+    io::println((t1 == t2).to_str());
+    io::println((t1 == t3).to_str());
+}
+
+struct Pair { first: f64, second: i64 }

@@ -193,19 +193,31 @@ This project outlasts any single context window.
   two or more live loop-carried values (a counter and an accumulator, say) could
   silently collapse them onto one. Regression-tested directly against `intervals()` and
   `allocate()` in `internal/backend/regalloc_test.go`.
+- Structural `==`/`!=` on a struct, tuple, enum or `String` now works in native code
+  (`internal/backend/equal.go`): a hand-written recursive routine reads a per-`TypeID`
+  layout table this file emits into read-only data (Shape, ObjKind and, for a `Fixed`
+  shape, the address of its `Kinds` byte array — an object's own header still supplies
+  its actual field count or byte length, since only the table's *shape* is constant per
+  `TypeID`), mirroring `internal/vm`'s `equalObjects` field for field, including IEEE
+  float equality inside an aggregate and the trap on comparing two closures. Verified
+  by hand against nested structs, `String` content, `NaN`/`-0.0` inside a struct, and
+  tuples, byte-identical across all five engine/level combinations; landed permanently
+  as `tests/e2e/cases/structural_equality`.
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
 `docs/deferred.md`: closures are not lowered natively at all yet (construction, capture
 reads, and any function with `Captures > 0` are rejected) — nearly every realistic
 program still needs `--vm` or the interpreter for that reason alone; native heap
 allocation never triggers a collection (no stack maps yet — spec/11-codegen.md's own
-DEFERRED note explains why); structural `==`/`<` on aggregates and `String` is
-unimplemented in native `compare()`; the `cmp` builtin doesn't carry its operand's kind
-through `OpCallBuiltin` in native code yet, the way `OpToStr` and the comparison
-operators do; integer arithmetic is still 64-bit only in both engines; `u64::MAX` has no
-run-time representation; the bytecode compiler does not lower `for` loops (the
-interpreter runs them); and `match` compiles to a linear chain of arm tests rather than
-a decision tree.
+DEFERRED note explains why); `<`/`<=`/`>`/`>=` on `String` in native code (only `==`/
+`!=` were built); the `cmp` builtin doesn't carry its operand's kind through
+`OpCallBuiltin` in native code yet, the way `OpToStr` and the comparison operators do;
+integer arithmetic is still 64-bit only in both engines; `u64::MAX` has no run-time
+representation; the bytecode compiler does not lower `for` loops (the interpreter runs
+them); `match` compiles to a linear chain of arm tests rather than a decision tree; and
+a struct or enum declared inside a function body (never checked, per Phase 2's own
+documented scope) now fails loudly in `internal/compile` instead of silently compiling
+against the wrong descriptor, which is safer but still not a fix.
 
 **Next action:** either close the remaining native gaps above (closures need the
 biggest design decision — a closure object escaping its creating frame is exactly the

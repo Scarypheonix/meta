@@ -111,11 +111,9 @@ var engines = []engineSpec{
 // a case in this list is a case the native engine is not being tested on, and the list
 // is meant to empty out.
 var nativeSkips = map[string]string{
-	"aliasing":                            "structural `==` on an aggregate needs a recursive runtime routine over the type table, not built yet (String and struct/tuple/enum `==`/`<` are both still `KindRef`/`KindString` gaps in compare())",
 	"closure_counter":                     "closures are not lowered natively yet",
 	"generics_ord":                        "the `cmp` builtin needs its operand's kind, which OpCallBuiltin does not carry yet (only OpToStr and the comparison ops were widened)",
 	"generics_user_trait_impl":            "calls max2 on primitives too, which reaches the same `cmp` builtin gap as generics_ord",
-	"opt_cse_must_not_merge_allocations":  "same structural-`==` gap as aliasing",
 	"opt_float_semantics_survive_folding": "rendering a float needs shortest-round-trip formatting in emitted code",
 }
 

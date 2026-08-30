@@ -43,6 +43,7 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Orphan rule (`E0117`) | cannot be violated while a program is one package; it becomes checkable with the package manager | Phase 8 |
 | Compiler-provided impls in Origin | `Show`, `Ord` and `Int` for the primitives are registered by the checker because their bodies need operations the language does not expose yet | Phase 7 |
 | Static field-mutability check | delivered in Phase 2: assigning a non-`mut` field is now `E0594` at compile time | done |
+| Block-level (nested) item declarations | `check/body.go` documents the choice explicitly: "Phase 2 checks items at file level only... left to Phase 8's incremental machinery." A struct declared inside a function body resolves but is never checked, so before Phase 5's exact layouts a use of it silently compiled against whichever descriptor happened to be at index 0; it now fails loudly instead (`internal/compile`'s per-instantiation lookup has nothing to find), which is correct per process rule 8 but not a fix | Phase 8 |
 
 ## Runtime
 
@@ -65,5 +66,6 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Incremental compilation in the LSP | needs the query architecture; full recheck first | Phase 8 |
 | Closures in native code | `originc build` rejects any function with `Captures > 0`; struct/tuple/enum-variant construction and field access are lowered (this phase), but building a closure object and reading a capture are not | Phase 5 |
 | Native heap collection | the backend's `alloc` bump-allocates but never triggers a collection: that needs precise stack maps, which need the bytecode widened to carry a value's kind the way `OpToStr` and the comparison ops already were (docs/spec/11-codegen.md's own DEFERRED note) | Phase 5 |
-| Structural `==`/`<` on aggregates and `String` in native code | `compare()` handles every primitive `bytecode.Kind` but not `KindRef` or `KindString`; the fix is a recursive runtime routine reading an embedded per-`TypeID` layout table, mirroring `internal/vm`'s `equalObjects`/`compareOp` | Phase 5 |
+| Structural `==`/`!=` on aggregates and `String` in native code | delivered in Phase 5: `equal_objects` reads an embedded per-`TypeID` layout table and recurses on a `WordRef` field, mirroring `internal/vm`'s `equalObjects` exactly (`internal/backend/equal.go`) | done |
+| Structural `<`/`<=`/`>`/`>=` on `String` in native code | only `==`/`!=` were built (`compare()`); a byte-lexicographic ordering routine is the natural next call in `equal.go`'s style, but nothing currently exercises it | Phase 5 |
 | The `cmp` builtin in native code | `OpCallBuiltin` for `cmp` does not carry its operand's `bytecode.Kind` the way `OpToStr` and the comparison operators do, so the native backend cannot yet tell a signed integer `cmp` from a float one; blocks `generics_ord` and any other primitive `.cmp()` on native | Phase 5 |

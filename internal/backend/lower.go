@@ -347,6 +347,15 @@ func (e *emitter) compare(v *ir.Value) error {
 		cond = unsignedCond(v.Op)
 	case bytecode.KindFloat:
 		return e.floatCompare(v)
+	case bytecode.KindRef, bytecode.KindString:
+		if v.Op == ir.OpEq || v.Op == ir.OpNe {
+			return e.structuralCompare(v)
+		}
+		// `<` and friends are built in only for integers, floats, char and String
+		// (spec/04-expressions.md); a struct or enum reaching here would be a checker
+		// bug. A String's own ordering needs a byte-lexicographic runtime routine this
+		// backend does not have yet (docs/deferred.md).
+		return fmt.Errorf("unimplemented: ordering %s values in native code", kind)
 	case bytecode.KindUnknown:
 		return fmt.Errorf("this is a compiler bug: a comparison reached the backend with no operand kind")
 	default:
@@ -358,6 +367,25 @@ func (e *emitter) compare(v *ir.Value) error {
 	e.a.CmpRR(scratchA, scratchB)
 	e.a.Setcc(cond, x86.RAX)
 	e.a.Movzx8(x86.RAX, x86.RAX)
+	e.def(v, x86.RAX)
+	return nil
+}
+
+// structuralCompare lowers `==` and `!=` on an aggregate or a String by calling the
+// runtime's recursive equal_objects (equal.go). Both operands are pushed before the
+// call, matching e.call and e.construct: the call clobbers the caller-saved registers,
+// so nothing here may assume an operand's allocated location survives it.
+func (e *emitter) structuralCompare(v *ir.Value) error {
+	e.load(scratchA, v.Args[0])
+	e.a.Push(scratchA)
+	e.load(scratchA, v.Args[1])
+	e.a.Push(scratchA)
+	e.a.Pop(x86.RSI)
+	e.a.Pop(x86.RDI)
+	e.a.Call(e.rt.equalObjects)
+	if v.Op == ir.OpNe {
+		e.a.XorRI(x86.RAX, 1)
+	}
 	e.def(v, x86.RAX)
 	return nil
 }

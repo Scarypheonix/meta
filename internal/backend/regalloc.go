@@ -126,11 +126,17 @@ func number(f *ir.Func) *numbering {
 
 // clobbersCallerSaved reports whether lowering an operation emits a `call`. Every
 // allocation is a call to the runtime's allocator, which is why the aggregate
-// constructors are in this list beside the obvious ones.
+// constructors are in this list beside the obvious ones. OpEq and OpNe are here even
+// though most of them lower to a plain register compare: a structural comparison
+// (equal.go) calls the runtime, and this function only sees the Op, not the
+// bytecode.Kind that decides which lowering a given one gets -- so every equality
+// comparison is treated as call-clobbering, which is conservative for the common case
+// and correct for both.
 func clobbersCallerSaved(op ir.Op) bool {
 	switch op {
 	case ir.OpCall, ir.OpCallClosure, ir.OpCallBuiltin,
-		ir.OpStruct, ir.OpTuple, ir.OpVariant, ir.OpClosure, ir.OpToStr:
+		ir.OpStruct, ir.OpTuple, ir.OpVariant, ir.OpClosure, ir.OpToStr,
+		ir.OpEq, ir.OpNe:
 		return true
 	}
 	return false

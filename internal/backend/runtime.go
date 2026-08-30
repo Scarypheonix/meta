@@ -38,14 +38,15 @@ const (
 
 // runtimeLabels names the emitted routines so lowering can call them.
 type runtimeLabels struct {
-	start    x86.Label
-	alloc    x86.Label
-	write    x86.Label
-	trap     x86.Label
-	intToStr x86.Label
-	print    x86.Label
-	println  x86.Label
-	panic    x86.Label
+	start        x86.Label
+	alloc        x86.Label
+	write        x86.Label
+	trap         x86.Label
+	intToStr     x86.Label
+	print        x86.Label
+	println      x86.Label
+	panic        x86.Label
+	equalObjects x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -63,6 +64,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.print = e.a.NewLabel("rt_print")
 	e.rt.println = e.a.NewLabel("rt_println")
 	e.rt.panic = e.a.NewLabel("rt_panic")
+	e.rt.equalObjects = e.a.NewLabel("rt_equal_objects")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -71,6 +73,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitIntToStr()
 	e.emitPrint()
 	e.emitPanic()
+	e.emitEqualObjects()
 }
 
 // emitPanic reports a `panic` and exits 101: rdi = the message String, rsi = the address
