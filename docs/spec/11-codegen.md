@@ -121,39 +121,55 @@ collector and the code generator must agree on, and process rule 5 puts such an
 agreement in exactly one module. Neither the collector nor the backend may derive the
 frame's shape independently.
 
-DEFERRED: stack maps are not emitted yet, and native code therefore allocates without
-collecting. A precise map requires knowing which frame slots hold references, and the
-SSA IR does not carry that on its own: it is built from bytecode (ADR-0016), which has no
-types. ADR-0021 closes that gap: `internal/compile` attaches each field/payload/
-tuple-element read's and each call's result kind to the bytecode instruction itself, and
-each function's parameter and capture kinds to the `bytecode.Fn`, at the places nothing
-downstream can recover a value's kind from otherwise; `internal/backend/kinds.go`'s
-`propagateKinds` — the same native-only IR pass shape as `closures.go`'s
-`resolveClosureCalls`, entirely apart from `internal/ir`, `internal/opt` or the VM —
-carries that seed to every other value structurally (an arithmetic op is always raw, a
-`phi` is whatever its operands already are, and so on), so every value the register
-allocator will ever give a home to now has a known kind, and the register allocator
-(`regalloc.go`'s `allocate`) already places every reference-kind spill slot in one
-contiguous run below the raw ones, exactly as this section's "Stack frames" specifies —
-which is what will let a stack map be two integers rather than a bitmap. What is still
-missing, and still scheduled in `docs/deferred.md`:
+The table itself is now emitted, following ADR-0021: `internal/compile` attaches each
+field/payload/tuple-element read's and each call's result kind to the bytecode
+instruction itself, and each function's parameter and capture kinds to the
+`bytecode.Fn`, at the places nothing downstream can recover a value's kind from
+otherwise; `internal/backend/kinds.go`'s `propagateKinds` — the same native-only IR pass
+shape as `closures.go`'s `resolveClosureCalls`, entirely apart from `internal/ir`,
+`internal/opt` or the VM — carries that seed to every other value structurally (an
+arithmetic op is always raw, a `phi` is whatever its operands already are, and so on),
+so every value the register allocator will ever give a home to has a known kind, and the
+register allocator (`regalloc.go`'s `allocate`) places every reference-kind spill slot
+in one contiguous run below the raw ones, exactly as this section's "Stack frames"
+specifies — which is what lets a stack map entry be two integers (`RefOffset`,
+`RefCount`) rather than a bitmap over frame slots.
 
-- The stack-map table itself: one entry per call site (not only a user-visible
-  allocation — any call can transitively allocate and trigger a collection, so any call's
-  return address must resolve to a map), sorted by code address in read-only data, and
-  reachable from the runtime block. A live reference in a register at a call site is
-  necessarily in one of the four callee-saved registers, never a caller-saved one
-  (ADR-0018's own allocation invariant), which bounds a map's register-root set to four
-  bits — the harder case (an arbitrary register, mid-loop, with no call to force
-  spilling) belongs to safepoints at a function entry or a loop back edge, which exist
-  for scheduler preemption (Phase 6) and are not needed to trigger a collection at all.
+`internal/layout/stackmap.go` owns the encoded shape (`StackMapEntry`, `EncodeStackMap`,
+`LookupStackMap`, `DecodeStackMap`), the one place process rule 5 requires it.
+`internal/backend/regalloc.go`'s `allocate` also computes `callSiteRegs`: for every
+call-clobbering value, which of the four callee-saved registers hold a live
+reference-kind interval at that exact point — never a caller-saved one, by ADR-0018's
+own allocation invariant, which is what bounds a map's register-root set to four bits.
+`internal/backend/stackmap.go`'s `recordCall` is called at every user-code call site
+`lower.go` lowers (direct and indirect calls, `alloc`, `equalObjects`, `compareBytes`,
+and the comparison-builtin allocation sites), binding a label at the call's own return
+address and recording an entry from `callSiteRegs` and the allocator's own contiguous
+reference-slot numbering. `runtime.go`'s own internal call sites (inside `write`,
+`print`, `intToStr`, and the trap/panic paths that never return to Origin code)
+deliberately get no entry: none holds an Origin-level reference, and the collector's
+`rbp`-chain walk can skip over them structurally rather than needing a table entry for
+every one of them. `buildStackMap` resolves every recorded label only after codegen's
+real-address pass has run, sorts by address, and encodes the table into read-only data;
+`writeStackMapFields` pokes its address and entry count into the runtime block
+(`rtStackMapOff`, `rtStackMapCountOff`) as compile-time constants, the same way other
+fixed values are already poked into the data segment.
+
+DEFERRED: the collector itself is still missing, and native code therefore allocates
+without ever collecting — `emitAlloc` still only bump-allocates and traps on OOM. What
+remains, per `docs/deferred.md`:
+
 - The collector that walks the map: for the immediate caller of `alloc`, and then up the
   `rbp` chain this section's calling convention already always maintains, one frame at a
-  time, each resolved by its own return address's map entry.
+  time, each resolved by its own return address's map entry via `LookupStackMap`.
+- Mark/copy and relocation of every discovered root, and updating the roots themselves
+  once objects move.
 
-Emitting a map that claims a precision the compiler cannot supply would be a stub that
-lies (process rule 8); ADR-0021 explicitly scopes what has landed to data no engine yet
-reads, verified directly rather than by claiming a map that does not exist.
+Emitting a table with no reader is not a stub that lies (process rule 8): every field it
+carries is exact, not approximated, and is verified directly against the real compiler
+(`internal/backend/stackmap_test.go` builds a program end to end and checks the emitted
+table's return addresses, sort order, and register roots) rather than by claiming a
+collector that does not exist yet.
 
 ## Object layout in native code
 

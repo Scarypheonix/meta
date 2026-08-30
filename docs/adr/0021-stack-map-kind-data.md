@@ -85,8 +85,32 @@ enforced rather than only specified. A value that reaches `spill` still carrying
 for a well-typed program — panics rather than guessing which group it belongs to (see
 "Consequences").
 
-This ADR's remaining open work is the stack-map table itself and the collector that
-consumes it — `docs/deferred.md` has the current list.
+**The stack-map table itself is now built from this data.** `internal/layout/stackmap.go`
+owns the encoded shape (process rule 5, one place): `StackMapEntry{ReturnAddr,
+RefOffset, RefCount, RegMask}`, `EncodeStackMap`/`DecodeStackMap`/`LookupStackMap` (a
+binary search over the address-sorted table). `internal/backend/regalloc.go`'s
+`allocate` computes, alongside the spill grouping above, `callSiteRegs`: for every
+call-clobbering value, which callee-saved registers hold a live reference-kind interval
+at that exact point (never a caller-saved one — ADR-0018's own allocation invariant is
+what keeps four bits enough for `RegMask`). `internal/backend/stackmap.go`'s
+`recordCall` is called at every user-code call site `internal/backend/lower.go` lowers
+(direct calls, indirect closure calls, `alloc`, `equalObjects`, `compareBytes`, and the
+comparison-builtin call sites `buildOrdering` allocates through) — binding a label at
+the call's own return address and building an entry from `callSiteRegs` and the
+allocator's contiguous reference-slot placement (`RefOffset`/`RefCount`, read directly
+off the allocator's own numbering, no separate computation). `runtime.go`'s own internal
+call sites (inside `write`, `print`, `intToStr`, and the trap/panic paths that never
+return to Origin code) deliberately get no entry — none holds an Origin-level reference,
+and a future collector's rbp-chain walk can skip over them structurally. `buildStackMap`
+resolves every recorded label to its final address only once codegen's second
+(real-address) pass has run, sorts by address, and encodes into read-only data;
+`writeStackMapFields` pokes the table's address and entry count into the runtime block
+(`rtStackMapOff`, `rtStackMapCountOff`) as compile-time constants, the same way the
+Mach-O/ELF writers already poke other fixed values — no runtime instructions needed,
+unlike `rtBumpOff`/`rtEndOff` which come from `mmap`'s own return value.
+
+This ADR's remaining open work is the collector that consumes this table — `docs/deferred.md`
+has the current list.
 
 ## Consequences
 - **Still nothing observable changes for a correct program.** The register allocator now
@@ -123,3 +147,14 @@ consumes it — `docs/deferred.md` has the current list.
   it as a pointer — memory corruption, not merely a missed optimization. That is why this
   ADR insists on deriving each `Kind` from the checker's own recorded type at the exact
   point `internal/compile` already has it in hand, rather than approximating.
+- **The table is inert until a collector reads it.** `emitAlloc` (`runtime.go`) still only
+  bump-allocates and traps on OOM; nothing calls `LookupStackMap` yet. Landing it ahead of
+  the collector follows the same incremental-and-tested pattern as the kind data and the
+  register allocator's grouping: verified directly
+  (`internal/layout/stackmap_test.go`'s round-trip/lookup/decode cases;
+  `internal/backend/regalloc_test.go`'s `TestCallSiteRegsNamesOnlyTheLiveReferenceInACalleeSavedRegister`;
+  `internal/backend/stackmap_test.go`'s end-to-end check, through the real compiler, that
+  every entry's return address lands inside the text segment, the table is sorted, at
+  least one entry records a live reference surviving an allocation in a callee-saved
+  register, and the runtime block's own entry count matches what decodes) and indirectly
+  (the full differential suite is unchanged, since no engine's behavior was touched).

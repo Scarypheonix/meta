@@ -290,13 +290,40 @@ This project outlasts any single context window.
   and fixed the same day `Kind` got its first actual reader. Verified by the panic's own
   regression test (`internal/backend/regalloc_test.go`), a new test for the grouping
   itself, and the full differential suite passing clean at every level again.
+- **The stack-map table is now built and reachable from every native binary**, closing
+  everything ADR-0021 scoped ahead of the collector itself. `internal/layout/stackmap.go`
+  owns the encoded shape (process rule 5): `StackMapEntry`, `EncodeStackMap`,
+  `LookupStackMap` (binary search), `DecodeStackMap`. `regalloc.go`'s `allocate` now also
+  computes `callSiteRegs` — for every call-clobbering value, which of the four
+  callee-saved registers hold a live reference-kind interval at that exact point, never a
+  caller-saved one (ADR-0018's own allocation invariant, which is what bounds a register
+  root set to four bits). `internal/backend/stackmap.go`'s `recordCall` is called at
+  every user-code call site `lower.go` lowers — direct and indirect calls, `alloc`,
+  `equalObjects`, `compareBytes`, and the comparison-builtin allocation sites — binding a
+  label at the call's own return address and recording an entry from `callSiteRegs` and
+  the allocator's own contiguous reference-slot numbering (`RefOffset`/`RefCount`, read
+  directly, no separate computation). `runtime.go`'s own internal call sites (`write`,
+  `print`, `intToStr`, and the trap/panic paths that never return to Origin code)
+  deliberately get no entry — none holds an Origin-level reference, and the future
+  collector's `rbp`-chain walk can skip over them structurally. `buildStackMap` resolves
+  every recorded label only after codegen's real-address pass runs, sorts by address, and
+  encodes into read-only data; `writeStackMapFields` pokes the table's address and count
+  into the runtime block (`rtStackMapOff`, `rtStackMapCountOff`) as compile-time
+  constants, the same way other fixed values are already poked into the data segment.
+  Verified end to end through the real compiler (`internal/backend/stackmap_test.go`:
+  every entry's return address lands inside the text segment, the table is address-sorted,
+  a live reference genuinely survives a real allocation in a callee-saved register, and
+  the runtime block's own entry count matches what decodes), plus the register-root
+  computation directly (`regalloc_test.go`) and the encoding round-trip directly
+  (`internal/layout/stackmap_test.go`). Nothing consumes the table yet — no engine's
+  behavior changed, and the full differential suite is unchanged.
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
-`docs/deferred.md`: native heap allocation never triggers a collection (the kind data
-and the register allocator's contiguous reference-slot placement are both landed and
-complete; the stack-map table and the collector itself are not — spec/11-codegen.md's
-own DEFERRED note has the full remaining list); integer arithmetic is still 64-bit only
-in both engines; `u64::MAX` has no run-time representation; `match` compiles to a linear
+`docs/deferred.md`: native heap allocation never triggers a collection (the kind data,
+the register allocator's contiguous reference-slot placement, and the stack-map table
+itself are all landed and complete; only the collector that reads the table is not —
+spec/11-codegen.md's own DEFERRED note has the full remaining list); integer arithmetic
+is still 64-bit only in both engines; `u64::MAX` has no run-time representation; `match` compiles to a linear
 chain of arm tests rather than a decision tree; a struct or enum declared inside a
 function body (never checked, per Phase 2's own documented scope) now fails loudly in
 `internal/compile` instead of silently compiling against the wrong descriptor, which is
@@ -305,14 +332,16 @@ escaping value in the same body loses the direct-call fast path for every use on
 boxed at all (ADR-0020's own documented, deliberate simplification — correct, just not
 maximally fast in that one mixed pattern).
 
-**Next action:** native heap collection remains the only large piece of Phase 5 left,
-and everything the stack-map table itself needs is now in place (per-value kind data,
-contiguous reference-slot grouping). The next concrete step is the table: one entry per
-call site (not only a user-visible allocation — any call can transitively allocate),
-sorted by code address in read-only data and reachable from the runtime block, then the
-collector that walks it starting from the immediate caller of `alloc` and up the `rbp`
-chain. Phase 5 is not closed until every phase 4 exit criterion holds under
-`-O0`/`-O1`/`-O2` on native output too, and collection is what that still needs.
+**Next action:** the collector is the only large piece of Phase 5 left, and everything
+it needs is now in place (per-value kind data, contiguous reference-slot grouping, and
+the stack-map table itself, reachable from the runtime block via `rtStackMapOff`/
+`rtStackMapCountOff`). The next concrete step is the collector: starting from the
+immediate caller of `alloc`, walk the `rbp` chain this section's calling convention
+already always maintains, resolve each frame's return address to its map entry via
+`LookupStackMap`, and mark/copy plus relocate every discovered root (register roots per
+`RegMask`, stack roots per `RefOffset`/`RefCount`). Phase 5 is not closed until every
+phase 4 exit criterion holds under `-O0`/`-O1`/`-O2` on native output too, and collection
+is what that still needs.
 
 **Awaiting the user:** the two things only the target machine can confirm — that a
 compiled Mach-O binary runs, and that `lldb` breaks on an Origin source line — are

@@ -132,6 +132,12 @@ type emitter struct {
 
 	fnLabels []x86.Label
 
+	// safepoints accumulates one entry per call site across every function in the
+	// program, in whatever order lowering visits them; buildStackMap sorts and encodes
+	// them once every function's code exists (ADR-0021, spec/11-codegen.md's
+	// "Safepoints and stack maps").
+	safepoints []pendingSafepoint
+
 	// Per-function state.
 	fn       *ir.Func
 	regs     *alloc
@@ -189,7 +195,10 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 		}
 	}
 
+	mapAddr, mapCount := e.buildStackMap()
+
 	data := make([]byte, rtBlockSize)
+	writeStackMapFields(data, mapAddr, mapCount)
 	return &result{
 		text:   e.a.Code(),
 		roData: e.roData,

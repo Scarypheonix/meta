@@ -25,8 +25,15 @@ const (
 	// rtBumpOff and rtEndOff are the runtime block's fields, addressed through r15.
 	rtBumpOff = 0
 	rtEndOff  = 8
+	// rtStackMapOff and rtStackMapCountOff locate the stack-map table (ADR-0021,
+	// spec/11-codegen.md's "Safepoints and stack maps"): its address in read-only data,
+	// and how many entries it holds. Both are compile-time constants, so they are
+	// written directly into the initial data segment rather than by any instruction —
+	// unlike rtBumpOff/rtEndOff, which only mmap's own return value can supply.
+	rtStackMapOff      = 16
+	rtStackMapCountOff = 24
 	// rtBlockSize is the block's size in bytes; it lives in the writable segment.
-	rtBlockSize = 16
+	rtBlockSize = 32
 
 	// wordSize is the size of everything the machine holds in a register.
 	wordSize = 8

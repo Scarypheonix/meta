@@ -404,6 +404,7 @@ func (e *emitter) structuralCompare(v *ir.Value) error {
 	e.a.Pop(x86.RSI)
 	e.a.Pop(x86.RDI)
 	e.a.Call(e.rt.equalObjects)
+	e.recordCall(v)
 	if v.Op == ir.OpNe {
 		e.a.XorRI(x86.RAX, 1)
 	}
@@ -424,6 +425,7 @@ func (e *emitter) stringOrder(v *ir.Value) error {
 	e.a.Pop(x86.RSI)
 	e.a.Pop(x86.RDI)
 	e.a.Call(e.rt.compareBytes)
+	e.recordCall(v)
 	e.a.CmpRI(x86.RAX, 0)
 	e.a.Setcc(signedCond(v.Op), x86.RAX)
 	e.a.Movzx8(x86.RAX, x86.RAX)
@@ -492,6 +494,7 @@ func (e *emitter) call(v *ir.Value) error {
 		e.a.Pop(argRegs[i])
 	}
 	e.a.Call(e.fnLabels[callee.Const])
+	e.recordCall(v)
 	e.def(v, x86.RAX)
 	return nil
 }
@@ -516,6 +519,7 @@ func (e *emitter) closure(v *ir.Value) error {
 	e.a.MovRI(x86.RDI, desc.Words)
 	e.a.MovRI(x86.RSI, uint64(ci.Type))
 	e.a.Call(e.rt.alloc)
+	e.recordCall(v)
 	e.a.MovRR(scratchB, x86.RAX) // the new object's reference, saved across the pops
 	for i := len(v.Args) - 1; i >= 0; i-- {
 		e.a.Pop(scratchA)
@@ -585,6 +589,7 @@ func (e *emitter) callClosure(v *ir.Value) error {
 	e.a.Push(scratchA)
 	e.a.Push(scratchA)
 	e.a.CallReg(scratchB)
+	e.recordCall(v)
 	e.a.AddRI(x86.RSP, 16)
 	e.def(v, x86.RAX)
 	return nil
@@ -603,6 +608,7 @@ func (e *emitter) builtin(v *ir.Value) error {
 		} else {
 			e.a.Call(e.rt.print)
 		}
+		e.recordCall(v)
 		e.a.XorRR(scratchA, scratchA)
 		e.def(v, scratchA)
 		return nil
@@ -692,6 +698,7 @@ func (e *emitter) buildOrdering(v *ir.Value) error {
 		e.a.MovRR(x86.RDI, scratchA)
 		e.a.MovRR(x86.RSI, scratchB)
 		e.a.Call(e.rt.compareBytes)
+		e.recordCall(v)
 		e.a.CmpRI(x86.RAX, 0)
 		e.a.Jcc(x86.Less, less)
 		e.a.Jcc(x86.Greater, greater)
@@ -705,6 +712,7 @@ func (e *emitter) buildOrdering(v *ir.Value) error {
 		e.a.XorRR(x86.RDI, x86.RDI) // Less/Equal/Greater all carry no payload
 		e.a.MovRI(x86.RSI, uint64(e.prog.Variants[idx].Type))
 		e.a.Call(e.rt.alloc)
+		e.recordCall(v)
 	}
 
 	e.a.Bind(less)
@@ -752,6 +760,7 @@ func (e *emitter) construct(v *ir.Value, t layout.TypeID) error {
 	e.a.MovRI(x86.RDI, desc.Words)
 	e.a.MovRI(x86.RSI, uint64(t))
 	e.a.Call(e.rt.alloc)
+	e.recordCall(v)
 	e.a.MovRR(scratchB, x86.RAX) // the new object's reference, saved across the pops
 	for i := len(v.Args) - 1; i >= 0; i-- {
 		e.a.Pop(scratchA)
@@ -768,6 +777,7 @@ func (e *emitter) toStr(v *ir.Value) error {
 	case bytecode.KindInt, bytecode.KindUint:
 		e.load(x86.RDI, v.Args[0])
 		e.a.Call(e.rt.intToStr)
+		e.recordCall(v)
 		e.def(v, x86.RAX)
 		return nil
 	case bytecode.KindString:

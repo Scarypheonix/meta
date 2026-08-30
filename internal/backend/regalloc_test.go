@@ -166,6 +166,43 @@ func TestReferenceSpillSlotsAreContiguousAndBelowRawOnes(t *testing.T) {
 	}
 }
 
+// TestCallSiteRegsNamesOnlyTheLiveReferenceInACalleeSavedRegister is a stack map's
+// register-root set, computed directly: of two values both live across the same call
+// (a reference and a raw one, both necessarily in callee-saved registers per ADR-0018's
+// own allocation invariant), callSiteRegs at that call must name the reference's
+// register and never the raw one's.
+func TestCallSiteRegsNamesOnlyTheLiveReferenceInACalleeSavedRegister(t *testing.T) {
+	f := ir.NewFunc("regroot", 0, 0)
+	entry := f.Entry
+	ref := entry.Append(f.NewValue(ir.OpStruct, diag.Span{})) // KindRef
+	raw := entry.Append(f.NewValue(ir.OpFunc, diag.Span{}))   // KindInt
+	call := entry.Append(f.NewValue(ir.OpToStr, diag.Span{}, raw))
+	tup := entry.Append(f.NewValue(ir.OpTuple, diag.Span{}, ref, raw, call))
+	entry.SetTerminator(f.NewValue(ir.OpReturn, diag.Span{}, tup))
+	f.RecomputeUses()
+
+	propagateKinds(f, &bytecode.Program{})
+	a := allocate(f)
+
+	refLoc, ok := a.where[ref]
+	if !ok || refLoc.spilled() {
+		t.Fatalf("ref did not get a register (loc=%+v, ok=%v); the test needs it to, to mean anything", refLoc, ok)
+	}
+	rawLoc, ok := a.where[raw]
+	if !ok || rawLoc.spilled() {
+		t.Fatalf("raw did not get a register (loc=%+v, ok=%v); the test needs it to, to mean anything", rawLoc, ok)
+	}
+
+	regs, ok := a.callSiteRegs[call]
+	if !ok {
+		t.Fatal("call has no entry in callSiteRegs at all")
+	}
+	if len(regs) != 1 || regs[0] != refLoc.reg {
+		t.Errorf("callSiteRegs[call] = %v, want exactly [%v] (ref's register, not raw's %v)",
+			regs, refLoc.reg, rawLoc.reg)
+	}
+}
+
 // TestAllocatePanicsRatherThanGuessAnUnknownKindAcrossACall is the other side of
 // ADR-0021's soundness argument: a value whose kind propagateKinds could not resolve,
 // forced to spill while live across a call, must never be silently grouped as "raw" --

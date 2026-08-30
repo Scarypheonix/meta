@@ -64,6 +64,14 @@ type alloc struct {
 	// used lists the callee-saved registers the function actually assigned, so the
 	// prologue saves those and no others.
 	used []x86.Reg
+	// callSiteRegs maps a value whose lowering emits a call (clobbersCallerSaved) to
+	// the callee-saved registers holding a live reference at that exact point --
+	// necessarily a subset of the four callee-saved registers, never a caller-saved
+	// one, because any interval spanning a call already had to choose one of those or
+	// spill (see the allocation loop above). This is a stack map's register-root set,
+	// in the deterministic order intervals() itself sorts in (start position, then
+	// value id), which spec/11-codegen.md's determinism requirement needs.
+	callSiteRegs map[*ir.Value][]x86.Reg
 }
 
 // order linearizes the blocks in reverse postorder, which is the order the code is
@@ -449,6 +457,28 @@ func allocate(f *ir.Func) *alloc {
 		if usedCallee[r] {
 			a.used = append(a.used, r)
 		}
+	}
+
+	a.callSiteRegs = map[*ir.Value][]x86.Reg{}
+	for v, at := range n.index {
+		if !clobbersCallerSaved(v.Op) {
+			continue
+		}
+		var regs []x86.Reg
+		for _, iv := range ivs {
+			if !(at > iv.start && at <= iv.end) {
+				continue
+			}
+			if !isRefKind(iv.val.Kind) {
+				continue
+			}
+			l, ok := a.where[iv.val]
+			if !ok || l.spilled() || !isCalleeSaved(l.reg) {
+				continue
+			}
+			regs = append(regs, l.reg)
+		}
+		a.callSiteRegs[v] = regs
 	}
 	return a
 }
