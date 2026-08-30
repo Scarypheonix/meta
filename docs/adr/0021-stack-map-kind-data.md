@@ -63,22 +63,31 @@ every answer on hand from the checker's own type tables:
   mirroring the checker's already-existing (but internal) `FnSig.Self`, since nothing
   outside the checker could otherwise learn a method's own receiver type.
 
-`internal/backend`'s own pass (not yet written; see "Consequences") is what will
-propagate these seed values across the rest of the IR — every op above with a
-structurally-derivable kind — the same way `internal/backend/closures.go`'s
+`internal/backend/kinds.go`'s `propagateKinds` is what carries these seed values across
+the rest of the IR — every op above with a structurally-derivable kind, plus `OpPhi`'s
+own small fixed point over its operands — the same way `internal/backend/closures.go`'s
 `resolveClosureCalls` already computes a native-only property purely from the IR its own
-`buildIR` builds, entirely apart from `internal/ir`, `internal/opt` or the VM. This ADR
-covers only the seed data; the propagation pass, the register allocator's placement of
-reference-kind spill slots as one contiguous run (already specified,
-spec/11-codegen.md's "Stack frames"), the stack-map table itself, and the collector that
-consumes it are the work `docs/deferred.md` still lists as open.
+`buildIR` builds, entirely apart from `internal/ir`, `internal/opt` or the VM. It runs
+right after `resolveClosureCalls`, in the same `buildIR` step, so `OpBoxFn` and a
+repointed `OpCallClosure` already have their final `Op` by the time it sees them.
+`ir.Value` itself gained a `Kind` field to carry this — populated partly by `ir.Build`
+(wherever the four seeded ops' answer is already in the `bytecode.Instr`/`bytecode.Fn`
+it is translating, with no extra context needed) and completed by `propagateKinds`
+(`OpConst`, which needs the constant pool `ir.Build` does not have, and everything else).
+This ADR's remaining open work is the register allocator's placement of reference-kind
+spill slots as one contiguous run (already specified, spec/11-codegen.md's "Stack
+frames"), the stack-map table itself, and the collector that consumes it —
+`docs/deferred.md` has the current list.
 
 ## Consequences
-- **Nothing observable changes.** This lands the seed data and nothing that reads it
-  yet, verified directly (`internal/compile/kind_test.go` asserts the exact `Kind` on
-  hand-picked programs covering a struct field, a variant payload, a tuple element, a
-  call result, a method's `self`, and a closure's captures) and indirectly (the full
-  differential suite is unchanged, because no engine's behavior depends on this data).
+- **Nothing observable changes.** This lands the seed data and the pass that completes
+  it into every value's actual kind, but nothing yet reads that result to change what
+  the backend emits — no register allocator behavior, no table, no collection. Verified
+  directly (`internal/compile/kind_test.go` for the seed data; `internal/backend/kinds_test.go`
+  for the completed kind, including `OpConst`, every structurally-fixed op, `OpPhi`
+  across a branch, and a boxed bare function's `OpBoxFn`/`OpCallClosure` pair) and
+  indirectly (the full differential suite is unchanged, because no engine's behavior
+  depends on this data).
 - **No write barrier, no card table, and no generational split are part of this phase's
   design.** `OpSetField` gets a `Kind` for symmetry with the other three field-access
   ops, but a barrier is what a *generational* collector needs to find old-to-young

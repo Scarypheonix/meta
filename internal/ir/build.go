@@ -197,6 +197,9 @@ func (b *builder) translate() error {
 	for i := 0; i < b.src.Params && i < b.nLocals; i++ {
 		v := b.f.NewValue(OpParam, b.src.Span)
 		v.Aux = i
+		if i < len(b.src.ParamKinds) {
+			v.Kind = b.src.ParamKinds[i]
+		}
 		b.f.Entry.Append(v)
 		b.f.Entry.defs[i] = v
 	}
@@ -316,6 +319,9 @@ func (b *builder) translateInstr(blk *Block, in bytecode.Instr, pc int) (bool, e
 	case bytecode.OpLoadCapture:
 		v := b.f.NewValue(OpCapture, in.Span)
 		v.Aux = int(in.A)
+		if i := int(in.A); i >= 0 && i < len(b.src.CaptureKinds) {
+			v.Kind = b.src.CaptureKinds[i]
+		}
 		b.push(blk.Append(v))
 	case bytecode.OpPop:
 		b.pop()
@@ -365,6 +371,7 @@ func (b *builder) translateInstr(blk *Block, in bytecode.Instr, pc int) (bool, e
 		args := b.popN(int(in.A) + 1)
 		v := b.f.NewValue(OpCall, in.Span, args...)
 		v.Aux = int(in.A)
+		v.Kind = in.Kind
 		b.push(blk.Append(v))
 
 	case bytecode.OpCallBuiltin:
@@ -417,6 +424,11 @@ func (b *builder) translateInstr(blk *Block, in bytecode.Instr, pc int) (bool, e
 		args := b.popN(pops)
 		v := b.f.NewValue(op, in.Span, args...)
 		v.Const = int(in.A)
+		// Only OpGetField, OpGetPayload and OpGetTupleElem (all mapped to ir.OpGetField)
+		// carry a meaningful Kind here; every other op reaching default leaves in.Kind at
+		// its zero value, KindUnknown, which is exactly what a value whose kind is not
+		// yet known here should have.
+		v.Kind = in.Kind
 		b.push(blk.Append(v))
 	}
 	return false, nil

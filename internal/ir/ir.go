@@ -221,6 +221,18 @@ type Value struct {
 	// closure, the cast's target for OpCast, the slot for OpParam and OpCapture.
 	Aux int
 
+	// Kind is bytecode.KindUnknown for most values: it is populated here only where
+	// Build can read it straight off the bytecode with no extra context (OpParam and
+	// OpCapture from the function's ParamKinds/CaptureKinds, and a field/payload/
+	// tuple-element read or a call from the instruction's own Kind, ADR-0021). It is
+	// not a general property of the IR — internal/opt and the VM path never read it —
+	// and it is not, on its own, every value's final kind: internal/backend's own
+	// kind-propagation pass is what extends this seed to values Build cannot label
+	// (OpConst, which needs the constant pool Build does not have; every value whose
+	// kind is fixed by its operation alone; and anything derived, like a φ, from ones
+	// that are already known).
+	Kind bytecode.Kind
+
 	// Span is where the value came from, so a trap names a source location.
 	Span diag.Span
 

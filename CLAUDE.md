@@ -257,44 +257,48 @@ This project outlasts any single context window.
   back out of a struct field — byte-identical across the interpreter, VM, and native at
   every optimization level; landed permanently as `tests/e2e/cases/fn_value_escapes`
   alongside the pre-existing `closure_counter`, now off the native skip list entirely.
-- **The kind data a stack map needs now exists (ADR-0021)**, the first step toward
-  native heap collection. `bytecode.Instr` gained a `Kind` field for the handful of
-  instructions whose result the backend cannot otherwise tell is a reference at all — a
-  field/payload/tuple-element read, and a call — and `bytecode.Fn` gained
-  `ParamKinds`/`CaptureKinds`. `internal/compile` populates all of it from the checker's
-  own already-computed types, at the same points ADR-0019's object-layout code already
-  reads them; a method's receiver kind needed one small new checker export
-  (`check.Result.SelfTypes`), mirroring the checker's existing internal `FnSig.Self`.
-  Nothing consumes this data yet — no engine's behavior changed, verified both directly
-  (`internal/compile/kind_test.go`, new, asserts the exact `Kind` on hand-picked programs
-  covering a struct field, a variant payload, a tuple element, a call result, `self`,
-  and a closure's captures) and by the full differential suite being unchanged. Every
-  other IR value's kind (arithmetic is always raw, a `phi` is whatever its operands
-  already are, and so on) is structurally derivable and does not need bytecode to carry
-  it — that propagation, the register allocator's placement of reference-kind spill
-  slots as one contiguous run, the stack-map table itself, and the collector that reads
-  it are the still-open next steps, laid out in spec/11-codegen.md's "Safepoints and
-  stack maps" and ADR-0021.
+- **Every value the register allocator will ever give a home to now has a known kind
+  (ADR-0021)**, the groundwork native heap collection needs. `bytecode.Instr` gained a
+  `Kind` field for the handful of instructions whose result the backend cannot otherwise
+  tell is a reference at all — a field/payload/tuple-element read, and a call — and
+  `bytecode.Fn` gained `ParamKinds`/`CaptureKinds`; `internal/compile` populates all of
+  it from the checker's own already-computed types, at the same points ADR-0019's
+  object-layout code already reads them (a method's receiver kind needed one small new
+  checker export, `check.Result.SelfTypes`, mirroring the checker's existing internal
+  `FnSig.Self`). `internal/backend/kinds.go`'s `propagateKinds`, a new native-only IR
+  pass run right after `closures.go`'s `resolveClosureCalls` in the same `buildIR` step,
+  carries that seed to everything else structurally — arithmetic is always raw, an
+  aggregate construction is always a reference, a `phi` is whatever its operands already
+  are (a small fixed point, since an operand can itself be another `phi` on a loop back
+  edge) — including the two ops `resolveClosureCalls` itself produces (`OpBoxFn` is
+  always a reference; a repointed `OpCallClosure` keeps the kind it had as `OpCall`).
+  Nothing consumes any of this yet — no engine's behavior changed, verified both directly
+  (`internal/compile/kind_test.go` for the seed data; `internal/backend/kinds_test.go`
+  for the completed kind, including a boxed bare function's `OpBoxFn`/`OpCallClosure`
+  pair specifically) and by the full differential suite being unchanged.
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
 `docs/deferred.md`: native heap allocation never triggers a collection (the kind data
-above is landed; the propagation pass, the stack-map table and the collector itself are
-not — spec/11-codegen.md's own DEFERRED note has the full remaining list); integer
-arithmetic is still 64-bit only in both engines; `u64::MAX` has no run-time
-representation; `match` compiles to a linear chain of arm tests rather than a decision
-tree; a struct or enum declared inside a function body (never checked, per Phase 2's own
-documented scope) now fails loudly in `internal/compile` instead of silently compiling
-against the wrong descriptor, which is safer but still not a fix; and a function used
-both as a direct callee and as an escaping value in the same body loses the direct-call
-fast path for every use once it is boxed at all (ADR-0020's own documented, deliberate
-simplification — correct, just not maximally fast in that one mixed pattern).
+above is landed and complete; the register allocator's contiguous reference-slot
+placement, the stack-map table and the collector itself are not — spec/11-codegen.md's
+own DEFERRED note has the full remaining list); integer arithmetic is still 64-bit only
+in both engines; `u64::MAX` has no run-time representation; `match` compiles to a linear
+chain of arm tests rather than a decision tree; a struct or enum declared inside a
+function body (never checked, per Phase 2's own documented scope) now fails loudly in
+`internal/compile` instead of silently compiling against the wrong descriptor, which is
+safer but still not a fix; and a function used both as a direct callee and as an
+escaping value in the same body loses the direct-call fast path for every use once it is
+boxed at all (ADR-0020's own documented, deliberate simplification — correct, just not
+maximally fast in that one mixed pattern).
 
 **Next action:** native heap collection remains the only large piece of Phase 5 left,
-and the next concrete step on it is the `internal/backend`-only kind-propagation pass
-(mirroring `closures.go`'s `resolveClosureCalls`) that extends ADR-0021's seed data to
-every IR value, which is what the register allocator's contiguous reference-slot
-placement and the stack-map table both need as their input. Phase 5 is not closed until
-every phase 4 exit criterion holds under `-O0`/`-O1`/`-O2` on native output too, and
+and the next concrete step is the register allocator's own change: placing every
+reference-kind spill slot in one contiguous run below the raw ones (already specified,
+spec/11-codegen.md's "Stack frames" — the point of the run being contiguous is that a
+stack map can then say "N reference slots starting at offset K" instead of a bitmap).
+That, plus the now-complete per-value kind data, is everything the stack-map table
+itself needs. Phase 5 is not closed until every phase 4 exit criterion holds under
+`-O0`/`-O1`/`-O2` on native output too, and
 collection is what that still needs.
 
 **Awaiting the user:** the two things only the target machine can confirm — that a

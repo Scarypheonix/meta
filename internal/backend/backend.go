@@ -75,6 +75,7 @@ func buildIR(prog *bytecode.Program) ([]*ir.Func, error) {
 			return nil, fmt.Errorf("building %s: %w", fn.Name, err)
 		}
 		resolveClosureCalls(f)
+		propagateKinds(f, prog)
 		out[i] = f
 	}
 	return out, nil

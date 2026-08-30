@@ -124,16 +124,17 @@ frame's shape independently.
 DEFERRED: stack maps are not emitted yet, and native code therefore allocates without
 collecting. A precise map requires knowing which frame slots hold references, and the
 SSA IR does not carry that on its own: it is built from bytecode (ADR-0016), which has no
-types. ADR-0021 supplies the seed of that answer — `internal/compile` now attaches each
-field/payload/tuple-element read's and each call's result kind to the bytecode
-instruction itself, and each function's parameter and capture kinds to the `bytecode.Fn`
-— since those are exactly the places nothing else downstream can recover a value's kind
-from. What is still missing, and still scheduled in `docs/deferred.md`:
+types. ADR-0021 closes that gap: `internal/compile` attaches each field/payload/
+tuple-element read's and each call's result kind to the bytecode instruction itself, and
+each function's parameter and capture kinds to the `bytecode.Fn`, at the places nothing
+downstream can recover a value's kind from otherwise; `internal/backend/kinds.go`'s
+`propagateKinds` — the same native-only IR pass shape as `closures.go`'s
+`resolveClosureCalls`, entirely apart from `internal/ir`, `internal/opt` or the VM —
+carries that seed to every other value structurally (an arithmetic op is always raw, a
+`phi` is whatever its operands already are, and so on), so every value the register
+allocator will ever give a home to now has a known kind. What is still missing, and
+still scheduled in `docs/deferred.md`:
 
-- An `internal/backend`-only pass that propagates a kind to every other IR value
-  structurally from that seed data (an arithmetic op is always raw, a `phi` is whatever
-  its operands already are, and so on) — the same shape as `internal/backend/closures.go`'s
-  `resolveClosureCalls`, entirely apart from `internal/ir`, `internal/opt` or the VM.
 - The register allocator placing every reference-kind spill slot in one contiguous run,
   as this section's "Stack frames" already specifies, which is what turns a stack map
   into two integers rather than a bitmap.
