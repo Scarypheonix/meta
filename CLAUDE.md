@@ -376,6 +376,22 @@ This project outlasts any single context window.
   still hits `unimplemented:` — that gap is real and unchanged — but nothing in the
   differential suite depends on it anymore, which is the state `docs/deferred.md` always
   called correct for Phase 5.
+- **Root-caused and fixed the `-O2` fixed-point bug** the collector's own stress test
+  had surfaced. `CommonSubexpressions` (`internal/opt/cse.go`) reported `changed`
+  whenever it found a dominating duplicate expression, even when that duplicate already
+  had zero uses left to replace. A trapping operation's own duplicate instruction
+  survives `DeadCodeElimination` forever once CSE has merged it (ADR-0005: it can still
+  trap, so an unused instance is never removed just because its uses were redirected
+  elsewhere), so every subsequent round rediscovered the exact same already-merged,
+  still-present pair and reported a change anyway — the pipeline (`runPasses`, `opt.go`)
+  could never reach the fixed point it was looking for on any function shaped like that.
+  Fixed by reporting `changed` only when a use was actually replaced, which is what
+  makes a second pass over an unchanged pair genuinely a no-op. Verified directly
+  (`internal/opt/opt_test.go`'s `TestCommonSubexpressionsIsIdempotentOnAnUnusedTrappingDuplicate`,
+  confirmed to fail without the fix) and end to end
+  (`tests/e2e/cases/opt_cse_converges_on_a_trapping_duplicate`, the minimal repro: two
+  loop-carried variables each assigned from the loop counter a different way, one
+  iteration apart).
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
 `docs/deferred.md`: integer arithmetic is still 64-bit only in both engines; `u64::MAX`
@@ -388,11 +404,9 @@ direct-call fast path for every use once it is boxed at all (ADR-0020's own docu
 deliberate simplification); native heap collection is single-space and non-generational,
 with no write barrier (ADR-0022's own deliberate scope, satisfying the same language-
 level guarantees as the VM/interpreter's generational collector, see spec/08-memory-
-model.md); `to_str` on a `Float` is unimplemented in native code (no spec fixes a
+model.md); and `to_str` on a `Float` is unimplemented in native code (no spec fixes a
 rendering yet — Phase 7, per `docs/deferred.md` — and nothing in the differential suite
-needs it now); and a `-O2` fixed-point non-convergence on a specific loop-carried-
-assignment shape, found while building the collector's own stress test but unrelated to
-it (see above), is not yet root-caused.
+needs it now).
 
 **Next action:** every automatable piece of Phase 5's own exit criterion is now met —
 `./check` passes clean, `nativeSkips` is empty, and the full differential suite (every
@@ -401,7 +415,6 @@ including exit status. What is left is exactly what ADR-0003 always scoped as ou
 what the implementer can claim: **Phase 5 is not complete until the user confirms, on
 the actual target machine**, that a compiled Mach-O binary runs and that `lldb` breaks
 on an Origin source line (ADR-0003's "Consequences" — that confirmation is a checklist
-item for `docs/phases/5-complete.md`, not something to write preemptively). Root-causing
-the `-O2` fixed-point bug above is worth doing but does not block this. A prebuilt
+item for `docs/phases/5-complete.md`, not something to write preemptively). A prebuilt
 `darwin/amd64` binary of `originc` itself (cross-compiled here, no Go install needed on
 the Mac) has already been handed to the user for exactly this confirmation.

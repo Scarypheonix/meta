@@ -77,9 +77,19 @@ func CommonSubexpressions(f *ir.Func, prog *bytecode.Program) bool {
 				if earlier == v || !d.ValueDominates(earlier, v) {
 					continue
 				}
-				f.ReplaceAllUses(v, earlier)
 				replaced = true
-				changed = true
+				// A trapping op's own instruction survives DCE even with no uses left
+				// (DeadCodeElimination keeps it precisely because it can trap), so a
+				// value already fully replaced in an earlier round is still here to be
+				// found again -- rediscovering it is not new work. Reporting `changed`
+				// only when there was a use left to replace is what makes this pass
+				// idempotent once nothing is actually being rewritten any more; without
+				// it, the pipeline never reaches runPasses's fixed point on a function
+				// with an unused-but-still-present duplicate of a trapping expression.
+				if v.Uses() > 0 {
+					f.ReplaceAllUses(v, earlier)
+					changed = true
+				}
 				break
 			}
 			if !replaced {

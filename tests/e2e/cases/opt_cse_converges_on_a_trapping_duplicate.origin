@@ -1,0 +1,14 @@
+use std::io;
+
+fn main() {
+    let mut a: i64 = 0;
+    let mut b: i64 = 1;
+    let mut i: i64 = 0;
+    while i < 100 {
+        a = i;
+        b = i + 1;
+        i = i + 1;
+    }
+    io::println(a.to_str());
+    io::println(b.to_str());
+}

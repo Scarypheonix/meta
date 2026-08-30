@@ -207,6 +207,37 @@ func TestCommonSubexpressionsMergesEqualComputations(t *testing.T) {
 	}
 }
 
+// TestCommonSubexpressionsIsIdempotentOnAnUnusedTrappingDuplicate guards a real bug: a
+// trapping duplicate (ADR-0005's own reason DeadCodeElimination keeps it) stays in its
+// block with no uses once CSE has merged it once, so a second pass finds the very same
+// dominating pair again. Reporting a change that second time -- as an earlier version
+// did, unconditionally on any match -- means runPasses (opt.go) never reaches a fixed
+// point on any function shaped like this one, which is exactly what happened building
+// the native collector's own stress test (docs/deferred.md, `-O2` fixed-point bug).
+func TestCommonSubexpressionsIsIdempotentOnAnUnusedTrappingDuplicate(t *testing.T) {
+	p := prog()
+	f, b := straight("idempotent")
+	x, y := konst(f, b, p, 3), konst(f, b, p, 4)
+	first := b.Append(f.NewValue(ir.OpAdd, diag.Span{}, x, y))
+	second := b.Append(f.NewValue(ir.OpAdd, diag.Span{}, x, y))
+	finish(f, b, second)
+
+	if !CommonSubexpressions(f, p) {
+		t.Fatal("two identical trapping additions were not merged on the first pass")
+	}
+	if f.Entry.Term.Args[0] != first {
+		t.Fatalf("the return reads %v, want the first add", f.Entry.Term.Args[0])
+	}
+	// DeadCodeElimination would ordinarily run next in the real pipeline and, correctly
+	// per ADR-0005, leaves `second` in place -- it can still trap, so an unused instance
+	// is never removed just because CSE redirected its uses elsewhere. `first` and
+	// `second` are therefore still both here, still an exact dominating match.
+	if CommonSubexpressions(f, p) {
+		t.Fatal("a second pass over an already-merged, still-present trapping duplicate " +
+			"reported a change; the pipeline would never converge")
+	}
+}
+
 // TestCommonSubexpressionsNeverMergesAllocations: two struct literals are distinct
 // objects and `ref_eq` can tell them apart (spec/04-expressions.md), so merging them
 // would change what a program observes.
