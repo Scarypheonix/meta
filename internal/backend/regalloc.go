@@ -279,6 +279,28 @@ func intervals(f *ir.Func, n *numbering) []*interval {
 				}
 			}
 		}
+		// A value b supplies to a successor's φ must survive to the physical end of b,
+		// where the edge's phi-copy code (backend.go's phiCopies) reads it — even when
+		// the value is defined in b itself. liveOut[b] does not carry this: liveness's
+		// own uses/defs dataflow deliberately excludes a same-block definition from
+		// that block's "uses" (a φ operand is used by the predecessor conceptually, not
+		// literally by an instruction there), which is correct for propagating
+		// liveness *across* block boundaries but leaves a purely-local def-then-φ-use
+		// invisible to it. Without this, such a value's interval ends at its own
+		// defining instruction, the allocator reuses its register for whatever comes
+		// next in the block, and phiCopies reads back garbage -- silently, since
+		// nothing here checks that a location is still the right one.
+		for _, s := range b.Succs {
+			idx := predIndex(s, b)
+			if idx < 0 {
+				continue
+			}
+			for _, p := range s.Phis {
+				if idx < len(p.Args) && p.Args[idx] != nil {
+					extend(p.Args[idx], n.end[b])
+				}
+			}
+		}
 	}
 
 	out := make([]*interval, 0, len(byVal))

@@ -6,6 +6,7 @@ import (
 	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/ir"
+	"github.com/scarypheonix/meta/internal/layout"
 	"github.com/scarypheonix/meta/internal/x86"
 )
 
@@ -145,6 +146,49 @@ func (e *emitter) instr(v *ir.Value) error {
 	case ir.OpTrap:
 		msg := e.prog.Consts[v.Const].Str
 		e.trapWith(e.trapMessage(msg, v.Span))
+
+	case ir.OpStruct:
+		if v.Const < 0 || v.Const >= len(e.prog.Structs) {
+			return fmt.Errorf("this is a compiler bug: struct index %d is out of range", v.Const)
+		}
+		return e.construct(v, e.prog.Structs[v.Const])
+
+	case ir.OpTuple:
+		return e.construct(v, layout.TypeID(v.Const))
+
+	case ir.OpVariant:
+		if v.Const < 0 || v.Const >= len(e.prog.Variants) {
+			return fmt.Errorf("this is a compiler bug: variant index %d is out of range", v.Const)
+		}
+		return e.construct(v, e.prog.Variants[v.Const].Type)
+
+	case ir.OpGetField:
+		e.load(scratchA, v.Args[0])
+		e.a.MovRM(scratchB, x86.At(scratchA, fieldOffset(v.Const)))
+		e.def(v, scratchB)
+
+	case ir.OpSetField:
+		e.load(scratchA, v.Args[0])
+		e.load(scratchB, v.Args[1])
+		e.a.MovMR(x86.At(scratchA, fieldOffset(v.Const)), scratchB)
+
+	case ir.OpIsVariant:
+		if v.Const < 0 || v.Const >= len(e.prog.Variants) {
+			return fmt.Errorf("this is a compiler bug: variant index %d is out of range", v.Const)
+		}
+		e.load(scratchA, v.Args[0])
+		e.a.MovRM(scratchB, x86.At(scratchA, 0)) // the header word
+		// The low 32 bits are the object's TypeID (internal/layout.Header); AndRI's
+		// 32-bit immediate sign-extends over a 64-bit operand, which would leave the
+		// high bits untouched for a mask like this one, so the mask is built in a
+		// register instead.
+		e.a.MovRI(x86.RAX, 0xFFFFFFFF)
+		e.a.AndRR(scratchB, x86.RAX)
+		e.a.MovRI(x86.RAX, uint64(e.prog.Variants[v.Const].Type))
+		e.a.CmpRR(scratchB, x86.RAX)
+		e.a.Setcc(x86.Equal, x86.RAX)
+		e.a.Movzx8(x86.RAX, x86.RAX)
+		e.def(v, x86.RAX)
 
 	default:
 		return fmt.Errorf("unimplemented: the native backend does not lower %s yet", v.Op)
@@ -408,8 +452,60 @@ func (e *emitter) builtin(v *ir.Value) error {
 		e.a.Call(e.rt.panic)
 		e.a.Ud2()
 		return nil
+
+	case compile.BuiltinRefEq:
+		// Identity, not equality: two references compare equal exactly when they name
+		// the same object, which for a reference is bit-for-bit register equality —
+		// no runtime call, unlike the aggregate builtins below.
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: ref_eq takes two arguments, got %d", len(v.Args))
+		}
+		e.load(scratchA, v.Args[0])
+		e.load(scratchB, v.Args[1])
+		e.a.CmpRR(scratchA, scratchB)
+		e.a.Setcc(x86.Equal, x86.RAX)
+		e.a.Movzx8(x86.RAX, x86.RAX)
+		e.def(v, x86.RAX)
+		return nil
 	}
 	return fmt.Errorf("unimplemented: builtin %d in native code", v.Const)
+}
+
+// fieldOffset is where payload word i sits, relative to an object reference (which
+// points at the header, spec/11-codegen.md's "Object layout in native code").
+func fieldOffset(i int) int32 { return int32(objHeaderSize + wordSize*i) }
+
+// construct lowers OpStruct, OpTuple and OpVariant: allocate an object of the given
+// exact layout (ADR-0019) and fill its fields from the operands, in order.
+//
+// Every field value is pushed to the stack before the call to the allocator, rather
+// than kept in a register: the allocator call clobbers the caller-saved registers, and
+// nothing here may assume an operand's home survives across it (the same reason
+// e.call pushes its arguments).
+func (e *emitter) construct(v *ir.Value, t layout.TypeID) error {
+	desc := e.prog.Types.Get(t)
+	for i, a := range v.Args {
+		if desc.Kinds[i] == layout.WordRef && a.Op == ir.OpFunc {
+			// A bare top-level function reference is TagFn at the VM's level: an index,
+			// not a heap object. Writing one into a reference-shaped field needs the
+			// same boxing into a captureless closure the VM does (ADR-0019), and native
+			// closures do not exist yet (this function's own caller already rejects a
+			// closure literal for the same reason).
+			return fmt.Errorf("unimplemented: a bare function value in a field, in native code")
+		}
+		e.load(scratchA, a)
+		e.a.Push(scratchA)
+	}
+	e.a.MovRI(x86.RDI, desc.Words)
+	e.a.MovRI(x86.RSI, uint64(t))
+	e.a.Call(e.rt.alloc)
+	e.a.MovRR(scratchB, x86.RAX) // the new object's reference, saved across the pops
+	for i := len(v.Args) - 1; i >= 0; i-- {
+		e.a.Pop(scratchA)
+		e.a.MovMR(x86.At(scratchB, fieldOffset(i)), scratchA)
+	}
+	e.def(v, scratchB)
+	return nil
 }
 
 // toStr renders a value as a String.

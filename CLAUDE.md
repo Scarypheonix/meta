@@ -174,32 +174,46 @@ This project outlasts any single context window.
 - `internal/x86`: a hand-written instruction encoder for the subset the backend needs.
 - `internal/obj`: complete Mach-O and ELF executable writers sharing one instruction
   stream (ADR-0003), no linker involved (ADR-0017).
-- `internal/backend`: lowers the SSA IR to machine code for the *non-allocating*
-  subset — integer/float/bool arithmetic with trapping semantics, comparisons, control
-  flow, and direct/indirect calls under the System V calling convention. `originc build`
-  is wired up and native output sits in the same differential the other two engines run
-  (`tests/e2e`'s `TestEnginesAgree`-equivalent for native, plus direct ELF execution).
+- `internal/backend`: lowers the SSA IR to machine code for integer/float/bool
+  arithmetic with trapping semantics, comparisons, control flow, direct/indirect calls
+  under the System V calling convention, and — now that exact layouts exist —
+  `OpStruct`/`OpTuple`/`OpVariant` construction and `OpGetField`/`OpSetField`/
+  `OpIsVariant` field access, allocating through the runtime's bump allocator
+  (`alloc`). `originc build` is wired up and native output sits in the same
+  differential the other two engines run; the `nativeSkips` list in `tests/e2e` is
+  the live, honest record of what native still cannot do, and it is shrinking rather
+  than growing.
 - `internal/layout` now has its second reader: with exact layouts in place, the backend
-  can read a field's offset and pointer-ness directly from its `Descriptor`, which is
-  what a stack map will need.
+  reads a field's offset and pointer-ness directly from its `Descriptor` — no
+  descriptor lookup at run time, since the offset is baked into the instruction.
+- Found and fixed a real register-allocator bug while extending the differential: a
+  value used only as a successor block's φ argument for the edge leaving its own
+  defining block got an interval that ended at its own definition, so the allocator
+  could recycle its register before the back-edge's φ copy read it back. Any loop with
+  two or more live loop-carried values (a counter and an accumulator, say) could
+  silently collapse them onto one. Regression-tested directly against `intervals()` and
+  `allocate()` in `internal/backend/regalloc_test.go`.
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
-`docs/deferred.md`: the backend does not yet lower `OpStruct`/`OpTuple`/`OpVariant`/
-`OpClosure` — any program that allocates still needs `--vm` or the interpreter, since
-native heap allocation needs a runtime (bump allocator, collection triggering, stack
-maps and safepoints at every call and loop back-edge per spec/08-memory-model.md) that
-has not been built yet; integer arithmetic is still 64-bit only in both engines (exact
-layouts give a field its declared width statically, but arithmetic itself doesn't trap
-or wrap at anything narrower yet); `u64::MAX` has no run-time representation; the
-bytecode compiler does not lower `for` loops (the interpreter runs them); and `match`
-compiles to a linear chain of arm tests rather than a decision tree.
+`docs/deferred.md`: closures are not lowered natively at all yet (construction, capture
+reads, and any function with `Captures > 0` are rejected) — nearly every realistic
+program still needs `--vm` or the interpreter for that reason alone; native heap
+allocation never triggers a collection (no stack maps yet — spec/11-codegen.md's own
+DEFERRED note explains why); structural `==`/`<` on aggregates and `String` is
+unimplemented in native `compare()`; the `cmp` builtin doesn't carry its operand's kind
+through `OpCallBuiltin` in native code yet, the way `OpToStr` and the comparison
+operators do; integer arithmetic is still 64-bit only in both engines; `u64::MAX` has no
+run-time representation; the bytecode compiler does not lower `for` loops (the
+interpreter runs them); and `match` compiles to a linear chain of arm tests rather than
+a decision tree.
 
-**Next action:** the native runtime — a bump-allocating nursery reachable from emitted
-machine code, then real GC integration (collection triggering, precise stack maps at
-every safepoint) — is what the backend needs before it can compile an allocating
-program, which is nearly every realistic one (even `to_str` allocates a `String`).
-Phase 5 is not closed until that lands and every phase 4 exit criterion still holds
-under `-O0`/`-O1`/`-O2` on native output too.
+**Next action:** either close the remaining native gaps above (closures need the
+biggest design decision — a closure object escaping its creating frame is exactly the
+case GC-precision was deferred to avoid, so building closures now means either
+accepting that gap explicitly for longer or building enough of the stack-map story to
+close it) or start on the native runtime's collection story directly. Phase 5 is not
+closed until every phase 4 exit criterion holds under `-O0`/`-O1`/`-O2` on native output
+too, which needs both.
 
 **Awaiting the user:** the two things only the target machine can confirm — that a
 compiled Mach-O binary runs, and that `lldb` breaks on an Origin source line — are

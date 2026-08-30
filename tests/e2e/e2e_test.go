@@ -111,17 +111,12 @@ var engines = []engineSpec{
 // a case in this list is a case the native engine is not being tested on, and the list
 // is meant to empty out.
 var nativeSkips = map[string]string{
-	"aliasing":                            "aggregates are not lowered natively yet (get_field)",
-	"closure_counter":                     "aggregates are not lowered natively yet (struct, closure)",
-	"generics_ord":                        "the `cmp` builtin needs the Ordering enum, so it needs aggregates",
-	"generics_user_trait_impl":            "aggregates are not lowered natively yet (get_field)",
-	"linked_list":                         "aggregates are not lowered natively yet (variant, get_payload)",
-	"mutual_recursion":                    "aggregates are not lowered natively yet (is_variant)",
-	"opt_cse_must_not_merge_allocations":  "aggregates are not lowered natively yet (struct, ref_eq)",
+	"aliasing":                            "structural `==` on an aggregate needs a recursive runtime routine over the type table, not built yet (String and struct/tuple/enum `==`/`<` are both still `KindRef`/`KindString` gaps in compare())",
+	"closure_counter":                     "closures are not lowered natively yet",
+	"generics_ord":                        "the `cmp` builtin needs its operand's kind, which OpCallBuiltin does not carry yet (only OpToStr and the comparison ops were widened)",
+	"generics_user_trait_impl":            "calls max2 on primitives too, which reaches the same `cmp` builtin gap as generics_ord",
+	"opt_cse_must_not_merge_allocations":  "same structural-`==` gap as aliasing",
 	"opt_float_semantics_survive_folding": "rendering a float needs shortest-round-trip formatting in emitted code",
-	"opt_licm_must_not_hoist_a_trap":      "aggregates are not lowered natively yet (variant)",
-	"opt_loop_invariant_arithmetic":       "aggregates are not lowered natively yet (variant)",
-	"result_and_try":                      "aggregates are not lowered natively yet (variant, get_payload)",
 }
 
 // runsNatively reports whether the host can execute what the backend produces. Only

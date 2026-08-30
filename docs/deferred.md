@@ -63,3 +63,7 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Cross-build instantiation caching | mitigation for monomorphization compile time (ADR-0010) | Phase 8 |
 | Cross-compilation | explicitly out of scope; two object writers is not cross-compilation (ADR-0003) | — (not planned) |
 | Incremental compilation in the LSP | needs the query architecture; full recheck first | Phase 8 |
+| Closures in native code | `originc build` rejects any function with `Captures > 0`; struct/tuple/enum-variant construction and field access are lowered (this phase), but building a closure object and reading a capture are not | Phase 5 |
+| Native heap collection | the backend's `alloc` bump-allocates but never triggers a collection: that needs precise stack maps, which need the bytecode widened to carry a value's kind the way `OpToStr` and the comparison ops already were (docs/spec/11-codegen.md's own DEFERRED note) | Phase 5 |
+| Structural `==`/`<` on aggregates and `String` in native code | `compare()` handles every primitive `bytecode.Kind` but not `KindRef` or `KindString`; the fix is a recursive runtime routine reading an embedded per-`TypeID` layout table, mirroring `internal/vm`'s `equalObjects`/`compareOp` | Phase 5 |
+| The `cmp` builtin in native code | `OpCallBuiltin` for `cmp` does not carry its operand's `bytecode.Kind` the way `OpToStr` and the comparison operators do, so the native backend cannot yet tell a signed integer `cmp` from a float one; blocks `generics_ord` and any other primitive `.cmp()` on native | Phase 5 |
