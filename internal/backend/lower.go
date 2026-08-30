@@ -347,15 +347,19 @@ func (e *emitter) compare(v *ir.Value) error {
 		cond = unsignedCond(v.Op)
 	case bytecode.KindFloat:
 		return e.floatCompare(v)
-	case bytecode.KindRef, bytecode.KindString:
+	case bytecode.KindRef:
 		if v.Op == ir.OpEq || v.Op == ir.OpNe {
 			return e.structuralCompare(v)
 		}
 		// `<` and friends are built in only for integers, floats, char and String
-		// (spec/04-expressions.md); a struct or enum reaching here would be a checker
-		// bug. A String's own ordering needs a byte-lexicographic runtime routine this
-		// backend does not have yet (docs/deferred.md).
-		return fmt.Errorf("unimplemented: ordering %s values in native code", kind)
+		// (spec/04-expressions.md); a struct, tuple or enum reaching here is a
+		// checker bug, not a missing lowering.
+		return fmt.Errorf("this is a compiler bug: ordering a %s value in native code", kind)
+	case bytecode.KindString:
+		if v.Op == ir.OpEq || v.Op == ir.OpNe {
+			return e.structuralCompare(v)
+		}
+		return e.stringOrder(v)
 	case bytecode.KindUnknown:
 		return fmt.Errorf("this is a compiler bug: a comparison reached the backend with no operand kind")
 	default:
@@ -386,6 +390,26 @@ func (e *emitter) structuralCompare(v *ir.Value) error {
 	if v.Op == ir.OpNe {
 		e.a.XorRI(x86.RAX, 1)
 	}
+	e.def(v, x86.RAX)
+	return nil
+}
+
+// stringOrder lowers `<`, `<=`, `>` and `>=` on String by calling the runtime's
+// lexicographic compare_bytes (equal.go), reused rather than duplicated: it already
+// returns the three-way sign `cmp`'s ordering needs (lower.go's buildOrdering), and a
+// sign compared against zero with the ordinary signed condition is exactly the bool an
+// operator needs.
+func (e *emitter) stringOrder(v *ir.Value) error {
+	e.load(scratchA, v.Args[0])
+	e.a.Push(scratchA)
+	e.load(scratchA, v.Args[1])
+	e.a.Push(scratchA)
+	e.a.Pop(x86.RSI)
+	e.a.Pop(x86.RDI)
+	e.a.Call(e.rt.compareBytes)
+	e.a.CmpRI(x86.RAX, 0)
+	e.a.Setcc(signedCond(v.Op), x86.RAX)
+	e.a.Movzx8(x86.RAX, x86.RAX)
 	e.def(v, x86.RAX)
 	return nil
 }
@@ -495,8 +519,90 @@ func (e *emitter) builtin(v *ir.Value) error {
 		e.a.Movzx8(x86.RAX, x86.RAX)
 		e.def(v, x86.RAX)
 		return nil
+
+	case compile.BuiltinCmpInt, compile.BuiltinCmpUint, compile.BuiltinCmpFloat, compile.BuiltinCmpString:
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: cmp takes two arguments, got %d", len(v.Args))
+		}
+		return e.buildOrdering(v)
 	}
 	return fmt.Errorf("unimplemented: builtin %d in native code", v.Const)
+}
+
+// buildOrdering lowers a `cmp` builtin: decide Less, Equal or Greater by the operand
+// kind compile.cmpBuiltinFor already baked into which of the four builtins this is,
+// then allocate the corresponding zero-payload Ordering variant -- the same
+// zero-argument allocation internal/vm's ordering() does, just chosen by three jumps
+// here instead of a Go switch there.
+func (e *emitter) buildOrdering(v *ir.Value) error {
+	e.load(scratchA, v.Args[0])
+	e.a.Push(scratchA)
+	e.load(scratchA, v.Args[1])
+	e.a.Push(scratchA)
+	e.a.Pop(scratchB) // b
+	e.a.Pop(scratchA) // a
+
+	less := e.a.NewLabel("cmp_less")
+	greater := e.a.NewLabel("cmp_greater")
+	equal := e.a.NewLabel("cmp_equal")
+	done := e.a.NewLabel("cmp_done")
+
+	switch v.Const {
+	case compile.BuiltinCmpInt:
+		e.a.CmpRR(scratchA, scratchB)
+		e.a.Jcc(x86.Less, less)
+		e.a.Jcc(x86.Greater, greater)
+		e.a.Jmp(equal)
+
+	case compile.BuiltinCmpUint:
+		e.a.CmpRR(scratchA, scratchB)
+		e.a.Jcc(x86.Below, less)
+		e.a.Jcc(x86.Above, greater)
+		e.a.Jmp(equal)
+
+	case compile.BuiltinCmpFloat:
+		e.a.MovqXR(x86.XMM0, scratchA)
+		e.a.MovqXR(x86.XMM1, scratchB)
+		e.a.UcomisdXX(x86.XMM0, x86.XMM1)
+		// Unordered (either operand NaN): internal/vm's ordering() finds both `<` and
+		// `>` false and falls through to Equal, so this does too, rather than
+		// inventing a fourth outcome the VM does not have.
+		e.a.Jcc(x86.Parity, equal)
+		e.a.Jcc(x86.Below, less)
+		e.a.Jcc(x86.Above, greater)
+		e.a.Jmp(equal)
+
+	case compile.BuiltinCmpString:
+		e.a.MovRR(x86.RDI, scratchA)
+		e.a.MovRR(x86.RSI, scratchB)
+		e.a.Call(e.rt.compareBytes)
+		e.a.CmpRI(x86.RAX, 0)
+		e.a.Jcc(x86.Less, less)
+		e.a.Jcc(x86.Greater, greater)
+		e.a.Jmp(equal)
+
+	default:
+		return fmt.Errorf("this is a compiler bug: builtin %d is not a `cmp`", v.Const)
+	}
+
+	allocVariant := func(idx int) {
+		e.a.XorRR(x86.RDI, x86.RDI) // Less/Equal/Greater all carry no payload
+		e.a.MovRI(x86.RSI, uint64(e.prog.Variants[idx].Type))
+		e.a.Call(e.rt.alloc)
+	}
+
+	e.a.Bind(less)
+	allocVariant(e.prog.Prelude.Less)
+	e.a.Jmp(done)
+	e.a.Bind(greater)
+	allocVariant(e.prog.Prelude.Greater)
+	e.a.Jmp(done)
+	e.a.Bind(equal)
+	allocVariant(e.prog.Prelude.Equal)
+
+	e.a.Bind(done)
+	e.def(v, x86.RAX)
+	return nil
 }
 
 // fieldOffset is where payload word i sits, relative to an object reference (which

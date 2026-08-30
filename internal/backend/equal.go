@@ -258,3 +258,83 @@ func (e *emitter) emitEqualObjects() {
 	a.Pop(x86.RBP)
 	a.Ret()
 }
+
+// emitCompareBytes writes the lexicographic byte comparison String's `cmp` needs: rdi
+// = a, rsi = b, result in rax as a three-way sign (-1, 0, 1), the same convention
+// strings.Compare uses -- internal/vm's ordering() gets there through two separate
+// bool comparisons instead, but a sign is exactly as informative and cheaper to turn
+// into one of Less/Equal/Greater at the call site (lower.go's buildOrdering).
+//
+// A leaf routine: it calls nothing, so unlike equal_objects it needs no 16-byte-aligned
+// sub-frame, just the four callee-saved registers it uses.
+func (e *emitter) emitCompareBytes() {
+	a := e.a
+	a.Align(16)
+	a.Bind(e.rt.compareBytes)
+
+	a.Push(x86.RBX)
+	a.Push(x86.R12)
+	a.Push(x86.R13)
+	a.Push(x86.R14)
+
+	a.MovRR(x86.RBX, x86.RDI) // a
+	a.MovRR(x86.R13, x86.RSI) // b
+
+	a.MovRM(x86.RAX, x86.At(x86.RBX, objHeaderSize)) // len a
+	a.MovRM(x86.RCX, x86.At(x86.R13, objHeaderSize)) // len b
+	a.MovRR(x86.R14, x86.RAX)
+	a.CmpRR(x86.RCX, x86.R14)
+	a.Cmov(x86.Less, x86.R14, x86.RCX) // r14 = min(len a, len b)
+
+	neg1 := a.NewLabel("cb_neg1")
+	pos1 := a.NewLabel("cb_pos1")
+	done := a.NewLabel("cb_done")
+
+	a.XorRR(x86.R12, x86.R12) // i = 0
+	loop := a.NewLabel("cb_loop")
+	a.Bind(loop)
+	a.CmpRR(x86.R12, x86.R14)
+	afterCommon := a.NewLabel("cb_after_common")
+	a.Jcc(x86.GreaterEqual, afterCommon)
+
+	a.MovRR(x86.R8, x86.R12)
+	a.AddRI(x86.R8, strBytesOff)
+	a.MovRR(x86.R9, x86.R8)
+	a.AddRR(x86.R9, x86.RBX)
+	a.XorRR(x86.RAX, x86.RAX)
+	a.MovRM8(x86.RAX, x86.At(x86.R9, 0)) // byte a
+	a.MovRR(x86.R9, x86.R8)
+	a.AddRR(x86.R9, x86.R13)
+	a.XorRR(x86.RCX, x86.RCX)
+	a.MovRM8(x86.RCX, x86.At(x86.R9, 0)) // byte b
+
+	a.CmpRR(x86.RAX, x86.RCX)
+	a.Jcc(x86.Less, neg1)
+	a.Jcc(x86.Greater, pos1)
+	a.AddRI(x86.R12, 1)
+	a.Jmp(loop)
+
+	// Every byte of the shorter's length matched: the shorter string sorts first,
+	// unless they are the same length, in which case they are equal.
+	a.Bind(afterCommon)
+	a.MovRM(x86.RAX, x86.At(x86.RBX, objHeaderSize)) // len a again (rax clobbered)
+	a.MovRM(x86.RCX, x86.At(x86.R13, objHeaderSize)) // len b
+	a.CmpRR(x86.RAX, x86.RCX)
+	a.Jcc(x86.Less, neg1)
+	a.Jcc(x86.Greater, pos1)
+	a.XorRR(x86.RAX, x86.RAX)
+	a.Jmp(done)
+
+	a.Bind(neg1)
+	a.MovRI(x86.RAX, ^uint64(0)) // -1
+	a.Jmp(done)
+	a.Bind(pos1)
+	a.MovRI(x86.RAX, 1)
+
+	a.Bind(done)
+	a.Pop(x86.R14)
+	a.Pop(x86.R13)
+	a.Pop(x86.R12)
+	a.Pop(x86.RBX)
+	a.Ret()
+}

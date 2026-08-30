@@ -47,6 +47,7 @@ type runtimeLabels struct {
 	println      x86.Label
 	panic        x86.Label
 	equalObjects x86.Label
+	compareBytes x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -65,6 +66,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.println = e.a.NewLabel("rt_println")
 	e.rt.panic = e.a.NewLabel("rt_panic")
 	e.rt.equalObjects = e.a.NewLabel("rt_equal_objects")
+	e.rt.compareBytes = e.a.NewLabel("rt_compare_bytes")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -74,6 +76,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitPrint()
 	e.emitPanic()
 	e.emitEqualObjects()
+	e.emitCompareBytes()
 }
 
 // emitPanic reports a `panic` and exits 101: rdi = the message String, rsi = the address

@@ -235,7 +235,12 @@ func castWidth(k types.PrimKind) int {
 // one of a shape with no distinct lowering, reports KindUnknown, and the backend refuses
 // to guess rather than emitting something plausible.
 func (c *Compiler) kindOf(e ast.Expr) bytecode.Kind {
-	return kindOfType(c.typeOf(e))
+	// concreteTypeOf, not typeOf: inside a generic instance's body the checker's own
+	// recorded type can still name that instance's own type parameter (e.g. `to_str`
+	// or `cmp` called on `x: T` inside `fn show_all[T: Show](x: T)`), and the concrete
+	// type this particular instantiation gives it is exactly what a static Kind needs
+	// to mean here -- the same substitution ADR-0019's object-layout code applies.
+	return kindOfType(c.concreteTypeOf(e))
 }
 
 func kindOfType(t types.Type) bytecode.Kind {

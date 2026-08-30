@@ -280,7 +280,10 @@ func (v *VM) callBuiltin(index, argCount int, span diag.Span) {
 		}
 		v.push(boolVal(a.R == b.R))
 
-	case compile.BuiltinCmp:
+	case compile.BuiltinCmpInt, compile.BuiltinCmpUint, compile.BuiltinCmpFloat, compile.BuiltinCmpString:
+		// One builtin per receiver kind exists so that native code (which cannot ask a
+		// register what it holds) knows which comparison to run; the VM's values
+		// already carry their own kind and treat all four identically.
 		v.push(refVal(v.ordering(args[0], args[1], span)))
 
 	case compile.BuiltinCheckedAdd, compile.BuiltinCheckedSub, compile.BuiltinCheckedMul:

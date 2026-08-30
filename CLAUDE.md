@@ -199,33 +199,46 @@ This project outlasts any single context window.
   shape, the address of its `Kinds` byte array — an object's own header still supplies
   its actual field count or byte length, since only the table's *shape* is constant per
   `TypeID`), mirroring `internal/vm`'s `equalObjects` field for field, including IEEE
-  float equality inside an aggregate and the trap on comparing two closures. Verified
-  by hand against nested structs, `String` content, `NaN`/`-0.0` inside a struct, and
-  tuples, byte-identical across all five engine/level combinations; landed permanently
-  as `tests/e2e/cases/structural_equality`.
+  float equality inside an aggregate and the trap on comparing two closures.
+- `<`/`<=`/`>`/`>=` on `String`, and the `cmp` builtin on every primitive kind, now work
+  in native code too. `compare_bytes` (`equal.go`) is the byte-lexicographic walk
+  `equal_objects`'s `ByteArray` case already needed, returning a three-way sign both
+  `stringOrder` and `cmp`'s `buildOrdering` read. `cmp` itself never got `OpCallBuiltin`
+  widened with an operand-kind operand the way `OpToStr` was — instead
+  `compile.cmpBuiltinFor` picks one of four kind-specific builtins (`BuiltinCmpInt`/
+  `Uint`/`Float`/`String`) at compile time, so the backend already knows which
+  comparison a call needs without reading anything from the instruction beyond which
+  builtin it is. Finding this also caught a latent bug in `kindOf` shared with
+  `OpToStr`: inside a generic instance's body a receiver's checked type can still name
+  that instance's own type parameter, and `kindOf` was reading it unsubstituted —
+  invisible for `to_str` (the VM ignores its Kind operand and dispatches on the value's
+  own runtime tag) but fatal for `cmp`'s new compile-time builtin choice, which fixed
+  both at once. Verified by hand against nested structs, `String` content and ordering
+  (including prefix and empty-string cases), `NaN`/`-0.0` inside a struct, tuples, and
+  `cmp` across every primitive kind, byte-identical across all five engine/level
+  combinations; landed permanently as `tests/e2e/cases/structural_equality` and
+  `tests/e2e/cases/cmp_and_ordering`.
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
 `docs/deferred.md`: closures are not lowered natively at all yet (construction, capture
 reads, and any function with `Captures > 0` are rejected) — nearly every realistic
 program still needs `--vm` or the interpreter for that reason alone; native heap
 allocation never triggers a collection (no stack maps yet — spec/11-codegen.md's own
-DEFERRED note explains why); `<`/`<=`/`>`/`>=` on `String` in native code (only `==`/
-`!=` were built); the `cmp` builtin doesn't carry its operand's kind through
-`OpCallBuiltin` in native code yet, the way `OpToStr` and the comparison operators do;
-integer arithmetic is still 64-bit only in both engines; `u64::MAX` has no run-time
-representation; the bytecode compiler does not lower `for` loops (the interpreter runs
-them); `match` compiles to a linear chain of arm tests rather than a decision tree; and
-a struct or enum declared inside a function body (never checked, per Phase 2's own
-documented scope) now fails loudly in `internal/compile` instead of silently compiling
-against the wrong descriptor, which is safer but still not a fix.
+DEFERRED note explains why); integer arithmetic is still 64-bit only in both engines;
+`u64::MAX` has no run-time representation; the bytecode compiler does not lower `for`
+loops (the interpreter runs them); `match` compiles to a linear chain of arm tests
+rather than a decision tree; and a struct or enum declared inside a function body
+(never checked, per Phase 2's own documented scope) now fails loudly in
+`internal/compile` instead of silently compiling against the wrong descriptor, which is
+safer but still not a fix.
 
-**Next action:** either close the remaining native gaps above (closures need the
-biggest design decision — a closure object escaping its creating frame is exactly the
-case GC-precision was deferred to avoid, so building closures now means either
-accepting that gap explicitly for longer or building enough of the stack-map story to
-close it) or start on the native runtime's collection story directly. Phase 5 is not
-closed until every phase 4 exit criterion holds under `-O0`/`-O1`/`-O2` on native output
-too, which needs both.
+**Next action:** closures are the last thing standing between `originc build` and
+compiling most realistic Origin programs, and also the biggest remaining design
+decision: a closure object escaping its creating frame is exactly the case GC-precision
+was deferred to avoid, so building closures now means either accepting that gap
+explicitly for longer or building enough of the stack-map story to close it first.
+Phase 5 is not closed until every phase 4 exit criterion holds under `-O0`/`-O1`/`-O2`
+on native output too, which needs both closures and real collection.
 
 **Awaiting the user:** the two things only the target machine can confirm — that a
 compiled Mach-O binary runs, and that `lldb` breaks on an Origin source line — are

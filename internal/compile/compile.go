@@ -34,7 +34,18 @@ const (
 	BuiltinPrintln
 	BuiltinPanic
 	BuiltinRefEq
-	BuiltinCmp
+	// BuiltinCmpInt, BuiltinCmpUint, BuiltinCmpFloat and BuiltinCmpString are one
+	// builtin per receiver kind rather than one `cmp` shared by all of them: the VM
+	// dispatches on its own value's runtime tag regardless and treats all four
+	// identically, but native code cannot ask a register what it holds, and
+	// OpCallBuiltin carries no operand-kind operand the way OpToStr does (there is
+	// nowhere to put one without widening bytecode.Instr). Picking the builtin index
+	// itself by kind, at compile time, answers the same question through the one
+	// channel that already exists.
+	BuiltinCmpInt
+	BuiltinCmpUint
+	BuiltinCmpFloat
+	BuiltinCmpString
 	BuiltinCheckedAdd
 	BuiltinCheckedSub
 	BuiltinCheckedMul

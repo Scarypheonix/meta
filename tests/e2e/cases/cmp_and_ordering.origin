@@ -1,0 +1,39 @@
+use std::io;
+
+fn show(o: Ordering) -> String {
+    match o {
+        Ordering::Less => "Less",
+        Ordering::Equal => "Equal",
+        Ordering::Greater => "Greater",
+    }
+}
+
+fn main() {
+    io::println(show(3.cmp(5)));
+    io::println(show(5.cmp(3)));
+    io::println(show(5.cmp(5)));
+
+    io::println(show(3u32.cmp(5u32)));
+    io::println(show(5u32.cmp(3u32)));
+
+    io::println(show(3.5.cmp(5.5)));
+    io::println(show(5.5.cmp(3.5)));
+    io::println(show(1.0.cmp(1.0)));
+    let nan = 0.0 / 0.0;
+    io::println(show(nan.cmp(1.0)));
+
+    io::println(show('a'.cmp('b')));
+    io::println(show('b'.cmp('a')));
+
+    io::println(show("apple".cmp("banana")));
+    io::println(show("banana".cmp("apple")));
+    io::println(show("apple".cmp("apple")));
+    io::println(show("app".cmp("apple")));
+    io::println(show("".cmp("")));
+
+    io::println(("apple" < "banana").to_str());
+    io::println(("apple" <= "apple").to_str());
+    io::println(("app" > "apple").to_str());
+    io::println(("" < "a").to_str());
+    io::println(("apple" >= "apple").to_str());
+}

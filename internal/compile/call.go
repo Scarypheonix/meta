@@ -1,6 +1,8 @@
 package compile
 
 import (
+	"fmt"
+
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/diag"
@@ -71,13 +73,30 @@ var builtinMethodOps = map[string]bytecode.Op{
 }
 
 var builtinMethodCalls = map[string]int{
-	"cmp":            BuiltinCmp,
 	"checked_add":    BuiltinCheckedAdd,
 	"checked_sub":    BuiltinCheckedSub,
 	"checked_mul":    BuiltinCheckedMul,
 	"saturating_add": BuiltinSaturatingAdd,
 	"saturating_sub": BuiltinSaturatingSub,
 	"saturating_mul": BuiltinSaturatingMul,
+}
+
+// cmpBuiltinFor picks which of the per-kind `cmp` builtins a call needs. `Ord` is
+// registered (internal/check's builtin impl table) for every signed and unsigned
+// integer width, both float widths, `char` and `String`; nothing else reaches here for
+// a well-typed program.
+func cmpBuiltinFor(k bytecode.Kind, span diag.Span) (int, error) {
+	switch k {
+	case bytecode.KindInt, bytecode.KindChar:
+		return BuiltinCmpInt, nil
+	case bytecode.KindUint:
+		return BuiltinCmpUint, nil
+	case bytecode.KindFloat:
+		return BuiltinCmpFloat, nil
+	case bytecode.KindString:
+		return BuiltinCmpString, nil
+	}
+	return 0, unsupported(fmt.Sprintf("`cmp` on a %s", k), span)
 }
 
 func (c *Compiler) methodCall(v *ast.MethodCall) error {
@@ -118,6 +137,20 @@ func (c *Compiler) methodCall(v *ast.MethodCall) error {
 			return err
 		}
 		c.emit(op, v.Span())
+		return nil
+	}
+	if v.Name.Name == "cmp" && len(v.Args) == 1 {
+		idx, err := cmpBuiltinFor(c.kindOf(v.Recv), v.Span())
+		if err != nil {
+			return err
+		}
+		if err := c.expr(v.Recv); err != nil {
+			return err
+		}
+		if err := c.expr(v.Args[0]); err != nil {
+			return err
+		}
+		c.emitAB(bytecode.OpCallBuiltin, idx, 2, v.Span())
 		return nil
 	}
 	if idx, ok := builtinMethodCalls[v.Name.Name]; ok {
