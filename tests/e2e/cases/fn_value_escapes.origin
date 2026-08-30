@@ -1,0 +1,30 @@
+use std::io;
+
+fn double(x: i64) -> i64 { x * 2 }
+fn triple(x: i64) -> i64 { x * 3 }
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 { f(x) }
+
+fn pick(flag: bool) -> fn(i64) -> i64 {
+    if flag { double } else { triple }
+}
+
+fn main() {
+    let f = double;
+    io::println(f(5).to_str());
+    io::println(apply(triple, 5).to_str());
+
+    let g = pick(true);
+    let h = pick(false);
+    io::println(g(10).to_str());
+    io::println(h(10).to_str());
+
+    let mut i = 0;
+    let mut acc = 0;
+    while i < 3 {
+        let fns = pick(i % 2 == 0);
+        acc = acc + fns(1);
+        i = i + 1;
+    }
+    io::println(acc.to_str());
+}

@@ -135,7 +135,7 @@ func number(f *ir.Func) *numbering {
 func clobbersCallerSaved(op ir.Op) bool {
 	switch op {
 	case ir.OpCall, ir.OpCallClosure, ir.OpCallBuiltin,
-		ir.OpStruct, ir.OpTuple, ir.OpVariant, ir.OpClosure, ir.OpToStr,
+		ir.OpStruct, ir.OpTuple, ir.OpVariant, ir.OpClosure, ir.OpBoxFn, ir.OpToStr,
 		ir.OpEq, ir.OpNe, ir.OpLt, ir.OpLe, ir.OpGt, ir.OpGe:
 		return true
 	}

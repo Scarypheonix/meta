@@ -166,7 +166,7 @@ This project outlasts any single context window.
 
 **In flight:** Phase 5, the native x86-64 backend. Landed so far:
 
-- `docs/spec/11-codegen.md` and ADR-0017 through ADR-0019 specify and decide the
+- `docs/spec/11-codegen.md` and ADR-0017 through ADR-0020 specify and decide the
   backend's shape: no linker, no libc, freestanding executables (ADR-0017); linear-scan
   register allocation (ADR-0018); every struct, tuple, enum-variant and closure
   instantiation now gets its own exact `Fixed` object layout, keyed the same way
@@ -228,34 +228,55 @@ This project outlasts any single context window.
   lowers to ops (calls, jumps, `is_variant`, `get_field`) it already handled. Landed
   permanently as `tests/e2e/cases/for_loop`, byte-identical across all seven
   engine/level combinations.
+- **Closures now compile natively (ADR-0020)**, closing what had been Phase 5's last
+  real gap. `internal/backend/closures.go`'s `resolveClosureCalls`, a new native-only
+  IR pass run unconditionally right after `ir.Build`, makes static what the VM decides
+  dynamically from a runtime tag (native values carry none, ADR-0008): an `OpFunc`
+  value stays a bare code address exactly when every one of its uses is being an
+  `OpCall`'s own immediate callee; every other use — a return, an argument, a phi, a
+  struct field — gets it wrapped in a new `OpBoxFn` op first, allocating the same
+  one-word closure shape `internal/vm/fields.go`'s `boxIfFn` already builds dynamically
+  for the identical situation. Every `OpCall` left with a non-bare-`OpFunc` callee is
+  then repointed at a new `OpCallClosure` op (a slot `internal/ir`'s classification
+  tables had reserved since earlier IR work, never filled in until now). A real closure
+  and a boxed bare function share one calling convention: the callee's code address
+  comes from the object's field 0, and the object reference itself travels to the
+  callee on the stack — in the fixed spot a call always leaves just above the return
+  address, never shifted into an argument register — where `OpCapture` reads it back
+  directly, with no persistent register or frame slot needed at all. An ordinary
+  function reached this way simply never reads that spot, so one convention serves
+  both without the call site ever needing to know which kind of callable a given value
+  actually is. Found and fixed a real bug in the pass itself while testing it against
+  an argument-passing case: `ReplaceAllUses` run *after* splicing the new box into its
+  block rewrote the box's own reference to the value it was boxing into a reference to
+  itself, corrupting every downstream read into a zero — caught immediately by the
+  first cross-function test case, fixed by reordering the two steps. Verified against
+  direct closures with multiple params and multiple captures, closures rebuilt fresh
+  each loop iteration with different captured values, a bare function stored in a
+  variable, passed as an argument, returned through an `if`/`else` (a phi), and read
+  back out of a struct field — byte-identical across the interpreter, VM, and native at
+  every optimization level; landed permanently as `tests/e2e/cases/fn_value_escapes`
+  alongside the pre-existing `closure_counter`, now off the native skip list entirely.
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
-`docs/deferred.md`: closures are not lowered natively at all yet (construction, capture
-reads, and any function with `Captures > 0` are rejected) — nearly every realistic
-program still needs `--vm` or the interpreter for that reason alone; native heap
-allocation never triggers a collection (no stack maps yet — spec/11-codegen.md's own
-DEFERRED note explains why); integer arithmetic is still 64-bit only in both engines;
-`u64::MAX` has no run-time representation; `match` compiles to a linear chain of arm
-tests rather than a decision tree; and a struct or enum declared inside a function body
-(never checked, per Phase 2's own documented scope) now fails loudly in
-`internal/compile` instead of silently compiling against the wrong descriptor, which is
-safer but still not a fix.
+`docs/deferred.md`: native heap allocation never triggers a collection (no stack maps
+yet — spec/11-codegen.md's own DEFERRED note explains why); integer arithmetic is
+still 64-bit only in both engines; `u64::MAX` has no run-time representation; `match`
+compiles to a linear chain of arm tests rather than a decision tree; a struct or enum
+declared inside a function body (never checked, per Phase 2's own documented scope) now
+fails loudly in `internal/compile` instead of silently compiling against the wrong
+descriptor, which is safer but still not a fix; and a function used both as a direct
+callee and as an escaping value in the same body loses the direct-call fast path for
+every use once it is boxed at all (ADR-0020's own documented, deliberate simplification
+— correct, just not maximally fast in that one mixed pattern).
 
-**Next action:** closures are the last thing standing between `originc build` and
-compiling most realistic Origin programs, and also the biggest remaining design
-decision: a closure object escaping its creating frame is exactly the case GC-precision
-was deferred to avoid, so building closures now means either accepting that gap
-explicitly for longer or building enough of the stack-map story to close it first. The
-soundness blocker specifically: at an indirect call site, telling a provable closure
-object (safe to dereference slot 0) apart from a bare function pointer is not decidable
-from "callee came from `OpClosure`" once there is any indirection: a phi node, a
-parameter, or (the project's own `closure_counter` test case) a function's own return
-value several SSA hops from any `OpClosure` node. A sound fix needs the same boxing
-treatment `internal/vm/fields.go`'s `boxIfFn` already gives aggregate-field writes,
-extended to every place a function-typed value can flow (let-bindings, arguments,
-returns, phi nodes). Phase 5 is not closed until every phase 4 exit criterion holds
-under `-O0`/`-O1`/`-O2` on native output too, which needs both closures and real
-collection.
+**Next action:** native heap collection is now the only large piece of Phase 5 left.
+The backend's `alloc` bump-allocates forever; making it actually collect needs precise
+stack maps, which need the bytecode widened to carry a value's kind at a safepoint the
+way `OpToStr` and the comparison ops already carry one for their own purposes
+(spec/11-codegen.md's own DEFERRED note is the starting point). Phase 5 is not closed
+until every phase 4 exit criterion holds under `-O0`/`-O1`/`-O2` on native output too,
+and collection is what that still needs.
 
 **Awaiting the user:** the two things only the target machine can confirm — that a
 compiled Mach-O binary runs, and that `lldb` breaks on an Origin source line — are

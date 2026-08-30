@@ -111,7 +111,6 @@ var engines = []engineSpec{
 // a case in this list is a case the native engine is not being tested on, and the list
 // is meant to empty out.
 var nativeSkips = map[string]string{
-	"closure_counter":                     "closures are not lowered natively yet",
 	"opt_float_semantics_survive_folding": "rendering a float needs shortest-round-trip formatting in emitted code",
 }
 

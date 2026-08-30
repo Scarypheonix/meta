@@ -126,16 +126,33 @@ func (e *emitter) instr(v *ir.Value) error {
 		return e.compare(v)
 
 	case ir.OpFunc:
-		// A function value is its entry address. Nothing but a direct call consumes one
-		// yet; a closure needs an object, which is Phase 5's remaining aggregate work.
+		// A function value is its entry address. resolveClosureCalls (closures.go) has
+		// already guaranteed that if this value is ever used as anything other than an
+		// OpCall's own immediate callee, it was wrapped in an OpBoxFn instead -- so
+		// every use reaching this case still wants exactly the raw address.
 		if v.Const < 0 || v.Const >= len(e.fnLabels) {
 			return fmt.Errorf("this is a compiler bug: function index %d is out of range", v.Const)
 		}
 		e.a.LeaLabel(scratchA, e.fnLabels[v.Const])
 		e.def(v, scratchA)
 
+	case ir.OpBoxFn:
+		// A one-word closure object whose only field is Args[0]'s raw address: the same
+		// shape internal/vm/fields.go's boxIfFn gives a bare function value written into
+		// a reference-shaped field, built the same way any other single-field object is.
+		return e.construct(v, e.prog.FnBoxType)
+
+	case ir.OpClosure:
+		return e.closure(v)
+
+	case ir.OpCapture:
+		return e.capture(v)
+
 	case ir.OpCall:
 		return e.call(v)
+
+	case ir.OpCallClosure:
+		return e.callClosure(v)
 
 	case ir.OpCallBuiltin:
 		return e.builtin(v)
@@ -449,10 +466,15 @@ func unsignedCond(op ir.Op) x86.Cond {
 }
 
 // call lowers a direct call. Args[0] is the callee; the rest are the arguments.
+//
+// callee.Op is always OpFunc here: closures.go's classifyCalls repoints any OpCall
+// whose callee is not a bare OpFunc value at OpCallClosure before this ever runs, so a
+// callee that fails this check is this function's own caller's bug, not a program this
+// backend cannot yet handle.
 func (e *emitter) call(v *ir.Value) error {
 	callee := v.Args[0]
 	if callee == nil || callee.Op != ir.OpFunc {
-		return fmt.Errorf("unimplemented: an indirect call in native code")
+		return fmt.Errorf("this is a compiler bug: a direct call's callee is not a bare function value")
 	}
 	args := v.Args[1:]
 	if len(args) > len(argRegs) {
@@ -470,6 +492,100 @@ func (e *emitter) call(v *ir.Value) error {
 		e.a.Pop(argRegs[i])
 	}
 	e.a.Call(e.fnLabels[callee.Const])
+	e.def(v, x86.RAX)
+	return nil
+}
+
+// closure lowers OpClosure: allocate a closure object and fill it. Field 0 is always
+// the underlying function's entry address -- computed the same way OpFunc's own
+// lowering computes it, not read from Args, since bytecode.OpClosure never pushes it --
+// and fields 1.. are the captures, in Args order. The captures are pushed to the stack
+// before the allocator call for the same reason construct's fields are: the call
+// clobbers the caller-saved registers, and nothing here may assume an operand's home
+// survives across it.
+func (e *emitter) closure(v *ir.Value) error {
+	if v.Const < 0 || v.Const >= len(e.prog.Closures) {
+		return fmt.Errorf("this is a compiler bug: closure index %d is out of range", v.Const)
+	}
+	ci := e.prog.Closures[v.Const]
+	desc := e.prog.Types.Get(ci.Type)
+	for _, a := range v.Args {
+		e.load(scratchA, a)
+		e.a.Push(scratchA)
+	}
+	e.a.MovRI(x86.RDI, desc.Words)
+	e.a.MovRI(x86.RSI, uint64(ci.Type))
+	e.a.Call(e.rt.alloc)
+	e.a.MovRR(scratchB, x86.RAX) // the new object's reference, saved across the pops
+	for i := len(v.Args) - 1; i >= 0; i-- {
+		e.a.Pop(scratchA)
+		e.a.MovMR(x86.At(scratchB, fieldOffset(i+1)), scratchA)
+	}
+	e.a.LeaLabel(scratchA, e.fnLabels[ci.FnIndex])
+	e.a.MovMR(x86.At(scratchB, fieldOffset(0)), scratchA)
+	e.def(v, scratchB)
+	return nil
+}
+
+// capture lowers OpCapture: read one of the current closure's fields. There is no
+// per-function register or frame slot holding the closure reference -- callClosure
+// below leaves it on the stack, in the fixed spot a call always leaves just above the
+// return address, so it is read from there directly, as many times as the body needs
+// it. Field 0 is the function's own entry address, so a capture at index i sits at
+// field i+1 (bytecode.OpLoadCapture's own VM lowering, internal/vm/exec.go, reads the
+// same offset).
+func (e *emitter) capture(v *ir.Value) error {
+	e.a.MovRM(scratchA, x86.At(x86.RBP, 16))
+	e.a.MovRM(scratchB, x86.At(scratchA, fieldOffset(int(v.Aux)+1)))
+	e.def(v, scratchB)
+	return nil
+}
+
+// callClosure lowers OpCallClosure: Args[0] is a closure-object reference -- never a
+// bare code pointer, closures.go's resolveClosureCalls established that as an invariant
+// before this ever runs -- and Args[1:] are the real arguments, passed exactly the way
+// call passes them.
+//
+// The callee's code address comes from the object's field 0. The object reference
+// itself also has to reach the callee, since its own body may read captures from it,
+// but not through an argument register: every one may already be carrying a real
+// parameter (a function is capped at 6, docs/spec/11-codegen.md, exactly how many
+// argRegs has), and shifting them over would give a direct call and an indirect one to
+// the same function two different parameter conventions. It goes on the stack instead,
+// in the fixed spot a call always leaves just above the return address -- [rbp+16] in
+// the callee's own frame, which is exactly where capture above reads it back. An
+// ordinary function reached this way (Captures == 0, boxed rather than a real closure
+// literal) never reads that spot at all, so leaving it there costs it nothing: one
+// calling convention serves both, and the call site never has to know, at compile time
+// or run time, which of the two a given closure-shaped value actually is.
+func (e *emitter) callClosure(v *ir.Value) error {
+	closure := v.Args[0]
+	args := v.Args[1:]
+	if len(args) > len(argRegs) {
+		return fmt.Errorf("unimplemented: calling a closure with %d arguments, past the %d the registers carry",
+			len(args), len(argRegs))
+	}
+	e.load(scratchA, closure)
+	e.a.MovRM(scratchB, x86.At(scratchA, fieldOffset(0)))
+	e.a.Push(scratchB) // the code address, saved across the argument pushes below
+	e.a.Push(scratchA) // the closure reference, saved the same way
+	for _, arg := range args {
+		e.load(scratchA, arg)
+		e.a.Push(scratchA)
+	}
+	for i := len(args) - 1; i >= 0; i-- {
+		e.a.Pop(argRegs[i])
+	}
+	e.a.Pop(scratchA) // the closure reference
+	e.a.Pop(scratchB) // the code address
+	// rsp must be 16-byte aligned at `call`, and the closure reference is one word --
+	// eight bytes short on its own -- so it goes on the stack twice. Which of the two
+	// the callee reads at [rbp+16] does not matter: they are the same value, and the
+	// second exists only to pay for the first.
+	e.a.Push(scratchA)
+	e.a.Push(scratchA)
+	e.a.CallReg(scratchB)
+	e.a.AddRI(x86.RSP, 16)
 	e.def(v, x86.RAX)
 	return nil
 }
@@ -621,11 +737,14 @@ func (e *emitter) construct(v *ir.Value, t layout.TypeID) error {
 	for i, a := range v.Args {
 		if desc.Kinds[i] == layout.WordRef && a.Op == ir.OpFunc {
 			// A bare top-level function reference is TagFn at the VM's level: an index,
-			// not a heap object. Writing one into a reference-shaped field needs the
-			// same boxing into a captureless closure the VM does (ADR-0019), and native
-			// closures do not exist yet (this function's own caller already rejects a
-			// closure literal for the same reason).
-			return fmt.Errorf("unimplemented: a bare function value in a field, in native code")
+			// not a heap object, and writing one into a reference-shaped field needs the
+			// same boxing into a captureless closure the VM does (ADR-0019). Reaching
+			// this branch means closures.go's resolveClosureCalls failed to box it
+			// first -- every use of an OpFunc value that is not being an OpCall's own
+			// immediate callee is supposed to be boxed (into exactly this shape, an
+			// OpBoxFn one field wide) before construct ever sees it, field values of a
+			// struct/tuple/variant construction included.
+			return fmt.Errorf("this is a compiler bug: an unboxed function value reached a reference-shaped field")
 		}
 		e.load(scratchA, a)
 		e.a.Push(scratchA)

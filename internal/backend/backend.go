@@ -74,6 +74,7 @@ func buildIR(prog *bytecode.Program) ([]*ir.Func, error) {
 		if err != nil {
 			return nil, fmt.Errorf("building %s: %w", fn.Name, err)
 		}
+		resolveClosureCalls(f)
 		out[i] = f
 	}
 	return out, nil
@@ -267,10 +268,6 @@ func (e *emitter) function(index int, f *ir.Func) error {
 			"registers carry (docs/spec/11-codegen.md leaves the rest on the stack)",
 			f.Params, len(argRegs))
 	}
-	if f.Captures > 0 {
-		return fmt.Errorf("unimplemented: closures in native code")
-	}
-
 	e.a.Align(16)
 	e.a.Bind(e.fnLabels[index])
 	e.a.Push(x86.RBP)

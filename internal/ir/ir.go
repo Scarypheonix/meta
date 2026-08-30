@@ -79,6 +79,16 @@ const (
 	OpCallBuiltin
 	OpFunc
 	OpClosure
+	// OpBoxFn wraps Args[0], a bare OpFunc value, into a one-word captureless closure
+	// object -- the native backend's own pass (internal/backend's resolveClosureCalls)
+	// inserts it wherever a function reference does not provably stay a direct call's
+	// own callee, so that every other consumer of a function-typed value (an
+	// OpCallClosure, a return, an argument, a phi) sees the same object shape a real
+	// OpClosure produces. Never built from bytecode directly: the VM's own value model
+	// already distinguishes a bare function from a closure dynamically (a runtime tag),
+	// which native code has no room for, so this exists to make that distinction static
+	// instead, only where native lowering actually needs it.
+	OpBoxFn
 
 	// Aggregates.
 	OpStruct
@@ -115,7 +125,7 @@ var opNames = [...]string{
 	OpAddF: "addf", OpSubF: "subf", OpMulF: "mulf", OpDivF: "divf", OpRemF: "remf", OpNegF: "negf",
 	OpEq: "eq", OpNe: "ne", OpLt: "lt", OpLe: "le", OpGt: "gt", OpGe: "ge", OpNot: "not",
 	OpCall: "call", OpCallClosure: "call_closure", OpCallBuiltin: "call_builtin",
-	OpFunc: "func", OpClosure: "closure",
+	OpFunc: "func", OpClosure: "closure", OpBoxFn: "box_fn",
 	OpStruct: "struct", OpTuple: "tuple", OpVariant: "variant",
 	OpGetField: "get_field", OpSetField: "set_field", OpIsVariant: "is_variant",
 	OpCast: "cast", OpToStr: "to_str", OpTrap: "trap",
@@ -153,7 +163,7 @@ func (o Op) MayTrapOnValues() bool {
 // distinct objects and `ref_eq` can tell them apart (spec/04-expressions.md).
 func (o Op) Allocates() bool {
 	switch o {
-	case OpStruct, OpTuple, OpVariant, OpClosure, OpToStr:
+	case OpStruct, OpTuple, OpVariant, OpClosure, OpBoxFn, OpToStr:
 		return true
 	}
 	return false
