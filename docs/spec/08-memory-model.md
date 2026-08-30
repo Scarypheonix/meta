@@ -64,6 +64,13 @@ guarantees, which the implementation MUST satisfy and which the property tests i
 5. Allocation may TRAP with `out of memory`; it never returns a null or invalid
    reference.
 
+These five guarantees are the language's own contract, satisfied identically by every
+engine; nothing about "generational" is part of it. The interpreter and the VM share
+`internal/gc`'s precise, generational, moving collector; the native backend's own
+collector (ADR-0022, spec/11-codegen.md's "Safepoints and stack maps") is a single-space,
+stop-the-world semispace copy — a deliberately simpler shape a hand-assembled freestanding
+runtime can get right first, satisfying the same five guarantees without generations.
+
 **Safepoints.** The compiler inserts safepoints at every function entry, every loop
 back-edge, and every allocation. A collection may begin only at a safepoint, and at a
 safepoint the stack map for the current call site describes exactly which stack slots

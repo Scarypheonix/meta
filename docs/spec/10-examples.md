@@ -273,13 +273,48 @@ stdout: `6\n` · exit: `0`
 The lambda captures `tx: Sender[i64]` and `n: i64`, both `Send`, so the lambda is `Send`
 and may be spawned (§08).
 
+## 13. A discarded allocation loop is reclaimed
+
+```origin
+use std::io;
+
+struct Pair { a: i64, b: i64 }
+
+fn main() {
+    let mut last = Pair { a: 0, b: 0 };
+    let mut i: i64 = 0;
+    while i < 5000000 {
+        last = Pair { a: i, b: i };
+        i = i + 1;
+    }
+    io::println(last.a.to_str());
+    io::println(last.b.to_str());
+}
+```
+
+stdout: `4999999\n4999999\n` · exit: `0`
+
+Every iteration but the last allocates a `Pair` that becomes unreachable the moment the
+next one is assigned, so the loop's total allocation (~120 MB of `Pair`s) is many times
+over any one collector's heap, and only the final `Pair` is ever live. A collector that
+leaks would exhaust its heap and TRAP with `out of memory` before `i` reaches 5000000; one
+that collects a live object would corrupt `last` or crash. Getting `4999999` twice is
+therefore a collection stress test in its own right (spec/08-memory-model.md's
+worked-examples table), landing here as a normal program rather than a `tests/gc/`-only
+property test because every engine — including native, whose own single-space
+stop-the-world collector (ADR-0022) this is what actually exercises — must reclaim
+correctly to reach this output at all. Both fields read `i` rather than `i` and `i + 1`
+deliberately: the latter trips a pre-existing `-O2` fixed-point bug unrelated to
+collection at all (`docs/deferred.md`), and this example's job is the collector, not that
+bug.
+
 ---
 
 ## Programs that must be REJECTED
 
 Each of these exits `1` with the named diagnostic and produces no binary.
 
-## 13. No implicit numeric coercion
+## 14. No implicit numeric coercion
 
 ```origin
 fn main() {
@@ -292,7 +327,7 @@ fn main() {
 `error[E0308]: mismatched types in `+`: left is `i32`, right is `i64``, with a help
 suggesting `a as i64 + b`. Origin never widens implicitly (§03).
 
-## 14. Non-exhaustive match
+## 15. Non-exhaustive match
 
 ```origin
 enum Shape { Circle(f64), Rect { w: f64, h: f64 } }
@@ -307,7 +342,7 @@ fn area(s: Shape) -> f64 {
 ``error[E0004]: non-exhaustive match: `Shape::Rect { .. }` is not covered``, with a help
 offering the missing arm. Because this is an error, `area` can never fail at runtime.
 
-## 15. Non-`Send` value crossing a channel
+## 16. Non-`Send` value crossing a channel
 
 ```origin
 struct Counter { mut n: i64 }

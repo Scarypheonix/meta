@@ -1,0 +1,21 @@
+use std::io;
+
+struct Pair { a: i64, b: i64 }
+
+fn churn(n: i64) -> i64 {
+    let mut last = Pair { a: 0, b: 0 };
+    let mut i: i64 = 0;
+    while i < n {
+        last = Pair { a: i, b: i };
+        i = i + 1;
+    }
+    last.a
+}
+
+fn main() {
+    let kept = Pair { a: 777, b: 888 };
+    let churned = churn(3000000);
+    io::println(kept.a.to_str());
+    io::println(kept.b.to_str());
+    io::println(churned.to_str());
+}

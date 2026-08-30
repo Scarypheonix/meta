@@ -130,6 +130,13 @@ type emitter struct {
 	// internal/vm's equalObjects does, rather than needing compile.go widened again.
 	typeTableAddr uint64
 
+	// gcRuntimeEntryAddr is a synthetic StackMapEntry the collector's own root walk
+	// (ADR-0022) substitutes when it reaches a frame with no real entry -- one of
+	// runtime.go's own routines (rt_int_to_str, say), which allocates internally but,
+	// like every runtime routine, was deliberately never wired into recordCall
+	// (ADR-0021's own documented scope). See collect.go's emitGCRuntimeFrameEntry.
+	gcRuntimeEntryAddr uint64
+
 	fnLabels []x86.Label
 
 	// safepoints accumulates one entry per call site across every function in the
@@ -170,6 +177,7 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 	e.outOfMemoryMsg = e.rawString("origin: out of memory at <runtime>\n")
 	e.panicPrefix = e.rawString("origin: ")
 	e.emitTypeTable()
+	e.emitGCRuntimeFrameEntry()
 
 	if prog.Entry < 0 || prog.Entry >= len(funcs) || funcs[prog.Entry] == nil {
 		return nil, fmt.Errorf("the program has no `main` to start at")
@@ -287,6 +295,21 @@ func (e *emitter) function(index int, f *ir.Func) error {
 	}
 	if e.frame > 0 {
 		e.a.SubRI(x86.RSP, e.frame)
+	}
+
+	// A reference-kind spill slot is reserved for the whole function body the moment its
+	// owning value is ever spilled (regalloc.go gives every spilled interval a permanent
+	// slot, never reused across non-overlapping ones), but a stack map's RefCount --
+	// fixed per function, not narrowed to what is actually live at each call site --
+	// covers every one of them at every safepoint, including a call that executes before
+	// the slot's own value is ever computed (a branch that skips its definition, or a
+	// call textually earlier in the function). Zeroing every reference slot here, before
+	// anything can be spilled into one, means a future collector (ADR-0022) that visits
+	// one before its value exists reads Nil rather than whatever an earlier stack frame
+	// happened to leave there -- a defensive read, not a value real Origin code can ever
+	// observe (ADR-0007: no null).
+	for i := 1; i <= e.regs.refSlots; i++ {
+		e.a.MovMI(e.mem(inSlot(i)), 0)
 	}
 
 	blocks := order(f)

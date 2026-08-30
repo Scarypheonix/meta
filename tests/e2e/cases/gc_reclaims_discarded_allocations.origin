@@ -1,0 +1,14 @@
+use std::io;
+
+struct Pair { a: i64, b: i64 }
+
+fn main() {
+    let mut last = Pair { a: 0, b: 0 };
+    let mut i: i64 = 0;
+    while i < 5000000 {
+        last = Pair { a: i, b: i };
+        i = i + 1;
+    }
+    io::println(last.a.to_str());
+    io::println(last.b.to_str());
+}

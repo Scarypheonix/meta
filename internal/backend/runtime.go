@@ -14,12 +14,10 @@ import (
 // beyond that it pushes. Origin code never calls them directly; lowering does.
 
 const (
-	// heapSize is what the runtime asks mmap for at start-up.
-	//
-	// Nothing reclaims it yet — a collector in native code needs precise stack maps,
-	// which need reference-typed IR (docs/spec/11-codegen.md, docs/deferred.md) — so a
-	// program's allocation is bounded by this number and `out of memory` is a real trap
-	// rather than a formality.
+	// heapSize is the size of each of the two semispaces the runtime asks mmap for at
+	// start-up (ADR-0022): one is "current" (rtBumpOff/rtEndOff bound it) and the other
+	// is where the next collection copies live objects into. Total mapped memory is
+	// therefore 2*heapSize, trivial against the 8 GiB target machine.
 	heapSize = 64 << 20
 
 	// rtBumpOff and rtEndOff are the runtime block's fields, addressed through r15.
@@ -32,8 +30,18 @@ const (
 	// unlike rtBumpOff/rtEndOff, which only mmap's own return value can supply.
 	rtStackMapOff      = 16
 	rtStackMapCountOff = 24
+	// rtOtherStartOff is the address of the semispace collection is not currently
+	// allocating out of (ADR-0022): the collector's destination, and the space
+	// rtBumpOff/rtEndOff describe after a collection flips them. Its end is always
+	// rtOtherStartOff + heapSize, a compile-time constant, so no separate field names it.
+	rtOtherStartOff = 32
+	// rtGcNextOff is the destination semispace's bump pointer while a collection is in
+	// progress (ADR-0022): rt_evacuate advances it on every copy, and rt_collect's own
+	// Cheney scan reads it as the scan loop's terminating condition. Meaningless outside
+	// an active collection, unlike every other runtime-block field.
+	rtGcNextOff = 40
 	// rtBlockSize is the block's size in bytes; it lives in the writable segment.
-	rtBlockSize = 32
+	rtBlockSize = 48
 
 	// wordSize is the size of everything the machine holds in a register.
 	wordSize = 8
@@ -55,6 +63,13 @@ type runtimeLabels struct {
 	panic        x86.Label
 	equalObjects x86.Label
 	compareBytes x86.Label
+	// collect, lookupStackMap, evacuate and scanObject are the collector (ADR-0022):
+	// collect is what emitAlloc calls on an out-of-space bump; the other three are its
+	// own subroutines, each also directly callable in isolation for testing.
+	collect        x86.Label
+	lookupStackMap x86.Label
+	evacuate       x86.Label
+	scanObject     x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -74,6 +89,10 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.panic = e.a.NewLabel("rt_panic")
 	e.rt.equalObjects = e.a.NewLabel("rt_equal_objects")
 	e.rt.compareBytes = e.a.NewLabel("rt_compare_bytes")
+	e.rt.collect = e.a.NewLabel("rt_collect")
+	e.rt.lookupStackMap = e.a.NewLabel("rt_lookup_stack_map")
+	e.rt.evacuate = e.a.NewLabel("rt_evacuate")
+	e.rt.scanObject = e.a.NewLabel("rt_scan_object")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -84,6 +103,10 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitPanic()
 	e.emitEqualObjects()
 	e.emitCompareBytes()
+	e.emitLookupStackMap()
+	e.emitEvacuate()
+	e.emitScanObject()
+	e.emitCollect()
 }
 
 // emitPanic reports a `panic` and exits 101: rdi = the message String, rsi = the address
@@ -131,16 +154,13 @@ func (e *emitter) emitPanic() {
 	a.Ud2()
 }
 
-// emitStart is the program's entry point: claim a heap, call `main`, exit cleanly.
-func (e *emitter) emitStart(mainLabel x86.Label) {
+// mmapHeap maps one heapSize-byte anonymous, read-write, private region and leaves its
+// address in rax, trapping with `out of memory` on failure. It is inlined at both of
+// emitStart's two call sites (ADR-0022's two semispaces) rather than a callable routine,
+// since emitStart runs before r15's own runtime block is fully written and this needs no
+// calling convention beyond "leave the result in rax".
+func (e *emitter) mmapHeap() {
 	a := e.a
-	a.Bind(e.rt.start)
-
-	// r15 holds the runtime block for the rest of the program's life (ADR-0018 reserves
-	// it). The address is an immediate: the data segment's address was decided before a
-	// byte of code was emitted, so there is nothing to relocate.
-	a.MovRI(x86.R15, e.dataAddr)
-
 	// mmap(NULL, heapSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
 	a.MovRI(x86.RAX, e.target.SysMmap)
 	a.XorRR(x86.RDI, x86.RDI)
@@ -158,16 +178,42 @@ func (e *emitter) emitStart(mainLabel x86.Label) {
 	a.Jcc(x86.AboveEqual, ok)
 	e.trapWith(e.outOfMemoryMsg)
 	a.Bind(ok)
+}
 
-	a.MovMR(x86.At(x86.R15, rtBumpOff), x86.RAX)
-	a.MovRI(x86.RCX, heapSize)
-	a.AddRR(x86.RAX, x86.RCX)
-	a.MovMR(x86.At(x86.R15, rtEndOff), x86.RAX)
+// emitStart is the program's entry point: claim a heap, call `main`, exit cleanly.
+func (e *emitter) emitStart(mainLabel x86.Label) {
+	a := e.a
+	a.Bind(e.rt.start)
+
+	// r15 holds the runtime block for the rest of the program's life (ADR-0018 reserves
+	// it). The address is an immediate: the data segment's address was decided before a
+	// byte of code was emitted, so there is nothing to relocate.
+	a.MovRI(x86.R15, e.dataAddr)
+
+	// Two semispaces (ADR-0022): the first becomes the current space (rtBumpOff/
+	// rtEndOff), the second is the collector's destination on the first collection
+	// (rtOtherStartOff). `syscall` clobbers only rcx and r11, never rbx, so the first
+	// mmap's result survives in rbx across the second call.
+	e.mmapHeap()
+	a.MovRR(x86.RBX, x86.RAX)
+	e.mmapHeap()
+
+	a.MovMR(x86.At(x86.R15, rtBumpOff), x86.RBX)
+	a.MovRR(x86.RCX, x86.RBX)
+	a.AddRI(x86.RCX, heapSize)
+	a.MovMR(x86.At(x86.R15, rtEndOff), x86.RCX)
+	a.MovMR(x86.At(x86.R15, rtOtherStartOff), x86.RAX)
 
 	// The kernel hands over a 16-byte aligned stack with argc on top. Origin's `main`
 	// takes no arguments, and every call site keeps the alignment the ABI requires, so
 	// aligning once here is enough.
 	a.AndRI(x86.RSP, -16)
+
+	// The collector's rbp-chain walk (ADR-0022) stops when a frame's saved caller-rbp is
+	// zero. `main`'s own prologue pushes whatever is in rbp right now as that first
+	// saved value, so clearing it here is what gives the walk a well-defined end after
+	// main's own frame, rather than however this routine's own rbp happens to be left.
+	a.XorRR(x86.RBP, x86.RBP)
 
 	a.Call(mainLabel)
 
@@ -179,10 +225,10 @@ func (e *emitter) emitStart(mainLabel x86.Label) {
 
 // emitAlloc is the bump allocator: rdi = payload words, rsi = type id, result in rax.
 //
-// There is no collector behind it. When the bump pointer reaches the end of the mapping
-// the program traps with `out of memory`, which spec/08-memory-model.md allows an
-// allocation to do; what it does not yet do is reclaim, and that is recorded as deferred
-// rather than pretended away.
+// When the bump pointer would exceed the current semispace, it collects once (ADR-0022)
+// and retries the very same allocation; only a request that still does not fit after a
+// real collection traps with `out of memory` (spec/08-memory-model.md's fifth
+// guarantee).
 func (e *emitter) emitAlloc() {
 	a := e.a
 	a.Align(16)
@@ -201,9 +247,32 @@ func (e *emitter) emitAlloc() {
 	a.MovRM(x86.RCX, x86.At(x86.R15, rtEndOff))
 	a.CmpRR(x86.RDX, x86.RCX)
 	a.Jcc(x86.BelowEqual, fits)
-	e.trapWith(e.outOfMemoryMsg)
-	a.Bind(fits)
 
+	// Doesn't fit: collect once and retry. rt_collect's own calling convention (ADR-0022)
+	// takes the caller of `alloc` as its first frame to walk: r9 names its return
+	// address, and rbp is already exactly its rbp, since nothing above this point has
+	// touched either. rdi/rsi (words/typeid) do not survive a call on their own --
+	// collect clobbers every caller-saved register reaching into everything it calls --
+	// so they are pushed across it and popped back before the retry.
+	a.MovRM(x86.R9, x86.At(x86.RSP, 0))
+	a.Push(x86.RDI)
+	a.Push(x86.RSI)
+	a.Call(e.rt.collect)
+	a.Pop(x86.RSI)
+	a.Pop(x86.RDI)
+
+	a.MovRR(x86.RCX, x86.RDI)
+	a.ShlI(x86.RCX, 3)
+	a.AddRI(x86.RCX, objHeaderSize)
+	a.MovRM(x86.RAX, x86.At(x86.R15, rtBumpOff))
+	a.MovRR(x86.RDX, x86.RAX)
+	a.AddRR(x86.RDX, x86.RCX)
+	a.MovRM(x86.RCX, x86.At(x86.R15, rtEndOff))
+	a.CmpRR(x86.RDX, x86.RCX)
+	a.Jcc(x86.BelowEqual, fits)
+	e.trapWith(e.outOfMemoryMsg)
+
+	a.Bind(fits)
 	a.MovMR(x86.At(x86.R15, rtBumpOff), x86.RDX)
 
 	// The header is the type id in the low 32 bits and the payload size in words at bit

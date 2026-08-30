@@ -107,6 +107,14 @@ fn main() {
 			t.Errorf("entries %d and %d are not in strictly ascending address order (%#x, then %#x)",
 				i-1, i, entries[i-1].ReturnAddr, e.ReturnAddr)
 		}
+		// A register can only be a live root at a call site if the function's own
+		// register allocator assigned it to some interval at all, which is exactly what
+		// SavedMask records (the function pushed it in its prologue). RegMask naming a
+		// register SavedMask does not is a stack map that could send ADR-0022's future
+		// collector unwinding to a slot that was never pushed.
+		if e.RegMask&^e.SavedMask != 0 {
+			t.Errorf("entry %d has RegMask %04b not a subset of SavedMask %04b", i, e.RegMask, e.SavedMask)
+		}
 	}
 }
 

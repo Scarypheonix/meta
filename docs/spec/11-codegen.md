@@ -155,21 +155,29 @@ real-address pass has run, sorts by address, and encodes the table into read-onl
 (`rtStackMapOff`, `rtStackMapCountOff`) as compile-time constants, the same way other
 fixed values are already poked into the data segment.
 
-DEFERRED: the collector itself is still missing, and native code therefore allocates
-without ever collecting — `emitAlloc` still only bump-allocates and traps on OOM. What
-remains, per `docs/deferred.md`:
+The collector itself (ADR-0022) walks the map: `internal/backend/collect.go`'s
+`rt_collect`, called by `emitAlloc` on an out-of-space bump, starts from the immediate
+caller of `alloc` and walks the `rbp` chain this section's calling convention already
+always maintains, one frame at a time, each resolved by its own return address's map
+entry via `rt_lookup_stack_map` (a frame with no entry — one of `runtime.go`'s own
+routines, which allocate internally but were never wired into `recordCall` — gets a
+synthetic all-saved, no-roots-of-its-own entry instead of being treated as a gap). Every
+discovered root, register or stack slot, is evacuated by `rt_evacuate` (Cheney's
+algorithm: copy once into a second, otherwise-idle semispace, forward the original) and
+`rt_scan_object` scans each copy for further references using the same per-`TypeID`
+layout table `equal.go` already built. The two semispaces then swap roles, and `emitAlloc`
+retries the same allocation once, trapping `out of memory` only if it still does not fit.
 
-- The collector that walks the map: for the immediate caller of `alloc`, and then up the
-  `rbp` chain this section's calling convention already always maintains, one frame at a
-  time, each resolved by its own return address's map entry via `LookupStackMap`.
-- Mark/copy and relocation of every discovered root, and updating the roots themselves
-  once objects move.
-
-Emitting a table with no reader is not a stub that lies (process rule 8): every field it
-carries is exact, not approximated, and is verified directly against the real compiler
-(`internal/backend/stackmap_test.go` builds a program end to end and checks the emitted
-table's return addresses, sort order, and register roots) rather than by claiming a
-collector that does not exist yet.
+Scoped, per ADR-0022, to a single-space, stop-the-world collector: no write barrier, no
+card table, no generational split. This satisfies spec/08-memory-model.md's five collector
+guarantees exactly as much as a generational collector does — nothing about "generational"
+is part of the language's own contract — and is what a hand-assembled freestanding runtime
+can get right first; going generational is Phase 6+ work. Verified against the real
+compiler and real, executed collections: `internal/backend/stackmap_test.go` for the table
+itself, and `tests/e2e/cases/gc_reclaims_discarded_allocations` /
+`gc_survives_across_a_call` (spec/10-examples.md #13) for the collector actually running —
+several real collections in one process, including a live root held in an outer frame
+while an inner one allocates heavily — at every optimization level, on every engine.
 
 ## Object layout in native code
 

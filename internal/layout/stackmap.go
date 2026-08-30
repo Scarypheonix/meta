@@ -26,15 +26,28 @@ type StackMapEntry struct {
 	// allocation invariant: an interval spanning a call always gets a callee-saved
 	// register or spills), which is why four bits are enough.
 	RegMask uint8
+	// SavedMask names which of the four callee-saved registers this call site's own
+	// function pushed in its prologue (backend.go's `function`, in the same bit order as
+	// RegMask). It is a per-function fact, not a per-call-site one, but it travels on
+	// every entry of the function's own call sites because nothing else names "the
+	// current function" in this table. A collector walking the rbp chain (ADR-0022)
+	// needs it to tell which of a caller's live registers survived a callee's body
+	// untouched (still the live CPU register) from which were spilled to a fixed
+	// rbp-relative slot in the callee's own prologue (the callee's caller's original
+	// value, recovered from that slot instead): for register i, if bit i is set, the
+	// saved copy sits at the callee's own rbp minus 8 times (1 + the number of
+	// lower-indexed set bits) -- the same fixed push order `calleeSaved` and `e.saved`
+	// already use, so a set bit's rank among the set bits below it is its push position.
+	SavedMask uint8
 }
 
 // StackMapEntrySize is one encoded entry's width: ReturnAddr(8) + RefOffset(4) +
-// RefCount(4) + RegMask(1), padded to keep every entry's ReturnAddr 8-byte aligned so a
-// binary search can index the table with a plain multiply. Exported so a caller that
-// must compute a table's byte extent before decoding it (internal/backend's own tests,
-// reading the table out of a raw image) has one place to read the width from rather than
-// hand-duplicating it.
-const StackMapEntrySize = 8 + 4 + 4 + 1 + 7
+// RefCount(4) + RegMask(1) + SavedMask(1), padded to keep every entry's ReturnAddr
+// 8-byte aligned so a binary search can index the table with a plain multiply. Exported
+// so a caller that must compute a table's byte extent before decoding it (internal/
+// backend's own tests, reading the table out of a raw image) has one place to read the
+// width from rather than hand-duplicating it.
+const StackMapEntrySize = 8 + 4 + 4 + 1 + 1 + 6
 
 const stackMapEntrySize = StackMapEntrySize
 
@@ -51,6 +64,7 @@ func EncodeStackMap(entries []StackMapEntry) []byte {
 		binary.LittleEndian.PutUint32(b[8:12], uint32(e.RefOffset))
 		binary.LittleEndian.PutUint32(b[12:16], uint32(e.RefCount))
 		b[16] = e.RegMask
+		b[17] = e.SavedMask
 	}
 	return out
 }
@@ -95,5 +109,6 @@ func decodeStackMapEntry(b []byte) StackMapEntry {
 		RefOffset:  int32(binary.LittleEndian.Uint32(b[8:12])),
 		RefCount:   int32(binary.LittleEndian.Uint32(b[12:16])),
 		RegMask:    b[16],
+		SavedMask:  b[17],
 	}
 }

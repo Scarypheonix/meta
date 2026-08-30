@@ -317,31 +317,67 @@ This project outlasts any single context window.
   computation directly (`regalloc_test.go`) and the encoding round-trip directly
   (`internal/layout/stackmap_test.go`). Nothing consumes the table yet — no engine's
   behavior changed, and the full differential suite is unchanged.
+- **Native heap collection is landed (ADR-0022)** — a single-space, stop-the-world
+  semispace copy, closing the collector gap the six bullets above were all building
+  toward. `emitStart` now `mmap`s two `heapSize` regions instead of one; `emitAlloc`
+  collects and retries once on an out-of-space bump, trapping `out of memory` only if the
+  retry still does not fit. `internal/backend/collect.go`'s `rt_collect` walks the `rbp`
+  chain from the immediate caller of `alloc`, resolving each frame via a new
+  `rt_lookup_stack_map` (machine code standing in for `layout.LookupStackMap`) and
+  evacuating every register and stack-slot root through `rt_evacuate` (Cheney's
+  algorithm) and `rt_scan_object` (reading the same per-`TypeID` table `equal.go`
+  built). `StackMapEntry` gained `SavedMask` — which callee-saved registers a call
+  site's own function pushed in its prologue — the one fact the table did not yet carry:
+  without it, recovering an *outer* frame's original register values from an *inner*
+  frame's save slots while walking outward is not possible. A frame with no real entry
+  (one of `runtime.go`'s own routines, e.g. `rt_int_to_str`, which allocates internally
+  but was never wired into `recordCall`) gets a synthetic all-saved, no-roots-of-its-own
+  entry rather than being treated as a stack-map gap. `backend.go`'s `function` now also
+  zeroes every reference-kind spill slot at entry, so a slot the collector visits before
+  its value's first store reads `Nil` rather than another frame's leftover bytes. Two
+  real bugs surfaced only once the walk actually ran on real programs (both now
+  regression-covered): `gcTransitionLocs` clobbering `rcx`/`rdx` while computing a
+  frame's own save-slot addresses corrupted the *next* frame's rbp/return-address the
+  moment they were computed into those same registers just before calling it, fixed by
+  stashing them in dedicated frame slots across the call; and an early draft wrote every
+  tracked register's final location back into the physical register once the whole walk
+  finished, which is correct for a register a frame never touched but corrupts one a
+  frame saved for its own unrelated local state (`rt_int_to_str`'s own buffer pointer,
+  concretely) — fixed by never doing a separate end-of-walk restore pass at all, since
+  each register's one correct write-back already happens inline, exactly once, at the
+  specific frame whose `RegMask` claims it. Verified against real, executed collections:
+  `tests/e2e/cases/gc_reclaims_discarded_allocations` (spec/10-examples.md #13: ~120 MB
+  into one loop-carried live struct, several real collections in one run) and
+  `gc_survives_across_a_call` (a live struct held in `main`'s own frame while a called
+  function allocates heavily — genuine cross-frame register recovery, not just the
+  frame-0 case) — both byte-identical across every engine and optimization level.
+  Building the first of those also surfaced an unrelated, pre-existing `internal/opt`
+  bug (a `-O2` fixed-point non-convergence on a loop assigning two variables from the
+  loop counter two different ways each iteration, confirmed to reproduce with no
+  allocation involved at all) — recorded in `docs/deferred.md` rather than chased here.
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
-`docs/deferred.md`: native heap allocation never triggers a collection (the kind data,
-the register allocator's contiguous reference-slot placement, and the stack-map table
-itself are all landed and complete; only the collector that reads the table is not —
-spec/11-codegen.md's own DEFERRED note has the full remaining list); integer arithmetic
-is still 64-bit only in both engines; `u64::MAX` has no run-time representation; `match` compiles to a linear
-chain of arm tests rather than a decision tree; a struct or enum declared inside a
-function body (never checked, per Phase 2's own documented scope) now fails loudly in
-`internal/compile` instead of silently compiling against the wrong descriptor, which is
-safer but still not a fix; and a function used both as a direct callee and as an
-escaping value in the same body loses the direct-call fast path for every use once it is
-boxed at all (ADR-0020's own documented, deliberate simplification — correct, just not
-maximally fast in that one mixed pattern).
+`docs/deferred.md`: integer arithmetic is still 64-bit only in both engines; `u64::MAX`
+has no run-time representation; `match` compiles to a linear chain of arm tests rather
+than a decision tree; a struct or enum declared inside a function body (never checked,
+per Phase 2's own documented scope) now fails loudly in `internal/compile` instead of
+silently compiling against the wrong descriptor, which is safer but still not a fix; a
+function used both as a direct callee and as an escaping value in the same body loses the
+direct-call fast path for every use once it is boxed at all (ADR-0020's own documented,
+deliberate simplification); native heap collection is single-space and non-generational,
+with no write barrier (ADR-0022's own deliberate scope, satisfying the same language-
+level guarantees as the VM/interpreter's generational collector, see spec/08-memory-
+model.md); and a `-O2` fixed-point non-convergence on a specific loop-carried-assignment
+shape, found while building the collector's own stress test but unrelated to it (see
+above), is not yet root-caused.
 
-**Next action:** the collector is the only large piece of Phase 5 left, and everything
-it needs is now in place (per-value kind data, contiguous reference-slot grouping, and
-the stack-map table itself, reachable from the runtime block via `rtStackMapOff`/
-`rtStackMapCountOff`). The next concrete step is the collector: starting from the
-immediate caller of `alloc`, walk the `rbp` chain this section's calling convention
-already always maintains, resolve each frame's return address to its map entry via
-`LookupStackMap`, and mark/copy plus relocate every discovered root (register roots per
-`RegMask`, stack roots per `RefOffset`/`RefCount`). Phase 5 is not closed until every
-phase 4 exit criterion holds under `-O0`/`-O1`/`-O2` on native output too, and collection
-is what that still needs.
+**Next action:** the `nativeSkips` list in `tests/e2e` — currently one entry,
+`opt_float_semantics_survive_folding` (rendering a float needs shortest-round-trip
+formatting in emitted code) — is what stands between here and Phase 5's own exit
+criterion: "every phase 4 exit criterion holds under `-O0`/`-O1`/`-O2` on native output
+too." Emptying it is the next concrete step. Separately, and not blocking that criterion
+on its own terms, the `-O2` fixed-point bug above is worth root-causing before it hides
+behind something else.
 
 **Awaiting the user:** the two things only the target machine can confirm — that a
 compiled Mach-O binary runs, and that `lldb` breaks on an Origin source line — are

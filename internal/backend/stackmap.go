@@ -49,8 +49,29 @@ func (e *emitter) recordCall(v *ir.Value) {
 			RefOffset: e.slotBase + wordSize,
 			RefCount:  int32(e.regs.refSlots),
 			RegMask:   mask,
+			SavedMask: e.savedMask(),
 		},
 	})
+}
+
+// savedMask names, in RegMask's own bit order, which callee-saved registers the current
+// function's own prologue pushed (e.saved, backend.go's `function`) -- a per-function
+// fact recorded on every one of that function's call sites, since the stack map has no
+// other place to name "the current function" from. A future collector walking the rbp
+// chain (ADR-0022) uses it to tell a live-but-untouched register (still the physical
+// register, unchanged since the call) from one this function itself spilled to a fixed
+// rbp-relative slot in its own prologue (the caller's original value, recovered from
+// there instead): for register i, StackMapEntry's own doc comment gives the slot.
+func (e *emitter) savedMask() uint8 {
+	var mask uint8
+	for _, r := range e.saved {
+		for i, c := range calleeSaved {
+			if c == r {
+				mask |= 1 << uint(i)
+			}
+		}
+	}
+	return mask
 }
 
 // buildStackMap resolves every recorded safepoint's return address (every label now
