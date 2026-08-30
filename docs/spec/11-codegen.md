@@ -132,12 +132,12 @@ downstream can recover a value's kind from otherwise; `internal/backend/kinds.go
 `resolveClosureCalls`, entirely apart from `internal/ir`, `internal/opt` or the VM —
 carries that seed to every other value structurally (an arithmetic op is always raw, a
 `phi` is whatever its operands already are, and so on), so every value the register
-allocator will ever give a home to now has a known kind. What is still missing, and
-still scheduled in `docs/deferred.md`:
+allocator will ever give a home to now has a known kind, and the register allocator
+(`regalloc.go`'s `allocate`) already places every reference-kind spill slot in one
+contiguous run below the raw ones, exactly as this section's "Stack frames" specifies —
+which is what will let a stack map be two integers rather than a bitmap. What is still
+missing, and still scheduled in `docs/deferred.md`:
 
-- The register allocator placing every reference-kind spill slot in one contiguous run,
-  as this section's "Stack frames" already specifies, which is what turns a stack map
-  into two integers rather than a bitmap.
 - The stack-map table itself: one entry per call site (not only a user-visible
   allocation — any call can transitively allocate and trigger a collection, so any call's
   return address must resolve to a map), sorted by code address in read-only data, and

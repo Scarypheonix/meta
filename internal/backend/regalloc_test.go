@@ -3,6 +3,7 @@ package backend
 import (
 	"testing"
 
+	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/ir"
 )
@@ -100,4 +101,102 @@ func TestAllocateGivesLoopCarriedPhisDistinctLocations(t *testing.T) {
 		t.Errorf("the counter and the accumulator share one location (%+v): "+
 			"one will silently overwrite the other on every iteration", li)
 	}
+}
+
+// TestReferenceSpillSlotsAreContiguousAndBelowRawOnes is ADR-0021's own regression
+// test: spec/11-codegen.md's "Stack frames" requires every reference-kind spill slot to
+// sit below every raw one, so a stack map can describe the reference area as one offset
+// and one count instead of a bitmap. Twelve values (six raw, six reference), all kept
+// live to one final instruction that uses every one of them, force more spilling than
+// the four callee-saved registers can absorb -- each value crosses the call the tuple
+// construction itself lowers to (clobbersCallerSaved), so every one of them prefers a
+// callee-saved register or a spill slot, never a caller-saved register.
+func TestReferenceSpillSlotsAreContiguousAndBelowRawOnes(t *testing.T) {
+	f := ir.NewFunc("many", 0, 0)
+	entry := f.Entry
+
+	const nRaw, nRef = 6, 6
+	var raws, refs []*ir.Value
+	for i := 0; i < nRaw; i++ {
+		// OpFunc needs no operands and staticKind gives it KindInt unconditionally, so
+		// it is a raw value with nothing else to set up.
+		raws = append(raws, entry.Append(f.NewValue(ir.OpFunc, diag.Span{})))
+	}
+	for i := 0; i < nRef; i++ {
+		// OpStruct's Const would normally be a real layout.TypeID, but staticKind
+		// reports KindRef for it unconditionally, so no registry is needed here.
+		refs = append(refs, entry.Append(f.NewValue(ir.OpStruct, diag.Span{})))
+	}
+	all := append(append([]*ir.Value{}, raws...), refs...)
+	tup := entry.Append(f.NewValue(ir.OpTuple, diag.Span{}, all...))
+	entry.SetTerminator(f.NewValue(ir.OpReturn, diag.Span{}, tup))
+	f.RecomputeUses()
+
+	propagateKinds(f, &bytecode.Program{})
+	a := allocate(f)
+
+	if a.slots == 0 {
+		t.Fatal("expected at least some spilling: twelve values share four callee-saved registers")
+	}
+
+	var refSpills, rawSpills int
+	for _, v := range refs {
+		if l, ok := a.where[v]; ok && l.spilled() {
+			refSpills++
+			if l.slot > a.refSlots {
+				t.Errorf("a reference-kind value spilled to slot %d, past refSlots=%d", l.slot, a.refSlots)
+			}
+		}
+	}
+	for _, v := range raws {
+		if l, ok := a.where[v]; ok && l.spilled() {
+			rawSpills++
+			if l.slot <= a.refSlots {
+				t.Errorf("a raw value spilled to slot %d, at or below refSlots=%d", l.slot, a.refSlots)
+			}
+		}
+	}
+	if refSpills == 0 || rawSpills == 0 {
+		t.Fatalf("test did not force both groups to spill (refSpills=%d rawSpills=%d); "+
+			"widen it rather than trusting a result that never exercised the boundary",
+			refSpills, rawSpills)
+	}
+	if a.refSlots != refSpills {
+		t.Errorf("refSlots = %d, want exactly %d (the number of spilled reference values)", a.refSlots, refSpills)
+	}
+}
+
+// TestAllocatePanicsRatherThanGuessAnUnknownKindAcrossACall is the other side of
+// ADR-0021's soundness argument: a value whose kind propagateKinds could not resolve,
+// forced to spill while live across a call, must never be silently grouped as "raw" --
+// wrong for an actual reference, it would make a future collection corrupt memory
+// instead of merely computing a worse stack map. This constructs exactly that gap by
+// hand (a parameter with no seed data, i.e. built from a Fn with an empty ParamKinds)
+// rather than relying on one still existing somewhere in kinds.go's real coverage.
+func TestAllocatePanicsRatherThanGuessAnUnknownKindAcrossACall(t *testing.T) {
+	f := ir.NewFunc("gap", 1, 0)
+	entry := f.Entry
+	// A real ir.Build would seed this from bytecode.Fn.ParamKinds[0]; built by hand and
+	// left unset, its Kind is the zero value, KindUnknown.
+	p := entry.Append(f.NewValue(ir.OpParam, diag.Span{}))
+
+	// Six more live values, plus p, all used by the tuple construction below -- which
+	// itself lowers to a call (clobbersCallerSaved) -- forces p to spill while live
+	// across it, without needing a second function to call.
+	var others []*ir.Value
+	for i := 0; i < 6; i++ {
+		others = append(others, entry.Append(f.NewValue(ir.OpFunc, diag.Span{})))
+	}
+	tup := entry.Append(f.NewValue(ir.OpTuple, diag.Span{}, append([]*ir.Value{p}, others...)...))
+	entry.SetTerminator(f.NewValue(ir.OpReturn, diag.Span{}, tup))
+	f.RecomputeUses()
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("allocate did not panic on a call-spanning value with no known kind")
+		}
+	}()
+	allocate(f)
+	t.Fatal("unreachable: allocate should have panicked")
 }

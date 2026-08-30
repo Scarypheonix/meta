@@ -1,8 +1,10 @@
 package backend
 
 import (
+	"fmt"
 	"sort"
 
+	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/ir"
 	"github.com/scarypheonix/meta/internal/x86"
 )
@@ -52,6 +54,13 @@ type interval struct {
 type alloc struct {
 	where map[*ir.Value]loc
 	slots int
+	// refSlots is how many of the low-numbered spill slots (1..refSlots) hold
+	// references; slots refSlots+1..slots are raw. spec/11-codegen.md's "Stack frames"
+	// requires every reference-kind slot to sit below every raw one, so that a stack
+	// map can describe the reference area as one offset and one count instead of a
+	// bitmap (ADR-0021 is what gives every spilled value's Kind the register allocator
+	// now reads to keep that grouping).
+	refSlots int
 	// used lists the callee-saved registers the function actually assigned, so the
 	// prologue saves those and no others.
 	used []x86.Reg
@@ -371,9 +380,28 @@ func allocate(f *ir.Func) *alloc {
 		active = kept
 	}
 
+	// refSpills and rawSpills collect spilled intervals in the order they were spilled;
+	// final slot numbers are assigned afterward so that every reference-kind slot ends
+	// up below every raw one (spec/11-codegen.md's "Stack frames"), regardless of the
+	// arrival order the linear scan itself spills them in.
+	var refSpills, rawSpills []*interval
 	spill := func(iv *interval) {
-		a.slots++
-		a.where[iv.val] = inSlot(a.slots)
+		if iv.spansCall && iv.val.Kind == bytecode.KindUnknown {
+			// A value the register allocator has to keep alive across a call, whose
+			// kind ADR-0021's propagateKinds still could not resolve, is exactly the
+			// case a stack map cannot afford to guess about: grouping it as "raw" when
+			// it might actually be a reference would make a future collection corrupt
+			// memory instead of merely computing a worse layout. Reaching this is a gap
+			// in kinds.go's coverage, not a program the language rejects -- every
+			// well-typed Origin program has a fully static type for every value.
+			panic(fmt.Sprintf(
+				"this is a compiler bug: %s in %s spans a call with no known kind", iv.val, f.Name))
+		}
+		if isRefKind(iv.val.Kind) {
+			refSpills = append(refSpills, iv)
+		} else {
+			rawSpills = append(rawSpills, iv)
+		}
 	}
 
 	for _, iv := range ivs {
@@ -408,12 +436,28 @@ func allocate(f *ir.Func) *alloc {
 		sort.Slice(active, func(i, j int) bool { return active[i].end < active[j].end })
 	}
 
+	for i, iv := range refSpills {
+		a.where[iv.val] = inSlot(i + 1)
+	}
+	for i, iv := range rawSpills {
+		a.where[iv.val] = inSlot(len(refSpills) + i + 1)
+	}
+	a.refSlots = len(refSpills)
+	a.slots = len(refSpills) + len(rawSpills)
+
 	for _, r := range calleeSaved {
 		if usedCallee[r] {
 			a.used = append(a.used, r)
 		}
 	}
 	return a
+}
+
+// isRefKind reports whether a value's kind is a heap reference a collector would need
+// to trace -- a struct/tuple/enum/closure (KindRef) or a String (KindString, ByteArray-
+// shaped but still a heap object, layout.go).
+func isRefKind(k bytecode.Kind) bool {
+	return k == bytecode.KindRef || k == bytecode.KindString
 }
 
 func isCalleeSaved(r x86.Reg) bool {

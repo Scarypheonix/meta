@@ -20,6 +20,7 @@ func Emit(f *Func, name string, span diag.Span) (*bytecode.Fn, error) {
 		slots: map[*Value]int{},
 		fn: &bytecode.Fn{
 			Name: name, Params: f.Params, Captures: f.Captures, Span: span,
+			ParamKinds: paramKinds(f), CaptureKinds: captureKinds(f),
 		},
 		blockStart: map[*Block]int{},
 	}
@@ -33,6 +34,31 @@ func Emit(f *Func, name string, span diag.Span) (*bytecode.Fn, error) {
 	e.patchJumps()
 	e.fn.Locals = e.nextSlot
 	return e.fn, nil
+}
+
+// paramKinds and captureKinds rebuild bytecode.Fn's ParamKinds/CaptureKinds (ADR-0021)
+// from f's own OpParam/OpCapture values, which already carry them (Build seeded them
+// from the Fn being re-optimized). Emit must not simply drop this data: -O1/-O2 build a
+// fresh bytecode.Fn here, and internal/backend's own re-Build of the result (buildIR)
+// needs it exactly where ir.Build originally read it from.
+func paramKinds(f *Func) []bytecode.Kind {
+	out := make([]bytecode.Kind, f.Params)
+	f.Values(func(v *Value) {
+		if v.Op == OpParam && v.Aux >= 0 && v.Aux < len(out) {
+			out[v.Aux] = v.Kind
+		}
+	})
+	return out
+}
+
+func captureKinds(f *Func) []bytecode.Kind {
+	out := make([]bytecode.Kind, f.Captures)
+	f.Values(func(v *Value) {
+		if v.Op == OpCapture && v.Aux >= 0 && v.Aux < len(out) {
+			out[v.Aux] = v.Kind
+		}
+	})
+	return out
 }
 
 type pendingJump struct {
@@ -111,6 +137,14 @@ func (e *emitter) emitAB(op bytecode.Op, a, b int, span diag.Span) int {
 	return len(e.fn.Code) - 1
 }
 
+// emitAK is emitA plus a value's kind (ADR-0021): re-emitting v as bytecode must not
+// drop what internal/backend needs from it, even though this package's other consumer
+// (the VM, at -O1/-O2) never reads it.
+func (e *emitter) emitAK(op bytecode.Op, a int, kind bytecode.Kind, span diag.Span) int {
+	e.fn.Code = append(e.fn.Code, bytecode.Instr{Op: op, A: int32(a), Kind: kind, Span: span})
+	return len(e.fn.Code) - 1
+}
+
 // load pushes a value from its slot.
 func (e *emitter) load(v *Value, span diag.Span) {
 	e.emitA(bytecode.OpLoad, e.slots[v], span)
@@ -159,7 +193,7 @@ func (e *emitter) emitValue(v *Value) error {
 		for _, a := range v.Args {
 			e.load(a, span)
 		}
-		e.emitA(bytecode.OpCall, v.Aux, span)
+		e.emitAK(bytecode.OpCall, v.Aux, v.Kind, span)
 
 	case OpCallBuiltin:
 		for _, a := range v.Args {
@@ -181,7 +215,7 @@ func (e *emitter) emitValue(v *Value) error {
 
 	case OpGetField:
 		e.load(v.Args[0], span)
-		e.emitA(bytecode.OpGetField, v.Const, span)
+		e.emitAK(bytecode.OpGetField, v.Const, v.Kind, span)
 
 	case OpSetField:
 		e.load(v.Args[0], span)

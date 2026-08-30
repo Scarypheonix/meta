@@ -276,11 +276,25 @@ This project outlasts any single context window.
   (`internal/compile/kind_test.go` for the seed data; `internal/backend/kinds_test.go`
   for the completed kind, including a boxed bare function's `OpBoxFn`/`OpCallClosure`
   pair specifically) and by the full differential suite being unchanged.
+- **The register allocator now places every reference-kind spill slot in one contiguous
+  run below the raw ones**, exactly what spec/11-codegen.md's "Stack frames" specifies
+  and the last piece a stack map needs before the table itself. `regalloc.go`'s
+  `allocate` sorts a spilled value by `isRefKind(iv.val.Kind)` and numbers the two
+  groups afterward; a call-spanning value that still carries `KindUnknown` at that point
+  panics rather than guessing, since a wrong guess would let a future collection corrupt
+  memory instead of merely computing a worse layout. That panic fired immediately, on
+  the first real program compiled with it: `internal/opt`'s `-O1`/`-O2` path was
+  silently dropping `Kind` on its own bytecode round-trip (`ir.Emit`'s `OpCall`/
+  `OpGetField` emission, a fresh `bytecode.Fn`'s `ParamKinds`/`CaptureKinds`, and
+  inlining's value cloner never touched it) — a real, previously-invisible gap, found
+  and fixed the same day `Kind` got its first actual reader. Verified by the panic's own
+  regression test (`internal/backend/regalloc_test.go`), a new test for the grouping
+  itself, and the full differential suite passing clean at every level again.
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
 `docs/deferred.md`: native heap allocation never triggers a collection (the kind data
-above is landed and complete; the register allocator's contiguous reference-slot
-placement, the stack-map table and the collector itself are not — spec/11-codegen.md's
+and the register allocator's contiguous reference-slot placement are both landed and
+complete; the stack-map table and the collector itself are not — spec/11-codegen.md's
 own DEFERRED note has the full remaining list); integer arithmetic is still 64-bit only
 in both engines; `u64::MAX` has no run-time representation; `match` compiles to a linear
 chain of arm tests rather than a decision tree; a struct or enum declared inside a
@@ -292,14 +306,13 @@ boxed at all (ADR-0020's own documented, deliberate simplification — correct, 
 maximally fast in that one mixed pattern).
 
 **Next action:** native heap collection remains the only large piece of Phase 5 left,
-and the next concrete step is the register allocator's own change: placing every
-reference-kind spill slot in one contiguous run below the raw ones (already specified,
-spec/11-codegen.md's "Stack frames" — the point of the run being contiguous is that a
-stack map can then say "N reference slots starting at offset K" instead of a bitmap).
-That, plus the now-complete per-value kind data, is everything the stack-map table
-itself needs. Phase 5 is not closed until every phase 4 exit criterion holds under
-`-O0`/`-O1`/`-O2` on native output too, and
-collection is what that still needs.
+and everything the stack-map table itself needs is now in place (per-value kind data,
+contiguous reference-slot grouping). The next concrete step is the table: one entry per
+call site (not only a user-visible allocation — any call can transitively allocate),
+sorted by code address in read-only data and reachable from the runtime block, then the
+collector that walks it starting from the immediate caller of `alloc` and up the `rbp`
+chain. Phase 5 is not closed until every phase 4 exit criterion holds under
+`-O0`/`-O1`/`-O2` on native output too, and collection is what that still needs.
 
 **Awaiting the user:** the two things only the target machine can confirm — that a
 compiled Mach-O binary runs, and that `lldb` breaks on an Origin source line — are

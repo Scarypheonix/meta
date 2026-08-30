@@ -259,6 +259,7 @@ func (c *cloner) cloneValue(v *ir.Value) *ir.Value {
 	nv := c.f.NewValue(v.Op, c.call.Span)
 	nv.Const = v.Const
 	nv.Aux = v.Aux
+	nv.Kind = v.Kind
 	// The clone starts out pointing at the callee's values; rewriteArgs then maps each
 	// to its caller-side counterpart. Starting from an empty slice instead loses every
 	// operand, which shows up as an instruction with no inputs rather than as a crash.

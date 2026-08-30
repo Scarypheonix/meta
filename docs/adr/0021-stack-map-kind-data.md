@@ -74,20 +74,42 @@ repointed `OpCallClosure` already have their final `Op` by the time it sees them
 (wherever the four seeded ops' answer is already in the `bytecode.Instr`/`bytecode.Fn`
 it is translating, with no extra context needed) and completed by `propagateKinds`
 (`OpConst`, which needs the constant pool `ir.Build` does not have, and everything else).
-This ADR's remaining open work is the register allocator's placement of reference-kind
-spill slots as one contiguous run (already specified, spec/11-codegen.md's "Stack
-frames"), the stack-map table itself, and the collector that consumes it —
-`docs/deferred.md` has the current list.
+
+The register allocator (`internal/backend/regalloc.go`) is the first actual consumer:
+`allocate`'s `spill` now sorts a spilled value into one of two groups by
+`isRefKind(iv.val.Kind)` instead of numbering slots in arrival order, and assigns final
+numbers afterward so every reference-kind slot (1..`refSlots`) sits below every raw one
+(`refSlots`+1..`slots`) — spec/11-codegen.md's "Stack frames" requirement, now actually
+enforced rather than only specified. A value that reaches `spill` still carrying
+`KindUnknown` while live across a call — a case `propagateKinds` should make impossible
+for a well-typed program — panics rather than guessing which group it belongs to (see
+"Consequences").
+
+This ADR's remaining open work is the stack-map table itself and the collector that
+consumes it — `docs/deferred.md` has the current list.
 
 ## Consequences
-- **Nothing observable changes.** This lands the seed data and the pass that completes
-  it into every value's actual kind, but nothing yet reads that result to change what
-  the backend emits — no register allocator behavior, no table, no collection. Verified
-  directly (`internal/compile/kind_test.go` for the seed data; `internal/backend/kinds_test.go`
+- **Still nothing observable changes for a correct program.** The register allocator now
+  groups spill slots by kind, but which physical slot a value gets was never something
+  Origin source can observe — no engine's behavior changed, verified directly
+  (`internal/compile/kind_test.go` for the seed data; `internal/backend/kinds_test.go`
   for the completed kind, including `OpConst`, every structurally-fixed op, `OpPhi`
-  across a branch, and a boxed bare function's `OpBoxFn`/`OpCallClosure` pair) and
-  indirectly (the full differential suite is unchanged, because no engine's behavior
-  depends on this data).
+  across a branch, and a boxed bare function's `OpBoxFn`/`OpCallClosure` pair;
+  `internal/backend/regalloc_test.go`'s two new tests for the grouping itself and for
+  the panic guard) and indirectly (the full differential suite is unchanged).
+- **Found and fixed a real gap the moment there was a consumer to expose it.** Wiring
+  the register allocator up as `Kind`'s first reader immediately panicked on a real
+  program at `-O2` (`cmp_and_ordering`): `internal/opt`'s `-O1`/`-O2` path rebuilds a
+  function's bytecode from its optimized IR (`ir.Emit`), and that rebuild was silently
+  dropping `Kind` in three places — `OpCall`/`OpGetField`'s own emission (plain `emitA`,
+  with no operand for it), a fresh `bytecode.Fn`'s `ParamKinds`/`CaptureKinds` (never
+  populated at all), and inlining's value cloner (`Const`/`Aux` copied, `Kind` was not).
+  All three are fixed (`ir.Emit` gained the same `emitAK` `internal/compile` already
+  had; `ParamKinds`/`CaptureKinds` are rebuilt from the function's own `OpParam`/
+  `OpCapture` values, which already carry the answer; the cloner copies `Kind` like its
+  other fields). This is exactly why the panic in "Decision" exists rather than a silent
+  raw-kind fallback: it turned a wrong stack map that would have shipped silently into a
+  test failure the same day it was introduced.
 - **No write barrier, no card table, and no generational split are part of this phase's
   design.** `OpSetField` gets a `Kind` for symmetry with the other three field-access
   ops, but a barrier is what a *generational* collector needs to find old-to-young
