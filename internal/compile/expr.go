@@ -291,7 +291,7 @@ func (c *Compiler) expr(e ast.Expr) error {
 		return c.loopExpr(v)
 
 	case *ast.For:
-		return unsupported("`for` in compiled code (the tree-walking interpreter runs it)", v.Span())
+		return c.forExpr(v)
 
 	case *ast.Break:
 		return c.breakExpr(v)
@@ -602,6 +602,84 @@ func (c *Compiler) breakExpr(v *ast.Break) error {
 	if !top.isValueLoop {
 		c.emit(bytecode.OpUnit, v.Span())
 	}
+	return nil
+}
+
+// forExpr compiles `for p in e { .. }` exactly to the desugaring spec/04-expressions.md
+// makes normative:
+//
+//	{
+//	    let mut __it = e.into_iter();
+//	    loop {
+//	        match __it.next() {
+//	            Option::None => break,
+//	            Option::Some(p) => { .. }
+//	        }
+//	    }
+//	}
+//
+// check.forElementType records the two implicit calls' instantiations for
+// monomorphization to find, keyed to v.Iter (standing in for `e.into_iter()`) and to v
+// itself (standing in for `__it.next()`, since `__it` is never a real binding here
+// either — it is a compiler temporary, exactly as the desugaring's own `__it` is).
+func (c *Compiler) forExpr(v *ast.For) error {
+	iterInst, ok := c.callTarget(v.Iter.NodeID())
+	if !ok {
+		return unsupported("`for` over a type whose `into_iter` has no concrete body", v.Iter.Span())
+	}
+	c.emitA(bytecode.OpFunc, c.instIndex[iterInst], v.Iter.Span())
+	if err := c.expr(v.Iter); err != nil {
+		return err
+	}
+	c.emitA(bytecode.OpCall, 1, v.Iter.Span())
+	itSlot := c.temp()
+	c.emitA(bytecode.OpStore, itSlot, v.Iter.Span())
+
+	nextInst, ok := c.callTarget(v.NodeID())
+	if !ok {
+		return unsupported("`for` over a type whose `next` has no concrete body", v.Span())
+	}
+	someIdx, err := c.optionSomeVariant(c.patTypeOf(v.Pat.NodeID()), v.Span())
+	if err != nil {
+		return err
+	}
+
+	top := c.here()
+	c.loops = append(c.loops, loopCtx{})
+
+	c.emitA(bytecode.OpFunc, c.instIndex[nextInst], v.Span())
+	c.emitA(bytecode.OpLoad, itSlot, v.Span())
+	c.emitA(bytecode.OpCall, 1, v.Span())
+	optSlot := c.temp()
+	c.emitA(bytecode.OpStore, optSlot, v.Span())
+
+	c.emitA(bytecode.OpLoad, optSlot, v.Span())
+	c.emitA(bytecode.OpIsVariant, someIdx, v.Span())
+	toBreak := c.emitA(bytecode.OpJumpIfFalse, 0, v.Span())
+
+	c.emitA(bytecode.OpLoad, optSlot, v.Span())
+	c.emitA(bytecode.OpGetPayload, 0, v.Span())
+	if err := c.bindIrrefutable(v.Pat, v.Span()); err != nil {
+		return err
+	}
+	if err := c.block(v.Body); err != nil {
+		return err
+	}
+	c.emit(bytecode.OpPop, v.Span()) // a `for` body's value is discarded, like `while`'s
+
+	contTarget := c.here()
+	c.emitA(bytecode.OpJump, top, v.Span())
+	c.patch(toBreak)
+
+	ctx := c.loops[len(c.loops)-1]
+	c.loops = c.loops[:len(c.loops)-1]
+	for _, b := range ctx.breaks {
+		c.patch(b)
+	}
+	for _, k := range ctx.continues {
+		c.fn.Code[k].A = int32(contTarget)
+	}
+	c.emit(bytecode.OpUnit, v.Span())
 	return nil
 }
 

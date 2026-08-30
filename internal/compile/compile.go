@@ -87,6 +87,15 @@ type Compiler struct {
 	nextSlot int
 	captures map[*resolve.Local]int
 	loops    []loopCtx
+
+	// optionDef and optionSome name the prelude's `Option` enum and its `Some` variant,
+	// found once alongside forcePreludeVariants' own lookup. forExpr reuses them to test
+	// the `Option[Item]` a `for` loop's desugared `next()` call returns, at whatever
+	// concrete `Item` the loop's pattern needs (ADR-0019: every instantiation gets its
+	// own exact layout, so this cannot be precomputed the way forcePreludeVariants
+	// precomputes Option[i64]).
+	optionDef  *types.Def
+	optionSome *ast.Variant
 }
 
 type constKey struct {
@@ -189,6 +198,7 @@ func (c *Compiler) forcePreludeVariants(prelude *ast.File) error {
 	if some == nil || none == nil || less == nil || equal == nil || greater == nil {
 		return nil
 	}
+	c.optionDef, c.optionSome = optionDef, some
 
 	var p bytecode.PreludeVariants
 	var err error

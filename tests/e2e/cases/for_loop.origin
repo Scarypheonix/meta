@@ -1,0 +1,57 @@
+use std::io;
+
+struct Counter { mut n: i64 }
+
+impl IntoIterator for Counter {
+    type Item = i64;
+    type Iter = Counter;
+    fn into_iter(self) -> Counter { self }
+}
+
+impl Iterator for Counter {
+    type Item = i64;
+    fn next(mut self) -> Option[i64] {
+        if self.n > 0 {
+            self.n = self.n - 1;
+            Option::Some(self.n)
+        } else {
+            Option::None
+        }
+    }
+}
+
+fn main() {
+    let mut total = 0;
+    for v in (Counter { n: 5 }) {
+        total = total + v;
+    }
+    io::println(total.to_str());
+
+    let mut count = 0;
+    for v in (Counter { n: 10 }) {
+        if v == 6 {
+            break;
+        }
+        count = count + 1;
+    }
+    io::println(count.to_str());
+
+    let mut odds = 0;
+    for v in (Counter { n: 6 }) {
+        if v % 2 == 0 {
+            continue;
+        }
+        odds = odds + 1;
+    }
+    io::println(odds.to_str());
+
+    let mut empty_runs = 0;
+    for v in (Counter { n: 0 }) {
+        empty_runs = empty_runs + v;
+    }
+    io::println(empty_runs.to_str());
+
+    for v in (Counter { n: 3 }) {
+        io::println(v.to_str());
+    }
+}

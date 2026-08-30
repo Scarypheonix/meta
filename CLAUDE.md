@@ -218,6 +218,16 @@ This project outlasts any single context window.
   `cmp` across every primitive kind, byte-identical across all five engine/level
   combinations; landed permanently as `tests/e2e/cases/structural_equality` and
   `tests/e2e/cases/cmp_and_ordering`.
+- `for` loops now compile on the VM and native backend, not only the interpreter.
+  `check.forElementType` records the desugaring's two implicit calls (`into_iter()`,
+  `next()`, spec/04-expressions.md's normative form) as instantiations keyed to
+  existing AST nodes that `ast.Inspect` already visits (`v.Iter` standing in for
+  `e.into_iter()`, `v` itself standing in for `__it.next()`), so `internal/mono` and
+  `internal/compile`'s new `forExpr` find a concrete callee for each exactly as an
+  explicit method call would. The backend needed no changes at all: a desugared `for`
+  lowers to ops (calls, jumps, `is_variant`, `get_field`) it already handled. Landed
+  permanently as `tests/e2e/cases/for_loop`, byte-identical across all seven
+  engine/level combinations.
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
 `docs/deferred.md`: closures are not lowered natively at all yet (construction, capture
@@ -225,9 +235,8 @@ reads, and any function with `Captures > 0` are rejected) — nearly every reali
 program still needs `--vm` or the interpreter for that reason alone; native heap
 allocation never triggers a collection (no stack maps yet — spec/11-codegen.md's own
 DEFERRED note explains why); integer arithmetic is still 64-bit only in both engines;
-`u64::MAX` has no run-time representation; the bytecode compiler does not lower `for`
-loops (the interpreter runs them); `match` compiles to a linear chain of arm tests
-rather than a decision tree; and a struct or enum declared inside a function body
+`u64::MAX` has no run-time representation; `match` compiles to a linear chain of arm
+tests rather than a decision tree; and a struct or enum declared inside a function body
 (never checked, per Phase 2's own documented scope) now fails loudly in
 `internal/compile` instead of silently compiling against the wrong descriptor, which is
 safer but still not a fix.
@@ -236,9 +245,17 @@ safer but still not a fix.
 compiling most realistic Origin programs, and also the biggest remaining design
 decision: a closure object escaping its creating frame is exactly the case GC-precision
 was deferred to avoid, so building closures now means either accepting that gap
-explicitly for longer or building enough of the stack-map story to close it first.
-Phase 5 is not closed until every phase 4 exit criterion holds under `-O0`/`-O1`/`-O2`
-on native output too, which needs both closures and real collection.
+explicitly for longer or building enough of the stack-map story to close it first. The
+soundness blocker specifically: at an indirect call site, telling a provable closure
+object (safe to dereference slot 0) apart from a bare function pointer is not decidable
+from "callee came from `OpClosure`" once there is any indirection: a phi node, a
+parameter, or (the project's own `closure_counter` test case) a function's own return
+value several SSA hops from any `OpClosure` node. A sound fix needs the same boxing
+treatment `internal/vm/fields.go`'s `boxIfFn` already gives aggregate-field writes,
+extended to every place a function-typed value can flow (let-bindings, arguments,
+returns, phi nodes). Phase 5 is not closed until every phase 4 exit criterion holds
+under `-O0`/`-O1`/`-O2` on native output too, which needs both closures and real
+collection.
 
 **Awaiting the user:** the two things only the target machine can confirm — that a
 compiled Mach-O binary runs, and that `lldb` breaks on an Origin source line — are

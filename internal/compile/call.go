@@ -199,6 +199,19 @@ func (c *Compiler) tryExpr(v *ast.Try) error {
 	return nil
 }
 
+// optionSomeVariant returns the bytecode variant index of `Option::Some` at a concrete
+// `item` type, building its exact layout on first use. forExpr uses it to test the
+// `Option[Item]` a `for` loop's desugared `next()` call returns (spec/04-expressions.md);
+// testing only `Some` and falling through to `break` otherwise is equivalent to also
+// testing `None`, since the checker already proved `next()` returns nothing else.
+func (c *Compiler) optionSomeVariant(item types.Type, span diag.Span) (int, error) {
+	if c.optionDef == nil || c.optionSome == nil {
+		return 0, unsupported("`for`: the prelude does not declare `Option`", span)
+	}
+	optionT := &types.Named{Def: c.optionDef, Args: []types.Type{item}}
+	return c.variantInst(c.optionSome, optionT)
+}
+
 // resultVariants finds, building on first use, the instantiated indices of `Ok` and
 // `Err` for a concrete Result type.
 func (c *Compiler) resultVariants(t types.Type, span diag.Span) (ok, errIdx int, err error) {
