@@ -34,9 +34,9 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Cycle detection in structural `==` | a cyclic graph makes `==` diverge (§04) | Phase 7 |
 | Tuple element access (`t.0`) | found in Phase 1: the grammar's `.` takes an identifier, so a tuple can only be read by pattern. Needs either integer field syntax or a lexer rule for `.0` | Phase 7 |
 | Float formatting in `to_str` | the spec does not fix a rendering; the interpreter uses the shortest round-tripping form and the e2e suite avoids depending on it | Phase 7 |
-| Per-width integer overflow | both engines carry every integer as an i64; giving a value its declared width needs exact per-instantiation layouts, which is backend work | Phase 5 |
+| Per-width integer overflow | both engines carry every integer as a single i64 `Value`; a field or local now has an exact declared width in its layout (ADR-0019), but arithmetic itself does not yet trap or wrap at anything narrower than 64 bits | Phase 5 |
 | `u64::MAX` at run time | the same limitation: it has no representation in an i64 value model, so it is rejected rather than returning a wrong number | Phase 5 |
-| Exact object layouts from monomorphization | Phase 4 monomorphizes *call dispatch* (ADR-0010): each generic function is compiled once per instantiation, and a call inside its body resolves to the concrete impl. Fields still use the two-word tagged-slot representation, because giving each instantiation its own exact layout is shared work with the backend (`internal/layout`, CLAUDE.md's module-boundary list) | Phase 5 |
+| Exact object layouts from monomorphization | delivered in Phase 5: every struct, tuple, enum-variant and closure instantiation gets its own exact `Fixed` layout, keyed the same way `internal/mono` keys a function instance (ADR-0019). `layout.Tagged` is retired | done |
 | `for` loops in compiled code | the bytecode compiler does not lower the `IntoIterator` desugaring yet; the interpreter runs them | Phase 5 |
 | Decision-tree lowering for `match` | the compiler emits a linear chain of arm tests; the tree belongs on the control-flow graph | Phase 5 |
 | Instantiation depth diagnostic truncation | E0055's instantiation chain is not shortened past the list level, so a deep chain's note is long: each entry's type name has already grown by the time truncation would apply | Phase 5 |

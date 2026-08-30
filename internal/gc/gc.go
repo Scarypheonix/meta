@@ -315,27 +315,3 @@ func (h *Heap) Bytes(r layout.Ref) string {
 	}
 	return string(out)
 }
-
-// ---------------------------------------------------------------------------
-// Tagged slots
-// ---------------------------------------------------------------------------
-
-// GetSlot reads tagged slot i of an object.
-func (h *Heap) GetSlot(r layout.Ref, i int) (layout.ValueTag, uint64) {
-	base := uint64(i) * 2
-	return layout.ValueTag(h.Get(r, base)), h.Get(r, base+1)
-}
-
-// SetSlot writes tagged slot i, through the write barrier when it holds a reference.
-func (h *Heap) SetSlot(r layout.Ref, i int, tag layout.ValueTag, bits uint64) {
-	base := uint64(i) * 2
-	h.Set(r, base, uint64(tag))
-	if tag == layout.TagRef {
-		h.SetRef(r, base+1, layout.Ref(bits))
-		return
-	}
-	h.Set(r, base+1, bits)
-}
-
-// Slots reports how many tagged slots an object has.
-func (h *Heap) Slots(r layout.Ref) int { return int(h.Words(r) / 2) }

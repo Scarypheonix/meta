@@ -56,10 +56,8 @@ func (v *VM) equalObjects(a, b layout.Ref, span diag.Span) bool {
 	if desc.Kind == layout.ObjClosure {
 		v.trap(span, "function values cannot be compared with `==`")
 	}
-	for i := 0; i < desc.Slots; i++ {
-		ta, av := v.heap.GetSlot(a, i)
-		tb, bv := v.heap.GetSlot(b, i)
-		if !v.equal(slotValue(ta, av), slotValue(tb, bv), span) {
+	for i := range desc.Kinds {
+		if !v.equal(v.readField(desc, a, i), v.readField(desc, b, i), span) {
 			return false
 		}
 	}
@@ -144,10 +142,9 @@ func (v *VM) displayObject(r layout.Ref) string {
 	if desc.Shape == layout.ByteArray {
 		return v.heap.Bytes(r)
 	}
-	slots := make([]string, 0, desc.Slots)
-	for i := 0; i < desc.Slots; i++ {
-		tag, bits := v.heap.GetSlot(r, i)
-		slots = append(slots, v.display(slotValue(tag, bits)))
+	slots := make([]string, 0, len(desc.Kinds))
+	for i := range desc.Kinds {
+		slots = append(slots, v.display(v.readField(desc, r, i)))
 	}
 
 	switch desc.Kind {
@@ -362,8 +359,9 @@ func saturate(index int, a, b int64) int64 {
 func (v *VM) optionSome(val Value, span diag.Span) layout.Ref {
 	v.requirePrelude(span)
 	info := v.prog.Variants[v.prog.Prelude.OptionSome]
-	r := v.alloc(info.Type, 2, span)
-	v.heap.SetSlot(r, 0, val.Tag, slotBits(val))
+	desc := v.prog.Types.Get(info.Type)
+	r := v.alloc(info.Type, desc.Words, span)
+	v.writeField(desc, r, 0, val, span)
 	return r
 }
 

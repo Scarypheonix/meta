@@ -265,7 +265,11 @@ func (c *Compiler) expr(e ast.Expr) error {
 				return err
 			}
 		}
-		c.emitAB(bytecode.OpTuple, int(c.tupleType(len(v.Elems))), len(v.Elems), v.Span())
+		tt, err := c.tupleInst(c.typeOf(v), v.Span())
+		if err != nil {
+			return err
+		}
+		c.emitAB(bytecode.OpTuple, int(tt), len(v.Elems), v.Span())
 		return nil
 
 	case *ast.Lambda:
@@ -377,12 +381,12 @@ func (c *Compiler) path(v *ast.PathExpr) error {
 		return nil
 
 	case resolve.Variant:
-		vi, ok := c.variantIdx[ref.Variant]
-		if !ok {
-			return unsupported("an unknown variant", v.Span())
-		}
 		if ref.Variant.Kind != ast.UnitVariant {
 			return unsupported("a variant constructor used as a value", v.Span())
+		}
+		vi, err := c.variantInst(ref.Variant, c.typeOf(v))
+		if err != nil {
+			return err
 		}
 		c.emitAB(bytecode.OpVariant, vi, 0, v.Span())
 		return nil
@@ -397,7 +401,10 @@ func (c *Compiler) structLit(v *ast.StructLit) error {
 	ref, _ := c.res.Ref(v.NodeID())
 	switch ref.Kind {
 	case resolve.Struct:
-		idx := c.structIdx[ref.Struct]
+		idx, err := c.structInst(c.typeOf(v), v.Span())
+		if err != nil {
+			return err
+		}
 		// Field initializers run in source order (spec/04-expressions.md), then the
 		// values are placed in declaration order, so the two are reconciled through
 		// temporaries rather than by reordering the evaluation.
@@ -425,7 +432,10 @@ func (c *Compiler) structLit(v *ast.StructLit) error {
 		return nil
 
 	case resolve.Variant:
-		vi := c.variantIdx[ref.Variant]
+		vi, err := c.variantInst(ref.Variant, c.typeOf(v))
+		if err != nil {
+			return err
+		}
 		slots := make([]int, len(ref.Variant.Fields))
 		for i := range slots {
 			slots[i] = -1
@@ -464,6 +474,13 @@ func (c *Compiler) lambda(v *ast.Lambda) error {
 		c.emitA(bytecode.OpLoad, c.slotOf(l), v.Span())
 	}
 
+	// The captures' types are read in the enclosing instance's context, before it is
+	// swapped out for the lambda body's own.
+	ct, err := c.closureInst(caps, v.Span())
+	if err != nil {
+		return err
+	}
+
 	// The lambda's body becomes an ordinary function whose captures are addressed
 	// separately from its locals.
 	idx := len(c.prog.Fns)
@@ -484,7 +501,7 @@ func (c *Compiler) lambda(v *ast.Lambda) error {
 	for _, p := range v.Params {
 		c.bindParam(p.Pat)
 	}
-	err := c.expr(v.Body)
+	err = c.expr(v.Body)
 	if err == nil {
 		c.emit(bytecode.OpReturn, v.Span())
 	}
@@ -493,7 +510,9 @@ func (c *Compiler) lambda(v *ast.Lambda) error {
 		return err
 	}
 
-	c.emitAB(bytecode.OpClosure, idx, len(caps), v.Span())
+	ci := len(c.prog.Closures)
+	c.prog.Closures = append(c.prog.Closures, bytecode.ClosureInfo{FnIndex: idx, Type: ct})
+	c.emitAB(bytecode.OpClosure, ci, len(caps), v.Span())
 	return nil
 }
 

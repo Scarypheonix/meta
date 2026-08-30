@@ -406,6 +406,34 @@ func (c *Checker) freshFor(span diag.Span) types.Type {
 	return v
 }
 
+// instantiateLocal instantiates a let-generalized local's scheme at one use site and
+// registers every fresh variable the instantiation created for end-of-body defaulting.
+//
+// types.Ctx.Instantiate lives in internal/types and has no access to a Checker's
+// pending-variable list, so a fresh variable it creates was previously invisible to
+// endBody: nothing registered it, so a single use of a generalized binding with
+// nothing else pinning its type down -- `let used = 1; io::println(used.to_str());`,
+// where the method call itself never forces a concrete type -- left a Var unresolved
+// with no defaulting and no error.
+//
+// This does not reach every case: if the fresh variable flows straight into *another*
+// generalized `let` that is itself never used again (`let t = (used, used);` with `t`
+// never read), that second `let` re-quantifies over it, endBody skips it as
+// generalized, and it stays unresolved -- correctly, since nothing observable depends
+// on what it would have been. internal/compile's field-layout code applies the same
+// defaulting itself for exactly that residual case (ADR-0019): a var still free at a
+// construction site is, by construction, one the checker proved unobservable.
+func (c *Checker) instantiateLocal(s *types.Scheme, span diag.Span) types.Type {
+	t := c.ctx.Instantiate(s)
+	if len(s.Vars) == 0 {
+		return t
+	}
+	for _, v := range types.FreeVars(t, nil) {
+		c.bodyVars = append(c.bodyVars, pendingVar{ty: v, span: span})
+	}
+	return t
+}
+
 // bindPatternScheme binds a pattern to a possibly-polymorphic type. `let` patterns must
 // be irrefutable (spec/05-patterns.md), which is what irrefutable records.
 func (c *Checker) bindPatternScheme(p ast.Pattern, s *types.Scheme, irrefutable bool) {

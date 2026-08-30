@@ -44,8 +44,8 @@ func (v *VM) run() {
 			if f.closure == layout.Nil {
 				panic("vm: capture read outside a closure")
 			}
-			tag, bits := v.heap.GetSlot(f.closure, int(in.A)+1)
-			v.push(slotValue(tag, bits))
+			desc := v.prog.Types.Get(v.heap.TypeOf(f.closure))
+			v.push(v.readField(desc, f.closure, int(in.A)+1))
 
 		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv, bytecode.OpRem,
 			bytecode.OpAnd, bytecode.OpOr, bytecode.OpXor, bytecode.OpShl, bytecode.OpShr,
@@ -113,7 +113,7 @@ func (v *VM) run() {
 			v.callBuiltin(int(in.A), int(in.B), in.Span)
 
 		case bytecode.OpClosure:
-			v.makeClosure(int(in.A), int(in.B), in.Span)
+			v.makeClosure(int(in.A), in.Span)
 
 		case bytecode.OpStruct:
 			v.makeObject(v.prog.Structs[in.A], int(in.B), in.Span)
@@ -130,8 +130,8 @@ func (v *VM) run() {
 			if obj.Tag != layout.TagRef {
 				panic("vm: field read on a value that is not an object")
 			}
-			tag, bits := v.heap.GetSlot(obj.R, int(in.A))
-			v.push(slotValue(tag, bits))
+			desc := v.prog.Types.Get(v.heap.TypeOf(obj.R))
+			v.push(v.readField(desc, obj.R, int(in.A)))
 
 		case bytecode.OpSetField:
 			val := v.pop()
@@ -139,7 +139,8 @@ func (v *VM) run() {
 			if obj.Tag != layout.TagRef {
 				panic("vm: field write on a value that is not an object")
 			}
-			v.heap.SetSlot(obj.R, int(in.A), val.Tag, slotBits(val))
+			desc := v.prog.Types.Get(v.heap.TypeOf(obj.R))
+			v.writeField(desc, obj.R, int(in.A), val, in.Span)
 
 		case bytecode.OpIsVariant:
 			obj := v.pop()
@@ -180,43 +181,30 @@ func (v *VM) constValue(i int, span diag.Span) Value {
 	}
 }
 
-// slotValue turns a heap slot back into a stack value.
-func slotValue(tag layout.ValueTag, bits uint64) Value {
-	if tag == layout.TagRef {
-		return Value{Tag: tag, R: layout.Ref(bits)}
-	}
-	return Value{Tag: tag, N: bits}
-}
-
-// slotBits is the word to store beside a value's tag.
-func slotBits(val Value) uint64 {
-	if val.Tag == layout.TagRef {
-		return uint64(val.R)
-	}
-	return val.N
-}
-
 // makeObject pops n values and builds an object from them.
 func (v *VM) makeObject(t layout.TypeID, n int, span diag.Span) {
-	r := v.alloc(t, uint64(n)*2, span)
+	desc := v.prog.Types.Get(t)
+	r := v.alloc(t, desc.Words, span)
 	// The values are written back to front so the stack is unwound in one pass, and the
 	// object is only reachable after every slot is filled -- a collection triggered by
 	// a later allocation must never see a half-built object.
 	for i := n - 1; i >= 0; i-- {
 		val := v.pop()
-		v.heap.SetSlot(r, i, val.Tag, slotBits(val))
+		v.writeField(desc, r, i, val, span)
 	}
 	v.push(refVal(r))
 }
 
-func (v *VM) makeClosure(fnIndex, captures int, span diag.Span) {
-	t := v.prog.ClosureTypes[captures]
-	r := v.alloc(t, uint64(captures+1)*2, span)
+func (v *VM) makeClosure(ci int, span diag.Span) {
+	info := v.prog.Closures[ci]
+	desc := v.prog.Types.Get(info.Type)
+	captures := len(desc.Kinds) - 1 // slot 0 is the function index
+	r := v.alloc(info.Type, desc.Words, span)
 	for i := captures - 1; i >= 0; i-- {
 		val := v.pop()
-		v.heap.SetSlot(r, i+1, val.Tag, slotBits(val))
+		v.writeField(desc, r, i+1, val, span)
 	}
-	v.heap.SetSlot(r, 0, layout.TagFn, uint64(fnIndex))
+	v.heap.Set(r, 0, uint64(info.FnIndex))
 	v.push(refVal(r))
 }
 
@@ -235,11 +223,10 @@ func (v *VM) doCall(argCount int, span diag.Span) {
 		v.pushFrame(idx, fn, layout.Nil, argCount, span)
 
 	case layout.TagRef:
-		tag, bits := v.heap.GetSlot(callee.R, 0)
-		if tag != layout.TagFn {
+		if v.prog.Types.Get(v.heap.TypeOf(callee.R)).Kind != layout.ObjClosure {
 			panic("vm: called an object that is not a closure")
 		}
-		idx := int(bits)
+		idx := int(v.heap.Get(callee.R, 0))
 		fn := v.prog.Fns[idx]
 		closure := callee.R
 		copy(v.stack[len(v.stack)-argCount-1:], v.stack[len(v.stack)-argCount:])

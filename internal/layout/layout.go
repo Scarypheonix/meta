@@ -83,26 +83,16 @@ const (
 	// bytes, and the bytes follow. It holds no references, which is what makes a
 	// `String` cheap for the collector to skip.
 	ByteArray
-	// Tagged is a run of slots, each two words: a ValueTag and its payload.
-	//
-	// It exists because Origin 0.1 does not monomorphize yet (ADR-0010, deferred to
-	// Phase 4), so the field of a generic struct has no statically known shape: the
-	// payload of `Option[T]` is a reference for `T = String` and a raw word for
-	// `T = i64`. A tag written beside each slot answers that at run time while keeping
-	// the collector precise -- it reads the tag, it does not guess from the bits.
-	//
-	// The cost is two words per slot. Phase 4 replaces it with exact layouts once
-	// monomorphization gives every instantiation its own descriptor.
-	Tagged
 )
 
-// ValueTag identifies what a Tagged slot holds. The collector reads it to decide
-// whether the word beside it is a reference, so this is part of the shared contract and
-// not a detail of the VM.
+// ValueTag identifies a VM stack value's runtime kind. It has no bearing on heap object
+// layout since ADR-0019 retired the `Tagged` shape; it lives here only because the VM
+// and the collector both need a shared vocabulary for a value that is not yet in an
+// object (a local, a temporary, an argument).
 type ValueTag uint64
 
 const (
-	// TagUnit is the unit value; its payload word is unused.
+	// TagUnit is the unit value.
 	TagUnit ValueTag = iota
 	// TagInt is an integer, held as its two's-complement bits.
 	TagInt
@@ -112,7 +102,7 @@ const (
 	TagBool
 	// TagChar is a Unicode scalar value.
 	TagChar
-	// TagRef is a heap reference: the collector traces and rewrites the payload word.
+	// TagRef is a heap reference.
 	TagRef
 	// TagFn is a top-level function index.
 	TagFn
@@ -150,12 +140,22 @@ const (
 type WordKind uint8
 
 const (
-	// WordRaw is an integer, bool, char or unit: compared by bits.
+	// WordRaw is an opaque raw word, compared by bits. Used directly only by tests;
+	// real descriptors use one of the more specific kinds below so that Show can
+	// render a field without a runtime tag to consult (ADR-0017).
 	WordRaw WordKind = iota
 	// WordRef is a reference the collector must trace and rewrite.
 	WordRef
 	// WordFloat holds IEEE bits and is compared as a float.
 	WordFloat
+	// WordInt is a signed or unsigned integer, compared by bits.
+	WordInt
+	// WordBool is 0 or 1.
+	WordBool
+	// WordChar is a Unicode scalar value.
+	WordChar
+	// WordUnit is the unit value; its word is unused.
+	WordUnit
 )
 
 // Descriptor describes one object shape.
@@ -168,8 +168,6 @@ type Descriptor struct {
 	Words uint64
 	// Kinds gives the kind of each payload word for a Fixed shape.
 	Kinds []WordKind
-	// Slots is the number of tagged slots for a Tagged shape.
-	Slots int
 	// Kind says what the object is, for equality and rendering.
 	Kind ObjKind
 	// FieldNames names a struct's or a struct variant's slots, in declaration order.
@@ -179,11 +177,6 @@ type Descriptor struct {
 	// for an ObjEnum descriptor.
 	TypeName    string
 	VariantName string
-}
-
-// TaggedDescriptor builds a descriptor for an object of n tagged slots.
-func TaggedDescriptor(name string, kind ObjKind, slots int) *Descriptor {
-	return &Descriptor{Name: name, Shape: Tagged, Words: uint64(slots) * 2, Slots: slots, Kind: kind}
 }
 
 // IsRef reports whether payload word i holds a reference.

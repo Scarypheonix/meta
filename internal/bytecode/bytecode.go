@@ -101,16 +101,18 @@ const (
 	OpCall
 	// OpCallBuiltin calls builtin A with B arguments.
 	OpCallBuiltin
-	// OpClosure builds a closure over function A, capturing B values from the stack.
+	// OpClosure builds closure-creation site A (Program.Closures), capturing B values
+	// from the stack.
 	OpClosure
 	// OpFunc pushes the top-level function A as a value.
 	OpFunc
 
 	// --- aggregates ---
 
-	// OpStruct builds struct type A from B values on the stack.
+	// OpStruct builds struct instantiation A (Program.Structs) from B values on the
+	// stack.
 	OpStruct
-	// OpTuple builds a tuple from A values on the stack.
+	// OpTuple builds tuple-shape descriptor A from B values on the stack.
 	OpTuple
 	// OpVariant builds enum variant A (constant index) from B payload values.
 	OpVariant
@@ -297,10 +299,16 @@ type Program struct {
 	Structs []layout.TypeID
 	// StringType is the descriptor id for `String`.
 	StringType layout.TypeID
-	// TupleTypes maps an arity to the descriptor for a tuple of that arity.
-	TupleTypes map[int]layout.TypeID
-	// ClosureTypes maps a capture count to the descriptor for a closure with that many.
-	ClosureTypes map[int]layout.TypeID
+	// Closures describes each closure-creation site: which function it invokes, and
+	// the exact layout of its captures (ADR-0019). Indexed directly by OpClosure's A
+	// operand, the same way Variants is indexed by OpVariant's.
+	Closures []ClosureInfo
+	// FnBoxType is the descriptor for a captureless closure that wraps a bare
+	// top-level function reference. A path naming a function evaluates to TagFn -- an
+	// index, not a heap object -- but a struct field or tuple slot of function type
+	// has one Fixed word that must always hold the same kind of value, so the VM boxes
+	// a TagFn into one of these before writing it there (ADR-0019).
+	FnBoxType layout.TypeID
 	// Prelude records the variant indices the VM needs to build values of its own:
 	// `Option` for the checked-arithmetic methods, `Ordering` for `cmp`. They are
 	// resolved at compile time so the VM never looks anything up by name.
@@ -327,8 +335,15 @@ type VariantInfo struct {
 	Payload int
 	// Name is used in diagnostics and disassembly.
 	Name string
-	// RefPayload says, per payload slot, whether it holds a heap reference.
-	RefPayload []bool
+}
+
+// ClosureInfo describes one closure-creation site.
+type ClosureInfo struct {
+	// FnIndex is the closure's body, an index into Program.Fns.
+	FnIndex int
+	// Type is the exact layout of the closure object: slot 0 is always the function
+	// index, and the rest are the captures, in capture order (ADR-0019).
+	Type layout.TypeID
 }
 
 // Disassemble renders a program as text. Snapshot tests compare its output, which is

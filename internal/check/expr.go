@@ -225,7 +225,7 @@ func (c *Checker) inferPath(v *ast.PathExpr) types.Type {
 	}
 	switch ref.Kind {
 	case resolve.LocalVar:
-		return c.ctx.Instantiate(c.localScheme(ref.Local))
+		return c.instantiateLocal(c.localScheme(ref.Local), v.Span())
 
 	case resolve.Fn:
 		return c.instantiateFn(v, ref.Fn)

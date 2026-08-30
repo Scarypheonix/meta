@@ -3,6 +3,7 @@ package compile
 import (
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/bytecode"
+	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/resolve"
 	"github.com/scarypheonix/meta/internal/types"
 )
@@ -26,7 +27,11 @@ func (c *Compiler) call(v *ast.Call) error {
 					return err
 				}
 			}
-			c.emitAB(bytecode.OpVariant, c.variantIdx[ref.Variant], len(v.Args), v.Span())
+			vi, err := c.variantInst(ref.Variant, c.typeOf(v))
+			if err != nil {
+				return err
+			}
+			c.emitAB(bytecode.OpVariant, vi, len(v.Args), v.Span())
 			return nil
 
 		case resolve.Builtin:
@@ -136,9 +141,9 @@ func (c *Compiler) tryExpr(v *ast.Try) error {
 		return err
 	}
 	inner := c.typeOf(v.X)
-	okVariant, errVariant, found := c.resultVariants(inner)
-	if !found {
-		return unsupported("`?` on something that is not a Result", v.Span())
+	okVariant, errVariant, err := c.resultVariants(inner, v.Span())
+	if err != nil {
+		return err
 	}
 
 	slot := c.temp()
@@ -161,23 +166,30 @@ func (c *Compiler) tryExpr(v *ast.Try) error {
 	return nil
 }
 
-// resultVariants finds the constant indices of `Ok` and `Err` for a Result type.
-func (c *Compiler) resultVariants(t types.Type) (ok, errIdx int, found bool) {
-	n, isNamed := types.AsNamed(t)
-	if !isNamed || n.Def.Enum == nil {
-		return 0, 0, false
+// resultVariants finds, building on first use, the instantiated indices of `Ok` and
+// `Err` for a concrete Result type.
+func (c *Compiler) resultVariants(t types.Type, span diag.Span) (ok, errIdx int, err error) {
+	n, isNamed := types.AsNamed(c.concreteType(t))
+	if !isNamed || n.Def == nil || n.Def.Enum == nil {
+		return 0, 0, unsupported("`?` on something that is not a Result", span)
 	}
+	var okVar, errVar *ast.Variant
 	for _, v := range n.Def.Enum.Variants {
-		idx, known := c.variantIdx[v]
-		if !known {
-			continue
-		}
 		switch v.Name.Name {
 		case "Ok":
-			ok, found = idx, true
+			okVar = v
 		case "Err":
-			errIdx = idx
+			errVar = v
 		}
 	}
-	return ok, errIdx, found
+	if okVar == nil || errVar == nil {
+		return 0, 0, unsupported("`?` on something that is not a Result", span)
+	}
+	if ok, err = c.variantInst(okVar, n); err != nil {
+		return 0, 0, err
+	}
+	if errIdx, err = c.variantInst(errVar, n); err != nil {
+		return 0, 0, err
+	}
+	return ok, errIdx, nil
 }

@@ -63,8 +63,12 @@ func (c *Compiler) testPattern(p ast.Pattern, slot int, fails *[]int) error {
 		ref, _ := c.res.Ref(v.NodeID())
 		switch ref.Kind {
 		case resolve.Variant:
+			vi, err := c.variantInst(ref.Variant, c.patTypeOf(v.NodeID()))
+			if err != nil {
+				return err
+			}
 			c.emitA(bytecode.OpLoad, slot, v.Span())
-			c.emitA(bytecode.OpIsVariant, c.variantIdx[ref.Variant], v.Span())
+			c.emitA(bytecode.OpIsVariant, vi, v.Span())
 			*fails = append(*fails, c.emitA(bytecode.OpJumpIfFalse, 0, v.Span()))
 			return nil
 		case resolve.Const:
@@ -119,8 +123,12 @@ func (c *Compiler) testPathPattern(v *ast.PathPat, slot int, fails *[]int) error
 	ref, _ := c.res.Ref(v.NodeID())
 	switch ref.Kind {
 	case resolve.Variant:
+		vi, err := c.variantInst(ref.Variant, c.patTypeOf(v.NodeID()))
+		if err != nil {
+			return err
+		}
 		c.emitA(bytecode.OpLoad, slot, v.Span())
-		c.emitA(bytecode.OpIsVariant, c.variantIdx[ref.Variant], v.Span())
+		c.emitA(bytecode.OpIsVariant, vi, v.Span())
 		*fails = append(*fails, c.emitA(bytecode.OpJumpIfFalse, 0, v.Span()))
 
 		for i, e := range v.Elems {

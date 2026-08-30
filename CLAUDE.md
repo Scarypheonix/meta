@@ -164,26 +164,45 @@ This project outlasts any single context window.
 
 ## Status
 
-**In flight:** nothing. Phase 4 closed.
+**In flight:** Phase 5, the native x86-64 backend. Landed so far:
 
-**Known-broken:** nothing. Recorded in `docs/deferred.md`, moved forward from Phase 4
-to Phase 5 because they turned out to need the backend's cooperation rather than the
-optimizer's: heap objects still use two-word tagged slots (call dispatch is
-monomorphized per ADR-0010; object *layout* is not yet — see `docs/phases/4-complete.md`
-for why those turned out to be separable); integer arithmetic is 64-bit only in both
-engines; `u64::MAX` has no run-time representation; the bytecode compiler does not lower
-`for` loops (the interpreter runs them); and `match` compiles to a linear chain of arm
-tests rather than a decision tree.
+- `docs/spec/11-codegen.md` and ADR-0017 through ADR-0019 specify and decide the
+  backend's shape: no linker, no libc, freestanding executables (ADR-0017); linear-scan
+  register allocation (ADR-0018); every struct, tuple, enum-variant and closure
+  instantiation now gets its own exact `Fixed` object layout, keyed the same way
+  `internal/mono` keys a function instance — `layout.Tagged` is retired (ADR-0019).
+- `internal/x86`: a hand-written instruction encoder for the subset the backend needs.
+- `internal/obj`: complete Mach-O and ELF executable writers sharing one instruction
+  stream (ADR-0003), no linker involved (ADR-0017).
+- `internal/backend`: lowers the SSA IR to machine code for the *non-allocating*
+  subset — integer/float/bool arithmetic with trapping semantics, comparisons, control
+  flow, and direct/indirect calls under the System V calling convention. `originc build`
+  is wired up and native output sits in the same differential the other two engines run
+  (`tests/e2e`'s `TestEnginesAgree`-equivalent for native, plus direct ELF execution).
+- `internal/layout` now has its second reader: with exact layouts in place, the backend
+  can read a field's offset and pointer-ness directly from its `Descriptor`, which is
+  what a stack map will need.
 
-**Next action:** Phase 5 — the native x86-64 backend. No LLVM, no Cranelift, no
-libgccjit, no C backend (hard constraint): machine code bytes are emitted directly from
-the SSA IR, and object files are written by hand. Two writers — Mach-O for shipping,
-ELF for container-side verification — share one instruction stream (ADR-0003). This is
-also where `internal/layout` gains a second reader beside the GC (process rule 5: one
-shared module, one set of tests) and where exact per-instantiation object layouts can
-finally retire the tagged slots that Phase 3 chose as a staging decision, now that there
-is a backend to agree on the replacement with.
+**Known-broken / explicitly out of scope for this slice**, recorded in
+`docs/deferred.md`: the backend does not yet lower `OpStruct`/`OpTuple`/`OpVariant`/
+`OpClosure` — any program that allocates still needs `--vm` or the interpreter, since
+native heap allocation needs a runtime (bump allocator, collection triggering, stack
+maps and safepoints at every call and loop back-edge per spec/08-memory-model.md) that
+has not been built yet; integer arithmetic is still 64-bit only in both engines (exact
+layouts give a field its declared width statically, but arithmetic itself doesn't trap
+or wrap at anything narrower yet); `u64::MAX` has no run-time representation; the
+bytecode compiler does not lower `for` loops (the interpreter runs them); and `match`
+compiles to a linear chain of arm tests rather than a decision tree.
+
+**Next action:** the native runtime — a bump-allocating nursery reachable from emitted
+machine code, then real GC integration (collection triggering, precise stack maps at
+every safepoint) — is what the backend needs before it can compile an allocating
+program, which is nearly every realistic one (even `to_str` allocates a `String`).
+Phase 5 is not closed until that lands and every phase 4 exit criterion still holds
+under `-O0`/`-O1`/`-O2` on native output too.
 
 **Awaiting the user:** the two things only the target machine can confirm — that a
-compiled Mach-O binary runs, and that `lldb` breaks on an Origin source line — are close
-now that this phase exists to produce one. Nothing else is blocking.
+compiled Mach-O binary runs, and that `lldb` breaks on an Origin source line — are
+closer now that `originc build` produces one, but still untested outside this
+container. A prebuilt `darwin/amd64` binary of `originc` itself (cross-compiled here,
+no Go install needed on the Mac) has been handed to the user for exactly this.

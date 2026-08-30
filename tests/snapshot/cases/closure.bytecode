@@ -5,7 +5,7 @@ fn 0 make(params=0 locals=2 captures=0)
      3  struct 0 1
      4  store 1
      5  load 1
-     6  closure 2 1
+     6  closure 0 1
      7  return
 
 fn 1 main(params=0 locals=2 captures=0)
