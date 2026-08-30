@@ -355,6 +355,27 @@ This project outlasts any single context window.
   bug (a `-O2` fixed-point non-convergence on a loop assigning two variables from the
   loop counter two different ways each iteration, confirmed to reproduce with no
   allocation involved at all) — recorded in `docs/deferred.md` rather than chased here.
+- **`tests/e2e`'s `nativeSkips` list is now empty.** Its one remaining entry,
+  `opt_float_semantics_survive_folding`, was never actually a native-codegen gap in the
+  sense the other five (now-closed) skips were — it was the *test* depending on
+  behavior `docs/deferred.md` already documents as unspecified and Phase-7 work: float
+  `to_str`'s exact rendering is "the implementation's choice," and the interpreter/VM's
+  shared `formatFloat` (`strconv.FormatFloat(f, 'g', -1, 64)`, plus a trailing `.0` for
+  an integral result) is that choice, not something the spec fixes yet. Implementing a
+  full shortest-round-trip float-to-decimal algorithm in hand-assembled x86 (Grisu/
+  Ryu/Dragon4-class work, needing real bounded-precision big-integer arithmetic with no
+  spec to build it against) would have been exactly the "code before its spec exists"
+  process rule 1 forbids. The right fix was the one `docs/deferred.md` already
+  prescribed: stop depending on it. The test's last line changed from printing
+  `(1.0 / 3.0).to_str()` to printing `(1.0 / 3.0 == 0.3333333333333333).to_str()` —
+  Go's `ParseFloat` (what the lexer's own float literals already go through) is the
+  exact inverse of `FormatFloat`'s shortest-round-trip mode, so the literal parses back
+  to bit-for-bit the same `f64` a correctly-computed `1.0/3.0` produces, and the test
+  still verifies exactly what its name says (constant folding doesn't change a float
+  division's result) without rendering a float at all. Native `to_str` on a `Float`
+  still hits `unimplemented:` — that gap is real and unchanged — but nothing in the
+  differential suite depends on it anymore, which is the state `docs/deferred.md` always
+  called correct for Phase 5.
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
 `docs/deferred.md`: integer arithmetic is still 64-bit only in both engines; `u64::MAX`
@@ -367,20 +388,20 @@ direct-call fast path for every use once it is boxed at all (ADR-0020's own docu
 deliberate simplification); native heap collection is single-space and non-generational,
 with no write barrier (ADR-0022's own deliberate scope, satisfying the same language-
 level guarantees as the VM/interpreter's generational collector, see spec/08-memory-
-model.md); and a `-O2` fixed-point non-convergence on a specific loop-carried-assignment
-shape, found while building the collector's own stress test but unrelated to it (see
-above), is not yet root-caused.
+model.md); `to_str` on a `Float` is unimplemented in native code (no spec fixes a
+rendering yet — Phase 7, per `docs/deferred.md` — and nothing in the differential suite
+needs it now); and a `-O2` fixed-point non-convergence on a specific loop-carried-
+assignment shape, found while building the collector's own stress test but unrelated to
+it (see above), is not yet root-caused.
 
-**Next action:** the `nativeSkips` list in `tests/e2e` — currently one entry,
-`opt_float_semantics_survive_folding` (rendering a float needs shortest-round-trip
-formatting in emitted code) — is what stands between here and Phase 5's own exit
-criterion: "every phase 4 exit criterion holds under `-O0`/`-O1`/`-O2` on native output
-too." Emptying it is the next concrete step. Separately, and not blocking that criterion
-on its own terms, the `-O2` fixed-point bug above is worth root-causing before it hides
-behind something else.
-
-**Awaiting the user:** the two things only the target machine can confirm — that a
-compiled Mach-O binary runs, and that `lldb` breaks on an Origin source line — are
-closer now that `originc build` produces one, but still untested outside this
-container. A prebuilt `darwin/amd64` binary of `originc` itself (cross-compiled here,
-no Go install needed on the Mac) has been handed to the user for exactly this.
+**Next action:** every automatable piece of Phase 5's own exit criterion is now met —
+`./check` passes clean, `nativeSkips` is empty, and the full differential suite (every
+case in `tests/e2e/cases`, every engine, every optimization level) agrees byte for byte,
+including exit status. What is left is exactly what ADR-0003 always scoped as outside
+what the implementer can claim: **Phase 5 is not complete until the user confirms, on
+the actual target machine**, that a compiled Mach-O binary runs and that `lldb` breaks
+on an Origin source line (ADR-0003's "Consequences" — that confirmation is a checklist
+item for `docs/phases/5-complete.md`, not something to write preemptively). Root-causing
+the `-O2` fixed-point bug above is worth doing but does not block this. A prebuilt
+`darwin/amd64` binary of `originc` itself (cross-compiled here, no Go install needed on
+the Mac) has already been handed to the user for exactly this confirmation.

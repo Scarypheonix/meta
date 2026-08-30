@@ -109,10 +109,9 @@ var engines = []engineSpec{
 // `unimplemented:` error rather than a wrong answer (process rule 8). Skipping those
 // here, by name and with the reason, is how the suite stays honest about what is built:
 // a case in this list is a case the native engine is not being tested on, and the list
-// is meant to empty out.
-var nativeSkips = map[string]string{
-	"opt_float_semantics_survive_folding": "rendering a float needs shortest-round-trip formatting in emitted code",
-}
+// is meant to empty out. It is empty now — every case in the corpus runs on every
+// engine — so a case landing here again is a real, temporary regression, not the norm.
+var nativeSkips = map[string]string{}
 
 // runsNatively reports whether the host can execute what the backend produces. Only
 // x86-64 Linux can, which is the point of ADR-0003's second writer.
