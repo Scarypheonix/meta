@@ -546,6 +546,14 @@ func (c *Compiler) emitAB(op bytecode.Op, a, b int, span diag.Span) int {
 	return len(c.fn.Code) - 1
 }
 
+// emitAK is emitA plus the value's static kind (ADR-0021): a field/payload/tuple-element
+// read or a call, the instructions whose result the native backend cannot otherwise tell
+// is a reference at all.
+func (c *Compiler) emitAK(op bytecode.Op, a int, kind bytecode.Kind, span diag.Span) int {
+	c.fn.Code = append(c.fn.Code, bytecode.Instr{Op: op, A: int32(a), Kind: kind, Span: span})
+	return len(c.fn.Code) - 1
+}
+
 // patch points a previously emitted jump at the current end of the code.
 func (c *Compiler) patch(at int) {
 	c.fn.Code[at].A = int32(len(c.fn.Code))

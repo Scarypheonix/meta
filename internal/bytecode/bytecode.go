@@ -174,21 +174,34 @@ type Instr struct {
 	Op Op
 	A  int32
 	B  int32
+	// Kind is the static type of the value this instruction produces, for the handful
+	// of opcodes whose result the native backend cannot otherwise recover: a field,
+	// payload or tuple-element read (internal/compile already knows a field's exact
+	// kind when it builds the field's own object layout, ADR-0019) and a call's result
+	// (which the checker already gave the call expression a type). KindUnknown is every
+	// other instruction's value; the ops that populate this are documented on Kind
+	// itself.
+	Kind Kind
 	// Span is where this instruction came from, so a trap names a source location.
 	Span diag.Span
 }
 
-// Kind is the static type of an operand, for the handful of opcodes whose behaviour
-// depends on it.
+// Kind is the static type of an operand or a result, for the handful of opcodes whose
+// behaviour — or whose value's own shape — the native backend cannot recover any other
+// way.
 //
 // The virtual machine does not need this: every value it holds carries a tag, so `to_str`
-// and `==` can look at what they were given. Native code has no tags — a register holds
-// sixty-four bits and nothing says what they mean — so the static type has to travel with
-// the instruction.
+// and `==` can look at what they were given, and a collection can look at an object's own
+// header to know what it is. Native code has no tags — a register holds sixty-four bits
+// and nothing says what they mean — so the static type has to travel with the
+// instruction, both for the operations whose lowering depends on it (comparisons,
+// `to_str`) and, since ADR-0021, for the ones a stack map needs to know are references at
+// all: a field, payload or tuple-element read, and a call's result.
 //
 // ADR-0016 anticipated exactly this: when the backend needs something the bytecode has
 // thrown away, the answer is to widen the bytecode rather than to grow a second lowering
-// path from the AST. This is the first thing to arrive that way.
+// path from the AST. This is the first thing to arrive that way, and ADR-0021 is the
+// second.
 type Kind int32
 
 // The operand kinds. KindUnknown is what an older or hand-written instruction carries,
@@ -281,6 +294,14 @@ type Fn struct {
 	// Captures is how many captured values a closure over this function holds.
 	Captures int
 	Code     []Instr
+	// ParamKinds and CaptureKinds are each parameter's and each capture's static kind,
+	// parallel to Params and Captures. The IR builder gives internal/ir.OpParam and
+	// OpCapture their Kind from here (ADR-0021): a parameter or a capture is an entry
+	// value with no producing instruction of its own for a Kind to travel with any
+	// other way. Empty for a Fn no native build ever reaches (a compiler-provided impl
+	// with no body); every Fn internal/compile emits carries both, in full.
+	ParamKinds   []Kind
+	CaptureKinds []Kind
 	// Span is the declaration's span, used when a trap has no better location.
 	Span diag.Span
 }
@@ -366,10 +387,14 @@ func (p *Program) Disassemble() string {
 				if int(in.A) < len(p.Variants) {
 					fmt.Fprintf(&sb, " %d  ; %s", in.A, p.Variants[in.A].Name)
 				}
-			case OpCall, OpStruct, OpTuple, OpCallBuiltin, OpClosure:
+			case OpCall:
+				fmt.Fprintf(&sb, " %d  ; kind=%s", in.A, in.Kind)
+			case OpStruct, OpTuple, OpCallBuiltin, OpClosure:
 				fmt.Fprintf(&sb, " %d %d", in.A, in.B)
+			case OpGetField, OpSetField, OpGetPayload, OpGetTupleElem:
+				fmt.Fprintf(&sb, " %d  ; kind=%s", in.A, in.Kind)
 			case OpLoad, OpStore, OpLoadCapture, OpJump, OpJumpIfFalse, OpJumpIfTrue,
-				OpGetField, OpSetField, OpGetPayload, OpGetTupleElem, OpFunc, OpCast, OpTrap:
+				OpFunc, OpCast, OpTrap:
 				fmt.Fprintf(&sb, " %d", in.A)
 			}
 			sb.WriteByte('\n')

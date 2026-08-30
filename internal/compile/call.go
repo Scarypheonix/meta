@@ -59,7 +59,7 @@ func (c *Compiler) call(v *ast.Call) error {
 			return err
 		}
 	}
-	c.emitA(bytecode.OpCall, len(v.Args), v.Span())
+	c.emitAK(bytecode.OpCall, len(v.Args), c.kindOf(v), v.Span())
 	return nil
 }
 
@@ -115,7 +115,7 @@ func (c *Compiler) methodCall(v *ast.MethodCall) error {
 				return err
 			}
 		}
-		c.emitA(bytecode.OpCall, len(v.Args)+1, v.Span())
+		c.emitAK(bytecode.OpCall, len(v.Args)+1, c.kindOf(v), v.Span())
 		return nil
 	}
 
@@ -178,6 +178,10 @@ func (c *Compiler) tryExpr(v *ast.Try) error {
 	if err != nil {
 		return err
 	}
+	okKind := bytecode.KindUnknown
+	if n, ok := types.AsNamed(c.concreteType(inner)); ok && len(n.Args) == 2 {
+		okKind = kindOfType(c.concreteType(n.Args[0]))
+	}
 
 	slot := c.temp()
 	c.emitA(bytecode.OpStore, slot, v.Span())
@@ -186,7 +190,7 @@ func (c *Compiler) tryExpr(v *ast.Try) error {
 	toErr := c.emitA(bytecode.OpJumpIfFalse, 0, v.Span())
 
 	c.emitA(bytecode.OpLoad, slot, v.Span())
-	c.emitA(bytecode.OpGetPayload, 0, v.Span())
+	c.emitAK(bytecode.OpGetPayload, 0, okKind, v.Span())
 	toEnd := c.emitA(bytecode.OpJump, 0, v.Span())
 
 	c.patch(toErr)

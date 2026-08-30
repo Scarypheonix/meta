@@ -257,26 +257,45 @@ This project outlasts any single context window.
   back out of a struct field — byte-identical across the interpreter, VM, and native at
   every optimization level; landed permanently as `tests/e2e/cases/fn_value_escapes`
   alongside the pre-existing `closure_counter`, now off the native skip list entirely.
+- **The kind data a stack map needs now exists (ADR-0021)**, the first step toward
+  native heap collection. `bytecode.Instr` gained a `Kind` field for the handful of
+  instructions whose result the backend cannot otherwise tell is a reference at all — a
+  field/payload/tuple-element read, and a call — and `bytecode.Fn` gained
+  `ParamKinds`/`CaptureKinds`. `internal/compile` populates all of it from the checker's
+  own already-computed types, at the same points ADR-0019's object-layout code already
+  reads them; a method's receiver kind needed one small new checker export
+  (`check.Result.SelfTypes`), mirroring the checker's existing internal `FnSig.Self`.
+  Nothing consumes this data yet — no engine's behavior changed, verified both directly
+  (`internal/compile/kind_test.go`, new, asserts the exact `Kind` on hand-picked programs
+  covering a struct field, a variant payload, a tuple element, a call result, `self`,
+  and a closure's captures) and by the full differential suite being unchanged. Every
+  other IR value's kind (arithmetic is always raw, a `phi` is whatever its operands
+  already are, and so on) is structurally derivable and does not need bytecode to carry
+  it — that propagation, the register allocator's placement of reference-kind spill
+  slots as one contiguous run, the stack-map table itself, and the collector that reads
+  it are the still-open next steps, laid out in spec/11-codegen.md's "Safepoints and
+  stack maps" and ADR-0021.
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
-`docs/deferred.md`: native heap allocation never triggers a collection (no stack maps
-yet — spec/11-codegen.md's own DEFERRED note explains why); integer arithmetic is
-still 64-bit only in both engines; `u64::MAX` has no run-time representation; `match`
-compiles to a linear chain of arm tests rather than a decision tree; a struct or enum
-declared inside a function body (never checked, per Phase 2's own documented scope) now
-fails loudly in `internal/compile` instead of silently compiling against the wrong
-descriptor, which is safer but still not a fix; and a function used both as a direct
-callee and as an escaping value in the same body loses the direct-call fast path for
-every use once it is boxed at all (ADR-0020's own documented, deliberate simplification
-— correct, just not maximally fast in that one mixed pattern).
+`docs/deferred.md`: native heap allocation never triggers a collection (the kind data
+above is landed; the propagation pass, the stack-map table and the collector itself are
+not — spec/11-codegen.md's own DEFERRED note has the full remaining list); integer
+arithmetic is still 64-bit only in both engines; `u64::MAX` has no run-time
+representation; `match` compiles to a linear chain of arm tests rather than a decision
+tree; a struct or enum declared inside a function body (never checked, per Phase 2's own
+documented scope) now fails loudly in `internal/compile` instead of silently compiling
+against the wrong descriptor, which is safer but still not a fix; and a function used
+both as a direct callee and as an escaping value in the same body loses the direct-call
+fast path for every use once it is boxed at all (ADR-0020's own documented, deliberate
+simplification — correct, just not maximally fast in that one mixed pattern).
 
-**Next action:** native heap collection is now the only large piece of Phase 5 left.
-The backend's `alloc` bump-allocates forever; making it actually collect needs precise
-stack maps, which need the bytecode widened to carry a value's kind at a safepoint the
-way `OpToStr` and the comparison ops already carry one for their own purposes
-(spec/11-codegen.md's own DEFERRED note is the starting point). Phase 5 is not closed
-until every phase 4 exit criterion holds under `-O0`/`-O1`/`-O2` on native output too,
-and collection is what that still needs.
+**Next action:** native heap collection remains the only large piece of Phase 5 left,
+and the next concrete step on it is the `internal/backend`-only kind-propagation pass
+(mirroring `closures.go`'s `resolveClosureCalls`) that extends ADR-0021's seed data to
+every IR value, which is what the register allocator's contiguous reference-slot
+placement and the stack-map table both need as their input. Phase 5 is not closed until
+every phase 4 exit criterion holds under `-O0`/`-O1`/`-O2` on native output too, and
+collection is what that still needs.
 
 **Awaiting the user:** the two things only the target machine can confirm — that a
 compiled Mach-O binary runs, and that `lldb` breaks on an Origin source line — are

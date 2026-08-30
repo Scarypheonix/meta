@@ -10,7 +10,7 @@ fn 0 area(params=1 locals=8 captures=0)
      8  is_variant 6  ; Shape::Circle
      9  jump_if_false 19
     10  load 1
-    11  get_payload 0
+    11  get_payload 0  ; kind=float
     12  store 2
     13  load 2
     14  store 3
@@ -22,12 +22,12 @@ fn 0 area(params=1 locals=8 captures=0)
     20  is_variant 7  ; Shape::Rect
     21  jump_if_false 36
     22  load 1
-    23  get_payload 0
+    23  get_payload 0  ; kind=float
     24  store 4
     25  load 4
     26  store 5
     27  load 1
-    28  get_payload 1
+    28  get_payload 1  ; kind=float
     29  store 6
     30  load 6
     31  store 7
@@ -42,7 +42,7 @@ fn 1 main(params=0 locals=1 captures=0)
      0  func 0
      1  const 2  ; float
      2  variant 6 1  ; Shape::Circle
-     3  call 1 0
+     3  call 1  ; kind=float
      4  store 0
      5  unit
      6  return

@@ -142,7 +142,7 @@ func (c *Compiler) assign(v *ast.Assign) error {
 
 		if op, compound := v.Op.BinaryOp(); compound {
 			c.emitA(bytecode.OpLoad, recv, v.Span())
-			c.emitA(bytecode.OpGetField, idx, v.Span())
+			c.emitAK(bytecode.OpGetField, idx, c.kindOf(place), v.Span())
 			if err := c.expr(v.Value); err != nil {
 				return err
 			}
@@ -241,6 +241,17 @@ func (c *Compiler) kindOf(e ast.Expr) bytecode.Kind {
 	// type this particular instantiation gives it is exactly what a static Kind needs
 	// to mean here -- the same substitution ADR-0019's object-layout code applies.
 	return kindOfType(c.concreteTypeOf(e))
+}
+
+// selfKind reports a method declaration's receiver kind, substituted for the instance
+// currently compiling (ADR-0021). It is KindUnknown for a plain function, which has no
+// entry in SelfTypes.
+func (c *Compiler) selfKind(decl *ast.FnDecl) bytecode.Kind {
+	t, ok := c.tys.SelfTypes[decl]
+	if !ok {
+		return bytecode.KindUnknown
+	}
+	return kindOfType(c.concreteType(t))
 }
 
 func kindOfType(t types.Type) bytecode.Kind {

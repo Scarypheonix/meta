@@ -123,6 +123,9 @@ func (c *Checker) checkFn(fn *ast.FnDecl, outerParams []*types.Param, self types
 	all := append(append([]*types.Param{}, outerParams...), sig.Params...)
 	c.env = envFor(all, self, trait)
 	c.env.bounds = append(append([]Bound{}, outerBounds...), sig.Bounds...)
+	if self != nil {
+		c.out.SelfTypes[fn] = self
+	}
 
 	c.beginBody(sig.Ret)
 

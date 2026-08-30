@@ -28,7 +28,7 @@ fn 1 main(params=0 locals=2 captures=0)
      8  load 1
      9  func 0
     10  load 0
-    11  call 1 0
+    11  call 1  ; kind=int
     12  add
     13  store 1
     14  unit

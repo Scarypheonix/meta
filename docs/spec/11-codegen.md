@@ -123,11 +123,36 @@ frame's shape independently.
 
 DEFERRED: stack maps are not emitted yet, and native code therefore allocates without
 collecting. A precise map requires knowing which frame slots hold references, and the
-SSA IR does not carry that: it is built from bytecode (ADR-0016), which has no types.
-The fix is the one ADR-0016 names — widen the bytecode so a value's kind travels with
-it, as `bytecode.Kind` already does for the operations whose lowering depends on it —
-and it is scheduled in `docs/deferred.md`. Emitting a map that claims a precision the
-compiler cannot supply would be a stub that lies (process rule 8).
+SSA IR does not carry that on its own: it is built from bytecode (ADR-0016), which has no
+types. ADR-0021 supplies the seed of that answer — `internal/compile` now attaches each
+field/payload/tuple-element read's and each call's result kind to the bytecode
+instruction itself, and each function's parameter and capture kinds to the `bytecode.Fn`
+— since those are exactly the places nothing else downstream can recover a value's kind
+from. What is still missing, and still scheduled in `docs/deferred.md`:
+
+- An `internal/backend`-only pass that propagates a kind to every other IR value
+  structurally from that seed data (an arithmetic op is always raw, a `phi` is whatever
+  its operands already are, and so on) — the same shape as `internal/backend/closures.go`'s
+  `resolveClosureCalls`, entirely apart from `internal/ir`, `internal/opt` or the VM.
+- The register allocator placing every reference-kind spill slot in one contiguous run,
+  as this section's "Stack frames" already specifies, which is what turns a stack map
+  into two integers rather than a bitmap.
+- The stack-map table itself: one entry per call site (not only a user-visible
+  allocation — any call can transitively allocate and trigger a collection, so any call's
+  return address must resolve to a map), sorted by code address in read-only data, and
+  reachable from the runtime block. A live reference in a register at a call site is
+  necessarily in one of the four callee-saved registers, never a caller-saved one
+  (ADR-0018's own allocation invariant), which bounds a map's register-root set to four
+  bits — the harder case (an arbitrary register, mid-loop, with no call to force
+  spilling) belongs to safepoints at a function entry or a loop back edge, which exist
+  for scheduler preemption (Phase 6) and are not needed to trigger a collection at all.
+- The collector that walks the map: for the immediate caller of `alloc`, and then up the
+  `rbp` chain this section's calling convention already always maintains, one frame at a
+  time, each resolved by its own return address's map entry.
+
+Emitting a map that claims a precision the compiler cannot supply would be a stub that
+lies (process rule 8); ADR-0021 explicitly scopes what has landed to data no engine yet
+reads, verified directly rather than by claiming a map that does not exist.
 
 ## Object layout in native code
 

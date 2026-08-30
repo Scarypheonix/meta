@@ -102,7 +102,7 @@ func (c *Compiler) testPattern(p ast.Pattern, slot int, fails *[]int) error {
 		for i, e := range v.Elems {
 			sub := c.temp()
 			c.emitA(bytecode.OpLoad, slot, v.Span())
-			c.emitA(bytecode.OpGetTupleElem, i, v.Span())
+			c.emitAK(bytecode.OpGetTupleElem, i, kindOfType(c.patTypeOf(e.NodeID())), v.Span())
 			c.emitA(bytecode.OpStore, sub, v.Span())
 			if err := c.testPattern(e, sub, fails); err != nil {
 				return err
@@ -134,7 +134,7 @@ func (c *Compiler) testPathPattern(v *ast.PathPat, slot int, fails *[]int) error
 		for i, e := range v.Elems {
 			sub := c.temp()
 			c.emitA(bytecode.OpLoad, slot, v.Span())
-			c.emitA(bytecode.OpGetPayload, i, v.Span())
+			c.emitAK(bytecode.OpGetPayload, i, kindOfType(c.patTypeOf(e.NodeID())), v.Span())
 			c.emitA(bytecode.OpStore, sub, v.Span())
 			if err := c.testPattern(e, sub, fails); err != nil {
 				return err
@@ -147,7 +147,7 @@ func (c *Compiler) testPathPattern(v *ast.PathPat, slot int, fails *[]int) error
 			}
 			sub := c.temp()
 			c.emitA(bytecode.OpLoad, slot, v.Span())
-			c.emitA(bytecode.OpGetPayload, i, v.Span())
+			c.emitAK(bytecode.OpGetPayload, i, kindOfType(c.patTypeOf(fp.Pat.NodeID())), v.Span())
 			c.emitA(bytecode.OpStore, sub, v.Span())
 			if err := c.testPattern(fp.Pat, sub, fails); err != nil {
 				return err
@@ -163,7 +163,7 @@ func (c *Compiler) testPathPattern(v *ast.PathPat, slot int, fails *[]int) error
 			}
 			sub := c.temp()
 			c.emitA(bytecode.OpLoad, slot, v.Span())
-			c.emitA(bytecode.OpGetField, i, v.Span())
+			c.emitAK(bytecode.OpGetField, i, kindOfType(c.patTypeOf(fp.Pat.NodeID())), v.Span())
 			c.emitA(bytecode.OpStore, sub, v.Span())
 			if err := c.testPattern(fp.Pat, sub, fails); err != nil {
 				return err

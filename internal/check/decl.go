@@ -96,6 +96,11 @@ type Result struct {
 	Insts map[ast.NodeID]*Inst
 	// Defs maps a struct or enum declaration to its type definition.
 	Defs map[ast.Item]*types.Def
+	// SelfTypes maps a method's declaration to its receiver's type, mirroring
+	// FnSig.Self (a checker-internal table this is the one field of it that
+	// internal/compile needs, to know a method's `self` parameter's kind for a stack
+	// map, ADR-0021). Absent for a plain function.
+	SelfTypes map[*ast.FnDecl]types.Type
 	// Lookup resolves a method on a type after checking is done. Monomorphization
 	// needs it: a trait method called on a type parameter cannot be resolved while the
 	// parameter is symbolic, and can be once the parameter has a type.
@@ -222,6 +227,7 @@ func Program(bag *diag.Bag, res *resolve.Result, files ...*ast.File) *Result {
 			Insts:      map[ast.NodeID]*Inst{},
 			Generics:   map[*ast.FnDecl][]*types.Param{},
 			Defs:       map[ast.Item]*types.Def{},
+			SelfTypes:  map[*ast.FnDecl]types.Type{},
 		},
 		defs:        map[ast.Item]*types.Def{},
 		fnSigs:      map[*ast.FnDecl]*FnSig{},

@@ -34,11 +34,16 @@ func (c *Compiler) compileInstance(inst *mono.Instance) error {
 	c.loops = nil
 
 	// Slot 0 is the receiver for a method, then the declared parameters in order.
+	// ParamKinds is built in the same order (ADR-0021): a stack map needs a parameter's
+	// kind at least once as live-across-a-call, and there is no producing instruction
+	// for a parameter's own value to carry it on.
 	if decl.Self != nil {
 		c.nextSlot++
 		c.fn.Locals = c.nextSlot
+		c.fn.ParamKinds = append(c.fn.ParamKinds, c.selfKind(decl))
 	}
 	for _, p := range decl.Params {
+		c.fn.ParamKinds = append(c.fn.ParamKinds, kindOfType(c.patTypeOf(p.Pat.NodeID())))
 		c.bindParam(p.Pat)
 	}
 
@@ -135,7 +140,7 @@ func (c *Compiler) bindIrrefutable(p ast.Pattern, span diag.Span) error {
 		c.emitA(bytecode.OpStore, slot, span)
 		for i, e := range v.Elems {
 			c.emitA(bytecode.OpLoad, slot, span)
-			c.emitA(bytecode.OpGetTupleElem, i, span)
+			c.emitAK(bytecode.OpGetTupleElem, i, kindOfType(c.patTypeOf(e.NodeID())), span)
 			if err := c.bindIrrefutable(e, span); err != nil {
 				return err
 			}
@@ -158,7 +163,7 @@ func (c *Compiler) bindPathPayload(v *ast.PathPat, slot int, span diag.Span) err
 	case resolve.Variant:
 		for i, e := range v.Elems {
 			c.emitA(bytecode.OpLoad, slot, span)
-			c.emitA(bytecode.OpGetPayload, i, span)
+			c.emitAK(bytecode.OpGetPayload, i, kindOfType(c.patTypeOf(e.NodeID())), span)
 			if err := c.bindIrrefutable(e, span); err != nil {
 				return err
 			}
@@ -169,7 +174,7 @@ func (c *Compiler) bindPathPayload(v *ast.PathPat, slot int, span diag.Span) err
 				return unsupported("an unknown field in a pattern", span)
 			}
 			c.emitA(bytecode.OpLoad, slot, span)
-			c.emitA(bytecode.OpGetPayload, i, span)
+			c.emitAK(bytecode.OpGetPayload, i, kindOfType(c.patTypeOf(fp.Pat.NodeID())), span)
 			if err := c.bindIrrefutable(fp.Pat, span); err != nil {
 				return err
 			}
@@ -183,7 +188,7 @@ func (c *Compiler) bindPathPayload(v *ast.PathPat, slot int, span diag.Span) err
 				return unsupported("an unknown field in a pattern", span)
 			}
 			c.emitA(bytecode.OpLoad, slot, span)
-			c.emitA(bytecode.OpGetField, i, span)
+			c.emitAK(bytecode.OpGetField, i, kindOfType(c.patTypeOf(fp.Pat.NodeID())), span)
 			if err := c.bindIrrefutable(fp.Pat, span); err != nil {
 				return err
 			}
@@ -475,10 +480,19 @@ func (c *Compiler) lambda(v *ast.Lambda) error {
 	}
 
 	// The captures' types are read in the enclosing instance's context, before it is
-	// swapped out for the lambda body's own.
+	// swapped out for the lambda body's own -- the same reason ParamKinds and
+	// CaptureKinds (ADR-0021) are built here too, rather than after the swap.
 	ct, err := c.closureInst(caps, v.Span())
 	if err != nil {
 		return err
+	}
+	capKinds := make([]bytecode.Kind, len(caps))
+	for i, l := range caps {
+		capKinds[i] = kindOfType(c.concreteType(c.tys.LocalTypes[l]))
+	}
+	paramKinds := make([]bytecode.Kind, len(v.Params))
+	for i, p := range v.Params {
+		paramKinds[i] = kindOfType(c.patTypeOf(p.Pat.NodeID()))
 	}
 
 	// The lambda's body becomes an ordinary function whose captures are addressed
@@ -486,6 +500,7 @@ func (c *Compiler) lambda(v *ast.Lambda) error {
 	idx := len(c.prog.Fns)
 	lfn := &bytecode.Fn{
 		Name: "<lambda>", Params: len(v.Params), Captures: len(caps), Span: v.Span(),
+		ParamKinds: paramKinds, CaptureKinds: capKinds,
 	}
 	c.prog.Fns = append(c.prog.Fns, lfn)
 
@@ -631,7 +646,11 @@ func (c *Compiler) forExpr(v *ast.For) error {
 	if err := c.expr(v.Iter); err != nil {
 		return err
 	}
-	c.emitA(bytecode.OpCall, 1, v.Iter.Span())
+	// The iterator's own kind is always a reference: Iterator::next takes `mut self`,
+	// and a mutation through it is only observable across the separate calls this
+	// desugaring makes if the type it mutates is a heap object (spec/08-memory-model.md
+	// -- mutability is a property of a field declaration, which only an aggregate has).
+	c.emitAK(bytecode.OpCall, 1, bytecode.KindRef, v.Iter.Span())
 	itSlot := c.temp()
 	c.emitA(bytecode.OpStore, itSlot, v.Iter.Span())
 
@@ -649,7 +668,9 @@ func (c *Compiler) forExpr(v *ast.For) error {
 
 	c.emitA(bytecode.OpFunc, c.instIndex[nextInst], v.Span())
 	c.emitA(bytecode.OpLoad, itSlot, v.Span())
-	c.emitA(bytecode.OpCall, 1, v.Span())
+	// next()'s result is always Option[Item], an enum with a payload variant: always a
+	// reference, regardless of what Item itself is.
+	c.emitAK(bytecode.OpCall, 1, bytecode.KindRef, v.Span())
 	optSlot := c.temp()
 	c.emitA(bytecode.OpStore, optSlot, v.Span())
 
@@ -658,7 +679,7 @@ func (c *Compiler) forExpr(v *ast.For) error {
 	toBreak := c.emitA(bytecode.OpJumpIfFalse, 0, v.Span())
 
 	c.emitA(bytecode.OpLoad, optSlot, v.Span())
-	c.emitA(bytecode.OpGetPayload, 0, v.Span())
+	c.emitAK(bytecode.OpGetPayload, 0, kindOfType(c.patTypeOf(v.Pat.NodeID())), v.Span())
 	if err := c.bindIrrefutable(v.Pat, v.Span()); err != nil {
 		return err
 	}
@@ -696,6 +717,6 @@ func (c *Compiler) fieldAccess(v *ast.FieldAccess) error {
 	if idx < 0 {
 		return unsupported("an unknown field", v.Span())
 	}
-	c.emitA(bytecode.OpGetField, idx, v.Span())
+	c.emitAK(bytecode.OpGetField, idx, c.kindOf(v), v.Span())
 	return nil
 }
