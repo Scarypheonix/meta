@@ -4,9 +4,12 @@ import (
 	"bytes"
 	stddwarf "debug/dwarf"
 	stdelf "debug/elf"
+	stdmacho "debug/macho"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/scarypheonix/meta/internal/obj"
 )
 
 // TestNativeBuildCarriesValidDebugInfo compiles a real program through the whole pipeline
@@ -27,6 +30,11 @@ fn main() {
     io::println(sum.to_str());
 }
 `)
+	checkELFDebugInfo(t, img)
+}
+
+func checkELFDebugInfo(t *testing.T, img *obj.Image) {
+	t.Helper()
 	if len(img.DebugAbbrev) == 0 || len(img.DebugInfo) == 0 || len(img.DebugLine) == 0 {
 		t.Fatal("the image carries no debug sections at all")
 	}
@@ -122,5 +130,97 @@ fn main() {
 	if !last.EndSequence || last.Address != img.TextAddr+uint64(len(img.Text)) {
 		t.Errorf("last row = {endSeq:%v addr:%#x}, want the end-of-sequence row at %#x",
 			last.EndSequence, last.Address, img.TextAddr+uint64(len(img.Text)))
+	}
+}
+
+// TestMachOBuildCarriesValidDebugInfo is the same end-to-end check for the shipping
+// format, which had none: ADR-0023's Mach-O path was only ever verified by attaching
+// synthetic sections to a hand-written image (internal/obj), never through the real
+// compiler. Since ADR-0024 found that no Mach-O this project produced could even run,
+// "the Mach-O path was checked structurally" is worth being precise about.
+//
+// `lldb` itself resolves `breakpoint set --file <name> --line N` against a Mach-O built
+// this way -- verified by hand in the development container, where lldb reads the file
+// cross-platform even though it cannot execute it. That is the whole acceptance criterion
+// minus the live process, which only the target machine can supply (ADR-0003).
+func TestMachOBuildCarriesValidDebugInfo(t *testing.T) {
+	img := buildStackMapTestImageFor(t, obj.MacOS, `
+use std::io;
+
+fn add(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+fn main() {
+    let sum = add(1, 2);
+    io::println(sum.to_str());
+}
+`)
+	if len(img.DebugLine) == 0 || len(img.Funcs) == 0 {
+		t.Fatal("the Mach-O image carries no debug information")
+	}
+
+	path := filepath.Join(t.TempDir(), "prog")
+	var buf bytes.Buffer
+	if err := img.Write(&buf); err != nil {
+		t.Fatalf("writing image: %v", err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o755); err != nil {
+		t.Fatalf("writing %s: %v", path, err)
+	}
+
+	mf, err := stdmacho.Open(path)
+	if err != nil {
+		t.Fatalf("debug/macho could not read the file we wrote: %v", err)
+	}
+	defer mf.Close()
+
+	// The symbol table `bt` names a frame from.
+	if mf.Symtab == nil {
+		t.Fatal("no LC_SYMTAB")
+	}
+	named := map[string]bool{}
+	for _, s := range mf.Symtab.Syms {
+		named[s.Name] = true
+	}
+	for _, want := range []string{"add", "main"} {
+		if !named[want] {
+			t.Errorf("no symbol named %q; lldb's `bt` would not name that frame", want)
+		}
+	}
+
+	d, err := mf.DWARF()
+	if err != nil {
+		t.Fatalf("debug/macho could not open DWARF from __DWARF: %v", err)
+	}
+	r := d.Reader()
+	cu, err := r.Next()
+	if err != nil || cu == nil || cu.Tag != stddwarf.TagCompileUnit {
+		t.Fatalf("reading the compile-unit DIE: entry %+v, err %v", cu, err)
+	}
+
+	// Every line row must name an address inside __TEXT: a breakpoint resolves through
+	// these, so a row pointing anywhere else is a breakpoint that lands nowhere.
+	lr, err := d.LineReader(cu)
+	if err != nil {
+		t.Fatalf("opening the line reader: %v", err)
+	}
+	rows := 0
+	for {
+		var e stddwarf.LineEntry
+		if err := lr.Next(&e); err != nil {
+			break
+		}
+		if e.EndSequence {
+			continue
+		}
+		if e.Address < img.TextAddr || e.Address >= img.TextAddr+uint64(len(img.Text)) {
+			t.Errorf("row %d's address %#x is outside __text [%#x, %#x)",
+				rows, e.Address, img.TextAddr, img.TextAddr+uint64(len(img.Text)))
+		}
+		rows++
+	}
+	if rows == 0 {
+		t.Error("the line table has no rows, so no breakpoint could resolve")
 	}
 }

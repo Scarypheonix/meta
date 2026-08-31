@@ -511,15 +511,22 @@ was gated on — **a Mach-O build has now run on the actual target machine and p
 right answer**, after ADR-0024 found and fixed the reason no Mach-O this project produced
 had ever been runnable.
 
-What is outstanding is the confirmation of *self-signed* output specifically: the binary
-the user ran was signed by `rcodesign`, which proved the structure and the approach;
-`internal/codesign` now does that signing itself, verified in-container against an
-independent implementation but not yet executed on a Mac. So the remaining checklist item
-for `docs/phases/5-complete.md` is unchanged in shape and much smaller in risk: **the
-user confirms, on the target machine, that a binary built by current `originc` runs
-unaided, and that `lldb` breaks on an Origin source line** (ADR-0003's "Consequences" —
-not something to write up preemptively). A rebuilt `darwin/amd64` `originc` carrying both
-ADR-0023 and ADR-0024 has been sent for exactly that.
+Self-signed output is confirmed too: the user then ran current `originc` on the Mac,
+compiled a program with it, and **the resulting binary ran unaided — no `codesign`, no
+linker, nothing but the compiler**.
+
+Exactly one item remains for `docs/phases/5-complete.md`: **`lldb`, on the target
+machine, stopping at an Origin source line in a Mach-O and naming the frames in `bt`.**
+Its risk is now small and precisely bounded, because the static half is verified here.
+`lldb` and `llvm-dwarfdump` read Mach-O cross-platform, and resolving a breakpoint by
+file and line is a DWARF lookup rather than execution — so, against a Mach-O built by
+the real compiler in this container, `lldb` resolves `breakpoint set --file dbg2.origin
+--line 4` to `add + 22, address = 0x100000fe6`, and `image lookup -n add` names the
+function from the symbol table. What is left needing a Mac is only the live process:
+stopping there, and `bt` at run time — which rests on the frame-pointer prologues the
+ELF path already exercises under `lldb` for real. `TestMachOBuildCarriesValidDebugInfo`
+now covers the Mach-O debug path end to end through the compiler, which nothing did
+while ADR-0023's Mach-O support was being written.
 
 The lesson worth keeping: ADR-0003's target-machine checklist item was not a formality.
 It found a defect that made every Mach-O this project ever emitted unrunnable, and no

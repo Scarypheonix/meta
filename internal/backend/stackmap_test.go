@@ -21,6 +21,13 @@ import (
 // internal/driver's runNative uses.
 func buildStackMapTestImage(t *testing.T, src string) *obj.Image {
 	t.Helper()
+	return buildStackMapTestImageFor(t, obj.Linux, src)
+}
+
+// buildStackMapTestImageFor is the same, for a chosen target: the Mach-O path needs its
+// own end-to-end coverage, not only the ELF one the container can execute.
+func buildStackMapTestImageFor(t *testing.T, target obj.Target, src string) *obj.Image {
+	t.Helper()
 	ids := ast.NewIDGen()
 	bag := diag.New()
 	pre := parse.FileWith(prelude.Source(), diag.New(), ids)
@@ -44,7 +51,7 @@ func buildStackMapTestImage(t *testing.T, src string) *obj.Image {
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	img, err := Build(prog, obj.Linux)
+	img, err := Build(prog, target)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}

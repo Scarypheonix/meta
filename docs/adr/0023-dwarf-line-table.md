@@ -135,6 +135,18 @@ names.
   and confirm the DWARF bytes are byte-identical to what ELF embeds, but `lldb` actually
   breaking on a line in a *Mach-O* binary is still the target machine's own confirmation,
   unautomatable here — no different from "the binary runs" already being on that list.
+
+  **Amended after ADR-0024.** That limit was drawn too pessimistically. `lldb` and
+  `llvm-dwarfdump` both read Mach-O *cross-platform*, and resolving a breakpoint by
+  file and line is a static DWARF lookup, not execution — so most of this is verifiable
+  in the container after all. Against a Mach-O built by the real compiler here, `lldb`
+  resolves `breakpoint set --file dbg2.origin --line 4` to `add + 22, address =
+  0x100000fe6` and `image lookup -n add` names the function out of the symbol table;
+  `llvm-dwarfdump --debug-line` prints the whole line program with `__TEXT` addresses.
+  What genuinely needs the Mac is only the *live process* half: stopping there, and
+  `bt` naming frames at run time. `internal/backend`'s own
+  `TestMachOBuildCarriesValidDebugInfo` now covers the Mach-O path end to end through
+  the compiler, which it never did while this ADR's Mach-O support was written.
 - **A future call-frame table, subprogram DIEs, and type/variable info remain fully
   additive.** Nothing about the compile-unit-only, symtab-for-names shape chosen here
   needs revisiting to add them later: a `.debug_frame` section is a new, independent
