@@ -1,0 +1,11 @@
+// EXPECT: reject E0702
+// spec: 12-concurrency.md — a thread's result crosses back to whoever joins it, so `T`
+// in `JoinHandle[T]` must be `Send` too.
+
+use std::thread;
+
+struct Counter { mut n: i64 }
+
+fn main() {
+    let h = thread::spawn(|| -> Counter { Counter { n: 0 } });
+}

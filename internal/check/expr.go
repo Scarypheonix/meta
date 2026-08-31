@@ -382,6 +382,9 @@ func variantIndex(def *types.Def, va *ast.Variant) int {
 
 // builtinType gives the compiler-provided functions their signatures.
 func (c *Checker) builtinType(name string, span diag.Span) types.Type {
+	if t := c.concurrencyBuiltinType(name, span); t != nil {
+		return t
+	}
 	str := types.P(types.String)
 	switch name {
 	case "io::print", "io::println":
@@ -1035,6 +1038,9 @@ func (c *Checker) inferCall(v *ast.Call) types.Type {
 	for i := range args {
 		c.unify(fn.Params[i], args[i], v.Args[i].Span(), ordinalArg(i))
 	}
+	// The concurrency builtins carry obligations their signatures cannot: the `Send`
+	// bounds ADR-0014 rests on, and a spawned closure's captures (spec/12-concurrency.md).
+	c.checkConcurrencyCall(v, fn, fn.Ret)
 	return fn.Ret
 }
 

@@ -9,6 +9,10 @@
 // Origin until the standard library exists in Phase 7. `Hash` waits for `Hasher`, which
 // waits for Phase 7 as well.
 
+use std::thread;
+use std::chan;
+use std::sync;
+
 pub enum Option[T] {
     None,
     Some(T),
@@ -71,4 +75,72 @@ pub trait Int {
 /// It is derived, not implemented by hand: a type is `Send` when it has no `mut` field
 /// and its fields are all `Send`.
 pub trait Send {
+}
+
+// --- Concurrency (spec/12-concurrency.md, ADR-0025) -------------------------------
+//
+// These four types are handles to objects the runtime owns: a scheduled thread, the two
+// ends of a channel, and a lock. The handle field is an index into the runtime's own
+// table, not an address, so a forged one is a lookup that fails rather than a wild
+// pointer -- every operation below TRAPS on a handle the runtime does not know.
+//
+// The methods carry the surface ADR-0025 chose; their bodies call compiler-provided
+// functions, which is how a prelude method reaches an operation Origin cannot yet
+// express. Phase 7's standard library replaces the mechanism, not the surface.
+
+/// A running thread and the value it will return.
+pub struct JoinHandle[T] {
+    handle: i64,
+}
+
+impl[T] JoinHandle[T] {
+    /// Blocks until the thread finishes, and yields its result. TRAPS if this handle has
+    /// already been joined.
+    pub fn join(self) -> T {
+        thread::join_handle(self)
+    }
+}
+
+/// The sending end of a channel.
+pub struct Sender[T] {
+    handle: i64,
+}
+
+impl[T] Sender[T] {
+    /// Blocks while the channel is full. TRAPS if the channel is closed.
+    pub fn send(self, value: T) {
+        chan::send_value(self, value)
+    }
+
+    /// Marks the channel closed. Queued values remain receivable. TRAPS if already closed.
+    pub fn close(self) {
+        chan::close_sender(self)
+    }
+}
+
+/// The receiving end of a channel.
+pub struct Receiver[T] {
+    handle: i64,
+}
+
+impl[T] Receiver[T] {
+    /// Blocks while the channel is empty. `None` once the channel is closed and drained,
+    /// and permanently thereafter.
+    pub fn recv(self) -> Option[T] {
+        chan::recv_value(self)
+    }
+}
+
+/// A lock guarding a value. The only way to share mutable state between threads
+/// (ADR-0014), and the only reason a type with `mut` fields can cross a thread boundary.
+pub struct Mutex[T] {
+    handle: i64,
+}
+
+impl[T] Mutex[T] {
+    /// Acquires the lock, calls `body` with the guarded value, releases the lock, and
+    /// returns what `body` returned. TRAPS if the calling thread already holds this lock.
+    pub fn with[R](self, body: fn(T) -> R) -> R {
+        sync::with_lock(self, body)
+    }
 }

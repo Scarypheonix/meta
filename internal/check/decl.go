@@ -23,6 +23,12 @@ type Bound struct {
 	Trait *TraitInfo
 	Args  []types.Type
 	Span  diag.Span
+	// Code overrides the diagnostic an unsatisfied bound reports, and What names what the
+	// value was being used for. A `Send` bound means something different at each place it
+	// arises -- a channel's element, a thread's result -- and one code for all of them
+	// would make the registry less useful, not more (spec/12-concurrency.md).
+	Code string
+	What string
 }
 
 // FnSig is a function's declared type. Signatures are mandatory (ADR-0009), so this is
@@ -169,11 +175,13 @@ type Checker struct {
 	ctx *types.Ctx
 	out *Result
 
-	defs    map[ast.Item]*types.Def
-	fnSigs  map[*ast.FnDecl]*FnSig
-	traits  map[*ast.TraitDecl]*TraitInfo
-	aliases map[*ast.TypeAliasDecl]types.Type
-	impls   []*ImplInfo
+	defs map[ast.Item]*types.Def
+	// preludeDefs indexes defs by name, for the concurrency builtins' signatures.
+	preludeDefs map[string]*types.Def
+	fnSigs      map[*ast.FnDecl]*FnSig
+	traits      map[*ast.TraitDecl]*TraitInfo
+	aliases     map[*ast.TypeAliasDecl]types.Type
+	impls       []*ImplInfo
 	// implsBySelf indexes impls by the name of the type they are for, which is how
 	// method resolution finds candidates without scanning every impl.
 	implsBySelf map[string][]*ImplInfo

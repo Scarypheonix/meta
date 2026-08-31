@@ -1,0 +1,13 @@
+// EXPECT: reject E0701
+// spec: 12-concurrency.md — a spawned closure carries its captures to another thread, so
+// each must be `Send`. Without this check ADR-0014 would have an obvious hole: a mutable
+// aggregate that cannot cross a channel would cross by being captured instead.
+
+use std::thread;
+
+struct Counter { mut n: i64 }
+
+fn main() {
+    let c = Counter { n: 0 };
+    let h = thread::spawn(|| -> i64 { c.n });
+}

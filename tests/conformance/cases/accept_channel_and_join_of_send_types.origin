@@ -1,0 +1,18 @@
+// EXPECT: accept
+// spec: 12-concurrency.md — the ordinary shapes: a thread returning a primitive, a
+// channel of an immutable aggregate, and a `recv` yielding `Option[T]`.
+
+use std::thread;
+use std::chan;
+
+struct Point { x: i64, y: i64 }
+
+fn main() {
+    let h = thread::spawn(|| -> i64 { 40 + 2 });
+    let v = h.join();
+
+    let (s, r) = chan::channel(1);
+    s.send(Point { x: 1, y: 2 });
+    s.close();
+    let got = r.recv();
+}

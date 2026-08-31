@@ -251,6 +251,14 @@ func (c *Checker) requireBound(subject types.Type, ti *TraitInfo, span diag.Span
 	c.obligations = append(c.obligations, Bound{Type: subject, Trait: ti, Span: span})
 }
 
+// requireSendAs is requireBound for a `Send` obligation that should report its own
+// diagnostic rather than the generic one: what the value was being used for is the whole
+// content of the message (spec/12-concurrency.md).
+func (c *Checker) requireSendAs(subject types.Type, ti *TraitInfo, span diag.Span, code, what string) {
+	c.obligations = append(c.obligations,
+		Bound{Type: subject, Trait: ti, Span: span, Code: code, What: what})
+}
+
 // solveObligations checks every bound collected while checking a body.
 func (c *Checker) solveObligations() {
 	for _, b := range c.obligations {

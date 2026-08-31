@@ -156,10 +156,12 @@ type resolver struct {
 	root    *Module
 	std     *Module
 	globals *scope
-	current *Module
-	scope   *scope
-	fnDepth int
-	lambdas []*lambdaCtx
+	// preludeScope holds the prelude's own imports, layered over globals.
+	preludeScope *scope
+	current      *Module
+	scope        *scope
+	fnDepth      int
+	lambdas      []*lambdaCtx
 	// loopDepth guards `break` and `continue`.
 	loopDepth int
 }
@@ -204,6 +206,13 @@ func Program(bag *diag.Bag, inputs ...Input) *Result {
 	r.root = newModule("", nil)
 	r.out.Root = r.root
 	r.globals = newScope(nil)
+	// The prelude's items go into the global scope, which is what makes them visible
+	// everywhere without a `use`. Its *imports* must not: `use std::thread` inside the
+	// prelude is how its own method bodies reach the runtime's operations, and leaking
+	// `thread` into every user module would make `use std::thread;` a no-op there. So
+	// prelude bodies resolve in a scope layered over the globals, holding only its
+	// imports.
+	r.preludeScope = newScope(r.globals)
 	for _, name := range PrimitiveNames {
 		r.globals.names[name] = Ref{Kind: Prim, Name: name}
 	}
@@ -242,11 +251,12 @@ func Program(bag *diag.Bag, inputs ...Input) *Result {
 
 	// Pass 3: process imports, now that every module's items exist.
 	for i, in := range inputs {
-		if in.Prelude {
-			continue
-		}
 		r.current = mods[i]
-		r.scope = mods[i].Scope
+		if in.Prelude {
+			r.scope = r.preludeScope
+		} else {
+			r.scope = mods[i].Scope
+		}
 		for _, u := range in.File.Uses {
 			r.resolveUse(u)
 		}
@@ -256,7 +266,7 @@ func Program(bag *diag.Bag, inputs ...Input) *Result {
 	for i, in := range inputs {
 		r.current = mods[i]
 		if in.Prelude {
-			r.scope = r.globals
+			r.scope = r.preludeScope
 		} else {
 			r.scope = mods[i].Scope
 		}
@@ -278,6 +288,12 @@ var globalBuiltins = map[string]bool{
 // instead of a special case. Phase 7 replaces them with Origin source.
 var stdModules = map[string][]string{
 	"std::io": {"print", "println"},
+	// Phase 6 (spec/12-concurrency.md). `spawn` and `channel` are what a program calls;
+	// the rest are the operations the prelude's own methods are written in terms of,
+	// since a method body cannot otherwise reach an operation the runtime provides.
+	"std::thread": {"spawn", "join_handle"},
+	"std::chan":   {"channel", "send_value", "recv_value", "close_sender"},
+	"std::sync":   {"mutex", "with_lock"},
 }
 
 func (r *resolver) registerStdModules() {

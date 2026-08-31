@@ -1,0 +1,18 @@
+// EXPECT: accept
+// spec: 12-concurrency.md, ADR-0014 — `Mutex[T]` is the sole route to shared mutation,
+// and the whole reason a type with `mut` fields can reach another thread at all. This is
+// the positive half of the rule the reject_* cases check: without it, `Send` would make
+// shared mutable state impossible rather than merely explicit.
+
+use std::thread;
+use std::sync;
+
+struct Counter { mut n: i64 }
+
+fn main() {
+    let m = sync::mutex(Counter { n: 0 });
+    let h = thread::spawn(|| -> i64 {
+        m.with(|c: Counter| -> i64 { c.n = c.n + 1; c.n })
+    });
+    let v = h.join();
+}

@@ -213,7 +213,14 @@ func (c *Checker) closureCaptureNotSend(lam *ast.Lambda) (string, *sendFailure) 
 // `mut` field is to remove the `mut` or to wrap the value in a `Mutex`.
 func (c *Checker) reportNotSend(b Bound) {
 	subject := types.Prune(b.Type)
-	d := c.bag.Errorf("E0700", b.Span, "`%s` cannot cross a thread boundary", subject).
+	code, what := b.Code, b.What
+	if code == "" {
+		code = "E0700"
+	}
+	if what == "" {
+		what = "cannot cross a thread boundary"
+	}
+	d := c.bag.Errorf(code, b.Span, "`%s` %s", subject, what).
 		Label("this value is not `Send`")
 
 	if _, isParam := subject.(*types.Param); isParam {

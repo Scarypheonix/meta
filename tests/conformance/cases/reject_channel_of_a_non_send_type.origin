@@ -1,0 +1,12 @@
+// EXPECT: reject E0700
+// spec: 12-concurrency.md — a channel's element type must be `Send`, reported where the
+// type is chosen rather than at a distant `send`.
+
+use std::chan;
+
+struct Counter { mut n: i64 }
+
+fn main() {
+    let (s, r) = chan::channel(0);
+    s.send(Counter { n: 1 });
+}

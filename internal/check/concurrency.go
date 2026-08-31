@@ -1,0 +1,175 @@
+package check
+
+import (
+	"github.com/scarypheonix/meta/internal/ast"
+	"github.com/scarypheonix/meta/internal/diag"
+	"github.com/scarypheonix/meta/internal/resolve"
+	"github.com/scarypheonix/meta/internal/types"
+)
+
+// The signatures of the compiler-provided concurrency operations (spec/12-concurrency.md).
+//
+// ADR-0025 put the surface in the prelude rather than in the grammar, so `spawn` is an
+// ordinary generic function and `JoinHandle[T]` an ordinary generic struct. What cannot
+// be written in Origin is the *body*: starting a thread, parking on a queue, taking a
+// lock. Those are the functions here, and the prelude's methods are written in terms of
+// them — the same arrangement `Show` already uses, where the trait is Origin and the impl
+// is the compiler's.
+//
+// Every one takes the handle struct itself rather than the raw handle inside it, so a
+// runtime that receives a value it does not recognize can trap rather than dereference
+// whatever integer it was handed (the prelude records the same, for the same reason).
+
+// preludeDef finds a prelude type by name. The prelude declares one type per name, so
+// there is nothing to disambiguate; the result is cached because this runs per call site.
+func (c *Checker) preludeDef(name string) *types.Def {
+	if c.preludeDefs == nil {
+		c.preludeDefs = map[string]*types.Def{}
+		for _, def := range c.defs {
+			if def != nil {
+				c.preludeDefs[def.Name] = def
+			}
+		}
+	}
+	return c.preludeDefs[name]
+}
+
+// named builds `Name[args...]` for a prelude type, or the error type when the prelude
+// does not declare it — which is a broken prelude, reported elsewhere as a parse failure.
+func (c *Checker) named(name string, args ...types.Type) types.Type {
+	def := c.preludeDef(name)
+	if def == nil {
+		return types.Error
+	}
+	return &types.Named{Def: def, Args: args}
+}
+
+// concurrencyBuiltinType gives the operations in std::thread, std::chan and std::sync
+// their signatures. It returns nil for a name it does not own, so builtinType can carry
+// on with the rest.
+func (c *Checker) concurrencyBuiltinType(name string, span diag.Span) types.Type {
+	unit := types.Unit()
+	i64 := types.P(types.I64)
+
+	switch name {
+	case "thread::spawn":
+		// spawn[T: Send](body: fn() -> T) -> JoinHandle[T]
+		//
+		// The `Send` bound is imposed at the call site rather than carried here, because
+		// a builtin's type is a plain FnT with nowhere to put a bound. checkSpawnBounds
+		// does it, and also checks the closure's captures, which no type can express.
+		t := c.freshFor(span)
+		return &types.FnT{
+			Params: []types.Type{&types.FnT{Params: nil, Ret: t}},
+			Ret:    c.named("JoinHandle", t),
+		}
+	case "thread::join_handle":
+		t := c.freshFor(span)
+		return &types.FnT{Params: []types.Type{c.named("JoinHandle", t)}, Ret: t}
+
+	case "chan::channel":
+		// channel[T: Send](capacity: i64) -> (Sender[T], Receiver[T])
+		t := c.freshFor(span)
+		return &types.FnT{
+			Params: []types.Type{i64},
+			Ret:    &types.TupleT{Elems: []types.Type{c.named("Sender", t), c.named("Receiver", t)}},
+		}
+	case "chan::send_value":
+		t := c.freshFor(span)
+		return &types.FnT{Params: []types.Type{c.named("Sender", t), t}, Ret: unit}
+	case "chan::recv_value":
+		t := c.freshFor(span)
+		return &types.FnT{Params: []types.Type{c.named("Receiver", t)}, Ret: c.named("Option", t)}
+	case "chan::close_sender":
+		t := c.freshFor(span)
+		return &types.FnT{Params: []types.Type{c.named("Sender", t)}, Ret: unit}
+
+	case "sync::mutex":
+		t := c.freshFor(span)
+		return &types.FnT{Params: []types.Type{t}, Ret: c.named("Mutex", t)}
+	case "sync::with_lock":
+		t := c.freshFor(span)
+		r := c.freshFor(span)
+		return &types.FnT{
+			Params: []types.Type{c.named("Mutex", t), &types.FnT{Params: []types.Type{t}, Ret: r}},
+			Ret:    r,
+		}
+	}
+	return nil
+}
+
+// checkConcurrencyCall imposes what the signatures above cannot: the `Send` obligations
+// that make ADR-0014's no-data-races claim true, and the capture check that a function
+// type cannot carry.
+//
+// It runs after the call's arguments have been inferred, so the types it reports are the
+// ones the programmer will recognize.
+func (c *Checker) checkConcurrencyCall(v *ast.Call, fn *types.FnT, result types.Type) {
+	ref, ok := c.res.Ref(v.Fn.NodeID())
+	if !ok || ref.Kind != resolve.Builtin {
+		return
+	}
+	send := c.traitByName("Send")
+	if send == nil {
+		return // a prelude without `Send` is broken; reported elsewhere
+	}
+
+	switch ref.Builtin {
+	case "thread::spawn":
+		// The thread's result crosses back to whoever joins it, so it must be `Send`.
+		// Reported against the closure, which is where a programmer can change it.
+		if len(v.Args) == 1 {
+			if h, ok := types.Prune(result).(*types.Named); ok && len(h.Args) == 1 {
+				c.requireSendAs(h.Args[0], send, v.Args[0].Span(), "E0702",
+					"cannot be returned from a thread")
+			}
+			c.checkSpawnCaptures(v.Args[0])
+		}
+
+	case "chan::channel":
+		// Nothing crosses yet, but the element type is fixed here, and reporting it at
+		// the `channel` call names the line that chose the type rather than a distant
+		// `send`.
+		if t, ok := types.Prune(result).(*types.TupleT); ok && len(t.Elems) == 2 {
+			if s, ok := types.Prune(t.Elems[0]).(*types.Named); ok && len(s.Args) == 1 {
+				c.requireSendAs(s.Args[0], send, v.Span(), "E0700",
+					"cannot be a channel's element type")
+			}
+		}
+
+	case "sync::mutex":
+		// `Mutex[T]` is `Send` for `Send` `T` -- the lock makes mutation safe, not the
+		// contents sendable, so a `T` that is unsendable for a reason other than `mut`
+		// is still unsendable inside one.
+		_ = fn
+	}
+}
+
+// checkSpawnCaptures reports a closure passed to `spawn` that captures something not
+// `Send` (E0701).
+//
+// This is the check a type cannot do. `fn() -> i64` is one type whether the closure
+// behind it captured an immutable counter or a mutable one, so the capture list recorded
+// by resolution is the only place the answer exists. It is also the check that closes the
+// obvious hole in ADR-0014: without it, a mutable aggregate that cannot cross a channel
+// crosses by being captured instead.
+func (c *Checker) checkSpawnCaptures(arg ast.Expr) {
+	lam, ok := arg.(*ast.Lambda)
+	if !ok {
+		return // a named function has no captures; anything else is checked by its type
+	}
+	name, failure := c.closureCaptureNotSend(lam)
+	if failure == nil {
+		return
+	}
+	d := c.bag.Errorf("E0701", arg.Span(),
+		"this closure cannot be spawned: it captures `%s`, which is not `Send`", name).
+		Label("captured here")
+	for _, line := range failure.chain() {
+		d.Note("%s", line)
+	}
+	d.Note("a spawned closure carries its captures to another thread, so each one must " +
+		"be `Send` for the same reason a channel's values must be")
+	d.Help("share the value as a `Mutex[%s]`, whose accessor holds the lock, or capture "+
+		"something immutable instead", failure.Type)
+}
