@@ -145,6 +145,11 @@ func inlineOne(f *ir.Func, call *ir.Value, callee *ir.Func, calleeIndex int) {
 	site.SetTerminator(f.NewValue(ir.OpJump, call.Span), entry)
 
 	result := f.NewValue(ir.OpPhi, call.Span)
+	// The φ stands in for the call, so it holds what the call held -- including the
+	// static kind only the checker knew (ADR-0021). Losing it here leaves a value the
+	// register allocator cannot place, which is a compiler-bug panic at -O2 for a
+	// program that builds at -O1.
+	result.Kind = call.Kind
 	for _, ret := range clone.returns {
 		var val *ir.Value
 		if len(ret.value.Args) > 0 {

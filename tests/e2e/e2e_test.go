@@ -113,15 +113,18 @@ var engines = []engineSpec{
 // engine — so a case landing here again is a real, temporary regression, not the norm.
 var nativeSkips = map[string]string{}
 
-// concurrencyCases are the cases that spawn a thread. The interpreter and the virtual
-// machine run them; the native backend does not yet, so they are skipped there by name
-// rather than quietly omitted from the corpus (process rule 8).
+// concurrencyCases are the cases the native backend cannot run yet -- the ones needing a
+// channel, a mutex, or a thread that parks without being joined. `spawn` and `join`
+// themselves run on all three engines now (thread.go), so they are deliberately absent
+// from this list.
+//
+// Skipping by name with the reason is how the suite stays honest about what is built,
+// exactly as `nativeSkips` did for Phase 5, and the list is meant to empty the same way.
 //
 // This list is the live record of how far Phase 6 has reached, exactly as `nativeSkips`
 // was for Phase 5, and it is meant to empty the same way: an entry disappears when the
 // engine can run it, and nothing else changes.
 var concurrencyCases = map[string]bool{
-	"thread_spawn_and_join":        true,
 	"channel_rendezvous_and_close": true,
 	"mutex_guards_shared_mutation": true,
 	"channel_send_on_closed_traps": true,

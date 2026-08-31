@@ -137,6 +137,13 @@ func (e *emitter) emitAB(op bytecode.Op, a, b int, span diag.Span) int {
 	return len(e.fn.Code) - 1
 }
 
+// emitABK is emitAB carrying a value's kind, for the same reason emitAK exists: a round
+// trip through bytecode must not lose what only the checker knew (ADR-0021).
+func (e *emitter) emitABK(op bytecode.Op, a, b int, kind bytecode.Kind, span diag.Span) int {
+	e.fn.Code = append(e.fn.Code, bytecode.Instr{Op: op, A: int32(a), B: int32(b), Kind: kind, Span: span})
+	return len(e.fn.Code) - 1
+}
+
 // emitAK is emitA plus a value's kind (ADR-0021): re-emitting v as bytecode must not
 // drop what internal/backend needs from it, even though this package's other consumer
 // (the VM, at -O1/-O2) never reads it.
@@ -199,7 +206,7 @@ func (e *emitter) emitValue(v *Value) error {
 		for _, a := range v.Args {
 			e.load(a, span)
 		}
-		e.emitAB(bytecode.OpCallBuiltin, v.Const, v.Aux, span)
+		e.emitABK(bytecode.OpCallBuiltin, v.Const, v.Aux, v.Kind, span)
 
 	case OpClosure:
 		for _, a := range v.Args {

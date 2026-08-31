@@ -625,6 +625,16 @@ func (c *Compiler) emitAB(op bytecode.Op, a, b int, span diag.Span) int {
 	return len(c.fn.Code) - 1
 }
 
+// emitABK is emitAB plus the value's static kind, for a builtin whose result kind is the
+// program's own T rather than fixed by which builtin it is (ADR-0021): `join` yields the
+// thread's result, `with` whatever its closure returned. The native backend cannot ask a
+// register what it holds, so a kind missing here is a value the register allocator will
+// refuse to place.
+func (c *Compiler) emitABK(op bytecode.Op, a, b int, kind bytecode.Kind, span diag.Span) int {
+	c.fn.Code = append(c.fn.Code, bytecode.Instr{Op: op, A: int32(a), B: int32(b), Kind: kind, Span: span})
+	return len(c.fn.Code) - 1
+}
+
 // emitAK is emitA plus the value's static kind (ADR-0021): a field/payload/tuple-element
 // read or a call, the instructions whose result the native backend cannot otherwise tell
 // is a reference at all.

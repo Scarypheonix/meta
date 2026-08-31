@@ -47,7 +47,12 @@ const (
 	// return value would.
 	gcPendingRbpOff = -72
 	gcPendingRetOff = -80
-	gcLocalsSz      = 80
+	// gcThreadOff is the thread whose stack the walk is currently on, or 0 while it is on
+	// the running thread's own. With more than one green thread every other thread's
+	// frames hold live references too, so the walk runs once per thread rather than once
+	// (spec/12-concurrency.md, thread.go).
+	gcThreadOff = -88
+	gcLocalsSz  = 96 // a multiple of 16: the ABI wants rsp aligned at every call
 )
 
 // gcTrackedRegs is rt_collect's own root-tracking registers, in RegMask/SavedMask's bit
@@ -348,6 +353,9 @@ func (e *emitter) emitCollect() {
 	for _, tr := range gcTrackedRegs {
 		a.MovMI(x86.At(x86.RBP, tr.locOff), 0) // 0 = "still the physical register"
 	}
+	// The walk starts on the running thread's own stack; gcThreadOff advances through
+	// every other thread once that one is exhausted (spec/12-concurrency.md).
+	a.MovMI(x86.At(x86.RBP, gcThreadOff), 0)
 
 	// The destination space is the one alloc's own bump/end did not just fail out of.
 	a.MovRM(x86.RAX, x86.At(x86.R15, rtOtherStartOff))
@@ -409,6 +417,7 @@ func (e *emitter) emitCollect() {
 	a.Jmp(walkLoop)
 
 	a.Bind(walkDone)
+	e.gcNextThreadStack(walkLoop)
 
 	// Cheney's scan: walk the destination space from its own start to its own (growing)
 	// bump position, evacuating every reference each already-copied object holds.
@@ -569,4 +578,125 @@ func (e *emitter) gcTransitionLocs() {
 
 		a.Bind(skip)
 	}
+}
+
+// gcNextThreadStack advances the root walk to the next green thread's stack, jumping back
+// to walkLoop when it finds one and falling through when every thread has been walked.
+//
+// A single-threaded program never enters the loop below: rtThreadsOff is empty, so this
+// is one load and one branch, which is what a program that never spawns should pay.
+//
+// The cursor lives in memory rather than a register throughout. rt_collect deliberately
+// does not preserve rbx/r12/r13/r14 -- they hold frame 0's own live roots, which
+// gcProcessRegRoot updates in place -- so holding anything in one of them here would
+// destroy a root the collector is in the middle of forwarding. The caller-saved registers
+// are no better, since every evacuation below is a call.
+//
+// The three states mean three different things, and confusing them corrupts the heap
+// rather than merely missing an object:
+//
+//   - `ready`: never run, so its stack is six primed zero words and a trampoline address,
+//     not a frame chain. Walking it would read those zeros as frames. Only its closure is
+//     a root.
+//   - `parked`: stopped inside rt_switch, so its chain is real and begins at the rbp that
+//     switch saved -- and its four tracked registers are in switch's own pushed slots,
+//     which is where the locs must start rather than "physical" (a parked thread owns no
+//     physical register).
+//   - `done`: no stack worth walking; the result it left behind is the root, and only when
+//     the compiler said that result is a reference.
+func (e *emitter) gcNextThreadStack(walkLoop x86.Label) {
+	a := e.a
+	advance := a.NewLabel("gc_thread_advance")
+	consider := a.NewLabel("gc_thread_consider")
+	finished := a.NewLabel("gc_threads_done")
+
+	// The first pass starts at the head of the list; later ones continue from the cursor.
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcThreadOff))
+	a.TestRR(x86.RCX, x86.RCX)
+	a.Jcc(x86.NotEqual, advance)
+	a.MovRM(x86.RCX, x86.At(x86.R15, rtThreadsOff))
+	a.Jmp(consider)
+
+	a.Bind(advance)
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcThreadOff))
+	a.MovRM(x86.RCX, x86.At(x86.RCX, tcbNextOff))
+
+	a.Bind(consider)
+	a.TestRR(x86.RCX, x86.RCX)
+	a.Jcc(x86.Equal, finished)
+	a.MovMR(x86.At(x86.RBP, gcThreadOff), x86.RCX)
+
+	// The running thread's stack was walked first, from its live registers. Walking it
+	// again through a control block that describes where it last parked would evacuate
+	// stale copies of roots this collection has already moved.
+	a.MovRM(x86.RAX, x86.At(x86.R15, rtCurrentOff))
+	a.CmpRR(x86.RCX, x86.RAX)
+	a.Jcc(x86.Equal, advance)
+
+	// Whatever its state, the closure it was handed is reachable from the control block
+	// alone until the thread has run it.
+	e.gcEvacuateTCBSlot(tcbClosureOff)
+
+	// A result, if the compiler said it is a reference. The runtime cannot tell a
+	// reference from an integer -- that is what the stack map does elsewhere -- so
+	// `spawn` records the answer for its own T.
+	skipResult := a.NewLabel("gc_thread_no_result")
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcThreadOff))
+	a.MovRM(x86.RAX, x86.At(x86.RCX, tcbResultIsRefOff))
+	a.TestRR(x86.RAX, x86.RAX)
+	a.Jcc(x86.Equal, skipResult)
+	e.gcEvacuateTCBSlot(tcbResultOff)
+	a.Bind(skipResult)
+
+	// Only a parked thread has a frame chain to walk.
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcThreadOff))
+	a.MovRM(x86.RAX, x86.At(x86.RCX, tcbStateOff))
+	a.CmpRI(x86.RAX, threadParked)
+	a.Jcc(x86.NotEqual, advance)
+
+	// Its tracked registers live in rt_switch's own pushed slots, addressed from the
+	// stack pointer switch saved.
+	a.MovRM(x86.RDX, x86.At(x86.RCX, tcbRSPOff))
+	for _, tr := range gcTrackedRegs {
+		var off int32
+		switch tr.reg {
+		case x86.RBX:
+			off = switchRBXOff
+		case x86.R12:
+			off = switchR12Off
+		case x86.R13:
+			off = switchR13Off
+		case x86.R14:
+			off = switchR14Off
+		}
+		a.MovRR(x86.RAX, x86.RDX)
+		a.AddRI(x86.RAX, off)
+		a.MovMR(x86.At(x86.RBP, tr.locOff), x86.RAX)
+	}
+
+	// Frame 0 of this thread is whoever called rt_switch: the rbp switch saved, and the
+	// return address sitting above its six pushed registers.
+	a.MovRM(x86.RAX, x86.At(x86.RCX, tcbRBPOff))
+	a.MovMR(x86.At(x86.RBP, gcWalkRbpOff), x86.RAX)
+	a.MovRM(x86.RAX, x86.At(x86.RDX, switchRetOff))
+	a.MovMR(x86.At(x86.RBP, gcWalkRetOff), x86.RAX)
+	a.Jmp(walkLoop)
+
+	a.Bind(finished)
+}
+
+// gcEvacuateTCBSlot evacuates one reference held in the thread control block the cursor
+// names, and writes the forwarded address back. The block is raw mmap'd memory rather
+// than a heap object, so nothing else will ever visit it.
+func (e *emitter) gcEvacuateTCBSlot(off int32) {
+	a := e.a
+	skip := a.NewLabel("gc_tcb_slot_skip")
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcThreadOff))
+	a.MovRM(x86.RDI, x86.At(x86.RCX, off))
+	a.TestRR(x86.RDI, x86.RDI)
+	a.Jcc(x86.Equal, skip)
+	a.Call(e.rt.evacuate)
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcThreadOff))
+	a.MovMR(x86.At(x86.RCX, off), x86.RAX)
+	a.Bind(skip)
 }

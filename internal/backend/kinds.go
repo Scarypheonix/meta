@@ -118,7 +118,14 @@ func staticKind(v *ir.Value, prog *bytecode.Program) (bytecode.Kind, bool) {
 		return castResultKind(bytecode.CastKind(v.Const), v.Aux), true
 
 	case ir.OpCallBuiltin:
-		return builtinResultKind(v.Const), true
+		if k := builtinResultKind(v.Const); k != bytecode.KindUnknown {
+			return k, true
+		}
+		// A builtin whose result is the program's own T (`join`, `taken`, `with`) already
+		// carries its kind on the instruction, seeded by internal/compile from the
+		// checker's types. Returning "unknown, and I am sure" here would overwrite that
+		// with nothing -- which is how a program that builds at -O1 came to panic at -O2.
+		return bytecode.KindUnknown, false
 	}
 	return bytecode.KindUnknown, false
 }
@@ -154,6 +161,21 @@ func builtinResultKind(idx int) bytecode.Kind {
 		return bytecode.KindRef
 	case compile.BuiltinSaturatingAdd, compile.BuiltinSaturatingSub, compile.BuiltinSaturatingMul:
 		return bytecode.KindInt
+	case compile.BuiltinSpawn, compile.BuiltinChannel, compile.BuiltinMutex:
+		// A bare handle: an index into the runtime's own tables, which internal/compile
+		// then wraps in the prelude type the call's checked type names
+		// (spec/12-concurrency.md).
+		return bytecode.KindInt
+	case compile.BuiltinAwait:
+		return bytecode.KindBool
+	case compile.BuiltinSend, compile.BuiltinCloseChan:
+		return bytecode.KindUnit
+	case compile.BuiltinJoin, compile.BuiltinTaken, compile.BuiltinWithLock:
+		// These yield the program's own T, whose kind varies per call site. It is on the
+		// instruction, put there by internal/compile from the checker's own types
+		// (ADR-0021), so there is nothing fixed to return here -- and answering anyway
+		// would be the "plausible wrong answer" process rule 8 refuses.
+		return bytecode.KindUnknown
 	}
 	return bytecode.KindUnknown
 }

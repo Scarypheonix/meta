@@ -379,6 +379,10 @@ func (b *builder) translateInstr(blk *Block, in bytecode.Instr, pc int) (bool, e
 		v := b.f.NewValue(OpCallBuiltin, in.Span, args...)
 		v.Const = int(in.A)
 		v.Aux = int(in.B)
+		// A builtin whose result kind is the program's own T carries it on the
+		// instruction (ADR-0021). Dropping it here would leave the value kindless after
+		// any optimizer round trip, which the register allocator refuses.
+		v.Kind = in.Kind
 		b.push(blk.Append(v))
 
 	case bytecode.OpClosure:

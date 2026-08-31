@@ -82,6 +82,9 @@ type runtimeLabels struct {
 	threadSwitch x86.Label
 	threadNew    x86.Label
 	threadEntry  x86.Label
+	threadSpawn  x86.Label
+	threadJoin   x86.Label
+	threadMain   x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -108,6 +111,9 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.threadSwitch = e.a.NewLabel("rt_switch")
 	e.rt.threadNew = e.a.NewLabel("rt_thread_new")
 	e.rt.threadEntry = e.a.NewLabel("rt_thread_entry")
+	e.rt.threadSpawn = e.a.NewLabel("rt_spawn")
+	e.rt.threadJoin = e.a.NewLabel("rt_join")
+	e.rt.threadMain = e.a.NewLabel("rt_main_thread")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -124,6 +130,9 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitThreadSwitch()
 	e.emitThreadNew()
 	e.emitThreadEntry()
+	e.emitThreadSpawn()
+	e.emitThreadJoin()
+	e.emitMainThread()
 	e.emitCollect()
 }
 
@@ -231,6 +240,11 @@ func (e *emitter) emitStart(mainLabel x86.Label) {
 	// zero. `main`'s own prologue pushes whatever is in rbp right now as that first
 	// saved value, so clearing it here is what gives the walk a well-defined end after
 	// main's own frame, rather than however this routine's own rbp happens to be left.
+	// Main needs a control block of its own before any thread can switch away from it
+	// (thread.go): every switch names two threads, and the collector needs somewhere to
+	// record where this one parked while another runs.
+	a.Call(e.rt.threadMain)
+
 	a.XorRR(x86.RBP, x86.RBP)
 
 	a.Call(mainLabel)

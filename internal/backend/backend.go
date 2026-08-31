@@ -130,6 +130,8 @@ type emitter struct {
 	stringType     layout.TypeID
 	newlineAddr    uint64
 	outOfMemoryMsg staticStr
+	// joinedTwiceMsg is §12's `handle already joined`.
+	joinedTwiceMsg staticStr
 	// panicPrefix is the "origin: " a panic's message is wrapped in, so that the three
 	// engines print the same line.
 	panicPrefix staticStr
@@ -205,6 +207,12 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 	e.newlineAddr = e.roDataAddr + uint64(len(e.roData))
 	e.roData = append(e.roData, '\n')
 	e.outOfMemoryMsg = e.rawString("origin: out of memory at <runtime>\n")
+	// A concurrency trap raised by the runtime rather than by a lowered instruction has
+	// no span of its own to name, the same way `out of memory` has none. The other two
+	// engines resolve such a trap to the user's own line by walking out of the prelude
+	// (interp/vm's userSpan); native code has no frame table to do that with yet, so it
+	// says `<runtime>` rather than inventing a location (docs/deferred.md).
+	e.joinedTwiceMsg = e.rawString("origin: handle already joined at <runtime>\n")
 	e.panicPrefix = e.rawString("origin: ")
 	e.emitTypeTable()
 	e.emitGCRuntimeFrameEntry()

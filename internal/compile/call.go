@@ -6,6 +6,7 @@ import (
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/diag"
+	"github.com/scarypheonix/meta/internal/layout"
 	"github.com/scarypheonix/meta/internal/resolve"
 	"github.com/scarypheonix/meta/internal/types"
 )
@@ -56,7 +57,23 @@ func (c *Compiler) call(v *ast.Call) error {
 					return err
 				}
 			}
-			c.emitAB(bytecode.OpCallBuiltin, idx, len(v.Args), v.Span())
+			argc := len(v.Args)
+			if idx == BuiltinSpawn {
+				// `spawn` takes one more argument than it is written with: whether the
+				// thread's result is a reference. Native code keeps that result in a
+				// thread control block, which is raw memory with no stack map over it, so
+				// the collector cannot tell a reference from an integer there. Only the
+				// compiler knows -- it has the checker's own T -- so it says. The other
+				// two engines ignore the argument; their hosts find references without
+				// being told (spec/12-concurrency.md).
+				isRef, err := c.spawnResultIsRef(v)
+				if err != nil {
+					return err
+				}
+				c.emitA(bytecode.OpConst, c.intConst(isRef), v.Span())
+				argc++
+			}
+			c.emitABK(bytecode.OpCallBuiltin, idx, argc, c.kindOf(v), v.Span())
 			return c.wrapConcurrencyHandle(idx, v)
 		}
 	}
@@ -306,4 +323,21 @@ func (c *Compiler) wrapConcurrencyHandle(idx int, v *ast.Call) error {
 		return nil
 	}
 	return nil
+}
+
+// spawnResultIsRef reports whether the T in `spawn`'s own `JoinHandle[T]` is something
+// the collector must treat as a reference.
+func (c *Compiler) spawnResultIsRef(v *ast.Call) (int64, error) {
+	named, ok := types.AsNamed(c.concreteType(c.typeOf(v)))
+	if !ok || len(named.Args) != 1 {
+		return 0, unsupported("a spawn whose handle type is not JoinHandle[T]", v.Span())
+	}
+	k, ok := wordKindFor(c.concreteType(named.Args[0]))
+	if !ok {
+		return 0, unsupported("a spawned thread whose result type has no object layout", v.Span())
+	}
+	if k == layout.WordRef {
+		return 1, nil
+	}
+	return 0, nil
 }

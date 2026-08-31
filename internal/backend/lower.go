@@ -598,6 +598,37 @@ func (e *emitter) callClosure(v *ir.Value) error {
 // builtin lowers a call to one of the compiler-provided functions.
 func (e *emitter) builtin(v *ir.Value) error {
 	switch v.Const {
+	case compile.BuiltinSpawn:
+		// rt_spawn(closure, resultIsRef) -> handle. The handle is an integer as far as
+		// the rest of the program is concerned; internal/compile wraps it in the
+		// `JoinHandle[T]` the checker gave the call (spec/12-concurrency.md).
+		// Two arguments: the closure, and whether its result is a reference. The second
+		// is a constant internal/compile supplies, because a thread's result lives in a
+		// control block that no stack map covers and only the compiler knows its T
+		// (spec/12-concurrency.md, thread.go's tcbResultIsRefOff).
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: spawn takes two arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.load(x86.RSI, v.Args[1])
+		e.a.Call(e.rt.threadSpawn)
+		e.recordCall(v)
+		e.def(v, x86.RAX)
+		return nil
+
+	case compile.BuiltinJoin:
+		if len(v.Args) != 1 {
+			return fmt.Errorf("this is a compiler bug: join takes one argument, got %d", len(v.Args))
+		}
+		// The argument is the `JoinHandle[T]` object, not the handle: the prelude's own
+		// method passes `self`. The control block's address is its first field.
+		e.load(x86.RDI, v.Args[0])
+		e.a.MovRM(x86.RDI, x86.At(x86.RDI, objHeaderSize))
+		e.a.Call(e.rt.threadJoin)
+		e.recordCall(v)
+		e.def(v, x86.RAX)
+		return nil
+
 	case compile.BuiltinPrint, compile.BuiltinPrintln:
 		if len(v.Args) != 1 {
 			return fmt.Errorf("this is a compiler bug: print takes one argument, got %d", len(v.Args))
