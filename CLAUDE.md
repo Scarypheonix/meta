@@ -52,10 +52,17 @@ internal/mono/        monomorphization of call dispatch (ADR-0010)
 internal/compile/     AST -> bytecode, per monomorphized instance
 internal/vm/          the bytecode virtual machine
 internal/prelude/     Option, Result, Ordering — written in Origin
+internal/x86/         a hand-written encoder for the instructions the backend emits
+internal/dwarf/       the DWARF4 line table and its compile-unit DIE (ADR-0023)
+internal/codesign/    the ad-hoc Mach-O code signature, without which macOS will not
+                      run an executable at all (ADR-0024)
+internal/obj/         ELF and Mach-O executable writers; no linker (ADR-0017)
+internal/backend/     SSA IR -> machine code, register allocation, the native runtime
 internal/driver/      pass ordering and error suppression
 tests/conformance/    type-system accept/reject corpus, one file per case
 tests/e2e/            programs + exact expected stdout/stderr/exit
 tests/docs/           documentation invariants (ADR numbering, code registry, lints)
+tests/debuginfo/      lldb/llvm-dwarfdump on both formats; skips if they are absent
 tests/fuzz/           fuzz targets for the lexer and parser
 docs/spec/            THE language specification — normative
 docs/adr/             architecture decision records — every irreversible choice
@@ -517,16 +524,31 @@ linker, nothing but the compiler**.
 
 Exactly one item remains for `docs/phases/5-complete.md`: **`lldb`, on the target
 machine, stopping at an Origin source line in a Mach-O and naming the frames in `bt`.**
-Its risk is now small and precisely bounded, because the static half is verified here.
-`lldb` and `llvm-dwarfdump` read Mach-O cross-platform, and resolving a breakpoint by
-file and line is a DWARF lookup rather than execution — so, against a Mach-O built by
-the real compiler in this container, `lldb` resolves `breakpoint set --file dbg2.origin
---line 4` to `add + 22, address = 0x100000fe6`, and `image lookup -n add` names the
-function from the symbol table. What is left needing a Mac is only the live process:
-stopping there, and `bt` at run time — which rests on the frame-pointer prologues the
-ELF path already exercises under `lldb` for real. `TestMachOBuildCarriesValidDebugInfo`
-now covers the Mach-O debug path end to end through the compiler, which nothing did
-while ADR-0023's Mach-O support was being written.
+Its risk is now small and precisely bounded, because everything except the live process
+is verified here. `lldb` and `llvm-dwarfdump` read Mach-O cross-platform, and resolving a
+breakpoint by file and line is a DWARF lookup rather than execution, so the whole static
+half of that criterion was swept across the corpus rather than spot-checked. Every
+`tests/e2e/cases` program was built as a Mach-O at every optimization level — 81 binaries,
+the first time more than one program had ever gone down that path at all — and:
+
+- all 81 carry a signature whose page digests re-derive correctly from the file, and all
+  81 are accepted by `rcodesign`'s independent parser;
+- all 81 pass `llvm-dwarfdump --verify`, LLVM's own DWARF validity checker;
+- across all 81, **805 of 805 `(file, line)` pairs resolve under `lldb` to an address the
+  compiler's own line table gives that line** — zero discrepancies. (A first pass
+  reported mismatches; the fault was the checking script pairing answers positionally
+  when one line legitimately has several addresses. `lldb` picks the first, which is
+  correct, and the corrected check is the one that ran.)
+
+`tests/debuginfo` makes that permanent rather than a one-off claim: it runs the LLVM
+verifier and the full line-resolution check over both formats, and skips when the tools
+are absent so `./check` still passes without them. `TestMachOBuildCarriesValidDebugInfo`
+covers the Mach-O debug path end to end through the compiler, which nothing did while
+ADR-0023's Mach-O support was being written.
+
+What is left needing a Mac is therefore only the live process: stopping at the
+breakpoint, and `bt` naming frames at run time — which rests on the frame-pointer
+prologues the ELF path already exercises under `lldb` for real.
 
 The lesson worth keeping: ADR-0003's target-machine checklist item was not a formality.
 It found a defect that made every Mach-O this project ever emitted unrunnable, and no
