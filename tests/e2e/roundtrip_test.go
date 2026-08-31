@@ -20,9 +20,6 @@ func TestIRRoundTrip(t *testing.T) {
 	root := testutil.RepoRoot(t)
 	for _, c := range loadCases(t) {
 		t.Run(c.Name, func(t *testing.T) {
-			if concurrencyCases[c.Name] {
-				t.Skip("Phase 6: the IR path has no scheduler yet")
-			}
 			wd, err := os.Getwd()
 			if err != nil {
 				t.Fatalf("getwd: %v", err)

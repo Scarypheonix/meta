@@ -294,6 +294,7 @@ func (v *VM) spawn(body Value, span diag.Span) int64 {
 }
 
 func (v *VM) join(h int64, span diag.Span) Value {
+	span = v.userSpan(span)
 	w := v.w
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -311,6 +312,7 @@ func (v *VM) join(h int64, span diag.Span) Value {
 }
 
 func (v *VM) makeChannel(capacity int64, span diag.Span) int64 {
+	span = v.userSpan(span)
 	if capacity < 0 {
 		v.trap(span, "channel capacity is negative")
 	}
@@ -323,6 +325,7 @@ func (v *VM) makeChannel(capacity int64, span diag.Span) int64 {
 }
 
 func (v *VM) channelSend(h int64, val Value, span diag.Span) {
+	span = v.userSpan(span)
 	w := v.w
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -359,6 +362,7 @@ func (v *VM) channelSend(h int64, val Value, span diag.Span) {
 }
 
 func (v *VM) channelRecv(h int64, span diag.Span) (Value, bool) {
+	span = v.userSpan(span)
 	w := v.w
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -383,6 +387,7 @@ func (v *VM) channelRecv(h int64, span diag.Span) (Value, bool) {
 }
 
 func (v *VM) channelClose(h int64, span diag.Span) {
+	span = v.userSpan(span)
 	w := v.w
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -408,6 +413,7 @@ func (v *VM) makeMutex(val Value) int64 {
 }
 
 func (v *VM) withLock(h int64, body Value, span diag.Span) Value {
+	span = v.userSpan(span)
 	w := v.w
 
 	m := func() *vmMutex {

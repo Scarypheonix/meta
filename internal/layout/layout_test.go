@@ -110,3 +110,36 @@ func TestReservedZeroTypeIDPanics(t *testing.T) {
 	}()
 	r.Get(0)
 }
+
+// TestAddRejectsTwoShapesUnderOneName is the guard that turns a silent layout alias into
+// a stop.
+//
+// Registry.Add treats a name as a shape's identity and returns the existing id for a
+// name it already knows. That is right for a genuine re-registration and catastrophic
+// otherwise: closure descriptors were once named by their capture count alone, so a
+// closure capturing an `i64` and one capturing a reference were both `(closure/1)`, the
+// second silently became the first, and every read of its capture interpreted the wrong
+// kind of word. Neither engine reported anything; the value was simply wrong.
+func TestAddRejectsTwoShapesUnderOneName(t *testing.T) {
+	r := NewRegistry()
+	r.Add(FixedDescriptor("same", []WordKind{WordInt, WordRef}))
+
+	defer func() {
+		if recover() == nil {
+			t.Error("registering a different shape under an existing name was accepted; " +
+				"one of the two layouts would be silently used for both")
+		}
+	}()
+	r.Add(FixedDescriptor("same", []WordKind{WordInt, WordInt}))
+}
+
+// TestAddIsIdempotentForTheSameShape: re-registering an identical descriptor is ordinary
+// and must keep returning the same id, which is what the cache above relies on.
+func TestAddIsIdempotentForTheSameShape(t *testing.T) {
+	r := NewRegistry()
+	a := r.Add(FixedDescriptor("same", []WordKind{WordInt, WordRef}))
+	b := r.Add(FixedDescriptor("same", []WordKind{WordInt, WordRef}))
+	if a != b {
+		t.Errorf("the same shape registered twice got ids %d and %d", a, b)
+	}
+}

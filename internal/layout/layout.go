@@ -210,6 +210,20 @@ func NewRegistry() *Registry {
 // the existing id, so lowering may declare a type wherever it first needs it.
 func (r *Registry) Add(d *Descriptor) TypeID {
 	if id, ok := r.byName[d.Name]; ok {
+		// A name identifies a shape. Two descriptors sharing a name must therefore be
+		// the same shape; returning the existing id for a *different* one silently
+		// aliases two layouts, and every read through the loser's id then interprets
+		// the wrong words -- an object's field read as a reference because some other
+		// type of the same name had a reference there. That is precisely the failure
+		// this check was added for: closure descriptors were named by their capture
+		// count alone, so a closure capturing an `i64` and one capturing a reference
+		// collapsed into whichever was registered first (process rule 8).
+		if prev := r.descs[id]; !sameShape(prev, d) {
+			panic(fmt.Sprintf(
+				"two different layouts registered as %q: %v (%d words) and %v (%d words); "+
+					"a descriptor's name must identify its shape",
+				d.Name, prev.Kinds, prev.Words, d.Kinds, d.Words))
+		}
 		return id
 	}
 	id := TypeID(len(r.descs))
@@ -252,4 +266,19 @@ func RefsOnly(isRef []bool) []WordKind {
 		}
 	}
 	return kinds
+}
+
+// sameShape reports whether two descriptors lay memory out identically. Names, field
+// names and the rest are documentation; the kinds and the word count are the contract
+// the collector and the code generator both read.
+func sameShape(a, b *Descriptor) bool {
+	if a.Words != b.Words || a.Kind != b.Kind || len(a.Kinds) != len(b.Kinds) {
+		return false
+	}
+	for i := range a.Kinds {
+		if a.Kinds[i] != b.Kinds[i] {
+			return false
+		}
+	}
+	return true
 }

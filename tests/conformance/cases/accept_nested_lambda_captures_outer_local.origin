@@ -1,0 +1,14 @@
+// EXPECT: accept
+// spec: 04-expressions.md — a lambda captures each free variable by value. A lambda
+// nested inside another captures the outer one's *local*, and the outer lambda must not
+// also record it as a capture of its own: it declares it.
+
+fn apply(f: fn(i64) -> i64) -> i64 { f(1) }
+
+fn main() {
+    let outer = || -> i64 {
+        let t = 3;
+        apply(|x| x + t)
+    };
+    let v = outer();
+}

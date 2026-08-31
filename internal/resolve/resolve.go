@@ -150,6 +150,11 @@ type lambdaCtx struct {
 	node     ast.NodeID
 	captured map[*Local]bool
 	order    []*Local
+	// depth is the frame this lambda's own body runs in. A lambda captures a binding
+	// only from a frame *outside* itself; one it declares locally is not a capture, and
+	// recording it as one gives the closure a capture slot filled from a frame where the
+	// binding does not exist yet.
+	depth int
 }
 
 type resolver struct {
@@ -988,6 +993,14 @@ func (r *resolver) noteCapture(local *Local) {
 		return // same frame: an ordinary local reference
 	}
 	for _, lc := range r.lambdas {
+		// Only the lambdas *between* the binding's frame and this reference capture it.
+		// A lambda whose own frame declares the binding reads it as a local; recording a
+		// capture there too gave it a capture slot that had to be filled at the point the
+		// closure was built, which is before the binding exists -- so it was filled with
+		// zero, and every read through it was silently wrong.
+		if lc.depth <= local.fnDepth {
+			continue
+		}
 		if !lc.captured[local] {
 			lc.captured[local] = true
 			lc.order = append(lc.order, local)
@@ -1197,12 +1210,12 @@ func (r *resolver) checkAssignable(a *ast.Assign) {
 }
 
 func (r *resolver) resolveLambda(l *ast.Lambda) {
-	lc := &lambdaCtx{node: l.NodeID(), captured: map[*Local]bool{}}
-	r.lambdas = append(r.lambdas, lc)
-
 	saved, savedDepth, savedLoop := r.scope, r.fnDepth, r.loopDepth
 	r.scope = newScope(r.scope)
 	r.fnDepth++
+
+	lc := &lambdaCtx{node: l.NodeID(), captured: map[*Local]bool{}, depth: r.fnDepth}
+	r.lambdas = append(r.lambdas, lc)
 	r.loopDepth = 0
 
 	for _, p := range l.Params {

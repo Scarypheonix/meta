@@ -113,9 +113,9 @@ var engines = []engineSpec{
 // engine — so a case landing here again is a real, temporary regression, not the norm.
 var nativeSkips = map[string]string{}
 
-// concurrencyCases are the cases that spawn a thread. The interpreter runs them today;
-// the virtual machine and the native backend do not yet, so they are skipped there by
-// name rather than quietly omitted from the corpus (process rule 8).
+// concurrencyCases are the cases that spawn a thread. The interpreter and the virtual
+// machine run them; the native backend does not yet, so they are skipped there by name
+// rather than quietly omitted from the corpus (process rule 8).
 //
 // This list is the live record of how far Phase 6 has reached, exactly as `nativeSkips`
 // was for Phase 5, and it is meant to empty the same way: an entry disappears when the
@@ -130,7 +130,6 @@ var concurrencyCases = map[string]bool{
 
 // concurrencySkips names the engines that cannot yet run a concurrent program.
 var concurrencySkips = map[driver.Engine]string{
-	driver.VM:     "Phase 6: the virtual machine has no scheduler yet",
 	driver.Native: "Phase 6: the native backend has no scheduler yet",
 }
 

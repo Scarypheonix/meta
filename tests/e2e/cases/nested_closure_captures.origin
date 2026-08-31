@@ -1,0 +1,39 @@
+use std::io;
+
+// Two bugs, both silent, both found by one program (ADR-0027's commit found the third).
+//
+// 1. The resolver recorded a binding as captured by *every* enclosing lambda, including
+//    the one whose own frame declares it. That gave the outer closure a capture slot
+//    filled at the point it was built -- before the binding existed -- so it read zero.
+//
+// 2. `layout.Registry.Add` treats a descriptor's name as its identity, and closure
+//    descriptors were named by their capture *count*. A closure capturing an `i64` and
+//    one capturing a reference were both `(closure/1)`, so they shared a layout and one
+//    of them read its capture as the wrong kind of word.
+//
+// Neither is visible to the interpreter, whose values are uniform; the virtual machine
+// and native code shared the defect because they share internal/compile.
+
+fn apply(f: fn(i64) -> i64) -> i64 { f(10) }
+fn run(g: fn() -> i64) -> i64 { g() }
+
+struct Holder { n: i64 }
+
+fn main() {
+    // A lambda nested in a lambda, capturing the outer lambda's local.
+    io::println(run(|| -> i64 { let t = 3; apply(|x| x + t) }).to_str());
+
+    // A closure capturing a reference and one capturing an integer, each with exactly
+    // one capture, so they collide on any name derived from the count alone.
+    let h = Holder { n: 7 };
+    let k = 5;
+    let by_ref = || -> i64 { h.n };
+    let by_int = || -> i64 { k };
+    io::println((by_ref() + by_int()).to_str());
+
+    // Three levels, mixing both.
+    io::println(run(|| -> i64 {
+        let a = 100;
+        run(|| -> i64 { let b = 20; apply(|x| x + a + b) })
+    }).to_str());
+}

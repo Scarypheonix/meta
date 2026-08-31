@@ -287,6 +287,19 @@ func wordKindFor(t types.Type) (layout.WordKind, bool) {
 	return wordKindOf(kindOfType(t))
 }
 
+// kindsName renders a kind vector for a descriptor's name, so that two shapes never
+// share one.
+func kindsName(kinds []layout.WordKind) string {
+	var sb []byte
+	for i, k := range kinds {
+		if i > 0 {
+			sb = append(sb, ',')
+		}
+		sb = fmt.Appendf(sb, "%d", int(k))
+	}
+	return string(sb)
+}
+
 func kindsKey(kinds []layout.WordKind) string {
 	buf := make([]byte, len(kinds))
 	for i, k := range kinds {
@@ -524,7 +537,10 @@ func (c *Compiler) closureInst(caps []*resolve.Local, span diag.Span) (layout.Ty
 	if id, ok := c.closureCache[key]; ok {
 		return id, nil
 	}
-	d := layout.FixedDescriptor(fmt.Sprintf("(closure/%d)", len(caps)), kinds)
+	// The name has to identify the shape, not merely the arity: Registry.Add treats a
+	// name as a shape's identity, so `(closure/1)` capturing an `i64` and `(closure/1)`
+	// capturing a reference would be the same type and one of them would be read wrong.
+	d := layout.FixedDescriptor(fmt.Sprintf("(closure/%d/%s)", len(caps), kindsName(kinds)), kinds)
 	d.Kind = layout.ObjClosure
 	id := c.prog.Types.Add(d)
 	c.closureCache[key] = id

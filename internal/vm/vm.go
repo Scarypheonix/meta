@@ -21,6 +21,7 @@ import (
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/gc"
 	"github.com/scarypheonix/meta/internal/layout"
+	"github.com/scarypheonix/meta/internal/prelude"
 )
 
 // TrapExitCode is the process exit status after a trap (spec/04-expressions.md).
@@ -179,7 +180,30 @@ func (v *VM) visitOwnRoots(visit func(*layout.Ref)) {
 func (v *VM) Stats() gc.Stats { return v.heap.Stats() }
 
 func (v *VM) trap(span diag.Span, format string, args ...any) {
-	panic(&Trap{Msg: fmt.Sprintf(format, args...), Span: span})
+	panic(&Trap{Msg: fmt.Sprintf(format, args...), Span: v.userSpan(span)})
+}
+
+// userSpan resolves a span to the innermost location in the program's own source.
+//
+// The prelude's methods are written in terms of compiler-provided operations, so a trap
+// raised by one -- "send on a closed channel" -- naturally carries a span inside the
+// prelude, which tells a programmer nothing they can act on. Walking out through the
+// return spans names the line they wrote. The interpreter does the same, which is also
+// what keeps the two engines' stderr byte-identical for the differential.
+func (v *VM) userSpan(span diag.Span) diag.Span {
+	if !isPreludeSpan(span) {
+		return span
+	}
+	for i := len(v.frames) - 1; i >= 0; i-- {
+		if s := v.frames[i].retSpan; s.Valid() && !isPreludeSpan(s) {
+			return s
+		}
+	}
+	return span
+}
+
+func isPreludeSpan(s diag.Span) bool {
+	return s.Valid() && s.File != nil && s.File.Name == prelude.Name
 }
 
 func (v *VM) push(val Value) { v.stack = append(v.stack, val) }
