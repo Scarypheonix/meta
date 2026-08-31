@@ -40,8 +40,15 @@ const (
 	// Cheney scan reads it as the scan loop's terminating condition. Meaningless outside
 	// an active collection, unlike every other runtime-block field.
 	rtGcNextOff = 40
+	// rtCurrentOff is the thread control block of the thread now running, and
+	// rtThreadsOff heads the list of every thread the program has created
+	// (spec/12-concurrency.md). The collector reads both: the running thread's stack is
+	// walked from rbp as it always was, and every other thread's from the rbp its own
+	// control block parked (thread.go).
+	rtCurrentOff = 48
+	rtThreadsOff = 56
 	// rtBlockSize is the block's size in bytes; it lives in the writable segment.
-	rtBlockSize = 48
+	rtBlockSize = 64
 
 	// wordSize is the size of everything the machine holds in a register.
 	wordSize = 8
@@ -70,6 +77,11 @@ type runtimeLabels struct {
 	lookupStackMap x86.Label
 	evacuate       x86.Label
 	scanObject     x86.Label
+	// threadSwitch, threadNew and threadEntry are the green-thread scheduler
+	// (spec/12-concurrency.md, thread.go).
+	threadSwitch x86.Label
+	threadNew    x86.Label
+	threadEntry  x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -93,6 +105,9 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.lookupStackMap = e.a.NewLabel("rt_lookup_stack_map")
 	e.rt.evacuate = e.a.NewLabel("rt_evacuate")
 	e.rt.scanObject = e.a.NewLabel("rt_scan_object")
+	e.rt.threadSwitch = e.a.NewLabel("rt_switch")
+	e.rt.threadNew = e.a.NewLabel("rt_thread_new")
+	e.rt.threadEntry = e.a.NewLabel("rt_thread_entry")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -106,6 +121,9 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitLookupStackMap()
 	e.emitEvacuate()
 	e.emitScanObject()
+	e.emitThreadSwitch()
+	e.emitThreadNew()
+	e.emitThreadEntry()
 	e.emitCollect()
 }
 
