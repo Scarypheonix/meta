@@ -17,6 +17,7 @@ import (
 	"fmt"
 
 	"github.com/scarypheonix/meta/internal/bytecode"
+	"github.com/scarypheonix/meta/internal/dwarf"
 	"github.com/scarypheonix/meta/internal/ir"
 	"github.com/scarypheonix/meta/internal/layout"
 	"github.com/scarypheonix/meta/internal/obj"
@@ -54,8 +55,22 @@ func Build(prog *bytecode.Program, target obj.Target) (*obj.Image, error) {
 				"an instruction's length must not depend on the value of an address",
 			len(first.text), len(final.text), len(first.roData), len(final.roData))
 	}
+	// The debug-info sections are built entirely from addresses inside .text (ADR-0023),
+	// which pass one and pass two already agree on byte for byte -- text's own address
+	// space starts at the same place and every instruction's length is pass-invariant by
+	// construction (the check above). This asserts that invariant held rather than
+	// silently trusting it, the same way the text/roData check does.
+	if len(final.debugLine) != len(first.debugLine) {
+		return nil, fmt.Errorf(
+			"this is a compiler bug: the two layout passes' debug line tables disagree (%d/%d bytes)",
+			len(first.debugLine), len(final.debugLine))
+	}
 
 	img := plan.Image(final.text, final.roData, final.data, 0, final.entry)
+	img.DebugAbbrev = final.debugAbbrev
+	img.DebugInfo = final.debugInfo
+	img.DebugLine = final.debugLine
+	img.Funcs = final.funcs
 	if err := img.Validate(); err != nil {
 		return nil, err
 	}
@@ -93,6 +108,11 @@ type result struct {
 	roData []byte
 	data   []byte
 	entry  uint64
+
+	// debugAbbrev, debugInfo and debugLine are ADR-0023's DWARF sections; funcs is the
+	// symbol-table data `bt` names a frame from.
+	debugAbbrev, debugInfo, debugLine []byte
+	funcs                             []dwarf.Func
 }
 
 // emitter holds one pass's state.
@@ -144,6 +164,16 @@ type emitter struct {
 	// them once every function's code exists (ADR-0021, spec/11-codegen.md's
 	// "Safepoints and stack maps").
 	safepoints []pendingSafepoint
+
+	// debugLines accumulates one dwarf.Line per source-line boundary crossed while
+	// emitting, across every function (ADR-0023); debugFuncs accumulates one dwarf.Func
+	// per emitted function, for the symbol table `bt` names a frame from. lastDebugFile
+	// and lastDebugLine are recordLine's own dedupe state -- a value's span produces a
+	// new row only when it names a different line than the previous instruction's did.
+	debugLines    []dwarf.Line
+	debugFuncs    []dwarf.Func
+	lastDebugFile string
+	lastDebugLine int
 
 	// Per-function state.
 	fn       *ir.Func
@@ -207,11 +237,26 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 
 	data := make([]byte, rtBlockSize)
 	writeStackMapFields(data, mapAddr, mapCount)
+
+	text := e.a.Code()
+	// The compile-unit DIE's own address range covers the whole of .text (there is
+	// exactly one compile unit, ADR-0023), not just where user code happens to start --
+	// plan.TextAddr is where e.a itself was seeded (emitProgram's own `x86.New(plan.TextAddr)`
+	// above), so this needs nothing e.a doesn't already expose.
+	lowPC := plan.TextAddr
+	highPC := lowPC + uint64(len(text))
+	abbrev, info, line := dwarf.Build(e.debugLines, lowPC, highPC)
+
 	return &result{
-		text:   e.a.Code(),
+		text:   text,
 		roData: e.roData,
 		data:   data,
 		entry:  e.a.Addr(e.rt.start),
+
+		debugAbbrev: abbrev,
+		debugInfo:   info,
+		debugLine:   line,
+		funcs:       e.debugFuncs,
 	}, nil
 }
 
@@ -274,6 +319,10 @@ func (e *emitter) function(index int, f *ir.Func) error {
 	e.slotBase = int32(8 * len(e.saved))
 	e.blockLbl = map[*ir.Block]x86.Label{}
 	e.epilogue = e.a.NewLabel(fmt.Sprintf("fn%d epilogue", index))
+	// A fresh function always gets a debug-line row for its own first instruction, even if
+	// it happens to share a (file, line) with whatever the previous function's last row
+	// named -- recordLine's dedupe is otherwise global across the whole program.
+	e.lastDebugFile, e.lastDebugLine = "", 0
 
 	// The frame keeps rsp 16-byte aligned at every call. Entering the body, rsp is
 	// aligned; `push rbp` and the saved registers move it, and this makes up the
@@ -288,6 +337,7 @@ func (e *emitter) function(index int, f *ir.Func) error {
 	}
 	e.a.Align(16)
 	e.a.Bind(e.fnLabels[index])
+	startAddr := e.a.PC()
 	e.a.Push(x86.RBP)
 	e.a.MovRR(x86.RBP, x86.RSP)
 	for _, r := range e.saved {
@@ -340,9 +390,13 @@ func (e *emitter) function(index int, f *ir.Func) error {
 	for _, b := range blocks {
 		e.a.Bind(e.blockLbl[b])
 		for _, v := range b.Instr {
+			e.recordLine(v)
 			if err := e.instr(v); err != nil {
 				return fmt.Errorf("%s: %w", e.prog.Fns[index].Name, err)
 			}
+		}
+		if b.Term != nil {
+			e.recordLine(b.Term)
 		}
 		if err := e.terminator(b); err != nil {
 			return fmt.Errorf("%s: %w", e.prog.Fns[index].Name, err)
@@ -371,7 +425,36 @@ func (e *emitter) function(index int, f *ir.Func) error {
 	}
 	e.a.Pop(x86.RBP)
 	e.a.Ret()
+
+	e.debugFuncs = append(e.debugFuncs, dwarf.Func{
+		Name:    e.prog.Fns[index].Name,
+		Address: startAddr,
+		Size:    e.a.PC() - startAddr,
+	})
 	return nil
+}
+
+// recordLine appends a dwarf.Line row for v's own source position, but only when it names
+// a different (file, line) than the previous instruction's did (ADR-0023): a row exists to
+// mark where a line *begins*, not one per instruction, and DW_LNS_copy's own row is what a
+// breakpoint or a `step` resolves against, not every address in between.
+func (e *emitter) recordLine(v *ir.Value) {
+	span := v.Span
+	if !span.Valid() {
+		return
+	}
+	line, col := span.Position()
+	file := span.File.Name
+	if file == e.lastDebugFile && line == e.lastDebugLine {
+		return
+	}
+	e.lastDebugFile, e.lastDebugLine = file, line
+	e.debugLines = append(e.debugLines, dwarf.Line{
+		Address: e.a.PC(),
+		File:    file,
+		Line:    line,
+		Col:     col,
+	})
 }
 
 // paramValue finds the OpParam value for one parameter index.

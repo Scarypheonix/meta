@@ -2,6 +2,7 @@ package obj
 
 import (
 	"bytes"
+	stddwarf "debug/dwarf"
 	"debug/elf"
 	"debug/macho"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/scarypheonix/meta/internal/dwarf"
 	"github.com/scarypheonix/meta/internal/x86"
 )
 
@@ -51,6 +53,20 @@ func helloProgram(t *testing.T, target Target, msg string, status int32) *Image 
 			len(code), textEstimate)
 	}
 	return plan.Image(code, []byte(msg), nil, 0, a.Addr(entry))
+}
+
+// withDebug attaches ADR-0023's debug sections to an image built by helloProgram: one
+// synthetic dwarf.Line at the image's own entry point, and one dwarf.Func covering the
+// whole of its text. It exists so obj's own tests can check the two writers place these
+// sections correctly without going through the whole compiler (internal/backend's own
+// TestNativeBuildCarriesValidDebugInfo does that, through the real pipeline).
+func withDebug(img *Image, funcName string) *Image {
+	lines := []dwarf.Line{{Address: img.Entry, File: "hello.origin", Line: 1, Col: 1}}
+	lowPC, highPC := img.TextAddr, img.TextAddr+uint64(len(img.Text))
+	abbrev, info, line := dwarf.Build(lines, lowPC, highPC)
+	img.DebugAbbrev, img.DebugInfo, img.DebugLine = abbrev, info, line
+	img.Funcs = []dwarf.Func{{Name: funcName, Address: img.TextAddr, Size: uint64(len(img.Text))}}
+	return img
 }
 
 func writeImage(t *testing.T, img *Image, path string) {
@@ -144,6 +160,53 @@ func TestELFParses(t *testing.T) {
 	}
 }
 
+// TestELFCarriesDebugInfo checks writeELF's own section-header-table and symbol-table
+// path (elf.go's buildELFSections) against an image that carries ADR-0023's debug
+// sections: the section table itself, .symtab naming the function, and the DWARF sections
+// reachable through debug/elf's own DWARF() opener, which resolves them by section name
+// rather than this package handing it byte offsets directly.
+func TestELFCarriesDebugInfo(t *testing.T) {
+	img := withDebug(helloProgram(t, Linux, "hi\n", 0), "_start")
+	path := filepath.Join(t.TempDir(), "hello")
+	writeImage(t, img, path)
+
+	f, err := elf.Open(path)
+	if err != nil {
+		t.Fatalf("debug/elf could not read the file we wrote: %v", err)
+	}
+	defer f.Close()
+
+	syms, err := f.Symbols()
+	if err != nil {
+		t.Fatalf("reading .symtab: %v", err)
+	}
+	found := false
+	for _, s := range syms {
+		if s.Name == "_start" {
+			found = true
+			if s.Value != img.TextAddr {
+				t.Errorf("_start is at %#x, want %#x (the start of .text)", s.Value, img.TextAddr)
+			}
+		}
+	}
+	if !found {
+		t.Errorf(".symtab has no entry named _start; got %v", syms)
+	}
+
+	d, err := f.DWARF()
+	if err != nil {
+		t.Fatalf("debug/elf could not open DWARF through the section table: %v", err)
+	}
+	r := d.Reader()
+	cu, err := r.Next()
+	if err != nil || cu == nil || cu.Tag != stddwarf.TagCompileUnit {
+		t.Fatalf("reading the compile-unit DIE: entry %+v, err %v", cu, err)
+	}
+	if low, _ := cu.Val(stddwarf.AttrLowpc).(uint64); low != img.TextAddr {
+		t.Errorf("DW_AT_low_pc = %#x, want %#x", low, img.TextAddr)
+	}
+}
+
 // TestMachOParses is the same check for the shipping format. The implementer cannot run a
 // Mach-O here, so reading it back with an independent parser is as far as verification
 // goes in the container; that a compiled binary runs is the user's checklist item on the
@@ -197,6 +260,73 @@ func TestMachOParses(t *testing.T) {
 		t.Error("no __text section, so a debugger has nothing to name the code")
 	} else if sect.Addr != img.TextAddr {
 		t.Errorf("__text starts at %#x, want %#x", sect.Addr, img.TextAddr)
+	}
+}
+
+// TestMachOCarriesDebugInfo is TestELFCarriesDebugInfo's counterpart for the shipping
+// format: structural only, since execution cannot be verified in this container
+// (writeMachO's own doc comment). It checks the __DWARF segment's three sections and the
+// LC_SYMTAB symbol table debug/macho reads back independently, plus -- like TestMachOParses
+// -- that debug/macho's own DWARF() opener (which finds sections by their "__debug_"
+// prefix) resolves the compile-unit DIE at all.
+func TestMachOCarriesDebugInfo(t *testing.T) {
+	img := withDebug(helloProgram(t, MacOS, "hi\n", 0), "_start")
+	path := filepath.Join(t.TempDir(), "hello")
+	writeImage(t, img, path)
+
+	f, err := macho.Open(path)
+	if err != nil {
+		t.Fatalf("debug/macho could not read the file we wrote: %v", err)
+	}
+	defer f.Close()
+
+	dwarfSeg, ok := func() (*macho.Segment, bool) {
+		for _, l := range f.Loads {
+			if s, ok := l.(*macho.Segment); ok && s.Name == "__DWARF" {
+				return s, true
+			}
+		}
+		return nil, false
+	}()
+	if !ok {
+		t.Fatal("no __DWARF segment")
+	}
+	if dwarfSeg.Addr != 0 || dwarfSeg.Memsz != 0 {
+		t.Errorf("__DWARF claims address range [%#x, %#x), want an unmapped [0, 0)",
+			dwarfSeg.Addr, dwarfSeg.Addr+dwarfSeg.Memsz)
+	}
+	for _, name := range []string{"__debug_abbrev", "__debug_info", "__debug_line"} {
+		if sect := f.Section(name); sect == nil {
+			t.Errorf("no %s section", name)
+		} else if sect.Size == 0 {
+			t.Errorf("%s is empty", name)
+		}
+	}
+
+	if f.Symtab == nil {
+		t.Fatal("no LC_SYMTAB")
+	}
+	found := false
+	for _, s := range f.Symtab.Syms {
+		if s.Name == "_start" {
+			found = true
+			if s.Value != img.TextAddr {
+				t.Errorf("_start is at %#x, want %#x (the start of .text)", s.Value, img.TextAddr)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no symbol named _start; got %v", f.Symtab.Syms)
+	}
+
+	d, err := f.DWARF()
+	if err != nil {
+		t.Fatalf("debug/macho could not open DWARF through the section table: %v", err)
+	}
+	r := d.Reader()
+	cu, err := r.Next()
+	if err != nil || cu == nil || cu.Tag != stddwarf.TagCompileUnit {
+		t.Fatalf("reading the compile-unit DIE: entry %+v, err %v", cu, err)
 	}
 }
 

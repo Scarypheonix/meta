@@ -16,6 +16,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/scarypheonix/meta/internal/dwarf"
 )
 
 // Format is an executable file format.
@@ -128,6 +130,16 @@ type Image struct {
 	TextAddr   uint64
 	RoDataAddr uint64
 	DataAddr   uint64
+
+	// DebugAbbrev, DebugInfo and DebugLine are ADR-0023's DWARF4 sections -- a line-number
+	// program built entirely from addresses inside Text, plus the one compile-unit DIE
+	// that anchors it. Nil (the zero value) is valid: a build that never asked for debug
+	// info just omits the sections and the debugging directories/segments that describe
+	// them, the same way Bss being zero omits nothing about a normal build.
+	DebugAbbrev, DebugInfo, DebugLine []byte
+	// Funcs is one entry per compiled function, for the plain symbol table `bt` names a
+	// frame from (never a DWARF subprogram DIE -- see internal/dwarf's package doc).
+	Funcs []dwarf.Func
 }
 
 // Layout decides where each segment will be mapped, before any code exists.
@@ -150,6 +162,19 @@ type Layout struct {
 // headerSize is how much room the file's own headers need before the first byte of code.
 // The headers are part of the first mapped segment — the standard trick that saves a
 // page — so the text cannot start at file offset zero.
+//
+// Both formats must return the same value regardless of whether the image being built
+// will end up carrying ADR-0023's debug information: Plan decides TextAddr before a
+// single instruction is emitted (and, for the native backend, identically on both of
+// Build's two passes), so this cannot depend on anything only known afterward. ELF's own
+// program-header region never grows for debug info — the section header table, symbol
+// table and DWARF sections all live past the loadable segments (elf.go's own doc comment)
+// — but Mach-O's do, because a load command is how a Mach-O file points a reader at
+// anything at all: __DWARF and LC_SYMTAB, when writeMachO emits them, sit in the same
+// header region __TEXT and __DATA's own commands do. So the Mach-O case always reserves
+// room for them, whether or not this particular image turns out to carry debug
+// information — the reservation only needs to be an upper bound, and any slack is zero-
+// padded (writeELF and writeMachO already pad up to TextAddr regardless).
 func headerSize(t Target) uint64 {
 	switch t.Format {
 	case ELF:
@@ -159,7 +184,9 @@ func headerSize(t Target) uint64 {
 			machoSegmentCmdSize + // __PAGEZERO
 			machoSegmentCmdSize + machoSectionSize + // __TEXT with __text
 			machoSegmentCmdSize + machoSectionSize + // __DATA with __data
-			machoUnixThreadCmdSize
+			machoUnixThreadCmdSize +
+			machoSegmentCmdSize + 3*machoSectionSize + // __DWARF (ADR-0023), reserved unconditionally
+			machoSymtabCmdSize // LC_SYMTAB, reserved unconditionally
 	}
 	panic(fmt.Sprintf("unimplemented: header size for %s", t.Format))
 }

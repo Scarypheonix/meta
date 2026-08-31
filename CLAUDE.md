@@ -392,6 +392,60 @@ This project outlasts any single context window.
   (`tests/e2e/cases/opt_cse_converges_on_a_trapping_duplicate`, the minimal repro: two
   loop-carried variables each assigned from the loop counter a different way, one
   iteration apart).
+- **A DWARF4 line table is now emitted, following a new decision, ADR-0023.** Found while
+  preparing the Mac confirmation materials below: spec/11-codegen.md's "Debug
+  information" section was normative and unimplemented — `lldb breakpoint set --file f
+  --line N` had nothing to resolve against, on any native build, ever. A new
+  `internal/dwarf` package owns the byte-level encoding (process rule 5, the same shape
+  as `internal/x86`'s instruction encoder): `.debug_abbrev`/`.debug_info` carry the one
+  `DW_TAG_compile_unit` DIE the phase's own scope calls for (no subprogram, variable or
+  type DIEs — deliberately out of scope, `docs/deferred.md`), and `.debug_line`'s
+  line-number program is built entirely from `.text` addresses, using only standard and
+  extended opcodes (never a *special* opcode, so `line_base`/`line_range` need never be
+  tuned for correctness). Built entirely from `.text` addresses, it is automatically
+  byte-identical on both of `backend.Build`'s two emission passes — the same
+  pass-invariance ADR-0017 already gives every instruction's length — which `Build` now
+  also asserts explicitly, alongside its existing text/roData check.
+  `internal/backend`'s `function()` gained `recordLine`, called once per instruction and
+  once per terminator: it appends a `dwarf.Line` row only when a value's span names a
+  different (file, line) than the previous instruction's did, and resets per function so
+  a function's own first row is never accidentally deduped against the previous
+  function's last one. Each function's own `(name, address, size)` is captured the same
+  way, into `dwarf.Func`. "`bt` names the function" comes from a plain symbol table on
+  both formats, never a `DW_TAG_subprogram` DIE — Origin's native calling convention
+  already uses standard `push rbp; mov rbp, rsp` prologues, so frame-pointer unwinding
+  needs nothing else. `internal/obj.Image` gained `DebugAbbrev`/`DebugInfo`/`DebugLine`/
+  `Funcs`; ELF (`elf.go`'s `buildELFSections`) gets a real section header table —
+  `.text`/`.rodata`/`.data` "shadow" sections over the bytes already in the two loaded
+  segments, plus `.debug_abbrev`/`.debug_info`/`.debug_line`/`.symtab`/`.strtab`/
+  `.shstrtab` appended after them — and Mach-O (`macho.go`'s `buildMachODebug`) gets a
+  `__DWARF` segment (three `__debug_*` sections, vmaddr/vmsize both zero: DWARF is read
+  from the file, never from the running process, so unlike `__TEXT`/`__DATA` this segment
+  claims no address-space range at all) plus an `LC_SYMTAB` command. Found and fixed two
+  real bugs while wiring this up: Mach-O's `headerSize` hadn't grown to reserve room for
+  the two new load commands, so the real header overran the space `Plan` had already
+  fixed `TextAddr` against, corrupting the file (fixed by making Mach-O's `headerSize`
+  always reserve that room, whether or not a given image ends up carrying debug info — an
+  upper bound costs nothing, since any slack is already zero-padded); and both writers'
+  "skip padding to `dataOff` when there is no data" optimization left the file's actual
+  write position short of where the debug section's offsets assumed it would be whenever
+  an image had debug info but a genuinely empty data segment (fixed by padding to
+  `dataOff` regardless, whenever debug sections are present). Verified against Go's own
+  independent `debug/dwarf`/`debug/elf`/`debug/macho` readers at three layers
+  (`internal/dwarf/dwarf_test.go` calling `dwarf.Build` directly;
+  `internal/obj/obj_test.go`'s new `TestELFCarriesDebugInfo`/`TestMachOCarriesDebugInfo`
+  attaching synthetic sections to a hand-written image; `internal/backend/dwarf_test.go`'s
+  `TestNativeBuildCarriesValidDebugInfo` through the real compiler end to end) — and,
+  going further than any other native-backend milestone this phase, against `lldb`
+  itself, running in this container: `originc build` a real program, then `lldb -b`
+  `breakpoint set --file dbg.origin --line N`, `run`, `bt` — it stops at the right
+  address, prints the right source line, and names both frames (`add`, `main`) with
+  correct `file:line:col`, executed for real rather than only claimed. `frame variable`
+  correctly reports no variable info, exactly the scope ADR-0023 committed to. Mach-O's
+  own correctness is structural-only here (`debug/macho`, no macOS available); a compiled
+  Mach-O binary actually breaking in `lldb` on the target machine remains the user's own
+  confirmation step below, now against code that has debug info at all for the first
+  time.
 
 **Known-broken / explicitly out of scope for this slice**, recorded in
 `docs/deferred.md`: integer arithmetic is still 64-bit only in both engines; `u64::MAX`
@@ -404,17 +458,24 @@ direct-call fast path for every use once it is boxed at all (ADR-0020's own docu
 deliberate simplification); native heap collection is single-space and non-generational,
 with no write barrier (ADR-0022's own deliberate scope, satisfying the same language-
 level guarantees as the VM/interpreter's generational collector, see spec/08-memory-
-model.md); and `to_str` on a `Float` is unimplemented in native code (no spec fixes a
+model.md); `to_str` on a `Float` is unimplemented in native code (no spec fixes a
 rendering yet — Phase 7, per `docs/deferred.md` — and nothing in the differential suite
-needs it now).
+needs it now); and DWARF is a line table and a symbol table only — no
+`DW_TAG_subprogram`/`DW_TAG_variable`/`DW_TAG_base_type` DIEs and no `.debug_frame`, so
+`frame variable` and expression evaluation under `lldb` do not work (ADR-0023's own
+deliberate scope; `docs/deferred.md`, Phase 7).
 
 **Next action:** every automatable piece of Phase 5's own exit criterion is now met —
-`./check` passes clean, `nativeSkips` is empty, and the full differential suite (every
-case in `tests/e2e/cases`, every engine, every optimization level) agrees byte for byte,
-including exit status. What is left is exactly what ADR-0003 always scoped as outside
-what the implementer can claim: **Phase 5 is not complete until the user confirms, on
-the actual target machine**, that a compiled Mach-O binary runs and that `lldb` breaks
-on an Origin source line (ADR-0003's "Consequences" — that confirmation is a checklist
-item for `docs/phases/5-complete.md`, not something to write preemptively). A prebuilt
-`darwin/amd64` binary of `originc` itself (cross-compiled here, no Go install needed on
-the Mac) has already been handed to the user for exactly this confirmation.
+`./check` passes clean, `nativeSkips` is empty, the full differential suite (every case
+in `tests/e2e/cases`, every engine, every optimization level) agrees byte for byte
+including exit status, and — new this session — a compiled ELF binary's DWARF line table
+has been verified against `lldb` itself in this container, not merely read back
+structurally. What is left is exactly what ADR-0003 always scoped as outside what the
+implementer can claim: **Phase 5 is not complete until the user confirms, on the actual
+target machine**, that a compiled Mach-O binary runs and that `lldb` breaks on an Origin
+source line (ADR-0003's "Consequences" — that confirmation is a checklist item for
+`docs/phases/5-complete.md`, not something to write preemptively). A prebuilt
+`darwin/amd64` binary of `originc` itself was handed to the user earlier in the phase,
+before the DWARF work above existed; it should be rebuilt and re-sent before the user's
+confirmation step, since the point of that step is now specifically to confirm `lldb`
+breaking on a line, which only current code can produce at all.

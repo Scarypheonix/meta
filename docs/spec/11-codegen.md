@@ -242,6 +242,31 @@ DEFERRED (see `docs/deferred.md`): the line table is what the phase's acceptance
 criterion needs, and emitting types by hand before anything reads them would be
 speculative.
 
+This is now delivered, following ADR-0023: `internal/dwarf` owns the byte-level DWARF4
+encoding (process rule 5, the same shape as `internal/x86`'s instruction encoder and
+`internal/layout`'s object layout) — a `.debug_line` program built from nothing but
+`.text` addresses, and the single `DW_TAG_compile_unit` DIE in `.debug_abbrev`/
+`.debug_info` that anchors it. `internal/backend`'s `function()` records one
+`(address, span)` pair per source-line boundary crossed while lowering (`recordLine`,
+`backend.go`) and one `(name, address, size)` triple per emitted function; `emitProgram`
+hands both to `dwarf.Build` once code generation finishes. Built entirely from `.text`
+addresses, the encoded bytes are automatically identical on both of `Build`'s two
+emission passes, the same pass-invariance guarantee ADR-0017 already gives every
+instruction's length — asserted, not just trusted, by a length check alongside the
+existing text/roData one. `internal/obj` places the result: ELF gets a real section
+header table (`.debug_abbrev`, `.debug_info`, `.debug_line`, `.symtab`, `.strtab`,
+`.shstrtab`, plus `.text`/`.rodata`/`.data` "shadow" sections describing the bytes
+already in the two loaded segments) appended after them, unaffected by anything about
+existing addressing; Mach-O gets a `__DWARF` segment (`__debug_abbrev`/`__debug_info`/
+`__debug_line`) with no address-space range of its own, plus an `LC_SYMTAB` command.
+"`bt` names the function" comes from a plain symbol table on both formats, never a
+`DW_TAG_subprogram` DIE: Origin's native calling convention already uses standard
+`push rbp; mov rbp, rsp` prologues, so frame-pointer unwinding needs nothing else.
+Verified in this container against `lldb` itself (batch mode: `breakpoint set --file
+... --line N`, `run`, `bt`), not merely structurally, for the ELF path; the Mach-O path
+is structural-only here (`debug/macho`), with execution left to the target machine's own
+confirmation (ADR-0003).
+
 ## Determinism
 
 Two builds of the same source with the same compiler MUST produce byte-identical output
