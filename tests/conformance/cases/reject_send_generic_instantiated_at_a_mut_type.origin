@@ -1,0 +1,13 @@
+// EXPECT: reject E0700
+// spec: 12-concurrency.md — `Send` is judged at the instantiation, not the declaration:
+// `Holder[i64]` is `Send` and `Holder[Counter]` is not.
+
+struct Counter { mut n: i64 }
+struct Holder[T] { v: T }
+
+fn needs_send[T: Send](v: T) -> i64 { 1 }
+
+fn main() {
+    let ok = needs_send(Holder[i64] { v: 1 });
+    let bad = needs_send(Holder[Counter] { v: Counter { n: 0 } });
+}

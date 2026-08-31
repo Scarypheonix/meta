@@ -1,0 +1,12 @@
+// EXPECT: reject E0700
+// spec: 12-concurrency.md — a variant's payload is never `mut` (a variant is replaced,
+// not mutated), so only the payload's own type decides.
+
+struct Counter { mut n: i64 }
+enum Shape { Plain(i64), Wrapped(Counter) }
+
+fn needs_send[T: Send](v: T) -> i64 { 1 }
+
+fn main() {
+    let a = needs_send(Shape::Wrapped(Counter { n: 0 }));
+}

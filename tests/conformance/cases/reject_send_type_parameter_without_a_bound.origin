@@ -1,0 +1,10 @@
+// EXPECT: reject E0700
+// spec: 12-concurrency.md — nothing is known about an unbounded parameter, so it is not
+// `Send`; the bound has to be declared.
+
+fn needs_send[T: Send](v: T) -> i64 { 1 }
+fn forwards[T](v: T) -> i64 { needs_send(v) }
+
+fn main() {
+    let a = forwards(1);
+}

@@ -1,0 +1,12 @@
+// EXPECT: reject E0700
+// spec: 12-concurrency.md — `Send` is transitive: a struct with no `mut` field of its own
+// is still not `Send` when one of its fields is not.
+
+struct Counter { mut n: i64 }
+struct Holder { c: Counter }
+
+fn needs_send[T: Send](v: T) -> i64 { 1 }
+
+fn main() {
+    let a = needs_send(Holder { c: Counter { n: 0 } });
+}

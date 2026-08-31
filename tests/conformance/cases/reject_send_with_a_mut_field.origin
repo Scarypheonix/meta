@@ -1,0 +1,12 @@
+// EXPECT: reject E0700
+// spec: 12-concurrency.md — an aggregate with any `mut` field is not `Send` and cannot
+// cross a thread boundary. ADR-0014: this is what makes `Mutex[T]` the only route to
+// shared mutation, and it is why safe Origin has no data races without a borrow checker.
+
+struct Counter { mut n: i64 }
+
+fn needs_send[T: Send](v: T) -> i64 { 1 }
+
+fn main() {
+    let a = needs_send(Counter { n: 0 });
+}

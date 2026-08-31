@@ -1,0 +1,24 @@
+// EXPECT: accept
+// spec: 08-memory-model.md, 12-concurrency.md — `Send` is derived, never implemented by
+// hand: a type is `Send` when it has no `mut` field and its fields are all `Send`.
+
+struct Point { x: i64, y: i64 }
+struct Holder[T] { v: T }
+struct Node { value: i64, next: Option[Node] }
+enum Shape { Circle(i64), Rect(Point) }
+
+fn needs_send[T: Send](v: T) -> i64 { 1 }
+
+fn main() {
+    // Primitives and `String`, which is immutable.
+    let a = needs_send(42);
+    let b = needs_send("hi");
+    // An aggregate with no `mut` field, transitively.
+    let c = needs_send(Point { x: 1, y: 2 });
+    let d = needs_send(Shape::Rect(Point { x: 1, y: 2 }));
+    let e = needs_send((1, "two", Point { x: 3, y: 4 }));
+    // A generic instantiated at a `Send` argument.
+    let f = needs_send(Holder[i64] { v: 1 });
+    // A recursive type: the cycle introduces no new mutable field.
+    let g = needs_send(Node { value: 1, next: Option::None });
+}

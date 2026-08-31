@@ -182,6 +182,16 @@ func (c *Checker) satisfies(subject types.Type, ti *TraitInfo) bool {
 		return true
 	}
 
+	// `Send` is derived from a type's structure rather than found among impls (ADR-0014,
+	// send.go). A concrete type is judged directly; a rigid parameter still needs a
+	// declared bound, since nothing is known about what it will be instantiated with, so
+	// that case falls through to the ordinary bound lookup below.
+	if ti.Decl.Name.Name == "Send" {
+		if _, rigid := subject.(*types.Param); !rigid {
+			return c.isSend(subject)
+		}
+	}
+
 	// A rigid parameter is satisfied only by a declared bound, directly or through a
 	// supertrait.
 	if p, ok := subject.(*types.Param); ok {
@@ -245,6 +255,14 @@ func (c *Checker) requireBound(subject types.Type, ti *TraitInfo, span diag.Span
 func (c *Checker) solveObligations() {
 	for _, b := range c.obligations {
 		if c.satisfies(b.Type, b.Trait) {
+			continue
+		}
+		// `Send` is derived, so the generic advice below -- "nothing implements it yet;
+		// write an impl" -- is not merely unhelpful but wrong: writing `impl Send` is not
+		// how a type becomes sendable, and following that help would be a mistake. Say
+		// which field makes it unsendable instead (spec/12-concurrency.md).
+		if b.Trait.Decl.Name.Name == "Send" {
+			c.reportNotSend(b)
 			continue
 		}
 		d := c.bag.Errorf("E0277", b.Span, "`%s` does not implement `%s`",
