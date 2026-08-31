@@ -2,15 +2,18 @@ package obj
 
 import (
 	"bytes"
+	"crypto/sha256"
 	stddwarf "debug/dwarf"
 	"debug/elf"
 	"debug/macho"
+	"encoding/binary"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
 
+	"github.com/scarypheonix/meta/internal/codesign"
 	"github.com/scarypheonix/meta/internal/dwarf"
 	"github.com/scarypheonix/meta/internal/x86"
 )
@@ -389,6 +392,84 @@ func TestMachOLinkeditIsTheFinalSegment(t *testing.T) {
 					segs[i-1].Addr, segs[i-1].Addr+segs[i-1].Memsz)
 			}
 		}
+	}
+}
+
+// TestMachOSignatureCoversTheFileItIsIn is the check that matters for a Mach-O actually
+// running: since macOS 11 the kernel refuses to execute one whose signature does not
+// match its contents (ADR-0024). This walks LC_CODE_SIGNATURE the way the kernel does --
+// from the load commands, by offset -- and re-hashes every page from the file on disk.
+func TestMachOSignatureCoversTheFileItIsIn(t *testing.T) {
+	img := withDebug(helloProgram(t, MacOS, "hi\n", 0), "_start")
+	img.Identifier = "hello"
+
+	var buf bytes.Buffer
+	if err := img.Write(&buf); err != nil {
+		t.Fatalf("writing image: %v", err)
+	}
+	raw := buf.Bytes()
+
+	cmd, ok := findLoadCommand(raw, lcCodeSignature)
+	if !ok {
+		t.Fatal("no LC_CODE_SIGNATURE: macOS will not run an unsigned executable")
+	}
+	sigOff := uint64(le32(cmd[8:]))
+	sigSize := uint64(le32(cmd[12:]))
+	if sigOff+sigSize != uint64(len(raw)) {
+		t.Errorf("the signature covers [%d, %d) but the file is %d bytes; it must be last",
+			sigOff, sigOff+sigSize, len(raw))
+	}
+
+	// __LINKEDIT must actually contain the signature, since that is where a Mach-O
+	// declares one lives.
+	f, err := macho.NewFile(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("debug/macho could not read the file: %v", err)
+	}
+	defer f.Close()
+	le := f.Segment("__LINKEDIT")
+	if le == nil {
+		t.Fatal("no __LINKEDIT segment")
+	}
+	if sigOff < le.Offset || sigOff+sigSize > le.Offset+le.Filesz {
+		t.Errorf("the signature at [%d, %d) is outside __LINKEDIT's [%d, %d)",
+			sigOff, sigOff+sigSize, le.Offset, le.Offset+le.Filesz)
+	}
+
+	// Now the signature's own claim: every page digest, re-derived from the file.
+	sig := raw[sigOff : sigOff+sigSize]
+	count := binary.BigEndian.Uint32(sig[8:])
+	checked := 0
+	for i := uint32(0); i < count; i++ {
+		blob := sig[binary.BigEndian.Uint32(sig[12+i*8+4:]):]
+		if binary.BigEndian.Uint32(blob) != 0xfade0c02 { // CSMAGIC_CODEDIRECTORY
+			continue
+		}
+		hashOffset := binary.BigEndian.Uint32(blob[16:])
+		nCode := binary.BigEndian.Uint32(blob[28:])
+		codeLimit := uint64(binary.BigEndian.Uint32(blob[32:]))
+		hashSize := uint32(blob[36])
+
+		if codeLimit != sigOff {
+			t.Errorf("codeLimit is %d, want %d: the signature must cover every byte before itself",
+				codeLimit, sigOff)
+		}
+		for p := uint32(0); p < nCode; p++ {
+			start := uint64(p) * codesign.PageSize
+			end := start + codesign.PageSize
+			if end > codeLimit {
+				end = codeLimit
+			}
+			want := sha256.Sum256(raw[start:end])
+			off := hashOffset + p*hashSize
+			if string(blob[off:off+hashSize]) != string(want[:]) {
+				t.Errorf("page %d's digest does not match the file's own bytes", p)
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Error("no code digests were checked; the signature has no CodeDirectory")
 	}
 }
 

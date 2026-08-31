@@ -447,6 +447,45 @@ This project outlasts any single context window.
   confirmation step below, now against code that has debug info at all for the first
   time.
 
+- **Mach-O executables are signed, and now actually run (ADR-0024).** The user ran the
+  first Mach-O this project ever produced on the real target machine and it did not run:
+  `zsh: killed`, SIGKILL from the kernel. The binary was correct — the same instruction
+  stream runs as an ELF, and the differential agrees across all three engines — but since
+  macOS 11 the kernel kills any executable carrying no valid code signature. Nothing
+  about that is Gatekeeper or the quarantine bit (removing it changes nothing); it is
+  unconditional, and goes unnoticed everywhere else only because Apple's linker ad-hoc
+  signs its own output by default. **Origin has no linker (ADR-0017), so its Mach-O
+  output was never signed and could never have run** — undetected for the whole phase
+  because the container cannot execute a Mach-O, so every previous "verification" of that
+  path was structural. Signing it after the fact failed too, with `codesign` saying only
+  "internal error in Code Signing subsystem". Installing `rcodesign` (an independent,
+  cross-platform implementation of Apple code signing that *does* run in the container)
+  named the real defect immediately: `__LINKEDIT isn't final Mach-O segment`. Two
+  structural bugs were behind it, both now fixed and regression-tested: there was no
+  `__LINKEDIT` segment at all (macOS requires one, last, because that is where a
+  signature is appended — the symbol and string tables moved into it, where they belong,
+  instead of sitting past every declared segment), and ADR-0023's own `__DWARF` segment
+  claimed `vmaddr 0`, colliding with `__PAGEZERO`'s `[0, 4 GiB)` claim — the
+  unmapped-debug-segment convention of a `.o` file, not valid in a linked executable.
+  With both fixed, an `rcodesign`-signed build **ran on the target machine and printed
+  the right answer**, which is what made the rest a question of how to sign rather than
+  what was wrong. `internal/codesign` now emits the signature itself, so
+  `originc build --target macos` produces a binary that runs with no external tool —
+  the same reasoning ADR-0017 used to refuse a linker, since a compiler whose output
+  needs a second proprietary tool to execute has the same defect in a different place,
+  and Phase 9's bootstrap would inherit it. Ad hoc means identity by content hash alone:
+  no key, no certificate, nothing cryptographic beyond SHA-256. The signature's size is
+  computed before any byte is written, because `__LINKEDIT`'s size and
+  `LC_CODE_SIGNATURE` both name it and both sit in the header the signature then hashes —
+  the same no-patching-after-the-fact discipline `Plan` imposes on addresses. Verified
+  three ways: `internal/codesign`'s own tests re-derive every page digest from the file
+  (including a short final page, the off-by-one case) rather than trusting the builder;
+  `internal/obj` walks `LC_CODE_SIGNATURE` the way the kernel does and re-hashes the real
+  written file; and, as a genuine cross-implementation check, the same hashing logic was
+  run against **`rcodesign`'s own signature** and validates it — identical `codeLimit`,
+  page boundaries and special-slot layout — with our emitted requirement-set digest
+  byte-identical to theirs.
+
 **Known-broken / explicitly out of scope for this slice**, recorded in
 `docs/deferred.md`: integer arithmetic is still 64-bit only in both engines; `u64::MAX`
 has no run-time representation; `match` compiles to a linear chain of arm tests rather
@@ -465,17 +504,24 @@ needs it now); and DWARF is a line table and a symbol table only — no
 `frame variable` and expression evaluation under `lldb` do not work (ADR-0023's own
 deliberate scope; `docs/deferred.md`, Phase 7).
 
-**Next action:** every automatable piece of Phase 5's own exit criterion is now met —
-`./check` passes clean, `nativeSkips` is empty, the full differential suite (every case
-in `tests/e2e/cases`, every engine, every optimization level) agrees byte for byte
-including exit status, and — new this session — a compiled ELF binary's DWARF line table
-has been verified against `lldb` itself in this container, not merely read back
-structurally. What is left is exactly what ADR-0003 always scoped as outside what the
-implementer can claim: **Phase 5 is not complete until the user confirms, on the actual
-target machine**, that a compiled Mach-O binary runs and that `lldb` breaks on an Origin
-source line (ADR-0003's "Consequences" — that confirmation is a checklist item for
-`docs/phases/5-complete.md`, not something to write preemptively). A prebuilt
-`darwin/amd64` binary of `originc` itself was handed to the user earlier in the phase,
-before the DWARF work above existed; it should be rebuilt and re-sent before the user's
-confirmation step, since the point of that step is now specifically to confirm `lldb`
-breaking on a line, which only current code can produce at all.
+**Next action:** `./check` passes clean, `nativeSkips` is empty, the full differential
+suite agrees byte for byte including exit status, a compiled ELF's DWARF line table has
+been verified against `lldb` itself in this container, and — the thing the whole phase
+was gated on — **a Mach-O build has now run on the actual target machine and printed the
+right answer**, after ADR-0024 found and fixed the reason no Mach-O this project produced
+had ever been runnable.
+
+What is outstanding is the confirmation of *self-signed* output specifically: the binary
+the user ran was signed by `rcodesign`, which proved the structure and the approach;
+`internal/codesign` now does that signing itself, verified in-container against an
+independent implementation but not yet executed on a Mac. So the remaining checklist item
+for `docs/phases/5-complete.md` is unchanged in shape and much smaller in risk: **the
+user confirms, on the target machine, that a binary built by current `originc` runs
+unaided, and that `lldb` breaks on an Origin source line** (ADR-0003's "Consequences" —
+not something to write up preemptively). A rebuilt `darwin/amd64` `originc` carrying both
+ADR-0023 and ADR-0024 has been sent for exactly that.
+
+The lesson worth keeping: ADR-0003's target-machine checklist item was not a formality.
+It found a defect that made every Mach-O this project ever emitted unrunnable, and no
+amount of in-container structural verification would have caught it. Treat "verified
+structurally" as what it says and nothing more.

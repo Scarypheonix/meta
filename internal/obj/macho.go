@@ -2,7 +2,10 @@ package obj
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
+
+	"github.com/scarypheonix/meta/internal/codesign"
 )
 
 // Mach-O constants, spelled out for the same reason the ELF ones are: the test reads the
@@ -191,6 +194,19 @@ func (img *Image) writeMachO(w io.Writer) error {
 	f.padTo(trailer.linkeditOff)
 	f.bytes(trailer.linkeditContent)
 
+	// The signature goes last, over a file whose every other byte -- including the header
+	// fields naming this signature's own offset and size -- is already final.
+	f.padTo(trailer.sigOff)
+	sig := codesign.Build(f.buf, img.identifier(), trailer.sigOff, 0, textSegFileSize)
+	if uint64(len(sig)) != trailer.sigSize {
+		return fmt.Errorf(
+			"this is a compiler bug: the code signature is %d bytes but the layout reserved %d; "+
+				"codesign.Size must agree with codesign.Build exactly, since the reservation is "+
+				"baked into the header the signature itself covers",
+			len(sig), trailer.sigSize)
+	}
+	f.bytes(sig)
+
 	_, err := w.Write(f.buf)
 	return err
 }
@@ -259,7 +275,15 @@ func buildMachOTrailer(img *Image, after uint64) *machoTrailer {
 	tr.strSize = uint64(len(strtab))
 	tr.linkeditContent = append(tr.linkeditContent, symtab...)
 	tr.linkeditContent = append(tr.linkeditContent, strtab...)
-	tr.linkeditSize = uint64(len(tr.linkeditContent))
+
+	// The signature covers everything before it and is the last thing in the file
+	// (ADR-0024), so its own start is its codeLimit. Its size follows from that and the
+	// identifier alone, which is what lets __LINKEDIT's size and LC_CODE_SIGNATURE -- both
+	// written into the header, inside the region the signature hashes -- be final before
+	// any hashing happens.
+	tr.sigOff = align(tr.linkeditOff+uint64(len(tr.linkeditContent)), 16)
+	tr.sigSize = codesign.Size(img.identifier(), tr.sigOff)
+	tr.linkeditSize = tr.sigOff + tr.sigSize - tr.linkeditOff
 
 	return tr
 }

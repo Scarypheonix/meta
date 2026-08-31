@@ -140,6 +140,20 @@ type Image struct {
 	// Funcs is one entry per compiled function, for the plain symbol table `bt` names a
 	// frame from (never a DWARF subprogram DIE -- see internal/dwarf's package doc).
 	Funcs []dwarf.Func
+
+	// Identifier names the code a Mach-O's ad-hoc signature covers (ADR-0024).
+	// Conventionally the output file's base name, which is what `codesign` itself
+	// defaults to; identifier() supplies a fallback when it is empty, since a signature
+	// with no identifier at all is not valid.
+	Identifier string
+}
+
+// identifier is the name the code signature gives this image, never empty.
+func (img *Image) identifier() string {
+	if img.Identifier == "" {
+		return "origin"
+	}
+	return img.Identifier
 }
 
 // Layout decides where each segment will be mapped, before any code exists.

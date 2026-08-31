@@ -364,6 +364,9 @@ func Build(path, outPath, targetName string, level opt.Level, stdout, stderr io.
 	if outPath == "" {
 		outPath = defaultOutputName(path)
 	}
+	// A Mach-O's ad-hoc signature names the code it covers (ADR-0024). `codesign` itself
+	// defaults that name to the output file's own, so this does too.
+	img.Identifier = filepath.Base(outPath)
 	if err := WriteExecutable(img, outPath); err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
 		return ExitDiagnostics

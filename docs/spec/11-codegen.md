@@ -227,6 +227,33 @@ virtual machine produce for the same program. That is what makes the three engin
 comparable, and the end-to-end suite asserts it for every case at every optimization
 level.
 
+## Code signing (macOS)
+
+A Mach-O executable MUST carry an ad-hoc code signature, and its `__LINKEDIT` segment
+MUST be the file's final segment. Neither is optional: since macOS 11 the kernel SIGKILLs
+an executable with no valid signature, and a signature is appended into `__LINKEDIT`, so
+a Mach-O without one cannot be signed at all — Apple's `codesign` reports only "internal
+error in Code Signing subsystem". An ELF has no equivalent requirement and carries no
+signature.
+
+The compiler emits the signature itself, following ADR-0024, rather than leaving the user
+to run `codesign`: `originc build --target macos` produces a binary that runs. Ad hoc
+means the signature asserts identity by content hash alone — no certificate, no key, no
+CMS payload — which is what `codesign --sign -` produces and exactly what the kernel needs.
+Developer ID signing, notarization and entitlements are DEFERRED (`docs/deferred.md`);
+they matter for distributing software to other people's machines, not for running it.
+
+`internal/codesign` owns the blob encoding (process rule 5, the same split as
+`internal/dwarf`): an embedded-signature superblob holding a CodeDirectory, an empty
+requirement set, and an empty CMS wrapper. The CodeDirectory covers the file from offset
+zero up to where the signature itself begins, hashed with SHA-256 in 4 KiB pages.
+
+The signature's size is computed before any byte of the file is written, because
+`__LINKEDIT`'s own size and `LC_CODE_SIGNATURE` both name it and both sit in the header,
+inside the region the signature hashes. That is the same discipline `Plan` imposes on
+segment addresses and the DWARF line table on its own: a freestanding executable has no
+relocations, so nothing may be patched after the fact.
+
 ## Debug information
 
 The executable carries DWARF line-number information mapping each machine-code address
