@@ -349,7 +349,7 @@ func (c *Checker) checkLet(v *ast.LetStmt) {
 	}
 
 	scheme := types.Mono(got)
-	if v.Value != nil && isSyntacticValue(v.Value) {
+	if v.Value != nil && c.isSyntacticValue(v.Value) {
 		// Only a syntactic value generalizes. `let v = Vec::new();` must stay
 		// monomorphic, or pushing an i64 and reading back a String would type-check.
 		scheme = c.ctx.Generalize(got)
@@ -360,27 +360,34 @@ func (c *Checker) checkLet(v *ast.LetStmt) {
 	c.bindPatternScheme(v.Pat, scheme, true)
 }
 
-// isSyntacticValue implements the value restriction of spec/03-types.md: a literal, a
-// path, a lambda, a tuple of syntactic values, or a constructor applied to them.
-func isSyntacticValue(e ast.Expr) bool {
+// isSyntacticValue decides whether a `let` binding generalizes (spec/03-types.md's value
+// restriction), and the answer is narrower than "is this a value?".
+//
+// The classical restriction exists to stop a *mutable* aggregate being generalized. Origin
+// needs a stronger one, because ADR-0010 monomorphizes and ADR-0019 gives every
+// instantiation its own exact layout: a generalized `let n = Option::None;` has no single
+// runtime type to be, since `Option[i64]::None` and `Option[String]::None` are different
+// object descriptors. Generalizing it produced a value built at one descriptor and matched
+// against another, which the virtual machine reported as a `match` where no arm matched --
+// a wrong answer rather than an error, and invisible to the interpreter, whose values are
+// uniform.
+//
+// So only things whose representation does not depend on the type they are used at may
+// generalize: a lambda and a path naming a function. Those are *code*, and code is
+// monomorphized per call site already. Everything that allocates -- a struct literal, a
+// tuple, a variant -- is monomorphic in its binding, and unifies with its single use.
+//
+// A literal is deliberately excluded too: `let x = 1;` generalized to every integer type
+// would have the same problem, since `i64` and `u8` are not one representation. Defaulting
+// (spec/03-types.md rule 3) is what settles a literal's type, not generalization.
+func (c *Checker) isSyntacticValue(e ast.Expr) bool {
 	switch v := e.(type) {
-	case *ast.IntLit, *ast.FloatLit, *ast.StrLit, *ast.CharLit, *ast.BoolLit,
-		*ast.PathExpr, *ast.Lambda, *ast.SelfExpr:
+	case *ast.Lambda:
 		return true
-	case *ast.TupleExpr:
-		for _, el := range v.Elems {
-			if !isSyntacticValue(el) {
-				return false
-			}
-		}
-		return true
-	case *ast.StructLit:
-		for _, f := range v.Fields {
-			if !isSyntacticValue(f.Value) {
-				return false
-			}
-		}
-		return true
+	case *ast.PathExpr:
+		// A function's name generalizes; a variant's name builds an object and does not.
+		ref, ok := c.res.Ref(v.NodeID())
+		return ok && ref.Kind == resolve.Fn
 	}
 	return false
 }

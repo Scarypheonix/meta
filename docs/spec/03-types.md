@@ -55,12 +55,22 @@ concrete property (ADR-0009):
    spans, and the ability to report "expected `i64`, found `String`" rather than an
    unhelpful chain of unification variables.
 2. **Value restriction.** A `let` binding generalizes its type only when its
-   right-hand side is a *syntactic value*: a literal, a path, a lambda, a tuple of
-   syntactic values, or a constructor applied to syntactic values. Anything else —
-   notably a call — is monomorphic. This is required for soundness because aggregates
-   have mutable fields and reference semantics; without it,
-   `let v = Vec::new();` would generalize to `forall T. Vec[T]` and permit pushing an
-   `i64` and reading back a `String`.
+   right-hand side is *code*: a lambda, or a path naming a function. Everything else —
+   a literal, a constructor, a struct or tuple expression, a call — is monomorphic, and
+   its type is settled by unification with the binding's uses.
+
+   This is narrower than the classical restriction, which admits any syntactic value,
+   and ADR-0027 records why. The classical rule exists to stop a *mutable* aggregate
+   being generalized: without it `let v = Vec::new();` would generalize to
+   `forall T. Vec[T]` and permit pushing an `i64` and reading back a `String`. Origin
+   needs more, because ADR-0010 monomorphizes and ADR-0019 gives every instantiation its
+   own exact layout. `Option[i64]::None` and `Option[String]::None` are different object
+   descriptors, so a generalized `let n = Option::None;` names no single runtime shape;
+   the object gets built at one descriptor and matched against another. Code has no such
+   problem: a lambda is monomorphized per call site, so generalizing it is sound.
+
+   A literal is excluded for the same reason: `i64` and `u8` are not one representation.
+   Rule 3's defaulting is what settles a literal's type.
 3. **Defaulting.** An unsolved integer variable defaults to `i64`; an unsolved float
    variable defaults to `f64`. Any other unsolved variable at the end of a function
    body is REJECTED with "cannot infer type; add an annotation" and a span pointing at
@@ -135,7 +145,9 @@ the trap's message. Function calls in `const` initializers are DEFERRED (Phase 4
 | `let x: u8 = 300;` | REJECTED — literal out of range for `u8` |
 | `let x = 1; let y: i32 = x;` | REJECTED — expected `i32`, found `i64`; no widening |
 | `let x = 1i32; let y = x as i64;` | accepted |
-| `let f = \|x\| x;` | `f: forall T. fn(T) -> T` — RHS is a syntactic value, generalized |
+| `let f = \|x\| x;` | `f: forall T. fn(T) -> T` — a lambda is code, generalized |
+| `let n = Option::None; let a: Option[i64] = n;` | `n: Option[i64]` — a constructor is monomorphic, so `n` unifies with its use |
+| `let n = Option::None;` used at both `Option[i64]` and `Option[String]` | REJECTED — one binding cannot have two layouts (ADR-0027) |
 | `let v = Vec::new();` | monomorphic; `Vec[?T]`, must be pinned by later use |
 | `let v = Vec::new(); v.push(1); v.push("a");` | REJECTED — second push, expected `i64` |
 | `fn id[T](x: T) -> T { x }` | accepted |

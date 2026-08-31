@@ -1,0 +1,10 @@
+// EXPECT: accept
+// spec: 03-types.md rule 2, ADR-0027 — narrowing the value restriction to code must not
+// take lambda polymorphism with it. A lambda is monomorphized per call site, so it has no
+// single runtime layout to be wrong about.
+
+fn main() {
+    let id = |x| x;
+    let a = id(1);
+    let b = id("hi");
+}

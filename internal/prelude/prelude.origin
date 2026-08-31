@@ -84,9 +84,12 @@ pub trait Send {
 // table, not an address, so a forged one is a lookup that fails rather than a wild
 // pointer -- every operation below TRAPS on a handle the runtime does not know.
 //
-// The methods carry the surface ADR-0025 chose; their bodies call compiler-provided
-// functions, which is how a prelude method reaches an operation Origin cannot yet
-// express. Phase 7's standard library replaces the mechanism, not the surface.
+// The runtime never builds one of these. A compiler-provided operation returns a bare
+// handle or a bare value, and the wrapping into `JoinHandle[T]`, `Option[T]` and the rest
+// happens in Origin -- here, or in the compiler where a call's own checked type says
+// which instantiation to construct. That is what lets three engines share one design:
+// the native backend has no notion of "the prelude's `Option`" to build from machine
+// code, and now it never needs one.
 
 /// A running thread and the value it will return.
 pub struct JoinHandle[T] {
@@ -97,7 +100,7 @@ impl[T] JoinHandle[T] {
     /// Blocks until the thread finishes, and yields its result. TRAPS if this handle has
     /// already been joined.
     pub fn join(self) -> T {
-        thread::join_handle(self)
+        thread::join_thread(self)
     }
 }
 
@@ -126,8 +129,17 @@ pub struct Receiver[T] {
 impl[T] Receiver[T] {
     /// Blocks while the channel is empty. `None` once the channel is closed and drained,
     /// and permanently thereafter.
+    ///
+    /// The two operations are one atomic step, not two: `await_value` dequeues under the
+    /// runtime's own lock and holds the value for this thread, and `taken_value` reads
+    /// what it took. Asking "is there a value?" and then taking one would be a race
+    /// between two receivers.
     pub fn recv(self) -> Option[T] {
-        chan::recv_value(self)
+        if chan::await_value(self) {
+            Option::Some(chan::taken_value(self))
+        } else {
+            Option::None
+        }
     }
 }
 

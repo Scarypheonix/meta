@@ -260,6 +260,11 @@ func (v *VM) callBuiltin(index, argCount int, span diag.Span) {
 	args := v.temps[base : base+argCount]
 	defer func() { v.temps = v.temps[:base] }()
 
+	if val, handled := v.concurrencyBuiltin(index, args, span); handled {
+		v.push(val)
+		return
+	}
+
 	switch index {
 	case compile.BuiltinPrint, compile.BuiltinPrintln:
 		s := v.heap.Bytes(args[0].R)

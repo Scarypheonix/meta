@@ -1,0 +1,11 @@
+// EXPECT: reject E0308
+// spec: 03-types.md rule 2, ADR-0027 — a constructor binding is monomorphic, because
+// `Option[i64]::None` and `Option[String]::None` are different object descriptors under
+// ADR-0019. One binding cannot have two layouts, so the second use is a type error rather
+// than a value built at one descriptor and read at another.
+
+fn main() {
+    let n = Option::None;
+    let a: Option[i64] = n;
+    let b: Option[String] = n;
+}

@@ -52,6 +52,18 @@ const (
 	BuiltinSaturatingAdd
 	BuiltinSaturatingSub
 	BuiltinSaturatingMul
+	// The concurrency operations (spec/12-concurrency.md). The prelude's own methods
+	// call these, so a program reaches them through `spawn`, `send`, `with` and the
+	// rest rather than by naming them.
+	BuiltinSpawn
+	BuiltinJoin
+	BuiltinChannel
+	BuiltinSend
+	BuiltinAwait
+	BuiltinTaken
+	BuiltinCloseChan
+	BuiltinMutex
+	BuiltinWithLock
 )
 
 // Compiler holds the state of one program's lowering.
@@ -312,6 +324,51 @@ func (c *Compiler) concreteType(t types.Type) types.Type {
 	return types.Prune(t)
 }
 
+// requireConcrete rejects a type that still contains an inference variable.
+//
+// Under ADR-0010 every instantiation has its own descriptor (ADR-0019), so a type with a
+// free variable names no single runtime shape. Building an object at one anyway is not a
+// near-miss: it silently produces a distinct descriptor, and a later `match` compares
+// against the real one and finds nothing -- which is exactly the failure the narrowed
+// value restriction (spec/03-types.md, ADR-0027) was introduced to prevent. Process rule
+// 8 applies: stopping is better than a plausible wrong answer, so anything that reaches
+// here with an open type is a compiler bug and says so.
+func requireConcrete(t types.Type, what string, span diag.Span) error {
+	if hasFreeVar(t) {
+		return unsupported(fmt.Sprintf(
+			"%s at the unresolved type %s; every instantiation needs a concrete layout (ADR-0019)",
+			what, t), span)
+	}
+	return nil
+}
+
+func hasFreeVar(t types.Type) bool {
+	switch v := types.Prune(t).(type) {
+	case *types.Var:
+		return true
+	case *types.Named:
+		for _, a := range v.Args {
+			if hasFreeVar(a) {
+				return true
+			}
+		}
+	case *types.TupleT:
+		for _, e := range v.Elems {
+			if hasFreeVar(e) {
+				return true
+			}
+		}
+	case *types.FnT:
+		for _, p := range v.Params {
+			if hasFreeVar(p) {
+				return true
+			}
+		}
+		return hasFreeVar(v.Ret)
+	}
+	return false
+}
+
 // concreteTypeOf is concreteType over an expression's checked type.
 func (c *Compiler) concreteTypeOf(e ast.Expr) types.Type {
 	return c.concreteType(c.typeOf(e))
@@ -357,6 +414,9 @@ func (c *Compiler) structInst(t types.Type, span diag.Span) (int, error) {
 	if !ok || named.Def == nil || named.Def.Struct == nil {
 		return 0, unsupported(fmt.Sprintf("constructing %s, which is not a concrete struct type", t), span)
 	}
+	if err := requireConcrete(named, "constructing "+named.Def.Name, span); err != nil {
+		return 0, err
+	}
 	key := "struct:" + instKey(named)
 	if idx, ok := c.structCache[key]; ok {
 		return idx, nil
@@ -393,6 +453,9 @@ func (c *Compiler) variantInst(variant *ast.Variant, enumT types.Type) (int, err
 	}
 	if pos < 0 || pos >= len(named.Def.VariantTypes) {
 		return 0, unsupported("an unknown variant", variant.Span())
+	}
+	if err := requireConcrete(named, "building "+named.Def.Name+"::"+variant.Name.Name, variant.Span()); err != nil {
+		return 0, err
 	}
 	key := "variant:" + instKey(named) + "::" + variant.Name.Name
 	if idx, ok := c.variantCache[key]; ok {

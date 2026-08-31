@@ -72,14 +72,18 @@ func (c *Checker) concurrencyBuiltinType(name string, targs []ast.Type, span dia
 		// spawn[T: Send](body: fn() -> T) -> JoinHandle[T]
 		//
 		// The `Send` bound is imposed at the call site rather than carried here, because
-		// a builtin's type is a plain FnT with nowhere to put a bound. checkSpawnBounds
+		// a builtin's type is a plain FnT with nowhere to put a bound. checkConcurrencyCall
 		// does it, and also checks the closure's captures, which no type can express.
+		//
+		// The operation itself yields a bare handle; internal/compile wraps it in the
+		// `JoinHandle[T]` this signature promises, using the instantiation the checker
+		// recorded here. The runtime never constructs a prelude type.
 		t := elem()
 		return &types.FnT{
 			Params: []types.Type{&types.FnT{Params: nil, Ret: t}},
 			Ret:    c.named("JoinHandle", t),
 		}
-	case "thread::join_handle":
+	case "thread::join_thread":
 		t := elem()
 		return &types.FnT{Params: []types.Type{c.named("JoinHandle", t)}, Ret: t}
 
@@ -93,9 +97,15 @@ func (c *Checker) concurrencyBuiltinType(name string, targs []ast.Type, span dia
 	case "chan::send_value":
 		t := elem()
 		return &types.FnT{Params: []types.Type{c.named("Sender", t), t}, Ret: unit}
-	case "chan::recv_value":
+	case "chan::await_value":
+		// Dequeues under the runtime's lock and holds the value for this thread, so that
+		// the prelude's `recv` can build `Option` in Origin without racing another
+		// receiver between the test and the take.
 		t := elem()
-		return &types.FnT{Params: []types.Type{c.named("Receiver", t)}, Ret: c.named("Option", t)}
+		return &types.FnT{Params: []types.Type{c.named("Receiver", t)}, Ret: types.P(types.Bool)}
+	case "chan::taken_value":
+		t := elem()
+		return &types.FnT{Params: []types.Type{c.named("Receiver", t)}, Ret: t}
 	case "chan::close_sender":
 		t := elem()
 		return &types.FnT{Params: []types.Type{c.named("Sender", t)}, Ret: unit}

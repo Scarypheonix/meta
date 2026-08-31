@@ -86,6 +86,10 @@ type Interp struct {
 	// main being 1 (spec/12-concurrency.md).
 	rt  *runtime
 	tid int64
+	// taken holds the value `chan::await_value` dequeued, until the prelude's `recv`
+	// reads it with `chan::taken_value`. It is per-thread, which is what makes the pair
+	// atomic with respect to another receiver.
+	taken Value
 }
 
 // New returns an interpreter writing program output to stdout and trap messages to

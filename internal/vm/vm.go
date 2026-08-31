@@ -97,6 +97,15 @@ type VM struct {
 	// maxFrames bounds recursion, so deep recursion traps as a stack overflow rather
 	// than exhausting the host (spec/08-memory-model.md).
 	maxFrames int
+
+	// w is the shared world -- the scheduler, the channels, and every other thread's
+	// machine (spec/12-concurrency.md). tid identifies this thread, main being 1.
+	w   *world
+	tid int64
+	// taken holds what BuiltinAwait dequeued, until BuiltinTaken reads it. Per-thread,
+	// which is what makes the pair atomic with respect to another receiver.
+	taken    Value
+	hasTaken bool
 }
 
 // Config sizes the VM.
@@ -122,14 +131,25 @@ func New(prog *bytecode.Program, cfg Config, stdout, stderr io.Writer) *VM {
 		stack:     make([]Value, 0, 256),
 		strings:   map[int]layout.Ref{},
 		maxFrames: cfg.MaxFrames,
+		w:         newWorld(),
+		tid:       1,
 	}
-	v.heap.SetRoots(v.visitRoots)
+	v.w.vms[v.tid] = v
+	// The collector sees every thread's roots, not only this one's: with more than one
+	// thread each has its own stack, and a root missed is an object collected while it
+	// is still reachable.
+	v.heap.SetRoots(v.w.visitWorldRoots)
 	return v
 }
 
 // visitRoots hands the collector every live reference. It is precise because every
 // stack slot is tagged: nothing is scanned conservatively and nothing is guessed.
 func (v *VM) visitRoots(visit func(*layout.Ref)) {
+	v.w.visitWorldRoots(visit)
+}
+
+// visitOwnRoots hands the collector this one thread's roots.
+func (v *VM) visitOwnRoots(visit func(*layout.Ref)) {
 	for i := range v.stack {
 		if v.stack[i].Tag == layout.TagRef && v.stack[i].R != layout.Nil {
 			visit(&v.stack[i].R)
@@ -145,12 +165,12 @@ func (v *VM) visitRoots(visit func(*layout.Ref)) {
 			visit(&v.frames[i].closure)
 		}
 	}
-	for k := range v.strings {
-		r := v.strings[k]
-		if r != layout.Nil {
-			visit(&r)
-			v.strings[k] = r
-		}
+	// The value dequeued by `await_value` and not yet read by `taken_value` is live and
+	// belongs to no stack: it has left the channel's queue and has not reached the
+	// program. Missing it means a collection between the two frees it, or moves it
+	// without rewriting this reference.
+	if v.hasTaken && v.taken.Tag == layout.TagRef && v.taken.R != layout.Nil {
+		visit(&v.taken.R)
 	}
 }
 
@@ -184,19 +204,64 @@ func (v *VM) alloc(t layout.TypeID, words uint64, span diag.Span) layout.Ref {
 // Run executes `main` and returns the process exit status.
 func (v *VM) Run() (exitCode int) {
 	defer func() {
-		if r := recover(); r != nil {
-			t, isTrap := r.(*Trap)
-			if !isTrap {
-				panic(r)
-			}
-			fmt.Fprintln(v.stderr, t.Error())
-			exitCode = TrapExitCode
+		r := recover()
+		if r == nil {
+			return
 		}
+		// `dying` means another thread trapped first and this one was woken to unwind;
+		// the trap to report is that one (ADR-0026).
+		if _, unwinding := r.(dying); unwinding {
+			v.w.mu.Lock()
+			t := v.w.trap
+			v.w.mu.Unlock()
+			if t != nil {
+				fmt.Fprintln(v.stderr, t.Error())
+			}
+			exitCode = TrapExitCode
+			return
+		}
+		t, isTrap := r.(*Trap)
+		if !isTrap {
+			panic(r)
+		}
+		// Recorded before reporting, so a thread parked on a channel or a lock wakes and
+		// unwinds rather than running past the end of the program.
+		v.w.mu.Lock()
+		v.w.fail(t)
+		v.w.live--
+		v.w.mu.Unlock()
+
+		fmt.Fprintln(v.stderr, t.Error())
+		exitCode = TrapExitCode
 	}()
+
+	// Main holds the world while it executes, exactly as a spawned thread does: the
+	// lock is what serializes mutators against each other and against a collection
+	// (concurrent.go).
+	v.w.exec.Lock()
 
 	entry := v.prog.Fns[v.prog.Entry]
 	v.pushFrame(v.prog.Entry, entry, layout.Nil, 0, entry.Span)
-	v.run()
+	v.run(0)
+
+	// `main` returning does not end the program while a spawned thread is still running
+	// (spec/12-concurrency.md). Main stops being a thread that can make progress first,
+	// so a deadlock among the survivors is still recognized.
+	v.w.mu.Lock()
+	v.w.live--
+	delete(v.w.vms, v.tid)
+	v.w.cond.Broadcast()
+	v.w.mu.Unlock()
+	v.w.exec.Unlock()
+	v.w.wg.Wait()
+
+	v.w.mu.Lock()
+	t := v.w.trap
+	v.w.mu.Unlock()
+	if t != nil {
+		fmt.Fprintln(v.stderr, t.Error())
+		return TrapExitCode
+	}
 	return 0
 }
 

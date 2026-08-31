@@ -11,8 +11,14 @@ import (
 )
 
 // run is the interpreter loop.
-func (v *VM) run() {
-	for len(v.frames) > 0 {
+// run executes until the frame stack drops back to floor.
+//
+// A floor above zero is a nested call: the runtime itself invoking a closure the program
+// gave it -- a spawned thread's body, or the function passed to `Mutex.with` -- which has
+// to run to completion and yield its value rather than being left for the outer loop to
+// finish (spec/12-concurrency.md).
+func (v *VM) run(floor int) {
+	for len(v.frames) > floor {
 		f := &v.frames[len(v.frames)-1]
 		if f.pc >= len(f.fn.Code) {
 			// A function whose code runs off the end returns unit; the compiler always
@@ -84,6 +90,11 @@ func (v *VM) run() {
 			v.push(boolVal(v.compareOp(in.Op, a, b, in.Span)))
 
 		case bytecode.OpJump:
+			// §08 puts a safepoint on every loop back edge, so a compute loop cannot
+			// starve the scheduler. A backward jump is what a back edge compiles to.
+			if int(in.A) <= f.pc {
+				v.safepoint()
+			}
 			f.pc = int(in.A)
 		case bytecode.OpJumpIfFalse:
 			if !v.pop().Bool() {
@@ -98,10 +109,10 @@ func (v *VM) run() {
 			result := v.pop()
 			v.stack = v.stack[:f.base]
 			v.frames = v.frames[:len(v.frames)-1]
-			if len(v.frames) == 0 {
+			v.push(result)
+			if len(v.frames) == floor {
 				return
 			}
-			v.push(result)
 
 		case bytecode.OpFunc:
 			v.push(Value{Tag: layout.TagFn, N: uint64(in.A)})
@@ -209,6 +220,22 @@ func (v *VM) makeClosure(ci int, span diag.Span) {
 }
 
 // doCall invokes the callee sitting beneath argCount arguments.
+// callValue calls a function value from the runtime's own code and returns its result.
+//
+// The closure and its arguments go on the operand stack exactly as a compiled call would
+// leave them, so nothing about the calling convention is special-cased; only the loop's
+// stopping point is.
+func (v *VM) callValue(callee Value, span diag.Span, args ...Value) Value {
+	floor := len(v.frames)
+	v.push(callee)
+	for _, a := range args {
+		v.push(a)
+	}
+	v.doCall(len(args), span)
+	v.run(floor)
+	return v.pop()
+}
+
 func (v *VM) doCall(argCount int, span diag.Span) {
 	callee := v.stack[len(v.stack)-argCount-1]
 

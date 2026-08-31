@@ -16,6 +16,16 @@ var builtinIndex = map[string]int{
 	"io::println": BuiltinPrintln,
 	"panic":       BuiltinPanic,
 	"ref_eq":      BuiltinRefEq,
+
+	"thread::spawn":       BuiltinSpawn,
+	"thread::join_thread": BuiltinJoin,
+	"chan::channel":       BuiltinChannel,
+	"chan::send_value":    BuiltinSend,
+	"chan::await_value":   BuiltinAwait,
+	"chan::taken_value":   BuiltinTaken,
+	"chan::close_sender":  BuiltinCloseChan,
+	"sync::mutex":         BuiltinMutex,
+	"sync::with_lock":     BuiltinWithLock,
 }
 
 func (c *Compiler) call(v *ast.Call) error {
@@ -47,7 +57,7 @@ func (c *Compiler) call(v *ast.Call) error {
 				}
 			}
 			c.emitAB(bytecode.OpCallBuiltin, idx, len(v.Args), v.Span())
-			return nil
+			return c.wrapConcurrencyHandle(idx, v)
 		}
 	}
 
@@ -242,4 +252,58 @@ func (c *Compiler) resultVariants(t types.Type, span diag.Span) (ok, errIdx int,
 		return 0, 0, err
 	}
 	return ok, errIdx, nil
+}
+
+// wrapConcurrencyHandle turns the bare handle a concurrency builtin returns into the
+// prelude type the checker says the call has (spec/12-concurrency.md).
+//
+// The runtime deliberately knows nothing about `JoinHandle[T]` or `Sender[T]`: it returns
+// an integer, and the wrapping happens here, where the call's own checked type names the
+// instantiation to build. That is what keeps the three engines sharing one design -- the
+// native backend could not construct a prelude type from machine code, and now nothing
+// asks it to.
+func (c *Compiler) wrapConcurrencyHandle(idx int, v *ast.Call) error {
+	switch idx {
+	case BuiltinSpawn, BuiltinMutex:
+		// A single handle in a single-field struct: `JoinHandle[T]` or `Mutex[T]`.
+		si, err := c.structInst(c.typeOf(v), v.Span())
+		if err != nil {
+			return err
+		}
+		c.emitAB(bytecode.OpStruct, si, 1, v.Span())
+		return nil
+
+	case BuiltinChannel:
+		// One handle, two ends: `(Sender[T], Receiver[T])`. Both name the same queue --
+		// they are separate types so that a receiver cannot send and a sender cannot
+		// close what it does not own.
+		tup, ok := c.concreteType(c.typeOf(v)).(*types.TupleT)
+		if !ok || len(tup.Elems) != 2 {
+			return unsupported("a channel whose type is not a pair of ends", v.Span())
+		}
+		sender, err := c.structInst(tup.Elems[0], v.Span())
+		if err != nil {
+			return err
+		}
+		receiver, err := c.structInst(tup.Elems[1], v.Span())
+		if err != nil {
+			return err
+		}
+		// The handle is produced once and needed twice, so it goes through an anonymous
+		// frame slot rather than a stack-duplicating opcode -- one fewer instruction for
+		// three engines to agree on.
+		slot := c.temp()
+		c.emitA(bytecode.OpStore, slot, v.Span())
+		c.emitA(bytecode.OpLoad, slot, v.Span())
+		c.emitAB(bytecode.OpStruct, sender, 1, v.Span())
+		c.emitA(bytecode.OpLoad, slot, v.Span())
+		c.emitAB(bytecode.OpStruct, receiver, 1, v.Span())
+		ti, err := c.tupleInst(c.typeOf(v), v.Span())
+		if err != nil {
+			return err
+		}
+		c.emitAB(bytecode.OpTuple, int(ti), 2, v.Span())
+		return nil
+	}
+	return nil
 }

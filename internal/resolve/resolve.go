@@ -296,8 +296,8 @@ var stdModules = map[string][]string{
 	// Phase 6 (spec/12-concurrency.md). `spawn` and `channel` are what a program calls;
 	// the rest are the operations the prelude's own methods are written in terms of,
 	// since a method body cannot otherwise reach an operation the runtime provides.
-	"std::thread": {"spawn", "join_handle"},
-	"std::chan":   {"channel", "send_value", "recv_value", "close_sender"},
+	"std::thread": {"spawn", "join_thread"},
+	"std::chan":   {"channel", "send_value", "await_value", "taken_value", "close_sender"},
 	"std::sync":   {"mutex", "with_lock"},
 }
 

@@ -387,8 +387,12 @@ func (in *Interp) withLock(h int64, body *Closure, span diag.Span) Value {
 // The builtins the prelude's methods are written in terms of
 // ---------------------------------------------------------------------------
 
-// preludeStruct builds one of the prelude's handle types around a runtime handle. No
-// Origin expression constructs these, which is why the interpreter has to.
+// preludeStruct wraps a runtime handle in one of the prelude's handle types.
+//
+// The interpreter walks the AST, so unlike the compiled engines it never passes through
+// internal/compile's wrapConcurrencyHandle and has to do this itself. It can: it has the
+// declarations in hand. What matters for the design is the compiled path, where the
+// runtime must not invent a type -- the native backend could not.
 func (in *Interp) preludeStruct(name string, h int64, span diag.Span) Value {
 	def := in.res.Structs[name]
 	if def == nil {
@@ -397,7 +401,7 @@ func (in *Interp) preludeStruct(name string, h int64, span diag.Span) Value {
 	return &Struct{Def: def, Vals: []Value{Int(h)}}
 }
 
-// handleOf reads the runtime handle out of one of those structs.
+// handleOf reads the runtime handle out of one of the prelude's handle structs.
 //
 // A program can forge one -- field visibility does not currently prevent writing
 // `Sender[i64] { handle: 99 }` -- so every operation looks the handle up rather than
@@ -415,8 +419,12 @@ func (in *Interp) handleOf(v Value, what string, span diag.Span) int64 {
 	return int64(n)
 }
 
-// concurrencyBuiltin dispatches the std::thread, std::chan and std::sync operations.
-// It reports whether it handled the name, so the ordinary builtin path can carry on.
+// concurrencyBuiltin dispatches the std::thread, std::chan and std::sync operations. It
+// reports whether it handled the name, so the ordinary builtin path can carry on.
+//
+// Each returns a bare handle or a bare value. Wrapping one into `JoinHandle[T]` or
+// `Option[T]` is the compiler's job or the prelude's, never the runtime's -- see
+// internal/compile's wrapConcurrencyHandle for why.
 func (in *Interp) concurrencyBuiltin(name string, args []Value, span diag.Span) (Value, bool) {
 	switch name {
 	case "thread::spawn":
@@ -426,7 +434,7 @@ func (in *Interp) concurrencyBuiltin(name string, args []Value, span diag.Span) 
 		}
 		return in.preludeStruct("JoinHandle", in.spawn(body, span), span), true
 
-	case "thread::join_handle":
+	case "thread::join_thread":
 		return in.join(in.handleOf(args[0], "JoinHandle", span), span), true
 
 	case "chan::channel":
@@ -446,12 +454,21 @@ func (in *Interp) concurrencyBuiltin(name string, args []Value, span diag.Span) 
 		in.channelSend(in.handleOf(args[0], "Sender", span), args[1], span)
 		return Unit{}, true
 
-	case "chan::recv_value":
+	case "chan::await_value":
 		v, got := in.channelRecv(in.handleOf(args[0], "Receiver", span), span)
-		if !got {
-			return in.optionNone(span), true
+		// The value is held for this thread until `taken_value` reads it, so that the
+		// prelude's `recv` can build `Option` in Origin without another receiver taking
+		// what this one dequeued.
+		in.taken = v
+		return Bool(got), true
+
+	case "chan::taken_value":
+		v := in.taken
+		if v == nil {
+			in.trap(span, "no value was taken from this channel")
 		}
-		return in.optionSome(v, span), true
+		in.taken = nil
+		return v, true
 
 	case "chan::close_sender":
 		in.channelClose(in.handleOf(args[0], "Sender", span), span)
