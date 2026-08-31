@@ -540,11 +540,27 @@ the first time more than one program had ever gone down that path at all — and
   when one line legitimately has several addresses. `lldb` picks the first, which is
   correct, and the corrected check is the one that ran.)
 
-`tests/debuginfo` makes that permanent rather than a one-off claim: it runs the LLVM
-verifier and the full line-resolution check over both formats, and skips when the tools
-are absent so `./check` still passes without them. `TestMachOBuildCarriesValidDebugInfo`
-covers the Mach-O debug path end to end through the compiler, which nothing did while
-ADR-0023's Mach-O support was being written.
+Three new tests keep all of that rather than leaving it a claim in a commit message:
+
+- `tests/debuginfo` runs LLVM's DWARF verifier and the whole line-resolution check over
+  both formats, skipping when those tools are absent so `./check` still passes without
+  them.
+- `tests/e2e/macho_test.go` builds **every** case as a Mach-O at every optimization
+  level and checks what makes one loadable — `__LINKEDIT` last, no segment overlapping
+  another or running past the end of the file, DWARF and a symbol table a debugger can
+  open, and a signature whose every page digest re-derives from the file. Both real bugs
+  reproduce against it: corrupting a byte after signing is caught as a digest mismatch,
+  and emitting the segments in the old order as `__LINKEDIT` not being last.
+- `internal/backend`'s `TestBothTargetsShareOneInstructionStream` checks ADR-0003's
+  central claim on compiler output rather than on a hand-written stub: the two targets
+  emit identical code lengths, differing only in baked-in 64-bit immediates (~2% of
+  bytes). If that ever stopped holding there would be two code generators, and the
+  differential run on ELF would stop saying anything about the Mach-O that ships.
+
+`TestMachOBuildCarriesValidDebugInfo` covers the Mach-O debug path end to end through the
+compiler, which nothing did while ADR-0023's Mach-O support was being written. An
+800-function, 800 KB program also builds and validates on both targets (199 signed pages,
+line rows still exact at line 4800), so none of this is small-input-only.
 
 What is left needing a Mac is therefore only the live process: stopping at the
 breakpoint, and `bt` naming frames at run time — which rests on the frame-pointer
