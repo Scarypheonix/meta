@@ -54,6 +54,9 @@ compiler appears here exactly once, and that no code appears twice.
 | E0618 | error | called something that is not a function | 0.1 |
 | E0658 | error | float literal used as a pattern | 0.1 |
 | W0001 | warning | unused `Result` | 0.1 |
+| E0700 | error | a value crossing a channel is not `Send` | 0.1 |
+| E0701 | error | a spawned closure captures a value that is not `Send` | 0.1 |
+| E0702 | error | `JoinHandle[T]` where `T` is not `Send` | 0.1 |
 | W0002 | warning | unused item | 0.1 |
 | W0003 | warning | binding pattern shadows a similarly-named unit variant | 0.1 |
 

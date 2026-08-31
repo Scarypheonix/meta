@@ -49,10 +49,13 @@ silently dropped. An item may move phases; it may not vanish without a line in
 
 | Item | Why deferred | Phase |
 |---|---|---|
-| Per-green-thread panic isolation | needs unwinding or a supervisor model; the single largest deferred item (ADR-0006) | Phase 6 |
+| Per-green-thread panic isolation | decided in Phase 6, and still deferred, now with a reason rather than a deadline (ADR-0026): isolation requires a dead thread to leave shared state usable, and under a shared heap (ADR-0008) with `Mutex` as the sharing mechanism (ADR-0014) a thread that panics inside `with` dies holding a lock over a half-mutated value. Rust survives that with unwinding plus poisoning, Erlang by sharing nothing; ADR-0006 ruled out the first and ADR-0008 the second. A surviving thread would read a value satisfying no invariant, which is a wrong answer rather than a crash — so the process dies instead. Reachable only if unwinding ever arrives, and to be revisited in the same breath as ADR-0006 | — (blocked on ADR-0006) |
 | Weak references | no consumer; complicates the moving collector | Phase 7 |
 | Finalizers | resurrect-and-order problems for no current benefit | Phase 7 |
-| Exposed atomics | add only if the scheduler needs them in Origin source (ADR-0014) | Phase 6 |
+| Exposed atomics | ADR-0014 made these conditional on the scheduler needing them in Origin source; it does not, since the scheduler is written in Go | — (not planned) |
+| `select` over several channels | needs a multi-way blocking primitive and a fairness policy; every program in Phase 6's scope is expressible with one channel per thread or a `Mutex`. Should land as a function over a list of cases, not a control-flow construct, or ADR-0025 is being revisited by accident | Phase 7 |
+| Async I/O | §08 originally scoped "kqueue-backed async I/O" to Phase 6; §12 amends that, because `io::println` is the entire I/O surface and there is nothing to be asynchronous about. Follows the file and socket APIs | Phase 7 |
+| Preventing a `Mutex`-protected value from escaping `with` | the closure form releases the lock at a known point, but nothing stops the body returning the protected value and using it unlocked. Closing this needs a lifetime or region system, which ADR-0004 declined for the language as a whole | — (blocked on ADR-0004) |
 | Lock-free data structures in safe Origin | impossible under ADR-0014; would need an `unsafe` escape hatch | — (not planned) |
 | `unsafe` blocks | nothing in the design needs one yet; adding one is a spec-pillar change | — (not planned) |
 

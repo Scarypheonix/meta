@@ -22,7 +22,7 @@ func TestEverySpecDocumentExists(t *testing.T) {
 		"00-overview.md", "01-lexical.md", "02-grammar.md", "03-types.md",
 		"04-expressions.md", "05-patterns.md", "06-traits-generics.md",
 		"07-modules.md", "08-memory-model.md", "09-errors.md", "10-examples.md",
-		"11-codegen.md", "codes.md",
+		"11-codegen.md", "12-concurrency.md", "codes.md",
 	}
 	for _, name := range required {
 		if _, err := os.Stat(filepath.Join(specDir(t), name)); err != nil {
@@ -70,6 +70,9 @@ func TestADRsAreUniquelyNumberedAndComplete(t *testing.T) {
 	}
 }
 
+// phaseRe matches the phase column's own form, e.g. "Phase 7".
+var phaseRe = regexp.MustCompile(`^Phase [0-9]+$`)
+
 func TestDeferredItemsCarryAPhase(t *testing.T) {
 	path := filepath.Join(testutil.RepoRoot(t), "docs", "deferred.md")
 	body, err := os.ReadFile(path)
@@ -88,8 +91,23 @@ func TestDeferredItemsCarryAPhase(t *testing.T) {
 			continue
 		}
 		rows++
-		if !strings.Contains(line, "Phase ") && !strings.Contains(line, "not planned") {
-			t.Errorf("deferred.md:%d has no phase and no explicit \"not planned\": %s", n+1, line)
+		// The disposition is the last cell, not anywhere in the row. Matching the whole
+		// line lets an item pass on its prose -- "delivered in Phase 5" in the *reason*
+		// column satisfied a substring check while saying nothing about where the item
+		// stands -- which is the opposite of what this test is for.
+		cells := strings.Split(strings.Trim(line, "|"), "|")
+		disposition := strings.TrimSpace(cells[len(cells)-1])
+		ok := phaseRe.MatchString(disposition) ||
+			disposition == "done" ||
+			strings.Contains(disposition, "not planned") ||
+			// An item can be blocked on a decision rather than scheduled behind one.
+			// That is a disposition too, and a more informative one than a phase
+			// number: it names what would have to change first.
+			strings.Contains(disposition, "blocked on ")
+		if !ok {
+			t.Errorf("deferred.md:%d has no disposition in its last column "+
+				"(want a phase, \"done\", \"not planned\", or \"blocked on ...\"), got %q: %s",
+				n+1, disposition, line)
 		}
 	}
 	if rows < 20 {

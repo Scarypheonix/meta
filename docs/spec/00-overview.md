@@ -26,6 +26,7 @@ must be corrected in the same commit that changes behaviour.
 | `09-errors.md` | `Result`, `?`, panics, diagnostics requirements |
 | `10-examples.md` | Worked examples with exact expected output |
 | `11-codegen.md` | Native code generation, object files, the runtime, debug info |
+| `12-concurrency.md` | Threads, channels, `Mutex`, deadlock, panics under concurrency |
 
 ## Design pillars
 

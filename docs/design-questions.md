@@ -66,3 +66,29 @@ and the least obvious answer:
 - **ADR-0004 + ADR-0014 (field-level mutability, `Send` derived from it).** Together
   these give a data-race-free language with no borrow checker and no ownership types.
   The cost is that a lock-free structure cannot be written in safe Origin at all.
+
+---
+
+## Phase 6 (concurrency)
+
+Asked, at the Phase 5 gate: what a spawned task *is* in the language, and what happens
+when one panics — the two questions the concurrency specification could not be written
+without.
+
+The user answered:
+
+> "your wish is my wish."
+
+Delegated, on the Phase 0 pattern. The answers live in ADR-0025 (concurrency is a
+library, not syntax) and ADR-0026 (a panic kills the process; per-thread isolation stays
+deferred, now with a reason rather than a deadline), and the surface they imply is
+`docs/spec/12-concurrency.md`. Both are overturnable by reading one file, which is the
+point of recording them this way.
+
+Note that most of Phase 6's *semantics* were not open questions at all: ADR-0014 fixed
+the memory model and §08 fixed green threads, `Send`, safepoint preemption and stack
+limits, all under the Phase 0 delegation. What was genuinely undecided was the surface
+and the failure model.
+
+The phase gates remain the user's: `docs/phases/6-complete.md` goes to them for review,
+as Phase 5's did.

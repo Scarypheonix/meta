@@ -93,8 +93,10 @@ memory corruption. The default limit is 8 MiB per green thread, configurable at 
 
 ## Concurrency
 
-Phase 6 delivers green threads over an M:N scheduler with channels and kqueue-backed
-async I/O. The memory model at the language level:
+Phase 6 delivers green threads over an M:N scheduler, with channels and `Mutex`. Async
+I/O was originally scoped here too; §12 amends that, because Origin has no I/O to be
+asynchronous about — it follows the file and socket APIs, in Phase 7. The surface of all
+of this is §12; what follows is the memory model it rests on:
 
 - **Threads share the heap**, but what may cross a channel is restricted: a value sent
   on a channel MUST implement `Send`.
