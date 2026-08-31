@@ -211,6 +211,30 @@ path for every use (ADR-0020); native collection is single-space, non-generation
 no write barrier (ADR-0022); and DWARF is a line table and a symbol table only, so
 `frame variable` does not work (ADR-0023).
 
-**Next action:** write `docs/spec/12-concurrency.md`, and put the design questions it
-raises to the user rather than answering them (process rule 7). Phase 6 has no code until
-that specification exists.
+**Landed so far in Phase 6:**
+
+- `docs/spec/12-concurrency.md`, ADR-0025 (concurrency is a library, not syntax) and
+  ADR-0026 (a panic kills the process; per-thread isolation stays deferred, now blocked
+  on ADR-0006 rather than scheduled). The user delegated both design questions; see
+  `docs/design-questions.md`.
+- **`Send` is derived structurally** (`internal/check/send.go`), which is what makes
+  ADR-0014's no-data-races claim a compiler rule rather than a document. E0700/E0701/E0702
+  name the offending field and chain through nesting; E0701 checks a spawned closure's
+  *captures*, which no type can express and without which a mutable aggregate reaches
+  another thread by capture instead of by channel.
+- **The surface**: `JoinHandle[T]`, `Sender[T]`, `Receiver[T]` and `Mutex[T]` in the
+  prelude, with methods calling compiler-provided operations. Those operations return a
+  bare handle; the wrapping into a prelude type happens in Origin or in
+  `internal/compile`, never in a runtime — the native backend could not build one.
+- **The interpreter and the virtual machine both run it.** Five end-to-end cases pass on
+  both, skipped by name on native with the reason (`concurrencyCases`), the same ledger
+  `nativeSkips` kept in Phase 5 and meant to empty the same way.
+
+**Next action:** the native backend's scheduler, which is the last engine and much the
+hardest: green threads in hand-written x86 mean context switching and growable stacks
+with no libc, and ADR-0022's collector is stop-the-world and single-space.
+
+**A note on the history:** the VM's concurrency runtime landed inside commit `6b073de`,
+whose message describes only ADR-0027 — the bug the VM work uncovered. The commit is
+accurate about the bug and silent about the 500 lines of `internal/vm/concurrent.go`
+beside it. Read that commit for both.
