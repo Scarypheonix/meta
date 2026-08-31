@@ -102,6 +102,10 @@ type Result struct {
 	// Enums maps an enum name to its declaration, so the interpreter can build prelude
 	// values such as `Option::None` without going through a scope.
 	Enums map[string]*ast.EnumDecl
+	// Structs is the same for structs, so the interpreter can build the prelude's
+	// concurrency handles (`JoinHandle`, `Sender`, `Receiver`, `Mutex`) whose values no
+	// Origin expression constructs (spec/12-concurrency.md).
+	Structs map[string]*ast.StructDecl
 	// Methods maps a type name to its inherent and trait-impl methods. Phase 1 keys by
 	// the impl's type name; Phase 2 replaces this with real trait resolution.
 	Methods map[string]map[string]*ast.FnDecl
@@ -199,6 +203,7 @@ func Program(bag *diag.Bag, inputs ...Input) *Result {
 			Captures: map[ast.NodeID][]*Local{},
 			Fns:      map[string]*ast.FnDecl{},
 			Enums:    map[string]*ast.EnumDecl{},
+			Structs:  map[string]*ast.StructDecl{},
 			Methods:  map[string]map[string]*ast.FnDecl{},
 		},
 	}
@@ -378,6 +383,7 @@ func (r *resolver) declareItem(it ast.Item) {
 		r.out.Fns[v.Name.Name] = v
 	case *ast.StructDecl:
 		r.declare(v.Name, Ref{Kind: Struct, Struct: v, Name: v.Name.Name})
+		r.out.Structs[v.Name.Name] = v
 	case *ast.EnumDecl:
 		r.declare(v.Name, Ref{Kind: Enum, Enum: v, Name: v.Name.Name})
 		r.out.Enums[v.Name.Name] = v

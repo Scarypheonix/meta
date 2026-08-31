@@ -1,0 +1,14 @@
+use std::io;
+use std::thread;
+
+fn main() {
+    let h = thread::spawn(|| -> i64 { 40 + 2 });
+    io::println(h.join().to_str());
+
+    // Joining in a fixed order makes the output independent of scheduling, which is what
+    // lets this be a differential case at all (spec/12-concurrency.md).
+    let a = thread::spawn(|| -> i64 { 1 });
+    let b = thread::spawn(|| -> i64 { 2 });
+    let c = thread::spawn(|| -> i64 { 3 });
+    io::println((a.join() + b.join() + c.join()).to_str());
+}

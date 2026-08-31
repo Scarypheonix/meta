@@ -42,6 +42,9 @@ func TestEveryCaseBuildsALoadableMachO(t *testing.T) {
 	for _, c := range cases {
 		for _, l := range levels {
 			t.Run(c.Name+"/"+l.name, func(t *testing.T) {
+				if concurrencyCases[c.Name] {
+					t.Skip("Phase 6: the native backend has no scheduler yet")
+				}
 				raw := buildMachO(t, root, c, l.level)
 				checkSegments(t, raw)
 				checkSignature(t, raw)

@@ -237,7 +237,7 @@ func (c *Checker) inferPath(v *ast.PathExpr) types.Type {
 		return c.variantValue(v, ref)
 
 	case resolve.Builtin:
-		return c.builtinType(ref.Builtin, v.Span())
+		return c.builtinType(ref.Builtin, v.Args, v.Span())
 
 	case resolve.PrimConst:
 		k, ok := primKinds[ref.Name]
@@ -381,8 +381,8 @@ func variantIndex(def *types.Def, va *ast.Variant) int {
 }
 
 // builtinType gives the compiler-provided functions their signatures.
-func (c *Checker) builtinType(name string, span diag.Span) types.Type {
-	if t := c.concurrencyBuiltinType(name, span); t != nil {
+func (c *Checker) builtinType(name string, targs []ast.Type, span diag.Span) types.Type {
+	if t := c.concurrencyBuiltinType(name, targs, span); t != nil {
 		return t
 	}
 	str := types.P(types.String)

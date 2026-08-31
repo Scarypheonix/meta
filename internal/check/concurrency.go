@@ -47,9 +47,25 @@ func (c *Checker) named(name string, args ...types.Type) types.Type {
 // concurrencyBuiltinType gives the operations in std::thread, std::chan and std::sync
 // their signatures. It returns nil for a name it does not own, so builtinType can carry
 // on with the rest.
-func (c *Checker) concurrencyBuiltinType(name string, span diag.Span) types.Type {
+func (c *Checker) concurrencyBuiltinType(name string, targs []ast.Type, span diag.Span) types.Type {
 	unit := types.Unit()
 	i64 := types.P(types.I64)
+
+	// Every one of these is generic in a single element type, so an explicit type
+	// argument -- `channel[i64](0)`, as spec/12-concurrency.md writes it -- names that
+	// type directly. Without this the type would have to be inferred from a later use,
+	// and a channel created and never used would have no type at all.
+	elem := func() types.Type {
+		if len(targs) == 1 {
+			return c.toType(targs[0])
+		}
+		if len(targs) > 1 {
+			c.bag.Errorf("E0107", span,
+				"`%s` takes 1 type argument but %d were supplied", name, len(targs)).
+				Label("wrong number of type arguments")
+		}
+		return c.freshFor(span)
+	}
 
 	switch name {
 	case "thread::spawn":
@@ -58,37 +74,37 @@ func (c *Checker) concurrencyBuiltinType(name string, span diag.Span) types.Type
 		// The `Send` bound is imposed at the call site rather than carried here, because
 		// a builtin's type is a plain FnT with nowhere to put a bound. checkSpawnBounds
 		// does it, and also checks the closure's captures, which no type can express.
-		t := c.freshFor(span)
+		t := elem()
 		return &types.FnT{
 			Params: []types.Type{&types.FnT{Params: nil, Ret: t}},
 			Ret:    c.named("JoinHandle", t),
 		}
 	case "thread::join_handle":
-		t := c.freshFor(span)
+		t := elem()
 		return &types.FnT{Params: []types.Type{c.named("JoinHandle", t)}, Ret: t}
 
 	case "chan::channel":
 		// channel[T: Send](capacity: i64) -> (Sender[T], Receiver[T])
-		t := c.freshFor(span)
+		t := elem()
 		return &types.FnT{
 			Params: []types.Type{i64},
 			Ret:    &types.TupleT{Elems: []types.Type{c.named("Sender", t), c.named("Receiver", t)}},
 		}
 	case "chan::send_value":
-		t := c.freshFor(span)
+		t := elem()
 		return &types.FnT{Params: []types.Type{c.named("Sender", t), t}, Ret: unit}
 	case "chan::recv_value":
-		t := c.freshFor(span)
+		t := elem()
 		return &types.FnT{Params: []types.Type{c.named("Receiver", t)}, Ret: c.named("Option", t)}
 	case "chan::close_sender":
-		t := c.freshFor(span)
+		t := elem()
 		return &types.FnT{Params: []types.Type{c.named("Sender", t)}, Ret: unit}
 
 	case "sync::mutex":
-		t := c.freshFor(span)
+		t := elem()
 		return &types.FnT{Params: []types.Type{t}, Ret: c.named("Mutex", t)}
 	case "sync::with_lock":
-		t := c.freshFor(span)
+		t := elem()
 		r := c.freshFor(span)
 		return &types.FnT{
 			Params: []types.Type{c.named("Mutex", t), &types.FnT{Params: []types.Type{t}, Ret: r}},

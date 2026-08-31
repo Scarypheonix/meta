@@ -116,6 +116,10 @@ func (in *Interp) userMethod(recv Value, name string) *ast.FnDecl {
 
 func (in *Interp) callBuiltin(name string, args []Value, c *ast.Call) Value {
 	span := c.Span()
+	// The concurrency operations the prelude's own methods call (spec/12-concurrency.md).
+	if v, ok := in.concurrencyBuiltin(name, args, span); ok {
+		return v
+	}
 	switch name {
 	case "io::print", "io::println":
 		if len(args) != 1 {

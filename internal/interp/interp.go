@@ -7,6 +7,7 @@ import (
 
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/diag"
+	"github.com/scarypheonix/meta/internal/prelude"
 	"github.com/scarypheonix/meta/internal/resolve"
 )
 
@@ -52,6 +53,9 @@ type frame struct {
 	captured map[*resolve.Local]Value
 	self     Value
 	hasSelf  bool
+	// callSpan is where this frame was called from, which is what lets a trap raised
+	// inside a prelude method name the user's own line instead of the prelude's.
+	callSpan diag.Span
 }
 
 func newFrame() *frame { return &frame{vars: map[*resolve.Local]Value{}} }
@@ -77,12 +81,17 @@ type Interp struct {
 	// stack overflow rather than corrupting memory.
 	depth    int
 	maxDepth int
+
+	// rt is the concurrency runtime, shared by every thread; tid identifies this thread,
+	// main being 1 (spec/12-concurrency.md).
+	rt  *runtime
+	tid int64
 }
 
 // New returns an interpreter writing program output to stdout and trap messages to
 // stderr.
 func New(res *resolve.Result, stdout, stderr io.Writer) *Interp {
-	return &Interp{res: res, stdout: stdout, stderr: stderr, maxDepth: 8192}
+	return &Interp{res: res, stdout: stdout, stderr: stderr, maxDepth: 8192, rt: newRuntime(), tid: 1}
 }
 
 // Run calls `main` and returns the process exit status: 0 on success, 101 on a trap.
@@ -93,21 +102,83 @@ func (in *Interp) Run() (exitCode int) {
 		return 1
 	}
 	defer func() {
-		if r := recover(); r != nil {
-			t, isTrap := r.(*Trap)
-			if !isTrap {
-				panic(r)
-			}
-			fmt.Fprintln(in.stderr, t.Error())
-			exitCode = TrapExitCode
+		r := recover()
+		if r == nil {
+			return
 		}
+		// `dying` means another thread trapped first and this one was woken to unwind;
+		// the trap to report is that one, not a second invented here (ADR-0026).
+		if _, unwinding := r.(dying); unwinding {
+			in.rt.mu.Lock()
+			t := in.rt.trap
+			in.rt.mu.Unlock()
+			if t != nil {
+				fmt.Fprintln(in.stderr, t.Error())
+			}
+			exitCode = TrapExitCode
+			return
+		}
+		t, isTrap := r.(*Trap)
+		if !isTrap {
+			panic(r)
+		}
+		// Record it before reporting, so any thread parked on a channel or a lock wakes
+		// and unwinds instead of running on past the end of the program.
+		in.rt.mu.Lock()
+		in.rt.fail(t)
+		in.rt.live--
+		in.rt.mu.Unlock()
+
+		fmt.Fprintln(in.stderr, t.Error())
+		exitCode = TrapExitCode
 	}()
 	in.callFunction(main, nil, nil, false, main.Span())
+
+	// `main` returning does not end the program while a spawned thread is still running
+	// (spec/12-concurrency.md): a Go program's exit racing its goroutines is a common
+	// bug, and "whichever happened first" is not an answer §04 permits.
+	in.rt.mu.Lock()
+	in.rt.live-- // main is no longer a thread that can make progress
+	in.rt.cond.Broadcast()
+	in.rt.mu.Unlock()
+	in.rt.wg.Wait()
+
+	// A thread that trapped while main was finishing still ends the process (ADR-0026).
+	in.rt.mu.Lock()
+	t := in.rt.trap
+	in.rt.mu.Unlock()
+	if t != nil {
+		fmt.Fprintln(in.stderr, t.Error())
+		return TrapExitCode
+	}
 	return 0
 }
 
 func (in *Interp) trap(span diag.Span, format string, args ...any) {
-	panic(&Trap{Msg: fmt.Sprintf(format, args...), Span: span})
+	panic(&Trap{Msg: fmt.Sprintf(format, args...), Span: in.userSpan(span)})
+}
+
+// userSpan resolves a span to the innermost location in the program's own source.
+//
+// The prelude's methods are written in terms of compiler-provided operations, so a trap
+// raised by one of them -- "send on a closed channel" -- naturally carries a span inside
+// the prelude, which tells a programmer nothing they can act on. Walking out to the
+// nearest frame called from real source names the line they wrote instead. Traps raised
+// directly by user code are unaffected, since their span is already outside the prelude.
+func (in *Interp) userSpan(span diag.Span) diag.Span {
+	if !isPreludeSpan(span) {
+		return span
+	}
+	for i := len(in.frames) - 1; i >= 0; i-- {
+		if s := in.frames[i].callSpan; s.Valid() && !isPreludeSpan(s) {
+			return s
+		}
+	}
+	return span
+}
+
+func isPreludeSpan(s diag.Span) bool {
+	return s.Valid() && s.File != nil && s.File.Name == prelude.Name
 }
 
 func (in *Interp) frame() *frame { return in.frames[len(in.frames)-1] }
@@ -125,6 +196,7 @@ func (in *Interp) callFunction(fn *ast.FnDecl, args []Value, recv Value, hasRecv
 	}
 
 	f := newFrame()
+	f.callSpan = span
 	f.self, f.hasSelf = recv, hasRecv
 	for i, p := range fn.Params {
 		in.bindPattern(f, p.Pat, args[i], span)
@@ -155,6 +227,7 @@ func (in *Interp) callClosure(cl *Closure, args []Value, span diag.Span) Value {
 		in.trap(span, "stack overflow")
 	}
 	f := newFrame()
+	f.callSpan = span
 	f.captured = cl.Env
 	for i, p := range lam.Params {
 		in.bindPattern(f, p.Pat, args[i], span)

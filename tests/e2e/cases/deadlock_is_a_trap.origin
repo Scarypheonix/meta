@@ -1,0 +1,12 @@
+use std::io;
+use std::chan;
+
+fn main() {
+    // Nothing will ever send, and there is no other thread to do it: the scheduler can
+    // see that every thread is parked with no condition that could become true, so it
+    // traps rather than hanging (spec/12-concurrency.md).
+    let (s, r) = chan::channel[i64](0);
+    io::println("waiting");
+    let v = r.recv();
+    io::println("not reached");
+}

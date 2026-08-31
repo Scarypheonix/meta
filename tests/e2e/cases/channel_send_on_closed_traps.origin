@@ -1,0 +1,13 @@
+use std::io;
+use std::chan;
+
+fn main() {
+    let (s, r) = chan::channel[i64](1);
+    s.send(1);
+    s.close();
+    io::println("closed");
+    // Sending after close is a programming error in the same sense division by zero is:
+    // the sender has lost track of who owns the channel's lifetime (spec/12).
+    s.send(2);
+    io::println("not reached");
+}

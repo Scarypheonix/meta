@@ -113,6 +113,27 @@ var engines = []engineSpec{
 // engine — so a case landing here again is a real, temporary regression, not the norm.
 var nativeSkips = map[string]string{}
 
+// concurrencyCases are the cases that spawn a thread. The interpreter runs them today;
+// the virtual machine and the native backend do not yet, so they are skipped there by
+// name rather than quietly omitted from the corpus (process rule 8).
+//
+// This list is the live record of how far Phase 6 has reached, exactly as `nativeSkips`
+// was for Phase 5, and it is meant to empty the same way: an entry disappears when the
+// engine can run it, and nothing else changes.
+var concurrencyCases = map[string]bool{
+	"thread_spawn_and_join":        true,
+	"channel_rendezvous_and_close": true,
+	"mutex_guards_shared_mutation": true,
+	"channel_send_on_closed_traps": true,
+	"deadlock_is_a_trap":           true,
+}
+
+// concurrencySkips names the engines that cannot yet run a concurrent program.
+var concurrencySkips = map[driver.Engine]string{
+	driver.VM:     "Phase 6: the virtual machine has no scheduler yet",
+	driver.Native: "Phase 6: the native backend has no scheduler yet",
+}
+
 // runsNatively reports whether the host can execute what the backend produces. Only
 // x86-64 Linux can, which is the point of ADR-0003's second writer.
 func runsNatively() bool { return runtime.GOOS == "linux" && runtime.GOARCH == "amd64" }
@@ -218,6 +239,11 @@ func TestSuiteIsNotEmpty(t *testing.T) {
 
 // skipNative reports why a case cannot run on the native engine, if it cannot.
 func skipNative(c caseFile, e engineSpec) (string, bool) {
+	if concurrencyCases[c.Name] {
+		if reason, unsupported := concurrencySkips[e.engine]; unsupported {
+			return reason, true
+		}
+	}
 	if e.engine != driver.Native {
 		return "", false
 	}

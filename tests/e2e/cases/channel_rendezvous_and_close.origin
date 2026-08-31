@@ -1,0 +1,29 @@
+use std::io;
+use std::thread;
+use std::chan;
+
+fn show(v: Option[i64]) {
+    match v {
+        Option::Some(n) => { io::println(n.to_str()); },
+        Option::None => { io::println("closed"); },
+    }
+}
+
+fn main() {
+    // Capacity 0: a send completes only when a receive is ready for it, so the values
+    // arrive in send order no matter how the two threads are scheduled.
+    let (s, r) = chan::channel[i64](0);
+    let h = thread::spawn(|| -> i64 {
+        s.send(1);
+        s.send(2);
+        s.send(3);
+        s.close();
+        0
+    });
+    show(r.recv());
+    show(r.recv());
+    show(r.recv());
+    show(r.recv());
+    show(r.recv());
+    let z = h.join();
+}
