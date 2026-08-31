@@ -21,12 +21,14 @@ const (
 	cpuTypeX8664    = 0x01000007
 	cpuSubtypeX8664 = 3
 
-	lcSegment64  = 0x19
-	lcUnixThread = 0x5
-	lcSymtab     = 0x2
+	lcSegment64     = 0x19
+	lcUnixThread    = 0x5
+	lcSymtab        = 0x2
+	lcCodeSignature = 0x1d
 
-	machoSymtabCmdSize = 24 // symtab_command: cmd, cmdsize, symoff, nsyms, stroff, strsize
-	machoSymSize       = 16 // nlist_64: n_strx, n_type, n_sect, n_desc, n_value
+	machoSymtabCmdSize  = 24 // symtab_command: cmd, cmdsize, symoff, nsyms, stroff, strsize
+	machoSymSize        = 16 // nlist_64: n_strx, n_type, n_sect, n_desc, n_value
+	machoCodeSigCmdSize = 16 // linkedit_data_command: cmd, cmdsize, dataoff, datasize
 
 	// nSect marks a symbol as defined in a section (n_sect names which one, 1-based
 	// across every section in the file); nExt marks it externally visible, the nlist_64
@@ -59,14 +61,18 @@ const (
 // has no dynamic loader (ADR-0017), so it declares the initial thread state directly and
 // the kernel starts it with rip already pointing at the entry stub.
 //
-// When the image carries ADR-0023's debug information, a third segment, __DWARF, and an
-// LC_SYMTAB load command are appended: __DWARF is a real LC_SEGMENT_64 with three
-// sections, one per DWARF section this package's internal/dwarf produced, but with
-// vmaddr and vmsize both zero -- DWARF is read directly from the file by every consumer
-// (lldb included), never from the running process's memory, so unlike __TEXT and __DATA
-// this segment occupies no address-space range at all. Execution cannot be verified in
-// this container (ADR-0003's own scope: the shipping target is macOS on a real Mac), so
-// this is checked structurally, by reading it back with debug/macho.
+// Every Mach-O also carries a `__LINKEDIT` segment, and it MUST be the file's final
+// segment: macOS's own loader and every signing implementation assume it (ADR-0024).
+// It holds the symbol table, the string table, and the ad-hoc code signature — which is
+// not optional either, since macOS 11 the kernel SIGKILLs any executable with no valid
+// signature at all, and a hand-written executable gets none for free the way one built
+// through `ld` does.
+//
+// When the image carries ADR-0023's debug information, a `__DWARF` segment holds the
+// three sections internal/dwarf produced. Unlike a `.o` file's own `__DWARF`, this one
+// takes a real, non-overlapping address range like every other segment here: a second
+// segment claiming vmaddr 0 collides with `__PAGEZERO`'s own [0, 4 GiB) claim, which
+// macOS's `codesign` rejects outright ("internal error in Code Signing subsystem").
 func (img *Image) writeMachO(w io.Writer) error {
 	t := img.Target
 	textOff := img.TextAddr - t.Base
@@ -77,22 +83,24 @@ func (img *Image) writeMachO(w io.Writer) error {
 	dataSegFileSize := uint64(len(img.Data))
 	dataSegVMSize := align(dataSegFileSize+img.Bss, t.PageSize)
 
-	hasDebug := len(img.DebugAbbrev) > 0 || len(img.Funcs) > 0
-	var debug *machoDebugPlan
-	if hasDebug {
-		debug = buildMachODebug(img, dataOff+dataSegFileSize)
-	}
+	trailer := buildMachOTrailer(img, dataOff+dataSegFileSize)
 
 	f := &writer{}
 
-	ncmds := uint32(4)
+	ncmds := uint32(6)                         // __PAGEZERO, __TEXT, __DATA, __LINKEDIT, LC_SYMTAB, LC_UNIXTHREAD
 	sizeofcmds := uint32(machoSegmentCmdSize + // __PAGEZERO
 		machoSegmentCmdSize + machoSectionSize + // __TEXT
 		machoSegmentCmdSize + machoSectionSize + // __DATA
+		machoSegmentCmdSize + // __LINKEDIT, which carries no sections
+		machoSymtabCmdSize +
 		machoUnixThreadCmdSize)
-	if debug != nil {
-		ncmds += 2 // __DWARF, LC_SYMTAB
-		sizeofcmds += machoSegmentCmdSize + 3*machoSectionSize + machoSymtabCmdSize
+	if trailer.dwarfSize > 0 {
+		ncmds++
+		sizeofcmds += machoSegmentCmdSize + 3*machoSectionSize
+	}
+	if trailer.sigSize > 0 {
+		ncmds++
+		sizeofcmds += machoCodeSigCmdSize
 	}
 
 	f.u32(mhMagic64)
@@ -122,20 +130,37 @@ func (img *Image) writeMachO(w io.Writer) error {
 	machoSection(f, "__data", "__DATA", img.DataAddr, dataSegFileSize, uint32(dataOff),
 		3, sSectionRegular)
 
-	if debug != nil {
-		// vmaddr and vmsize are both zero: see the doc comment above for why this segment
-		// claims no address-space range at all.
-		machoSegment(f, "__DWARF", 0, 0, debug.contentOff, debug.dwarfSize, vmProtNone, vmProtNone, 3)
-		machoSection(f, "__debug_abbrev", "__DWARF", 0, uint64(len(img.DebugAbbrev)), uint32(debug.abbrevOff), 0, sSectionRegular)
-		machoSection(f, "__debug_info", "__DWARF", 0, uint64(len(img.DebugInfo)), uint32(debug.infoOff), 0, sSectionRegular)
-		machoSection(f, "__debug_line", "__DWARF", 0, uint64(len(img.DebugLine)), uint32(debug.lineOff), 0, sSectionRegular)
+	if trailer.dwarfSize > 0 {
+		machoSegment(f, "__DWARF", t.Base+trailer.dwarfOff, align(trailer.dwarfSize, t.PageSize),
+			trailer.dwarfOff, trailer.dwarfSize, vmProtRead, vmProtRead, 3)
+		machoSection(f, "__debug_abbrev", "__DWARF", t.Base+trailer.abbrevOff,
+			uint64(len(img.DebugAbbrev)), uint32(trailer.abbrevOff), 0, sSectionRegular)
+		machoSection(f, "__debug_info", "__DWARF", t.Base+trailer.infoOff,
+			uint64(len(img.DebugInfo)), uint32(trailer.infoOff), 0, sSectionRegular)
+		machoSection(f, "__debug_line", "__DWARF", t.Base+trailer.lineOff,
+			uint64(len(img.DebugLine)), uint32(trailer.lineOff), 0, sSectionRegular)
+	}
 
-		f.u32(lcSymtab)
-		f.u32(machoSymtabCmdSize)
-		f.u32(uint32(debug.symOff))
-		f.u32(uint32(len(img.Funcs)))
-		f.u32(uint32(debug.strOff))
-		f.u32(uint32(len(debug.strtab)))
+	// __LINKEDIT must be the final segment of any Mach-O (ADR-0024). It carries no
+	// sections: the symbol table and the code signature inside it are described by their
+	// own load commands' file offsets, not by section headers.
+	machoSegment(f, "__LINKEDIT", t.Base+trailer.linkeditOff, align(trailer.linkeditSize, t.PageSize),
+		trailer.linkeditOff, trailer.linkeditSize, vmProtRead, vmProtRead, 0)
+
+	f.u32(lcSymtab)
+	f.u32(machoSymtabCmdSize)
+	f.u32(uint32(trailer.symOff))
+	f.u32(uint32(len(img.Funcs)))
+	f.u32(uint32(trailer.strOff))
+	f.u32(uint32(trailer.strSize))
+
+	if trailer.sigSize > 0 {
+		// LC_CODE_SIGNATURE, a linkedit_data_command: where inside __LINKEDIT the ad-hoc
+		// signature blob sits.
+		f.u32(lcCodeSignature)
+		f.u32(machoCodeSigCmdSize)
+		f.u32(uint32(trailer.sigOff))
+		f.u32(uint32(trailer.sigSize))
 	}
 
 	// LC_UNIXTHREAD: the initial register state. Everything is zero except rip.
@@ -158,43 +183,59 @@ func (img *Image) writeMachO(w io.Writer) error {
 	if dataSegFileSize > 0 {
 		f.padTo(dataOff)
 		f.bytes(img.Data)
-	} else if debug != nil {
-		// buildMachODebug computed every appended section's offset starting at
-		// dataOff + len(img.Data); with no data bytes to write, the file must still
-		// reach dataOff before the debug content begins, or the two disagree.
-		f.padTo(dataOff)
 	}
-	if debug != nil {
-		f.bytes(debug.content)
+	if trailer.dwarfSize > 0 {
+		f.padTo(trailer.dwarfOff)
+		f.bytes(trailer.dwarfContent)
 	}
+	f.padTo(trailer.linkeditOff)
+	f.bytes(trailer.linkeditContent)
 
 	_, err := w.Write(f.buf)
 	return err
 }
 
-// machoDebugPlan is buildMachODebug's output: the file layout for everything past the two
-// loadable segments, computed up front the same way elf.go's elfSectionPlan is -- every
-// size here is known from img alone, so the load commands (which name these offsets) can
-// be written before any of these bytes exist.
-type machoDebugPlan struct {
-	contentOff                  uint64
-	dwarfSize                   uint64 // __debug_abbrev + __debug_info + __debug_line combined
+// machoTrailer is the file layout past __DATA: the optional __DWARF segment (ADR-0023)
+// and the mandatory __LINKEDIT one (ADR-0024). It is computed up front, before a single
+// byte of the file is written, the same way textOff/roDataOff/dataOff already are — every
+// size here is known from img alone, and the load commands naming these offsets are
+// written long before the bytes they point at exist.
+//
+// Each region is page-aligned, and each segment's vmaddr keeps this file's own convention
+// that a segment's address is `Base + its file offset`: monotonic offsets therefore give
+// monotonic, non-overlapping addresses for free.
+type machoTrailer struct {
+	// __DWARF, absent (all zero) when the image carries no debug information.
+	dwarfOff, dwarfSize         uint64
 	abbrevOff, infoOff, lineOff uint64
-	symOff, strOff              uint64
-	// content is the three DWARF sections, the nlist_64 symbol table and the string
-	// table, back to back, in exactly the order their offsets above claim.
-	content []byte
-	strtab  []byte
+	dwarfContent                []byte
+
+	// __LINKEDIT: the symbol table, the string table, then the code signature.
+	linkeditOff, linkeditSize uint64
+	symOff, strOff, strSize   uint64
+	sigOff, sigSize           uint64
+	linkeditContent           []byte
 }
 
-// buildMachODebug lays out the nlist_64 symbol table (one STT_FUNC-equivalent global
-// per img.Funcs entry, naming the same address range the ELF symtab does) and the three
-// sections internal/dwarf built (ADR-0023).
-func buildMachODebug(img *Image, contentOff uint64) *machoDebugPlan {
-	abbrevOff := contentOff
-	infoOff := abbrevOff + uint64(len(img.DebugAbbrev))
-	lineOff := infoOff + uint64(len(img.DebugInfo))
-	symOff := lineOff + uint64(len(img.DebugLine))
+// buildMachOTrailer lays out the nlist_64 symbol table (one global per img.Funcs entry,
+// naming the same addresses the ELF symtab does), the three sections internal/dwarf built,
+// and the ad-hoc code signature — everything that follows the two loadable segments.
+func buildMachOTrailer(img *Image, after uint64) *machoTrailer {
+	t := img.Target
+	tr := &machoTrailer{}
+
+	if len(img.DebugAbbrev) > 0 {
+		tr.dwarfOff = align(after, t.PageSize)
+		tr.abbrevOff = tr.dwarfOff
+		tr.infoOff = tr.abbrevOff + uint64(len(img.DebugAbbrev))
+		tr.lineOff = tr.infoOff + uint64(len(img.DebugInfo))
+		tr.dwarfSize = uint64(len(img.DebugAbbrev) + len(img.DebugInfo) + len(img.DebugLine))
+
+		tr.dwarfContent = append(tr.dwarfContent, img.DebugAbbrev...)
+		tr.dwarfContent = append(tr.dwarfContent, img.DebugInfo...)
+		tr.dwarfContent = append(tr.dwarfContent, img.DebugLine...)
+		after = tr.dwarfOff + tr.dwarfSize
+	}
 
 	// nlist_64's string table uses the same convention ELF's SHT_STRTAB does: index 0 is
 	// the mandatory empty string.
@@ -207,26 +248,20 @@ func buildMachODebug(img *Image, contentOff uint64) *machoDebugPlan {
 
 		symtab = binary.LittleEndian.AppendUint32(symtab, nameOff)
 		symtab = append(symtab, nSect|nExt)                  // n_type
-		symtab = append(symtab, 1)                           // n_sect: __text is always section 1 (the first section in load-command order)
+		symtab = append(symtab, 1)                           // n_sect: __text is always section 1
 		symtab = binary.LittleEndian.AppendUint16(symtab, 0) // n_desc: unused
 		symtab = binary.LittleEndian.AppendUint64(symtab, fn.Address)
 	}
-	strOff := symOff + uint64(len(symtab))
 
-	var content []byte
-	content = append(content, img.DebugAbbrev...)
-	content = append(content, img.DebugInfo...)
-	content = append(content, img.DebugLine...)
-	content = append(content, symtab...)
-	content = append(content, strtab...)
+	tr.linkeditOff = align(after, t.PageSize)
+	tr.symOff = tr.linkeditOff
+	tr.strOff = tr.symOff + uint64(len(symtab))
+	tr.strSize = uint64(len(strtab))
+	tr.linkeditContent = append(tr.linkeditContent, symtab...)
+	tr.linkeditContent = append(tr.linkeditContent, strtab...)
+	tr.linkeditSize = uint64(len(tr.linkeditContent))
 
-	return &machoDebugPlan{
-		contentOff: contentOff,
-		dwarfSize:  uint64(len(img.DebugAbbrev) + len(img.DebugInfo) + len(img.DebugLine)),
-		abbrevOff:  abbrevOff, infoOff: infoOff, lineOff: lineOff,
-		symOff: symOff, strOff: strOff,
-		content: content, strtab: strtab,
-	}
+	return tr
 }
 
 func machoSegment(f *writer, name string, vmaddr, vmsize, fileoff, filesize uint64, maxprot, initprot uint32, nsects uint32) {

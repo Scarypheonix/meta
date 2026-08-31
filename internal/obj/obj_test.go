@@ -291,9 +291,13 @@ func TestMachOCarriesDebugInfo(t *testing.T) {
 	if !ok {
 		t.Fatal("no __DWARF segment")
 	}
-	if dwarfSeg.Addr != 0 || dwarfSeg.Memsz != 0 {
-		t.Errorf("__DWARF claims address range [%#x, %#x), want an unmapped [0, 0)",
-			dwarfSeg.Addr, dwarfSeg.Addr+dwarfSeg.Memsz)
+	// __DWARF must not claim vmaddr 0: __PAGEZERO already owns the whole [0, Base) range,
+	// and a second segment colliding with it makes macOS's own `codesign` fail outright
+	// with "internal error in Code Signing subsystem" (ADR-0024, found on the target
+	// machine — the first time a Mach-O build was ever actually run).
+	if dwarfSeg.Addr < MacOS.Base {
+		t.Errorf("__DWARF is at %#x, which collides with __PAGEZERO's [0, %#x)",
+			dwarfSeg.Addr, MacOS.Base)
 	}
 	for _, name := range []string{"__debug_abbrev", "__debug_info", "__debug_line"} {
 		if sect := f.Section(name); sect == nil {
@@ -327,6 +331,64 @@ func TestMachOCarriesDebugInfo(t *testing.T) {
 	cu, err := r.Next()
 	if err != nil || cu == nil || cu.Tag != stddwarf.TagCompileUnit {
 		t.Fatalf("reading the compile-unit DIE: entry %+v, err %v", cu, err)
+	}
+}
+
+// TestMachOLinkeditIsTheFinalSegment is the invariant whose absence made every Mach-O this
+// project ever produced unrunnable, found only when a build was first executed on a real
+// Mac (ADR-0024): macOS requires __LINKEDIT to be a Mach-O's last segment, in both file
+// and address order, because that is where a code signature is appended. Without it the
+// kernel SIGKILLs the process and `codesign` cannot even sign the file to fix it.
+func TestMachOLinkeditIsTheFinalSegment(t *testing.T) {
+	for _, withDebugInfo := range []bool{false, true} {
+		img := helloProgram(t, MacOS, "hi\n", 0)
+		if withDebugInfo {
+			img = withDebug(img, "_start")
+		}
+		path := filepath.Join(t.TempDir(), "hello")
+		writeImage(t, img, path)
+
+		f, err := macho.Open(path)
+		if err != nil {
+			t.Fatalf("debug/macho could not read the file we wrote: %v", err)
+		}
+
+		var segs []*macho.Segment
+		for _, l := range f.Loads {
+			if s, ok := l.(*macho.Segment); ok {
+				segs = append(segs, s)
+			}
+		}
+		f.Close()
+
+		if len(segs) == 0 {
+			t.Fatal("no segments at all")
+		}
+		last := segs[len(segs)-1]
+		if last.Name != "__LINKEDIT" {
+			names := []string{}
+			for _, s := range segs {
+				names = append(names, s.Name)
+			}
+			t.Errorf("debug=%v: the final segment is %q, want __LINKEDIT; got %v",
+				withDebugInfo, last.Name, names)
+		}
+		// Every segment past __PAGEZERO must also sit above it and start after the one
+		// before it: an overlap is what made `codesign` fail with an internal error.
+		for i, s := range segs {
+			if s.Name == "__PAGEZERO" {
+				continue
+			}
+			if s.Addr < MacOS.Base {
+				t.Errorf("debug=%v: %s is at %#x, inside __PAGEZERO's [0, %#x)",
+					withDebugInfo, s.Name, s.Addr, MacOS.Base)
+			}
+			if i > 0 && segs[i-1].Name != "__PAGEZERO" && s.Addr < segs[i-1].Addr+segs[i-1].Memsz {
+				t.Errorf("debug=%v: %s starts at %#x, inside %s's [%#x, %#x)",
+					withDebugInfo, s.Name, s.Addr, segs[i-1].Name,
+					segs[i-1].Addr, segs[i-1].Addr+segs[i-1].Memsz)
+			}
+		}
 	}
 }
 

@@ -186,7 +186,9 @@ func headerSize(t Target) uint64 {
 			machoSegmentCmdSize + machoSectionSize + // __DATA with __data
 			machoUnixThreadCmdSize +
 			machoSegmentCmdSize + 3*machoSectionSize + // __DWARF (ADR-0023), reserved unconditionally
-			machoSymtabCmdSize // LC_SYMTAB, reserved unconditionally
+			machoSymtabCmdSize + // LC_SYMTAB, reserved unconditionally
+			machoSegmentCmdSize + // __LINKEDIT, mandatory and always emitted (ADR-0024)
+			machoCodeSigCmdSize // LC_CODE_SIGNATURE (ADR-0024)
 	}
 	panic(fmt.Sprintf("unimplemented: header size for %s", t.Format))
 }
