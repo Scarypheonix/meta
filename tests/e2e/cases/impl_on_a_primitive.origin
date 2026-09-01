@@ -1,0 +1,45 @@
+use std::io;
+
+// A trait implemented for primitive types. Which impl a call reaches is a question about
+// the receiver's *static* type: `1i64` and `2u8` are the same 64-bit word at run time, and
+// the same is true of the two `f64`/`f32` values below. Every engine answers it the same
+// way, from monomorphization's table (ADR-0010) -- the interpreter included, which is why
+// it needs that table rather than the runtime value in front of it.
+trait Tag {
+    fn tag(self) -> String;
+
+    /// A default body, so the answer also has to survive one level of indirection.
+    fn twice(self) -> String {
+        self.tag()
+    }
+}
+
+impl Tag for i64 { fn tag(self) -> String { "i64" } }
+impl Tag for u8 { fn tag(self) -> String { "u8" } }
+impl Tag for f64 { fn tag(self) -> String { "f64" } }
+impl Tag for bool { fn tag(self) -> String { "bool" } }
+impl Tag for char { fn tag(self) -> String { "char" } }
+impl Tag for String {
+    fn tag(self) -> String { "String" }
+    fn twice(self) -> String { "String twice" }
+}
+
+// The same call site, one instance per instantiation.
+fn show[T: Tag](x: T) {
+    io::println(x.tag());
+    io::println(x.twice());
+}
+
+fn main() {
+    let a = 1i64;
+    let b = 2u8;
+    io::println(a.tag());
+    io::println(b.tag());
+
+    show(a);
+    show(b);
+    show(3.5f64);
+    show(true);
+    show('z');
+    show("s");
+}

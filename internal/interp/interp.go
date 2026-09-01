@@ -7,6 +7,7 @@ import (
 
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/diag"
+	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/prelude"
 	"github.com/scarypheonix/meta/internal/resolve"
 )
@@ -53,6 +54,12 @@ type frame struct {
 	captured map[*resolve.Local]Value
 	self     Value
 	hasSelf  bool
+	// inst is the monomorphized instance whose body this frame is running, and is what
+	// every call made from it is resolved against (ADR-0010). Without it the interpreter
+	// would have to guess which impl a call on a type parameter reaches, and for a
+	// numeric one -- `impl Loud for i64` beside `impl Loud for u8` -- there is nothing in
+	// a Go int64 to guess from.
+	inst *mono.Instance
 	// callSpan is where this frame was called from, which is what lets a trap raised
 	// inside a prelude method name the user's own line instead of the prelude's.
 	callSpan diag.Span
@@ -73,10 +80,15 @@ func (f *frame) lookup(l *resolve.Local) (Value, bool) {
 
 // Interp evaluates a resolved program.
 type Interp struct {
-	res    *resolve.Result
-	stdout io.Writer
-	stderr io.Writer
-	frames []*frame
+	res *resolve.Result
+	// mo is the program's instantiation set, and rootInst finds the single instance of a
+	// function that has no generic parameters of its own -- the entry point for a call
+	// whose callee monomorphization did not have to choose between.
+	mo       *mono.Result
+	rootInst map[*ast.FnDecl]*mono.Instance
+	stdout   io.Writer
+	stderr   io.Writer
+	frames   []*frame
 	// depth guards against unbounded recursion, which the specification says traps as a
 	// stack overflow rather than corrupting memory.
 	depth    int
@@ -93,9 +105,20 @@ type Interp struct {
 }
 
 // New returns an interpreter writing program output to stdout and trap messages to
-// stderr.
-func New(res *resolve.Result, stdout, stderr io.Writer) *Interp {
-	return &Interp{res: res, stdout: stdout, stderr: stderr, maxDepth: 8192, rt: newRuntime(), tid: 1}
+// stderr. mo is the instantiation set for the same program: the interpreter runs only
+// programs that have been checked and monomorphized, and resolves every call through it,
+// exactly as the bytecode compiler and the backend do.
+func New(res *resolve.Result, mo *mono.Result, stdout, stderr io.Writer) *Interp {
+	in := &Interp{res: res, mo: mo, stdout: stdout, stderr: stderr, maxDepth: 8192, rt: newRuntime(), tid: 1}
+	in.rootInst = map[*ast.FnDecl]*mono.Instance{}
+	if mo != nil {
+		for _, inst := range mo.Instances {
+			if len(inst.Args) == 0 {
+				in.rootInst[inst.Decl] = inst
+			}
+		}
+	}
+	return in
 }
 
 // Run calls `main` and returns the process exit status: 0 on success, 101 on a trap.
@@ -136,7 +159,7 @@ func (in *Interp) Run() (exitCode int) {
 		fmt.Fprintln(in.stderr, t.Error())
 		exitCode = TrapExitCode
 	}()
-	in.callFunction(main, nil, nil, false, main.Span())
+	in.callFunction(main, in.rootInst[main], nil, nil, false, main.Span())
 
 	// `main` returning does not end the program while a spawned thread is still running
 	// (spec/12-concurrency.md): a Go program's exit racing its goroutines is a common
@@ -187,8 +210,9 @@ func isPreludeSpan(s diag.Span) bool {
 
 func (in *Interp) frame() *frame { return in.frames[len(in.frames)-1] }
 
-// callFunction evaluates a function or method body in a fresh frame.
-func (in *Interp) callFunction(fn *ast.FnDecl, args []Value, recv Value, hasRecv bool, span diag.Span) Value {
+// callFunction evaluates a function or method body in a fresh frame, running as the
+// given instance: `inst` is what the calls inside that body are resolved against.
+func (in *Interp) callFunction(fn *ast.FnDecl, inst *mono.Instance, args []Value, recv Value, hasRecv bool, span diag.Span) Value {
 	if fn.Body == nil {
 		in.trap(span, "call to `%s`, which has no body", fn.Name.Name)
 	}
@@ -201,6 +225,7 @@ func (in *Interp) callFunction(fn *ast.FnDecl, args []Value, recv Value, hasRecv
 
 	f := newFrame()
 	f.callSpan = span
+	f.inst = inst
 	f.self, f.hasSelf = recv, hasRecv
 	for i, p := range fn.Params {
 		in.bindPattern(f, p.Pat, args[i], span)
@@ -221,7 +246,7 @@ func (in *Interp) callFunction(fn *ast.FnDecl, args []Value, recv Value, hasRecv
 // callClosure applies a function value.
 func (in *Interp) callClosure(cl *Closure, args []Value, span diag.Span) Value {
 	if cl.Fn != nil {
-		return in.callFunction(cl.Fn, args, cl.Recv, cl.HasRecv, span)
+		return in.callFunction(cl.Fn, cl.Inst, args, cl.Recv, cl.HasRecv, span)
 	}
 	lam := cl.Lambda
 	if len(args) != len(lam.Params) {
@@ -233,6 +258,9 @@ func (in *Interp) callClosure(cl *Closure, args []Value, span diag.Span) Value {
 	f := newFrame()
 	f.callSpan = span
 	f.captured = cl.Env
+	// A lambda's body is compiled inside the instance that created it and has no
+	// instance of its own, so calls it makes resolve against that one (ADR-0010).
+	f.inst = cl.Inst
 	for i, p := range lam.Params {
 		in.bindPattern(f, p.Pat, args[i], span)
 	}
@@ -489,7 +517,14 @@ func (in *Interp) evalPath(p *ast.PathExpr) (Value, ctrl) {
 		}
 		return v, normal
 	case resolve.Fn:
-		return &Closure{Fn: ref.Fn}, normal
+		// The instance is the one this *use site* reaches: `identity` mentioned where an
+		// `i64` is wanted is `identity[i64]`, and monomorphization recorded which. A
+		// function with no generic parameters has exactly one instance and no entry.
+		inst, ok := in.mo.Lookup(in.frame().inst, p.NodeID())
+		if !ok {
+			inst = in.rootInst[ref.Fn]
+		}
+		return &Closure{Fn: ref.Fn, Inst: inst}, normal
 	case resolve.Builtin:
 		return &Builtin{Name: ref.Builtin}, normal
 	case resolve.Variant:
@@ -619,7 +654,7 @@ func (in *Interp) makeClosure(l *ast.Lambda) Value {
 			env[local] = v
 		}
 	}
-	return &Closure{Lambda: l, Env: env}
+	return &Closure{Lambda: l, Env: env, Inst: in.frame().inst}
 }
 
 func (in *Interp) evalMatch(m *ast.Match) (Value, ctrl) {
@@ -683,10 +718,15 @@ func (in *Interp) evalFor(fo *ast.For) (Value, ctrl) {
 	if c.stops() {
 		return Unit{}, c
 	}
-	it := in.callMethodOn(iterable, "into_iter", nil, fo.Iter.Span())
+	// The desugaring's two calls have no nodes of their own, so both are keyed to the
+	// `for` node in two tables (internal/check's forElementType explains why).
+	cur := in.frame().inst
+	intoIter, _ := in.mo.LookupIter(cur, fo.NodeID())
+	nextFn, _ := in.mo.Lookup(cur, fo.NodeID())
+	it := in.callResolved(intoIter, iterable, "into_iter", nil, fo.Iter.Span())
 	f := in.frame()
 	for {
-		next := in.callMethodOn(it, "next", nil, fo.Span())
+		next := in.callResolved(nextFn, it, "next", nil, fo.Span())
 		e, ok := next.(*Enum)
 		if !ok || e.Def.Name.Name != "Option" {
 			in.trap(fo.Span(), "`next` must return `Option`, found %s", TypeName(next))

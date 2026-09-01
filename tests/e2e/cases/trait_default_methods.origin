@@ -1,0 +1,46 @@
+use std::io;
+
+// A default method body (spec/06-traits-generics.md): declared once on the trait, run
+// once per implementing type. It is generic in `Self` exactly the way a generic function
+// is generic in its parameters, so monomorphization gives it one instance per impl --
+// which is why `describe` below prints a different name each time even though there is
+// only one copy of its source.
+trait Named {
+    fn name(self) -> String;
+
+    /// A default method may call a required one.
+    fn describe(self) -> String {
+        self.name()
+    }
+
+    /// And another default. An impl that declares this itself wins over it.
+    fn kind(self) -> String {
+        "unknown"
+    }
+}
+
+struct Cat {}
+struct Dog {}
+
+impl Named for Cat {
+    fn name(self) -> String { "cat" }
+}
+
+impl Named for Dog {
+    fn name(self) -> String { "dog" }
+    fn kind(self) -> String { "canine" }
+}
+
+// A default method is reachable through a bound, not just on a concrete type.
+fn report[T: Named](x: T) {
+    io::println(x.describe());
+    io::println(x.kind());
+}
+
+fn main() {
+    let c = Cat {};
+    io::println(c.describe());
+    io::println(c.kind());
+    report(c);
+    report(Dog {});
+}

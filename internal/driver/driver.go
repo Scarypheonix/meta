@@ -260,7 +260,7 @@ func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer
 		return ExitDiagnostics
 	}
 	if engine == Interpreter {
-		return interp.New(prog.Resolved, stdout, stderr).Run()
+		return interp.New(prog.Resolved, prog.Mono, stdout, stderr).Run()
 	}
 	code, err := compile.Program(prog.Resolved, prog.Types, prog.Mono, prog.AllASTs...)
 	if err != nil {
@@ -419,7 +419,7 @@ func Run(path string, stdout, stderr io.Writer) int {
 	if !ok {
 		return ExitDiagnostics
 	}
-	return interp.New(prog.Resolved, stdout, stderr).Run()
+	return interp.New(prog.Resolved, prog.Mono, stdout, stderr).Run()
 }
 
 // DumpAST compiles a file and prints its syntax tree.

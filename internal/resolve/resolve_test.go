@@ -215,44 +215,6 @@ func TestBreakOutsideALoopIsReported(t *testing.T) {
 	}
 }
 
-func TestImplMethodsAreCollected(t *testing.T) {
-	_, res, bag := resolveSrc(t, `
-struct S { x: i64 }
-impl S {
-    fn get(self) -> i64 { 0 }
-    fn set(mut self, v: i64) { }
-}
-`)
-	if bag.HasErrors() {
-		t.Fatalf("unexpected errors:\n%s", bag)
-	}
-	methods := res.Methods["S"]
-	if len(methods) != 2 || methods["get"] == nil || methods["set"] == nil {
-		t.Errorf("collected %d methods on `S`, want get and set", len(methods))
-	}
-}
-
-// Whether two methods with one name clash depends on which traits their impls are for,
-// which only the checker knows. The resolver just collects them for the interpreter's
-// runtime dispatch; the rejection is a conformance case (trait_duplicate_inherent_method).
-func TestMethodTableCollectsEveryImplMethod(t *testing.T) {
-	_, res, bag := resolveSrc(t, `
-struct S { x: i64 }
-impl S {
-    fn get(self) -> i64 { 0 }
-}
-impl S {
-    fn other(self) -> i64 { 1 }
-}
-`)
-	if bag.HasErrors() {
-		t.Fatalf("unexpected errors:\n%s", bag)
-	}
-	if m := res.Methods["S"]; m["get"] == nil || m["other"] == nil {
-		t.Errorf("methods from separate impls should all be collected, got %d", len(m))
-	}
-}
-
 func TestMatchArmBindingsDoNotLeak(t *testing.T) {
 	_, _, bag := resolveSrc(t, `
 enum E { A(i64), B }

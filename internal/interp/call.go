@@ -5,6 +5,7 @@ import (
 
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/diag"
+	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/resolve"
 )
 
@@ -72,42 +73,30 @@ func (in *Interp) evalMethodCall(m *ast.MethodCall) (Value, ctrl) {
 		}
 		args = append(args, v)
 	}
-	return in.callMethod(recv, m.Name.Name, args, m.Span()), normal
+	target, _ := in.mo.Lookup(in.frame().inst, m.NodeID())
+	return in.callResolved(target, recv, m.Name.Name, args, m.Span()), normal
 }
 
-// callMethodOn is the entry point used by the `for` desugaring.
-func (in *Interp) callMethodOn(recv Value, name string, args []Value, span diag.Span) Value {
-	return in.callMethod(recv, name, args, span)
-}
-
-// callMethod resolves a method call: user-declared impl methods first, then the
-// builtin methods on primitives (spec/06-traits-generics.md's resolution order, minus
-// the trait machinery that arrives in Phase 2).
-func (in *Interp) callMethod(recv Value, name string, args []Value, span diag.Span) Value {
-	if fn := in.userMethod(recv, name); fn != nil {
-		return in.callFunction(fn, args, recv, true, span)
+// callResolved runs the method a call site reaches.
+//
+// `target` is monomorphization's answer for this site inside the instance that is running
+// -- the same answer the bytecode compiler and the backend get, from the same table
+// (ADR-0010). It is what makes `x.shout()` inside `fn go[T: Loud](x: T)` reach a different
+// impl per instantiation, which nothing about the runtime value could say: `1i64` and
+// `2u8` are one Go int64 here.
+//
+// A site with no instance reaches a compiler-provided impl -- `42.to_str()`,
+// `"a".cmp("b")` -- which is not Origin source to run, and falls through to the builtin
+// methods.
+func (in *Interp) callResolved(target *mono.Instance, recv Value, name string, args []Value, span diag.Span) Value {
+	if target != nil && target.Decl.Body != nil {
+		return in.callFunction(target.Decl, target, args, recv, true, span)
 	}
 	if v, ok := in.builtinMethod(recv, name, args, span); ok {
 		return v
 	}
 	in.trap(span, "no method `%s` on %s", name, TypeName(recv))
 	return Unit{}
-}
-
-func (in *Interp) userMethod(recv Value, name string) *ast.FnDecl {
-	var typeName string
-	switch r := recv.(type) {
-	case *Struct:
-		typeName = r.Def.Name.Name
-	case *Enum:
-		typeName = r.Def.Name.Name
-	default:
-		return nil
-	}
-	if methods, ok := in.res.Methods[typeName]; ok {
-		return methods[name]
-	}
-	return nil
 }
 
 // ---------------------------------------------------------------------------

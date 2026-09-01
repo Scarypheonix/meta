@@ -1,8 +1,8 @@
 // Package interp is Origin's tree-walking interpreter (Phase 1).
 //
-// Phase 1 is dynamically typed on purpose: the project's plan is to get semantics right
-// before types. Where the specification's behaviour depends on a static type the
-// interpreter does what it can and says so:
+// It evaluates the syntax tree directly, and its values are Go values: an Origin integer
+// is a Go int64 with no width, an aggregate is a Go pointer. Where the specification's
+// behaviour depends on a static type, that costs it something and it says so:
 //
 //   - Integer arithmetic uses i64 semantics for every integer. Per-width overflow
 //     (`255u8 + 1`) needs the type checker and lands in Phase 2.
@@ -10,8 +10,14 @@
 //     because the receiver's type is not known until then. Phase 2 moves it earlier.
 //
 // Both are recorded in docs/phases/1-complete.md. Neither is a stub that lies: the rule
-// is enforced, just later than the specification's phase ordering will eventually put
-// it.
+// is enforced, just later than the specification's phase ordering will eventually put it.
+//
+// Method dispatch used to be a third such place and is not any more. Which impl a call
+// reaches is a fact about the receiver's static type -- `impl Loud for i64` and
+// `impl Loud for u8` are one Go int64 here -- so the interpreter reads the answer from the
+// instantiation set instead of guessing from the value, exactly as the bytecode compiler
+// and the backend do (ADR-0029). It keeps no types of its own; it reads the ones the
+// checker already computed.
 package interp
 
 import (
@@ -20,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/scarypheonix/meta/internal/ast"
+	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/resolve"
 )
 
@@ -112,6 +119,11 @@ type Closure struct {
 	// Recv is the bound receiver for a method value.
 	Recv    Value
 	HasRecv bool
+	// Inst is the monomorphized instance the function value stands for: for a named
+	// function, the one its use site reaches; for a lambda, the one that created it. A
+	// function value carries it because a call through the value happens somewhere with
+	// no name to look up (ADR-0010).
+	Inst *mono.Instance
 }
 
 func (*Closure) isValue() {}

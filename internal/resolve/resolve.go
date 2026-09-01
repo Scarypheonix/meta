@@ -106,9 +106,6 @@ type Result struct {
 	// concurrency handles (`JoinHandle`, `Sender`, `Receiver`, `Mutex`) whose values no
 	// Origin expression constructs (spec/12-concurrency.md).
 	Structs map[string]*ast.StructDecl
-	// Methods maps a type name to its inherent and trait-impl methods. Phase 1 keys by
-	// the impl's type name; Phase 2 replaces this with real trait resolution.
-	Methods map[string]map[string]*ast.FnDecl
 }
 
 // Ref returns the resolution recorded for a node, and whether one exists.
@@ -212,7 +209,6 @@ func Program(bag *diag.Bag, inputs ...Input) *Result {
 			Fns:      map[string]*ast.FnDecl{},
 			Enums:    map[string]*ast.EnumDecl{},
 			Structs:  map[string]*ast.StructDecl{},
-			Methods:  map[string]map[string]*ast.FnDecl{},
 		},
 	}
 
@@ -415,32 +411,11 @@ func (r *resolver) declareItem(it ast.Item) {
 	case *ast.TypeAliasDecl:
 		r.declare(v.Name, Ref{Kind: TypeAlias, Alias: v, Name: v.Name.Name})
 	case *ast.ImplDecl:
-		// An impl declares no top-level name; its methods are found through the type.
-		name := implTypeName(v.Type)
-		if name == "" {
-			return
-		}
-		if r.out.Methods[name] == nil {
-			r.out.Methods[name] = map[string]*ast.FnDecl{}
-		}
-		// Duplicates are not diagnosed here: whether two methods clash depends on which
-		// traits their impls are for, which only the checker knows. This table exists
-		// for the interpreter's runtime dispatch.
-		for _, m := range v.Methods {
-			r.out.Methods[name][m.Name.Name] = m
-		}
+		// An impl declares no top-level name at all: its methods are reached through the
+		// receiver's type, which is the checker's question rather than the resolver's,
+		// and the instance every call site reaches is monomorphization's (ADR-0010).
 	case *ast.ErrorItem:
 	}
-}
-
-// implTypeName returns the name an impl attaches its methods to, or "" when the impl's
-// type is not a simple path (which Phase 1 does not support).
-func implTypeName(t ast.Type) string {
-	pt, ok := t.(*ast.PathType)
-	if !ok || pt.Path == nil || len(pt.Path.Segments) == 0 {
-		return ""
-	}
-	return pt.Path.Last().Name
 }
 
 func (r *resolver) declare(name ast.Ident, ref Ref) {

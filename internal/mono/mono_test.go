@@ -259,3 +259,59 @@ fn main() {
 		}
 	}
 }
+
+// A trait's default method body is generic in `Self` (internal/check's `signature` puts
+// `Self` in the method's generic parameters), so it monomorphizes like any other generic
+// function: one instance per implementing type, each resolving the required methods it
+// calls against that type's own impl.
+func TestDefaultMethodGetsOneInstancePerImplementor(t *testing.T) {
+	_, _, mo, bag := build(t, `
+trait Named {
+    fn name(self) -> String;
+    fn describe(self) -> String { self.name() }
+}
+struct Cat {}
+struct Dog {}
+impl Named for Cat { fn name(self) -> String { "cat" } }
+impl Named for Dog { fn name(self) -> String { "dog" } }
+fn main() {
+    let a = Cat {}.describe();
+    let b = Dog {}.describe();
+}
+`)
+	if bag.HasErrors() {
+		t.Fatalf("unexpected errors:\n%s", bag)
+	}
+	var describes []*Instance
+	for _, i := range mo.Instances {
+		if strings.HasPrefix(i.Name, "describe[") {
+			describes = append(describes, i)
+		}
+	}
+	if len(describes) != 2 {
+		t.Fatalf("`describe` produced %d instances, want 2 (one per implementor): %v",
+			len(describes), namesOf(mo))
+	}
+	// Each one must reach its own implementor's `name`, not the trait's declaration.
+	for _, inst := range describes {
+		if len(inst.Calls) != 1 {
+			t.Fatalf("%s resolved %d calls, want 1 (`self.name()`)", inst.Name, len(inst.Calls))
+		}
+		for _, target := range inst.Calls {
+			if target.Decl.Body == nil {
+				t.Errorf("%s reached a bodyless declaration", inst.Name)
+			}
+		}
+	}
+	// Both impls call their method `name`, so the instance names match; what must
+	// differ is the declaration each one reached.
+	var reached []*ast.FnDecl
+	for _, inst := range describes {
+		for _, target := range inst.Calls {
+			reached = append(reached, target.Decl)
+		}
+	}
+	if reached[0] == reached[1] {
+		t.Error("both instances of `describe` reached the same `name`; each should reach its own impl")
+	}
+}

@@ -707,10 +707,10 @@ func (c *Checker) recordForCall(into map[ast.NodeID]*Inst, nodeID ast.NodeID, re
 	for _, p := range cand.Sig.Params {
 		subst[p] = c.freshFor(span)
 	}
-	c.recordMethodInst(into, nodeID, name, cand, recv, subst)
 	if cand.Trait != nil {
 		subst[cand.Trait.SelfParam] = recv
 	}
+	c.recordMethodInst(into, nodeID, name, cand, recv, subst)
 	for _, b := range cand.Sig.Bounds {
 		c.requireBound(types.Substitute(b.Type, subst), b.Trait, span)
 	}
@@ -1103,10 +1103,14 @@ func (c *Checker) inferMethodCall(v *ast.MethodCall) types.Type {
 	for _, p := range cand.Sig.Params {
 		subst[p] = c.freshFor(v.Span())
 	}
-	c.recordMethodInst(c.out.Insts, v.NodeID(), v.Name.Name, cand, recv, subst)
+	// `Self` is one of the generic parameters of a trait's own declaration (decl.go's
+	// `signature` puts it there), so it has to be in the substitution before the
+	// instantiation is recorded -- otherwise a default method body, whose declaration
+	// *is* the trait's, is recorded with `Self` unknown and reaches no instance at all.
 	if cand.Trait != nil {
 		subst[cand.Trait.SelfParam] = recv
 	}
+	c.recordMethodInst(c.out.Insts, v.NodeID(), v.Name.Name, cand, recv, subst)
 	for _, b := range cand.Sig.Bounds {
 		c.requireBound(types.Substitute(b.Type, subst), b.Trait, v.Span())
 	}

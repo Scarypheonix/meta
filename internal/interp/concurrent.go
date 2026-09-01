@@ -180,7 +180,8 @@ func (in *Interp) spawn(body *Closure, span diag.Span) int64 {
 	// of interpreter state that is per-thread. Everything else, the heap included, is
 	// shared by construction, which is exactly what `Send` exists to make safe.
 	child := &Interp{
-		res: in.res, stdout: in.stdout, stderr: in.stderr,
+		res: in.res, mo: in.mo, rootInst: in.rootInst,
+		stdout: in.stdout, stderr: in.stderr,
 		maxDepth: in.maxDepth, rt: r, tid: tid,
 	}
 
