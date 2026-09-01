@@ -661,12 +661,11 @@ func (c *Checker) inferFor(v *ast.For) types.Type {
 // `next()` yielding `Option[Item]`.
 //
 // The desugaring never becomes AST nodes of its own — there is no `ast.MethodCall` for
-// `into_iter()` or `next()` to hang an instantiation off — so the two implicit calls'
-// instantiations are recorded here, keyed to nodes the desugaring's normative form
-// would otherwise attach them to: `v.Iter` (`e.into_iter()`'s receiver) and `v` itself
-// (standing in for `__it.next()`, since `__it` never exists as a binding). Both are
-// visited by `ast.Inspect` over the `for`'s own body, which is how `internal/mono`
-// discovers them the same way it discovers an explicit method call's instantiation.
+// `into_iter()` or `next()` to hang an instantiation off — so both implicit calls are
+// recorded against the `for` node itself, in two tables: `next` in Insts, where every
+// other call site lives, and `into_iter` in IterInsts. Two tables rather than two nodes,
+// because the only other node the desugaring could name is the iterable expression, and
+// that already has an entry of its own whenever it is itself a call (`for k in m.keys()`).
 func (c *Checker) forElementType(v *ast.For, iter types.Type) types.Type {
 	if types.IsError(iter) {
 		return types.Error
@@ -678,7 +677,7 @@ func (c *Checker) forElementType(v *ast.For, iter types.Type) types.Type {
 	c.requireBound(iter, intoIter, v.Iter.Span())
 	elem := c.normalize(&types.AssocT{Trait: intoIter.Decl, Member: "Item", Self: iter})
 
-	iterType, ok := c.recordForCall(v.Iter.NodeID(), iter, "into_iter", v.Iter.Span())
+	iterType, ok := c.recordForCall(c.out.IterInsts, v.NodeID(), iter, "into_iter", v.Iter.Span())
 	if !ok {
 		// `iter` does not actually implement `IntoIterator`: requireBound above already
 		// reports it once checking the body finishes.
@@ -687,7 +686,7 @@ func (c *Checker) forElementType(v *ast.For, iter types.Type) types.Type {
 	if iteratorTrait := c.traitByName("Iterator"); iteratorTrait != nil {
 		c.requireBound(iterType, iteratorTrait, v.Span())
 	}
-	c.recordForCall(v.NodeID(), iterType, "next", v.Span())
+	c.recordForCall(c.out.Insts, v.NodeID(), iterType, "next", v.Span())
 	return elem
 }
 
@@ -696,7 +695,7 @@ func (c *Checker) forElementType(v *ast.For, iter types.Type) types.Type {
 // It mirrors the instantiation-recording half of inferMethodCall, without the argument
 // unification an explicit call site needs. ok is false when no candidate exists for
 // name on recv, which the caller treats as an error already reported elsewhere.
-func (c *Checker) recordForCall(nodeID ast.NodeID, recv types.Type, name string, span diag.Span) (ret types.Type, ok bool) {
+func (c *Checker) recordForCall(into map[ast.NodeID]*Inst, nodeID ast.NodeID, recv types.Type, name string, span diag.Span) (ret types.Type, ok bool) {
 	cand, _ := c.lookupMethod(recv, name)
 	if cand == nil {
 		return types.Error, false
@@ -708,7 +707,7 @@ func (c *Checker) recordForCall(nodeID ast.NodeID, recv types.Type, name string,
 	for _, p := range cand.Sig.Params {
 		subst[p] = c.freshFor(span)
 	}
-	c.recordMethodInst(nodeID, name, cand, recv, subst)
+	c.recordMethodInst(into, nodeID, name, cand, recv, subst)
 	if cand.Trait != nil {
 		subst[cand.Trait.SelfParam] = recv
 	}
@@ -1104,7 +1103,7 @@ func (c *Checker) inferMethodCall(v *ast.MethodCall) types.Type {
 	for _, p := range cand.Sig.Params {
 		subst[p] = c.freshFor(v.Span())
 	}
-	c.recordMethodInst(v.NodeID(), v.Name.Name, cand, recv, subst)
+	c.recordMethodInst(c.out.Insts, v.NodeID(), v.Name.Name, cand, recv, subst)
 	if cand.Trait != nil {
 		subst[cand.Trait.SelfParam] = recv
 	}
@@ -1271,7 +1270,7 @@ var _ = math.MaxInt64
 // desugaring in spec/04-expressions.md implies, but that never becomes an AST node of
 // its own — `for`'s `into_iter()`/`next()` — can be recorded too, keyed to whichever
 // existing node stands in for it (see forElementType).
-func (c *Checker) recordMethodInst(nodeID ast.NodeID, name string, cand *methodCandidate, recv types.Type, subst map[*types.Param]types.Type) {
+func (c *Checker) recordMethodInst(into map[ast.NodeID]*Inst, nodeID ast.NodeID, name string, cand *methodCandidate, recv types.Type, subst map[*types.Param]types.Type) {
 	inst := &Inst{Decl: cand.Decl, Recv: recv, Method: name}
 	for _, p := range c.out.Generics[cand.Decl] {
 		arg, known := subst[p]
@@ -1281,5 +1280,5 @@ func (c *Checker) recordMethodInst(nodeID ast.NodeID, name string, cand *methodC
 		inst.Params = append(inst.Params, p)
 		inst.Args = append(inst.Args, arg)
 	}
-	c.out.Insts[nodeID] = inst
+	into[nodeID] = inst
 }

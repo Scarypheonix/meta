@@ -713,6 +713,20 @@ func (e *emitter) builtin(v *ir.Value) error {
 		}
 		return e.withLock(v)
 
+	case compile.BuiltinHash:
+		// The specified hash (spec/13-collections.md): the same number on all three
+		// engines, which is why the algorithm and the encoding are in the specification
+		// rather than in whichever runtime got there first.
+		if len(v.Args) != 1 {
+			return fmt.Errorf("this is a compiler bug: hash::of takes one argument, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.a.MovRI(x86.RSI, uint64(hashKindOf(v.Args[0].Kind)))
+		e.a.Call(e.rt.hashWord)
+		e.recordCall(v)
+		e.def(v, x86.RAX)
+		return nil
+
 	case compile.BuiltinNewArray:
 		// rt_array_new(capacity, typeid): the second argument is the layout
 		// internal/compile chose for this instantiation, which is what tells the

@@ -3,6 +3,7 @@ package check
 import (
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/diag"
+	"github.com/scarypheonix/meta/internal/prelude"
 	"github.com/scarypheonix/meta/internal/resolve"
 	"github.com/scarypheonix/meta/internal/types"
 )
@@ -26,12 +27,32 @@ func (c *Checker) preludeDef(name string) *types.Def {
 	if c.preludeDefs == nil {
 		c.preludeDefs = map[string]*types.Def{}
 		for _, def := range c.defs {
-			if def != nil {
+			if def != nil && DeclaredInPrelude(def) {
 				c.preludeDefs[def.Name] = def
 			}
 		}
 	}
 	return c.preludeDefs[name]
+}
+
+// DeclaredInPrelude reports whether a definition is the prelude's own.
+//
+// A program may declare a type with a name the prelude also uses -- `enum List` is an
+// ordinary thing to write, and spec/07-modules.md makes the prelude the last resolution
+// step, so the program's own name wins in the program's own code. What must not happen is
+// the reverse: a builtin's signature naming `List` and getting the *program's*, which is
+// how `map::new` briefly came to return a list of somebody else's enum.
+func DeclaredInPrelude(def *types.Def) bool {
+	var span diag.Span
+	switch {
+	case def.Struct != nil:
+		span = def.Struct.Span()
+	case def.Enum != nil:
+		span = def.Enum.Span()
+	default:
+		return false
+	}
+	return span.Valid() && span.File != nil && span.File.Name == prelude.Name
 }
 
 // named builds `Name[args...]` for a prelude type, or the error type when the prelude

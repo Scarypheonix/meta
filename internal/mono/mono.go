@@ -44,6 +44,10 @@ type Instance struct {
 	// no entry is one no instance can be named for: a method whose impl is provided by
 	// the compiler, which the code generator lowers to a builtin.
 	Calls map[ast.NodeID]*Instance
+	// IterCalls maps a `for` loop to the `into_iter` instance it reaches. It is separate
+	// from Calls because the loop's other implicit call, `next`, is keyed by the same
+	// node (internal/check's Result explains why neither can move).
+	IterCalls map[ast.NodeID]*Instance
 
 	key    string
 	depth  int
@@ -67,6 +71,16 @@ func (r *Result) Lookup(from *Instance, node ast.NodeID) (*Instance, bool) {
 		return nil, false
 	}
 	inst, ok := from.Calls[node]
+	return inst, ok
+}
+
+// LookupIter finds the `into_iter` instance one `for` loop reaches, from the table that
+// exists because the loop's two implicit calls share a node (internal/check's Result).
+func (r *Result) LookupIter(from *Instance, node ast.NodeID) (*Instance, bool) {
+	if from == nil {
+		return nil, false
+	}
+	inst, ok := from.IterCalls[node]
 	return inst, ok
 }
 
@@ -149,11 +163,12 @@ func (w *walker) instance(decl *ast.FnDecl, params []*types.Param, args []types.
 	}
 	inst := &Instance{
 		Decl: decl, Args: args, Subst: subst,
-		Name:   instanceName(decl, args),
-		Calls:  map[ast.NodeID]*Instance{},
-		key:    key,
-		depth:  depth,
-		parent: from,
+		Name:      instanceName(decl, args),
+		Calls:     map[ast.NodeID]*Instance{},
+		IterCalls: map[ast.NodeID]*Instance{},
+		key:       key,
+		depth:     depth,
+		parent:    from,
 	}
 	w.out.byKey[key] = inst
 	w.out.Instances = append(w.out.Instances, inst)
@@ -162,14 +177,21 @@ func (w *walker) instance(decl *ast.FnDecl, params []*types.Param, args []types.
 }
 
 // walkBody resolves every call site in one instance's body.
+//
+// Two tables, because a `for` loop makes two calls the source does not write and only one
+// node to hang them off: `next` is in Insts with every other call site, and `into_iter` is
+// in IterInsts (internal/check's forElementType explains why it cannot share).
 func (w *walker) walkBody(inst *Instance) {
 	ast.Inspect(inst.Decl.Body, func(n ast.Node) bool {
-		ci, ok := w.tys.Insts[n.NodeID()]
-		if !ok {
-			return true
+		if ci, ok := w.tys.Insts[n.NodeID()]; ok {
+			if target := w.resolve(inst, ci, n.Span()); target != nil {
+				inst.Calls[n.NodeID()] = target
+			}
 		}
-		if target := w.resolve(inst, ci, n.Span()); target != nil {
-			inst.Calls[n.NodeID()] = target
+		if ci, ok := w.tys.IterInsts[n.NodeID()]; ok {
+			if target := w.resolve(inst, ci, n.Span()); target != nil {
+				inst.IterCalls[n.NodeID()] = target
+			}
 		}
 		return true
 	})

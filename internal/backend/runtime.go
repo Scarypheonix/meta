@@ -138,6 +138,10 @@ type runtimeLabels struct {
 	arraySet      x86.Label
 	arrayPush     x86.Label
 	arrayTruncate x86.Label
+	// The specified hash (hash.go, spec/13-collections.md).
+	hashMix    x86.Label
+	hashWord   x86.Label
+	hashObject x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -189,6 +193,9 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.arraySet = e.a.NewLabel("rt_array_set")
 	e.rt.arrayPush = e.a.NewLabel("rt_array_push")
 	e.rt.arrayTruncate = e.a.NewLabel("rt_array_truncate")
+	e.rt.hashMix = e.a.NewLabel("rt_hash_mix")
+	e.rt.hashWord = e.a.NewLabel("rt_hash_word")
+	e.rt.hashObject = e.a.NewLabel("rt_hash_object")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -230,6 +237,9 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitArraySet()
 	e.emitArrayPush()
 	e.emitArrayTruncate()
+	e.emitHashMix()
+	e.emitHashWord()
+	e.emitHashObject()
 	e.emitCollect()
 }
 

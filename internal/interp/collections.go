@@ -1,6 +1,11 @@
 package interp
 
-import "github.com/scarypheonix/meta/internal/diag"
+import (
+	"encoding/binary"
+	"math"
+
+	"github.com/scarypheonix/meta/internal/diag"
+)
 
 // The array operations, interpreted (spec/13-collections.md).
 //
@@ -27,6 +32,30 @@ func (*Array) isValue() {}
 // is ignored: the interpreter has no object layouts to be told about.
 func (in *Interp) arrayBuiltin(name string, args []Value, span diag.Span) (Value, bool) {
 	switch name {
+	case "hash::of":
+		return Int(int64(in.hashOf(args[0], span))), true
+
+	case "map::new":
+		// The other two engines never reach this: internal/compile writes an empty entry
+		// list and a zeroed index out of operations that already exist. The interpreter
+		// walks the syntax tree, so it builds the same two fields here.
+		def := in.res.Structs["Map"]
+		if def == nil {
+			in.trap(span, "the prelude does not define `Map`")
+		}
+		entries := in.res.Structs["List"]
+		if entries == nil {
+			in.trap(span, "the prelude does not define `List`")
+		}
+		index := &Array{Elems: make([]Value, mapInitialSlots), Cap: mapInitialSlots}
+		for i := range index.Elems {
+			index.Elems[i] = Int(0)
+		}
+		return &Struct{Def: def, Vals: []Value{
+			&Struct{Def: entries, Vals: []Value{&Array{}}},
+			index,
+		}}, true
+
 	case "list::new":
 		// The other two engines never reach a `list::new` at all: internal/compile
 		// writes it out as an empty array wrapped in the prelude's own struct. The
@@ -87,6 +116,11 @@ func (in *Interp) arrayBuiltin(name string, args []Value, span diag.Span) (Value
 	return nil, false
 }
 
+// mapInitialSlots is how much room a fresh map's index has, and must agree with
+// internal/compile's own constant: the prelude divides by the capacity, so a map that
+// started with a different one would probe differently on this engine.
+const mapInitialSlots = 8
+
 func (in *Interp) arrayArg(v Value, span diag.Span) *Array {
 	a, ok := v.(*Array)
 	if !ok {
@@ -107,4 +141,72 @@ func (in *Interp) arrayIndex(a *Array, v Value, span diag.Span) int {
 		in.trap(span, "index out of range")
 	}
 	return int(i)
+}
+
+// The specified hash (spec/13-collections.md's "Hashing").
+//
+// 64-bit FNV-1a over an encoding fixed by the specification rather than by whichever engine
+// got there first, because `hash::of` returns a number a program can print and the three
+// engines have to agree on it. Every arm below is one row of that document's table.
+const (
+	fnvOffset = 14695981039346656037
+	fnvPrime  = 1099511628211
+)
+
+func fnvBytes(h uint64, bs []byte) uint64 {
+	for _, b := range bs {
+		h = (h ^ uint64(b)) * fnvPrime
+	}
+	return h
+}
+
+func fnvWord(h uint64, w uint64) uint64 {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], w)
+	return fnvBytes(h, buf[:])
+}
+
+// hashOf is a value's own hash: FNV-1a from the offset basis over the encoding
+// spec/13-collections.md's table gives it. A composite folds each part's own hash in as a
+// word, so what a value hashes to never depends on where it sits.
+func (in *Interp) hashOf(v Value, span diag.Span) uint64 {
+	switch t := v.(type) {
+	case Int:
+		return fnvWord(fnvOffset, uint64(t))
+	case Float:
+		f := float64(t)
+		if f == 0 { // -0.0 hashes as 0.0, because they compare equal
+			f = 0
+		}
+		return fnvWord(fnvOffset, math.Float64bits(f))
+	case Bool:
+		if t {
+			return fnvWord(fnvOffset, 1)
+		}
+		return fnvWord(fnvOffset, 0)
+	case Char:
+		return fnvWord(fnvOffset, uint64(t))
+	case Unit:
+		return fnvOffset // nothing at all is fed in
+	case *Str:
+		return fnvBytes(fnvOffset, []byte(t.S))
+	case *Tuple:
+		return in.hashParts(t.Elems, span)
+	case *Struct:
+		return in.hashParts(t.Vals, span)
+	case *Enum:
+		return in.hashParts(t.Vals, span)
+	case *Array:
+		return in.hashParts(t.Elems, span)
+	}
+	in.trap(span, "a function value cannot be hashed")
+	return fnvOffset
+}
+
+func (in *Interp) hashParts(parts []Value, span diag.Span) uint64 {
+	h := uint64(fnvOffset)
+	for _, p := range parts {
+		h = fnvWord(h, in.hashOf(p, span))
+	}
+	return h
 }

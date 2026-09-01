@@ -100,6 +100,12 @@ type Result struct {
 	// are the *enclosing* function's parameters, so the monomorphizer substitutes its
 	// own instantiation into them before it has a concrete tuple.
 	Insts map[ast.NodeID]*Inst
+	// IterInsts maps a `for` loop to the instantiation of its `into_iter`, which needs a
+	// table of its own rather than a place in Insts: the desugaring has no AST node to
+	// hang it off, and the obvious stand-in -- the iterable expression -- already has an
+	// entry of its own whenever it is itself a call. `for k in m.keys()` is exactly that
+	// collision, and it made the loop call `keys` where it meant to call `into_iter`.
+	IterInsts map[ast.NodeID]*Inst
 	// Defs maps a struct or enum declaration to its type definition.
 	Defs map[ast.Item]*types.Def
 	// SelfTypes maps a method's declaration to its receiver's type, mirroring
@@ -233,6 +239,7 @@ func Program(bag *diag.Bag, res *resolve.Result, files ...*ast.File) *Result {
 			LocalTypes: map[*resolve.Local]types.Type{},
 			Methods:    map[ast.NodeID]*ast.FnDecl{},
 			Insts:      map[ast.NodeID]*Inst{},
+			IterInsts:  map[ast.NodeID]*Inst{},
 			Generics:   map[*ast.FnDecl][]*types.Param{},
 			Defs:       map[ast.Item]*types.Def{},
 			SelfTypes:  map[*ast.FnDecl]types.Type{},

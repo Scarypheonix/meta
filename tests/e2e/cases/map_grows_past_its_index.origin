@@ -1,0 +1,36 @@
+use std::io;
+use std::map;
+
+// Enough insertions to grow the index several times over, which re-probes every entry
+// into a bigger table -- and must not disturb the order they were inserted in.
+fn main() {
+    let m = map::new[i64, i64]();
+    let mut i = 0;
+    while i < 1000 {
+        m.insert(i, i * 2);
+        i = i + 1;
+    }
+    io::println(m.len().to_str());
+
+    let mut sum = 0;
+    let mut misses = 0;
+    let mut j = 0;
+    while j < 1000 {
+        match m.get(j) {
+            Option::Some(v) => { sum = sum + v; },
+            Option::None => { misses = misses + 1; },
+        }
+        j = j + 1;
+    }
+    io::println(sum.to_str());
+    io::println(misses.to_str());
+
+    // Insertion order survives every regrow.
+    let ks = m.keys();
+    io::println(ks.at(0).to_str());
+    io::println(ks.at(999).to_str());
+    match m.get(1000) {
+        Option::Some(v) => { io::println("unexpected"); },
+        Option::None => { io::println("none"); },
+    }
+}

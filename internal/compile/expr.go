@@ -638,7 +638,7 @@ func (c *Compiler) breakExpr(v *ast.Break) error {
 // itself (standing in for `__it.next()`, since `__it` is never a real binding here
 // either — it is a compiler temporary, exactly as the desugaring's own `__it` is).
 func (c *Compiler) forExpr(v *ast.For) error {
-	iterInst, ok := c.callTarget(v.Iter.NodeID())
+	iterInst, ok := c.mono.LookupIter(c.inst, v.NodeID())
 	if !ok {
 		return unsupported("`for` over a type whose `into_iter` has no concrete body", v.Iter.Span())
 	}

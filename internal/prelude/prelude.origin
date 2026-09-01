@@ -13,6 +13,8 @@ use std::thread;
 use std::chan;
 use std::sync;
 use std::array;
+use std::list;
+use std::hash;
 
 pub enum Option[T] {
     None,
@@ -270,5 +272,226 @@ impl[T] IntoIterator for List[T] {
     type Iter = ListIter[T];
     fn into_iter(self) -> ListIter[T] {
         ListIter { list: self, i: 0 }
+    }
+}
+
+/// One key and the value it maps to. `Map` hands these out in insertion order.
+pub struct Entry[K, V] {
+    key: K,
+    mut value: V,
+}
+
+/// A keyed lookup that iterates in insertion order (spec/13-collections.md).
+///
+/// Two structures, not one: `entries` is the insertion order and is what iteration walks,
+/// and `index` is an open-addressed table of `1 + position` into it, which is what makes a
+/// lookup a probe rather than a scan. A zero slot in `index` is an empty one, which is why
+/// the positions are stored one higher than they are.
+///
+/// The insertion order is a promise the language makes rather than an accident: a hash
+/// order would differ between the three engines, and a program that printed a map would
+/// then not be a valid differential case.
+pub struct Map[K, V] {
+    mut entries: List[Entry[K, V]],
+    mut index: Array[i64],
+}
+
+impl[K, V] Map[K, V] {
+    /// How many entries the map holds.
+    pub fn len(self) -> i64 {
+        self.entries.len()
+    }
+
+    /// Whether the map holds none.
+    pub fn is_empty(self) -> bool {
+        self.entries.len() == 0
+    }
+
+    /// Where `k` would sit in the index: the slot holding it, or the first empty slot on
+    /// its probe path. The table is never full when this is called -- `insert` grows it
+    /// first -- so the walk always ends.
+    fn probe(self, k: K) -> i64 {
+        let cap = array::cap(self.index);
+        let mut i = hash::of(k);
+        if i < 0 {
+            i = 0 - i;
+        }
+        i = i % cap;
+        while true {
+            let slot = array::at(self.index, i);
+            if slot == 0 {
+                return i;
+            }
+            if self.entries.at(slot - 1).key == k {
+                return i;
+            }
+            i = i + 1;
+            if i == cap {
+                i = 0;
+            }
+        }
+        0
+    }
+
+    /// Doubles the index and re-probes every entry into it. The entries themselves do not
+    /// move: their order is the map's own, and rebuilding it would lose it.
+    fn regrow(self) {
+        let want = array::cap(self.index) * 2;
+        let fresh = array::new[i64](want);
+        let mut i = 0;
+        while i < want {
+            array::push(fresh, 0);
+            i = i + 1;
+        }
+        self.index = fresh;
+
+        let mut e = 0;
+        while e < self.entries.len() {
+            let at = self.probe(self.entries.at(e).key);
+            array::set(self.index, at, e + 1);
+            e = e + 1;
+        }
+    }
+
+    /// Adds `k`, or replaces what it mapped to. Returns the value it replaced, if any; the
+    /// entry keeps the position it was first inserted at.
+    pub fn insert(self, k: K, v: V) -> Option[V] {
+        // Keep the table under half full, so a probe is short and always finds a gap.
+        if (self.entries.len() + 1) * 2 >= array::cap(self.index) {
+            self.regrow();
+        }
+        let at = self.probe(k);
+        let slot = array::at(self.index, at);
+        if slot == 0 {
+            self.entries.push(Entry { key: k, value: v });
+            array::set(self.index, at, self.entries.len());
+            return Option::None;
+        }
+        let entry = self.entries.at(slot - 1);
+        let old = entry.value;
+        entry.value = v;
+        Option::Some(old)
+    }
+
+    /// What `k` maps to, or `None`.
+    pub fn get(self, k: K) -> Option[V] {
+        if self.entries.len() == 0 {
+            return Option::None;
+        }
+        let slot = array::at(self.index, self.probe(k));
+        if slot == 0 {
+            return Option::None;
+        }
+        Option::Some(self.entries.at(slot - 1).value)
+    }
+
+    /// Whether `k` is in the map.
+    pub fn contains(self, k: K) -> bool {
+        match self.get(k) {
+            Option::Some(v) => true,
+            Option::None => false,
+        }
+    }
+
+    /// Removes `k` and returns what it mapped to, or `None`.
+    ///
+    /// This rebuilds both structures, which is O(n) where the rest are O(1): a removal has
+    /// to close the gap it leaves in the insertion order, and the alternative is a
+    /// tombstone in every probe from then on.
+    pub fn remove(self, k: K) -> Option[V] {
+        if self.entries.len() == 0 {
+            return Option::None;
+        }
+        let slot = array::at(self.index, self.probe(k));
+        if slot == 0 {
+            return Option::None;
+        }
+        let gone = self.entries.at(slot - 1).value;
+
+        let kept = list::new[Entry[K, V]]();
+        let mut i = 0;
+        while i < self.entries.len() {
+            if i != slot - 1 {
+                kept.push(self.entries.at(i));
+            }
+            i = i + 1;
+        }
+        self.entries = kept;
+
+        let fresh = array::new[i64](array::cap(self.index));
+        let mut j = 0;
+        while j < array::cap(self.index) {
+            array::push(fresh, 0);
+            j = j + 1;
+        }
+        self.index = fresh;
+
+        let mut e = 0;
+        while e < self.entries.len() {
+            let at = self.probe(self.entries.at(e).key);
+            array::set(self.index, at, e + 1);
+            e = e + 1;
+        }
+        Option::Some(gone)
+    }
+
+    /// Every key, in insertion order.
+    pub fn keys(self) -> List[K] {
+        let out = list::new[K]();
+        let mut i = 0;
+        while i < self.entries.len() {
+            out.push(self.entries.at(i).key);
+            i = i + 1;
+        }
+        out
+    }
+
+    /// Every value, in insertion order.
+    pub fn values(self) -> List[V] {
+        let out = list::new[V]();
+        let mut i = 0;
+        while i < self.entries.len() {
+            out.push(self.entries.at(i).value);
+            i = i + 1;
+        }
+        out
+    }
+
+    /// Drops every entry.
+    pub fn clear(self) {
+        self.entries = list::new[Entry[K, V]]();
+        let fresh = array::new[i64](array::cap(self.index));
+        let mut i = 0;
+        while i < array::cap(self.index) {
+            array::push(fresh, 0);
+            i = i + 1;
+        }
+        self.index = fresh;
+    }
+}
+
+/// Walks a map's entries in insertion order.
+pub struct MapIter[K, V] {
+    entries: List[Entry[K, V]],
+    mut i: i64,
+}
+
+impl[K, V] Iterator for MapIter[K, V] {
+    type Item = Entry[K, V];
+    fn next(mut self) -> Option[Entry[K, V]] {
+        if self.i >= self.entries.len() {
+            return Option::None;
+        }
+        let e = self.entries.at(self.i);
+        self.i = self.i + 1;
+        Option::Some(e)
+    }
+}
+
+impl[K, V] IntoIterator for Map[K, V] {
+    type Item = Entry[K, V];
+    type Iter = MapIter[K, V];
+    fn into_iter(self) -> MapIter[K, V] {
+        MapIter { entries: self.entries, i: 0 }
     }
 }

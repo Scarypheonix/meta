@@ -309,6 +309,11 @@ var stdModules = map[string][]string{
 	// operation exists to have somewhere to write the name, not because a runtime does
 	// anything special for it.
 	"std::list": {"new"},
+	"std::map":  {"new"},
+	// `hash::of` is specified, not private: three engines have to agree on it, so
+	// spec/13-collections.md fixes the algorithm and the encoding rather than leaving
+	// them to whoever writes the runtime.
+	"std::hash": {"of"},
 	// Phase 6 (spec/12-concurrency.md). `spawn` and `channel` are what a program calls;
 	// the rest are the operations the prelude's own methods are written in terms of,
 	// since a method body cannot otherwise reach an operation the runtime provides.

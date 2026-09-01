@@ -79,6 +79,12 @@ const (
 	// because `List::new` needs somewhere to live in a language with no associated
 	// functions, not because any engine implements it.
 	BuiltinListNew
+	// BuiltinMapNew is `list::new`'s twin: an empty map is an empty list of entries and
+	// an empty index array, and internal/compile writes both out (call.go's mapNew).
+	BuiltinMapNew
+	// BuiltinHash is spec/13-collections.md's `hash::of`: 64-bit FNV-1a over a specified
+	// encoding, which is what makes it the same number on all three engines.
+	BuiltinHash
 )
 
 // Compiler holds the state of one program's lowering.
@@ -106,6 +112,7 @@ type Compiler struct {
 	variantCache map[string]int
 	tupleCache   map[string]layout.TypeID
 	arrayCache   map[string]layout.TypeID
+	preludeDefs  map[string]*types.Def
 	closureCache map[string]layout.TypeID
 
 	// Per-function state.

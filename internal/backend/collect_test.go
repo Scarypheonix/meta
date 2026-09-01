@@ -525,3 +525,63 @@ fn main() {
 }
 `, "7600\n40")
 }
+
+// TestACollectionForwardsAMapsEntries is the deepest of these: a `Map` is a list of entries
+// and an index array, the list is a struct over another array, and the entries hold heap
+// values of their own -- four levels of reference, all of them moving, while the map grows
+// its index and rebuilds it several times over.
+func TestACollectionForwardsAMapsEntries(t *testing.T) {
+	checkRun(t, `
+use std::io;
+use std::map;
+
+struct Node { value: i64, tail: Option[Node] }
+
+fn build(n: i64) -> Option[Node] {
+    let mut out = Option::None;
+    let mut i = 0;
+    while i < n { out = Option::Some(Node { value: i, tail: out }); i = i + 1; }
+    out
+}
+
+fn total(l: Option[Node]) -> i64 {
+    let mut sum = 0;
+    let mut cur = l;
+    while true {
+        match cur {
+            Option::Some(nd) => { sum = sum + nd.value; cur = nd.tail; },
+            Option::None => { return sum; },
+        }
+    }
+    sum
+}
+
+fn main() {
+    let m = map::new[i64, Option[Node]]();
+    let mut i = 0;
+    while i < 60 {
+        m.insert(i, build(15));
+        i = i + 1;
+    }
+    io::println(m.len().to_str());
+
+    let mut acc = 0;
+    for e in m {
+        acc = acc + total(e.value);
+    }
+    io::println(acc.to_str());
+
+    // Lookups still find what they hashed to, after everything moved.
+    let mut misses = 0;
+    let mut j = 0;
+    while j < 60 {
+        match m.get(j) {
+            Option::Some(v) => { },
+            Option::None => { misses = misses + 1; },
+        }
+        j = j + 1;
+    }
+    io::println(misses.to_str());
+}
+`, "60\n6300\n0") // 60 lists of sum(0..14) = 105.
+}

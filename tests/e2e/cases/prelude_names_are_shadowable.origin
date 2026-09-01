@@ -1,0 +1,27 @@
+use std::io;
+use std::map;
+
+// spec/07-modules.md makes the prelude the last resolution step, so a program that
+// declares its own `List` or `Entry` gets its own -- and the prelude's own signatures must
+// still mean the prelude's, which is a different question and was briefly the same one.
+enum List { Nil, Cons(i64, List) }
+struct Entry { n: i64 }
+
+fn sum(l: List) -> i64 {
+    match l {
+        List::Nil => 0,
+        List::Cons(head, tail) => head + sum(tail),
+    }
+}
+
+fn main() {
+    io::println(sum(List::Cons(1, List::Cons(2, List::Nil))).to_str());
+    io::println(Entry { n: 4 }.n.to_str());
+
+    let m = map::new[String, i64]();
+    m.insert("k", 9);
+    io::println(m.len().to_str());
+    for k in m.keys() {
+        io::println(k);
+    }
+}

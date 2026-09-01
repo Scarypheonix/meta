@@ -1,6 +1,8 @@
 package vm
 
 import (
+	"math"
+
 	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/layout"
@@ -77,6 +79,9 @@ func (v *VM) arrayIndex(n uint64, val Value, span diag.Span) uint64 {
 func (v *VM) arrayBuiltin(index int, args []Value, span diag.Span) (Value, bool) {
 	span = v.userSpan(span)
 	switch index {
+	case compile.BuiltinHash:
+		return intVal(int64(v.hashOf(args[0], span))), true
+
 	case compile.BuiltinNewArray:
 		// args[1] is the layout internal/compile picked for this instantiation: whether
 		// the elements are references, which the collector must know and the runtime
@@ -130,4 +135,74 @@ func (v *VM) arrayBuiltin(index int, args []Value, span diag.Span) (Value, bool)
 		return unitVal(), true
 	}
 	return Value{}, false
+}
+
+// The specified hash (spec/13-collections.md's "Hashing").
+//
+// The same 64-bit FNV-1a over the same encoding the interpreter and native code use --
+// specified rather than left to each engine, because `hash::of` returns a number a program
+// can print. What differs here is only where the parts come from: a descriptor's word
+// kinds, rather than Go values or a type table.
+const (
+	fnvOffset = 14695981039346656037
+	fnvPrime  = 1099511628211
+)
+
+func fnvWord(h, w uint64) uint64 {
+	for i := 0; i < 8; i++ {
+		h = (h ^ (w>>(8*i))&0xFF) * fnvPrime
+	}
+	return h
+}
+
+func fnvBytes(h uint64, s string) uint64 {
+	for i := 0; i < len(s); i++ {
+		h = (h ^ uint64(s[i])) * fnvPrime
+	}
+	return h
+}
+
+// hashOf is a value's own hash, following the same table the other two engines do: FNV-1a
+// from the offset basis, with a composite folding each part's own hash in as a word.
+func (v *VM) hashOf(val Value, span diag.Span) uint64 {
+	switch val.Tag {
+	case layout.TagUnit:
+		return fnvOffset // nothing at all is fed in
+	case layout.TagFloat:
+		bits := val.N
+		if math.Float64frombits(bits) == 0 { // -0.0 hashes as 0.0, because they compare equal
+			bits = 0
+		}
+		return fnvWord(fnvOffset, bits)
+	case layout.TagRef:
+		return v.hashObject(val.R, span)
+	case layout.TagFn, layout.TagBuiltin:
+		v.trap(span, "a function value cannot be hashed")
+	}
+	return fnvWord(fnvOffset, val.N)
+}
+
+// hashObject hashes one heap object: a String over its bytes, everything else by folding
+// each part's own hash in as a word.
+func (v *VM) hashObject(r layout.Ref, span diag.Span) uint64 {
+	if r == layout.Nil {
+		return fnvWord(fnvOffset, 0)
+	}
+	desc := v.prog.Types.Get(v.heap.TypeOf(r))
+	h := uint64(fnvOffset)
+	switch desc.Shape {
+	case layout.ByteArray:
+		return fnvBytes(h, v.heap.Bytes(r))
+	case layout.RefArray, layout.RawArray:
+		n := v.heap.Get(r, 0)
+		for i := uint64(0); i < n; i++ {
+			h = fnvWord(h, v.hashOf(v.arrayElem(desc, r, i), span))
+		}
+		return h
+	default:
+		for i := range desc.Kinds {
+			h = fnvWord(h, v.hashOf(v.readField(desc, r, i), span))
+		}
+		return h
+	}
 }

@@ -5,6 +5,7 @@ import (
 
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/bytecode"
+	"github.com/scarypheonix/meta/internal/check"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/layout"
 	"github.com/scarypheonix/meta/internal/resolve"
@@ -36,6 +37,8 @@ var builtinIndex = map[string]int{
 	"array::push":     BuiltinArrayPush,
 	"array::truncate": BuiltinArrayTruncate,
 	"list::new":       BuiltinListNew,
+	"map::new":        BuiltinMapNew,
+	"hash::of":        BuiltinHash,
 }
 
 func (c *Compiler) call(v *ast.Call) error {
@@ -63,6 +66,9 @@ func (c *Compiler) call(v *ast.Call) error {
 			}
 			if idx == BuiltinListNew {
 				return c.listNew(v)
+			}
+			if idx == BuiltinMapNew {
+				return c.mapNew(v)
 			}
 			for _, a := range v.Args {
 				if err := c.expr(a); err != nil {
@@ -142,6 +148,93 @@ func (c *Compiler) listNew(v *ast.Call) error {
 		return err
 	}
 	c.emitAB(bytecode.OpStruct, si, 1, v.Span())
+	return nil
+}
+
+// mapNew compiles `map::new[K, V]()`: an empty list of entries and an index with room in
+// it, wrapped in the prelude's `Map[K, V]`.
+//
+// The index starts with slots rather than empty, because the prelude's own probe divides by
+// its capacity: a table with no slots has nowhere to put anything, and growing it is
+// `insert`'s job rather than a special case at the start.
+func (c *Compiler) mapNew(v *ast.Call) error {
+	m, ok := types.AsNamed(c.concreteType(c.typeOf(v)))
+	if !ok || len(m.Args) != 2 {
+		return unsupported("a `map::new` whose type is not Map[K, V]", v.Span())
+	}
+	entry := c.entryType(m)
+	if entry == nil {
+		return unsupported("a `map::new` before the prelude declares `Entry`", v.Span())
+	}
+	if err := c.emitListOf(entry, v); err != nil {
+		return err
+	}
+	if err := c.emitZeroedIndex(mapInitialSlots, v); err != nil {
+		return err
+	}
+	si, err := c.structInst(c.typeOf(v), v.Span())
+	if err != nil {
+		return err
+	}
+	c.emitAB(bytecode.OpStruct, si, 2, v.Span())
+	return nil
+}
+
+// mapInitialSlots is how much room a fresh map's index has. Eight is two cache lines and
+// enough for three entries before the prelude's own half-full rule grows it.
+const mapInitialSlots = 8
+
+// entryType builds `Entry[K, V]` for a map's own K and V.
+func (c *Compiler) entryType(m *types.Named) types.Type {
+	def := c.preludeDef("Entry")
+	if def == nil {
+		return nil
+	}
+	return &types.Named{Def: def, Args: []types.Type{m.Args[0], m.Args[1]}}
+}
+
+// emitListOf pushes an empty `List[T]`, the same two operations listNew emits.
+func (c *Compiler) emitListOf(elem types.Type, v *ast.Call) error {
+	id, err := c.arrayInst(&types.Named{Def: types.ArrayDef, Args: []types.Type{elem}}, v.Span())
+	if err != nil {
+		return err
+	}
+	c.emitA(bytecode.OpConst, c.intConst(0), v.Span())
+	c.emitA(bytecode.OpConst, c.intConst(int64(id)), v.Span())
+	c.emitABK(bytecode.OpCallBuiltin, BuiltinNewArray, 2, bytecode.KindRef, v.Span())
+
+	list := c.preludeDef("List")
+	if list == nil {
+		return unsupported("a list before the prelude declares `List`", v.Span())
+	}
+	si, err := c.structInst(&types.Named{Def: list, Args: []types.Type{elem}}, v.Span())
+	if err != nil {
+		return err
+	}
+	c.emitAB(bytecode.OpStruct, si, 1, v.Span())
+	return nil
+}
+
+// emitZeroedIndex pushes an `Array[i64]` of n zeroed slots: the map's own index, which is
+// full-length from the start because a probe reads every slot on its path.
+func (c *Compiler) emitZeroedIndex(n int64, v *ast.Call) error {
+	i64 := types.P(types.I64)
+	id, err := c.arrayInst(&types.Named{Def: types.ArrayDef, Args: []types.Type{i64}}, v.Span())
+	if err != nil {
+		return err
+	}
+	c.emitA(bytecode.OpConst, c.intConst(n), v.Span())
+	c.emitA(bytecode.OpConst, c.intConst(int64(id)), v.Span())
+	c.emitABK(bytecode.OpCallBuiltin, BuiltinNewArray, 2, bytecode.KindRef, v.Span())
+	slot := c.temp()
+	c.emitA(bytecode.OpStore, slot, v.Span())
+	for i := int64(0); i < n; i++ {
+		c.emitA(bytecode.OpLoad, slot, v.Span())
+		c.emitA(bytecode.OpConst, c.intConst(0), v.Span())
+		c.emitABK(bytecode.OpCallBuiltin, BuiltinArrayPush, 2, bytecode.KindBool, v.Span())
+		c.emit(bytecode.OpPop, v.Span())
+	}
+	c.emitA(bytecode.OpLoad, slot, v.Span())
 	return nil
 }
 
@@ -412,4 +505,18 @@ func (c *Compiler) concurrencyElemIsRef(idx int, v *ast.Call) (int64, error) {
 		return 1, nil
 	}
 	return 0, nil
+}
+
+// preludeDef finds a prelude type by name, the way internal/check's own preludeDef does.
+// The prelude declares one type per name, so there is nothing to disambiguate.
+func (c *Compiler) preludeDef(name string) *types.Def {
+	if c.preludeDefs == nil {
+		c.preludeDefs = map[string]*types.Def{}
+		for _, def := range c.tys.Defs {
+			if def != nil && check.DeclaredInPrelude(def) {
+				c.preludeDefs[def.Name] = def
+			}
+		}
+	}
+	return c.preludeDefs[name]
 }

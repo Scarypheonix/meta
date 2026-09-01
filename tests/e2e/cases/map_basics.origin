@@ -1,0 +1,44 @@
+use std::io;
+use std::map;
+
+// A map is Origin source in the prelude: an insertion-ordered list of entries, and an
+// open-addressed index into it built on the specified hash (spec/13-collections.md).
+fn show(v: Option[i64]) {
+    match v {
+        Option::Some(n) => { io::println(n.to_str()); },
+        Option::None => { io::println("none"); },
+    }
+}
+
+fn main() {
+    let m = map::new[String, i64]();
+    io::println(m.is_empty().to_str());
+
+    show(m.insert("a", 1));
+    show(m.insert("b", 2));
+    // Re-inserting a key replaces its value and keeps its place in the order.
+    show(m.insert("a", 3));
+    io::println(m.len().to_str());
+
+    show(m.get("a"));
+    show(m.get("b"));
+    show(m.get("missing"));
+    io::println(m.contains("b").to_str());
+    io::println(m.contains("missing").to_str());
+
+    m.insert("c", 4);
+    for k in m.keys() {
+        io::println(k);
+    }
+    for e in m {
+        io::println(e.value.to_str());
+    }
+
+    show(m.remove("a"));
+    show(m.remove("a"));
+    show(m.get("a"));
+    io::println(m.len().to_str());
+    for k in m.keys() {
+        io::println(k);
+    }
+}

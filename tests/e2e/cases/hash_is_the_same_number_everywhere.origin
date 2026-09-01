@@ -1,0 +1,35 @@
+use std::io;
+use std::hash;
+use std::list;
+
+struct P { x: i64, y: String }
+
+// `hash::of` is specified rather than left to each engine (spec/13-collections.md), because
+// it returns a number a program can print -- so this case is the differential holding all
+// three to the same FNV-1a over the same encoding.
+fn main() {
+    io::println(hash::of(0).to_str());
+    io::println(hash::of(1).to_str());
+    io::println(hash::of(-1).to_str());
+    io::println(hash::of("").to_str());
+    io::println(hash::of("hello").to_str());
+    io::println(hash::of(true).to_str());
+    io::println(hash::of('z').to_str());
+    io::println(hash::of(1.5).to_str());
+    io::println(hash::of(P { x: 1, y: "a" }).to_str());
+    io::println(hash::of(Option::Some(7)).to_str());
+
+    // Equal values hash equally, which is the one rule a hash owes `==`.
+    io::println((hash::of(0.0) == hash::of(-0.0)).to_str());
+    io::println((hash::of(P { x: 1, y: "a" }) == hash::of(P { x: 1, y: "a" })).to_str());
+
+    let xs = list::new[i64]();
+    let ys = list::new[i64]();
+    xs.push(1);
+    xs.push(2);
+    ys.push(1);
+    ys.push(2);
+    io::println((hash::of(xs) == hash::of(ys)).to_str());
+    ys.push(3);
+    io::println((hash::of(xs) == hash::of(ys)).to_str());
+}

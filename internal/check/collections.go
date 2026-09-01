@@ -43,6 +43,26 @@ func (c *Checker) arrayBuiltinType(name string, targs []ast.Type, span diag.Span
 	array := func(t types.Type) types.Type { return &types.Named{Def: types.ArrayDef, Args: []types.Type{t}} }
 
 	switch name {
+	case "hash::of":
+		// hash::of[T](v: T) -> i64
+		return &types.FnT{Params: []types.Type{elem()}, Ret: i64}
+
+	case "map::new":
+		// map::new[K, V]() -> Map[K, V]
+		var k, v types.Type
+		switch len(targs) {
+		case 0:
+			k, v = c.freshFor(span), c.freshFor(span)
+		case 2:
+			k, v = c.toType(targs[0]), c.toType(targs[1])
+		default:
+			c.bag.Errorf("E0107", span,
+				"`%s` takes 2 type arguments but %d were supplied", name, len(targs)).
+				Label("wrong number of type arguments")
+			k, v = types.Error, types.Error
+		}
+		return &types.FnT{Ret: c.named("Map", k, v)}
+
 	case "list::new":
 		// list::new[T]() -> List[T]
 		return &types.FnT{Ret: c.named("List", elem())}

@@ -110,6 +110,10 @@ fn (m: Map[K, V]) keys() -> List[K]
 fn (m: Map[K, V]) values() -> List[V]
 ```
 
+Lookup is a hash table; iteration is a separate, insertion-ordered list of entries. A
+`remove` rebuilds both, so it costs O(*n*) where the rest are O(1) amortized — removals are
+rare in the programs this phase is for, and the alternative is a tombstone in every probe.
+
 **Iteration is in insertion order.** `keys()`, `values()` and `for` yield entries in the
 order they were first inserted; re-inserting an existing key updates its value and leaves its
 position alone; `remove` takes an entry out of the order entirely.
@@ -120,17 +124,57 @@ program that printed a map would then not be a valid differential case. Insertio
 every `Map` program deterministic and comparable, and it is the order a person expects when
 they print one.
 
-The hash function itself is **not observable**: no operation returns one, so nothing in this
-document constrains it beyond "equal keys hash equally".
+A key must not be mutated while it is in a map. Nothing prevents it — a `mut` field is a
+`mut` field — and the result is defined but useless: the key hashes differently than it did,
+so `get` probes elsewhere and answers `None` for an entry that is still in `keys()`. That is
+a wrong answer the program asked for rather than undefined behaviour, and it is the one
+place where §04's guarantee is a guarantee about the language and not about the program.
 
 `Map[K, V]` implements `IntoIterator`, yielding `Entry[K, V]` — a struct with `key` and
 `value` fields — in insertion order.
 
+## Hashing
+
+```origin
+use std::hash;
+
+fn hash::of[T](v: T) -> i64
+```
+
+`hash::of` is what `Map` probes with, and it is **specified rather than left to the
+implementation**, because the three engines have to agree on every value a program can
+print. It is 64-bit FNV-1a over a canonical encoding of the value:
+
+```
+h = 14695981039346656037
+for each byte b:  h = (h XOR b) * 1099511628211      (wrapping, unsigned)
+```
+
+and the bytes are:
+
+| Value | Bytes fed to the hash |
+|---|---|
+| `i8`–`i64`, `u8`–`u64`, `char`, `bool` | the value's word, sign- or zero-extended to 64 bits, little-endian |
+| `f32`, `f64` | the IEEE bits of the value widened to `f64`, little-endian, with `-0.0` normalized to `0.0` first |
+| `()` | nothing at all |
+| `String` | its bytes, in order |
+| a struct, tuple, enum variant or closure | each field's own hash in turn, as eight little-endian bytes |
+| an `Array[T]` or a `List[T]` | each element's own hash in turn, as eight little-endian bytes |
+
+The result is reinterpreted as a signed `i64`, so it may be negative; `Map` masks it before
+probing.
+
+Two rules follow, and both are what a hash is for: **equal values hash equally** — the
+encoding above reads exactly what `==` compares, field for field and element for element,
+which is why `-0.0` is normalized (`0.0 == -0.0`) and why a type's identity is *not* mixed
+in (two different types are never equal, so a collision between them costs a comparison and
+nothing else). And unequal values may hash equally, which is a collision and not a bug.
+
 ## What the compiler provides
 
-Only `Array[T]`'s operations, and one private hash. `List` and `Map` are Origin source in the
-prelude, which is the point of ADR-0028: the runtime knows what an array is and nothing about
-a list.
+`Array[T]`'s operations and `hash::of`. `List` and `Map` are Origin source in the prelude,
+which is the point of ADR-0028: the runtime knows what an array is, how to hash a value, and
+nothing at all about a list or a map.
 
 The object layout is `internal/layout`'s, as everything else is (§08, ADR-0019): an array is
 a length-prefixed run, either `RefArray` when its elements are references or `RawArray` when
@@ -171,6 +215,8 @@ out-of-range read to return whatever is next in memory.
 | `m.remove("a")` then `m.get("a")` | `Some(3)`, then `None` |
 | 1000 insertions, then `len()` | `1000` |
 | a `Map[String, List[i64]]` built, mutated through, and printed | deterministic on all three engines |
+| `hash::of(0.0) == hash::of(-0.0)` | `true` — the encoding normalizes it, because `==` does |
+| `hash::of` of the same value on three engines | the same number |
 | a `List[Node]` surviving a collection that moves every element | the same elements |
 
 Every row is a case in `tests/e2e/cases/`, asserting exact stdout, stderr and exit status on
