@@ -46,17 +46,28 @@ const (
 	tcbJoinedOff = 48
 	// tcbStackBaseOff is the mapping's own address, for munmap when the thread is done.
 	tcbStackBaseOff = 56
+	// tcbBlockedOff is 1 while this thread is waiting for a condition it cannot check for
+	// itself -- a value on a channel, room in one, a thread to finish, a lock to be
+	// dropped. The scheduler will not run a blocked thread, so "no thread is runnable" is
+	// exactly §12's total deadlock (sched.go).
+	//
+	// It is deliberately separate from tcbStateOff, which the collector reads for a
+	// different question: whether this thread has a stack worth walking. A thread parked
+	// on a channel and a thread that merely yielded have the same state and different
+	// blockedness.
+	tcbBlockedOff = 64
 	// tcbResultIsRefOff records whether the result this thread will leave in tcbResultOff
 	// is a reference the collector must evacuate, or a raw value it must not touch. The
 	// runtime cannot tell them apart -- that is what the stack map exists for elsewhere --
 	// so the compiler, which knows `spawn`'s own T, writes the answer here.
 	tcbResultIsRefOff = 72
-	// tcbWaiterOff is the thread that switched into this one, and therefore the thread to
-	// switch back to when it finishes. With only `join` able to start a thread this is a
-	// complete scheduler; a run queue replaces it when channels can park a thread that
-	// nobody has joined.
-	tcbWaiterOff = 80
-	tcbSize      = 96 // a multiple of 16, so a stack primed above it stays aligned
+	// tcbTakenOff holds the value a receive took off a channel, between the two halves of
+	// the prelude's own `recv` (chan.go). It is a root the collector must visit when
+	// tcbTakenIsRefOff says the channel's element type is a reference, for the same reason
+	// tcbResultOff is: raw memory, no stack map over it.
+	tcbTakenOff      = 80
+	tcbTakenIsRefOff = 88
+	tcbSize          = 96 // a multiple of 16, so a stack primed above it stays aligned
 
 	// Thread states.
 	//
@@ -173,7 +184,9 @@ func (e *emitter) emitThreadNew() {
 	a.MovMR(x86.At(x86.RAX, tcbClosureOff), x86.RBX)
 	a.MovMR(x86.At(x86.RAX, tcbStackBaseOff), x86.RAX)
 	a.MovMI(x86.At(x86.RAX, tcbResultOff), 0)
-	a.MovMI(x86.At(x86.RAX, tcbWaiterOff), 0)
+	a.MovMI(x86.At(x86.RAX, tcbTakenOff), 0)
+	a.MovMI(x86.At(x86.RAX, tcbTakenIsRefOff), 0)
+	a.MovMI(x86.At(x86.RAX, tcbBlockedOff), 0)
 
 	// The stack pointer starts at the top of the mapping, 16-byte aligned, and is then
 	// primed with what `rt_switch`'s tail expects to find: six saved registers and a
@@ -239,9 +252,18 @@ func (e *emitter) emitThreadEntry() {
 	a.MovMR(x86.At(x86.RBX, tcbResultOff), x86.RAX)
 	a.MovMI(x86.At(x86.RBX, tcbStateOff), threadDone)
 
-	// Hand control back to whoever switched in. A finished thread never runs again, so
-	// this switch does not return and the outgoing save is only bookkeeping.
-	a.MovRM(x86.RSI, x86.At(x86.RBX, tcbWaiterOff))
+	// Finishing is a state change like any other, so everyone waiting gets to re-check:
+	// whoever joined this thread, and `main`'s own drain loop, which is waiting for exactly
+	// this (sched.go).
+	a.Call(e.rt.schedWakeAll)
+
+	// Hand the processor to whoever can use it. A finished thread never runs again, so this
+	// switch does not return and the outgoing save is only bookkeeping.
+	stuck := a.NewLabel("entry_stuck")
+	a.Call(e.rt.schedNext)
+	a.TestRR(x86.RAX, x86.RAX)
+	a.Jcc(x86.Equal, stuck)
+	a.MovRR(x86.RSI, x86.RAX)
 	a.MovMR(x86.At(x86.R15, rtCurrentOff), x86.RSI)
 	a.MovRR(x86.RDI, x86.RBX)
 	a.Call(e.rt.threadSwitch)
@@ -250,6 +272,12 @@ func (e *emitter) emitThreadEntry() {
 	// ever did, stopping is better than running off the end of the trampoline into
 	// whatever follows it (process rule 8).
 	a.Ud2()
+
+	// The wake above makes `main` runnable whatever it was waiting for, and `main` is never
+	// marked done, so a finished thread always has somewhere to go. Reaching this would
+	// mean the thread list itself is wrong rather than that the program deadlocked.
+	a.Bind(stuck)
+	e.trapWith(e.deadlockMsg)
 }
 
 // emitThreadSpawn writes `rt_spawn(closure rdi, resultIsRef rsi) -> tcb rax`.
@@ -270,13 +298,16 @@ func (e *emitter) emitThreadSpawn() {
 	a.Ret()
 }
 
-// emitThreadJoin writes `rt_join(tcb rdi) -> result rax`.
+// emitThreadJoin writes `rt_join(tcb rdi) -> status rax, result rdx`.
 //
-// It runs the thread to completion on the calling thread's behalf and yields what its
-// closure returned. That is a complete scheduler for programs whose only concurrency is
-// spawn and join, and deliberately not one for anything else: a thread that parks on a
-// channel has nobody to switch back to it, which is why channels arrive with a run queue
-// rather than on top of this.
+// Waiting for a thread is now the same shape as waiting for anything else: block, hand the
+// processor to the scheduler, and re-check on the way back (sched.go). It no longer runs
+// the thread it is waiting for -- a joined thread may itself park on a channel, and then
+// the joiner running it would be waiting for a thread that is waiting for a third.
+//
+// The status says what the caller must trap on, rather than trapping here: a runtime
+// routine has no span, and §12's messages name the user's own line. `schedRefused` is
+// `handle already joined`, `schedDeadlock` is `all threads are blocked`.
 //
 // The full prologue is load-bearing, not habit. This frame is what a parked joining
 // thread's stack chain starts at (the rbp rt_switch saved is this one), and the collector
@@ -291,22 +322,17 @@ func (e *emitter) emitThreadJoin() {
 	a := e.a
 	a.Bind(e.rt.threadJoin)
 
-	a.Push(x86.RBP)
-	a.MovRR(x86.RBP, x86.RSP)
-	a.Push(x86.RBX)
-	a.Push(x86.R12)
-	a.Push(x86.R13)
-	a.Push(x86.R14)
-	a.MovRR(x86.RBX, x86.RDI) // the thread being joined
+	e.runtimePrologue()
+	a.MovRR(x86.RBX, x86.RDI)                       // the thread being joined
+	a.MovRM(x86.R12, x86.At(x86.R15, rtCurrentOff)) // this one
 
 	// Joining twice is a programming error, like sending on a closed channel: the second
 	// call would otherwise block forever on a thread that already finished (§12).
-	notJoined := a.NewLabel("join_not_joined")
+	refused := a.NewLabel("join_refused")
+	stuck := a.NewLabel("join_stuck")
 	a.MovRM(x86.RAX, x86.At(x86.RBX, tcbJoinedOff))
 	a.TestRR(x86.RAX, x86.RAX)
-	a.Jcc(x86.Equal, notJoined)
-	e.trapWith(e.joinedTwiceMsg)
-	a.Bind(notJoined)
+	a.Jcc(x86.NotEqual, refused)
 	a.MovMI(x86.At(x86.RBX, tcbJoinedOff), 1)
 
 	loop := a.NewLabel("join_loop")
@@ -316,30 +342,28 @@ func (e *emitter) emitThreadJoin() {
 	a.CmpRI(x86.RAX, threadDone)
 	a.Jcc(x86.Equal, done)
 
-	// Switch into it. The joining thread becomes this one's waiter, so the trampoline
-	// knows who to hand control back to, and parks itself for the duration -- which is
-	// what makes its stack walkable by a collection the joined thread triggers.
-	a.MovRM(x86.R12, x86.At(x86.R15, rtCurrentOff))
-	a.MovMR(x86.At(x86.RBX, tcbWaiterOff), x86.R12)
-	a.MovMI(x86.At(x86.R12, tcbStateOff), threadParked)
-	a.MovMR(x86.At(x86.R15, rtCurrentOff), x86.RBX)
-
-	a.MovRR(x86.RDI, x86.R12)
-	a.MovRR(x86.RSI, x86.RBX)
-	a.Call(e.rt.threadSwitch)
-
-	// Back on the joining thread's own stack, whatever happened over there.
-	a.MovMR(x86.At(x86.R15, rtCurrentOff), x86.R12)
-	a.MovMI(x86.At(x86.R12, tcbStateOff), threadRunning)
+	a.MovMI(x86.At(x86.R12, tcbBlockedOff), 1)
+	a.Call(e.rt.schedPark)
+	a.TestRR(x86.RAX, x86.RAX)
+	a.Jcc(x86.NotEqual, stuck)
 	a.Jmp(loop)
 
 	a.Bind(done)
-	a.MovRM(x86.RAX, x86.At(x86.RBX, tcbResultOff))
-	a.Pop(x86.R14)
-	a.Pop(x86.R13)
-	a.Pop(x86.R12)
-	a.Pop(x86.RBX)
-	a.Pop(x86.RBP)
+	a.MovRM(x86.RDX, x86.At(x86.RBX, tcbResultOff))
+	a.XorRR(x86.RAX, x86.RAX)
+	e.runtimeEpilogue()
+	a.Ret()
+
+	a.Bind(refused)
+	a.MovRI(x86.RAX, schedRefused)
+	a.XorRR(x86.RDX, x86.RDX)
+	e.runtimeEpilogue()
+	a.Ret()
+
+	a.Bind(stuck)
+	a.MovRI(x86.RAX, schedDeadlock)
+	a.XorRR(x86.RDX, x86.RDX)
+	e.runtimeEpilogue()
 	a.Ret()
 }
 
@@ -373,7 +397,9 @@ func (e *emitter) emitMainThread() {
 	a.MovMI(x86.At(x86.RAX, tcbClosureOff), 0)
 	a.MovMI(x86.At(x86.RAX, tcbResultOff), 0)
 	a.MovMI(x86.At(x86.RAX, tcbResultIsRefOff), 0)
-	a.MovMI(x86.At(x86.RAX, tcbWaiterOff), 0)
+	a.MovMI(x86.At(x86.RAX, tcbTakenOff), 0)
+	a.MovMI(x86.At(x86.RAX, tcbTakenIsRefOff), 0)
+	a.MovMI(x86.At(x86.RAX, tcbBlockedOff), 0)
 	// Main goes on rtThreadsOff's list like every other thread. The walk skips whichever
 	// thread is running (gcNextThreadStack compares each against rtCurrentOff), so listing
 	// main costs nothing while main is the thread that allocated -- and while main is

@@ -90,6 +90,13 @@ type runtimeLabels struct {
 	threadSpawn  x86.Label
 	threadJoin   x86.Label
 	threadMain   x86.Label
+	// schedNext, schedWakeAll, schedPark and schedDrain are the run queue (sched.go):
+	// what a thread parked on a channel hands the processor to, and what runs the
+	// threads `main` never joined before the process exits.
+	schedNext    x86.Label
+	schedWakeAll x86.Label
+	schedPark    x86.Label
+	schedDrain   x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -119,6 +126,10 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.threadSpawn = e.a.NewLabel("rt_spawn")
 	e.rt.threadJoin = e.a.NewLabel("rt_join")
 	e.rt.threadMain = e.a.NewLabel("rt_main_thread")
+	e.rt.schedNext = e.a.NewLabel("rt_sched_next")
+	e.rt.schedWakeAll = e.a.NewLabel("rt_wake_all")
+	e.rt.schedPark = e.a.NewLabel("rt_park")
+	e.rt.schedDrain = e.a.NewLabel("rt_drain")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -138,6 +149,10 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitThreadSpawn()
 	e.emitThreadJoin()
 	e.emitMainThread()
+	e.emitSchedNext()
+	e.emitSchedWakeAll()
+	e.emitSchedPark()
+	e.emitSchedDrain()
 	e.emitCollect()
 }
 
@@ -253,6 +268,12 @@ func (e *emitter) emitStart(mainLabel x86.Label) {
 	a.XorRR(x86.RBP, x86.RBP)
 
 	a.Call(mainLabel)
+
+	// §12: `main` returning ends the program only once every spawned thread has finished.
+	// A thread nobody joined has had no reason to run before now, and one that parked on a
+	// channel is still waiting to be woken; the drain loop runs both to completion
+	// (sched.go).
+	a.Call(e.rt.schedDrain)
 
 	a.MovRI(x86.RAX, e.target.SysExit)
 	a.XorRR(x86.RDI, x86.RDI)

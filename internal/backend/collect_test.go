@@ -258,3 +258,53 @@ fn main() {
 }
 `, "1225\n354000")
 }
+
+// TestACollectionWalksEveryThreadsStacks is the multi-thread version: three spawned
+// threads allocating, one of them joined and the other two left for the drain `_start`
+// runs after `main` returns (sched.go), while `main` holds a list of its own across all of
+// it. Every one of those stacks is a root set, and the list `main` keeps is the assertion
+// that none of them was walked in a way that missed or moved it wrongly.
+func TestACollectionWalksEveryThreadsStacks(t *testing.T) {
+	checkRun(t, `
+use std::io;
+use std::thread;
+
+struct Node { value: i64, tail: Option[Node] }
+
+fn build(n: i64) -> Option[Node] {
+    let mut out = Option::None;
+    let mut i = 0;
+    while i < n { out = Option::Some(Node { value: i, tail: out }); i = i + 1; }
+    out
+}
+
+fn total(list: Option[Node]) -> i64 {
+    let mut sum = 0;
+    let mut cur = list;
+    while true {
+        match cur {
+            Option::Some(nd) => { sum = sum + nd.value; cur = nd.tail; },
+            Option::None => { return sum; },
+        }
+    }
+    sum
+}
+
+fn work() -> i64 {
+    let mut acc = 0;
+    let mut k = 0;
+    while k < 60 { acc = acc + total(build(40)); k = k + 1; }
+    acc
+}
+
+fn main() {
+    let keep = build(50);
+    let a = thread::spawn(|| -> i64 { work() });
+    let b = thread::spawn(|| -> i64 { work() });
+    let c = thread::spawn(|| -> i64 { work() });
+    io::println(total(keep).to_str());
+    io::println(a.join().to_str());
+    io::println(total(keep).to_str());
+}
+`, "1225\n46800\n1225")
+}

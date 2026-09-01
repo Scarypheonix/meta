@@ -624,7 +624,8 @@ func (e *emitter) builtin(v *ir.Value) error {
 		e.a.MovRM(x86.RDI, x86.At(x86.RDI, objHeaderSize))
 		e.a.Call(e.rt.threadJoin)
 		e.recordCall(v)
-		e.def(v, x86.RAX)
+		e.schedStatus(e.joinedTwiceMsg)
+		e.def(v, x86.RDX)
 		return nil
 
 	case compile.BuiltinPrint, compile.BuiltinPrintln:
@@ -678,6 +679,29 @@ func (e *emitter) builtin(v *ir.Value) error {
 		return e.buildOrdering(v)
 	}
 	return fmt.Errorf("unimplemented: builtin %d in native code", v.Const)
+}
+
+// schedStatus turns a blocking runtime routine's status (sched.go) into a trap, and falls
+// through when the operation succeeded.
+//
+// The runtime returns a status rather than trapping itself because a trap's text names a
+// source location and a runtime routine has none to name. What it does *not* yet name is
+// the user's own line: the call being lowered here is the one the prelude's method makes,
+// so `refused` reads `<runtime>` where the other two engines walk out of the prelude to
+// the caller (interp/vm's userSpan). That gap is docs/deferred.md's, not this function's.
+func (e *emitter) schedStatus(refused staticStr) {
+	a := e.a
+	ok := a.NewLabel("sched_status_ok")
+	notRefused := a.NewLabel("sched_status_not_refused")
+
+	a.TestRR(x86.RAX, x86.RAX)
+	a.Jcc(x86.Equal, ok)
+	a.CmpRI(x86.RAX, schedRefused)
+	a.Jcc(x86.NotEqual, notRefused)
+	e.trapWith(refused)
+	a.Bind(notRefused)
+	e.trapWith(e.deadlockMsg)
+	a.Bind(ok)
 }
 
 // buildOrdering lowers a `cmp` builtin: decide Less, Equal or Greater by the operand

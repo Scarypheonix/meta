@@ -132,6 +132,10 @@ type emitter struct {
 	outOfMemoryMsg staticStr
 	// joinedTwiceMsg is §12's `handle already joined`.
 	joinedTwiceMsg staticStr
+	// deadlockMsg is §12's `all threads are blocked`, for the one place that detects it
+	// with no user code left on the stack to name: the drain loop `_start` runs after
+	// `main` has returned (sched.go).
+	deadlockMsg staticStr
 	// panicPrefix is the "origin: " a panic's message is wrapped in, so that the three
 	// engines print the same line.
 	panicPrefix staticStr
@@ -213,6 +217,7 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 	// (interp/vm's userSpan); native code has no frame table to do that with yet, so it
 	// says `<runtime>` rather than inventing a location (docs/deferred.md).
 	e.joinedTwiceMsg = e.rawString("origin: handle already joined at <runtime>\n")
+	e.deadlockMsg = e.rawString("origin: all threads are blocked at <runtime>\n")
 	e.panicPrefix = e.rawString("origin: ")
 	e.emitTypeTable()
 	e.emitGCRuntimeFrameEntry()
