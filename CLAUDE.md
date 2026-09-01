@@ -4,8 +4,8 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Current phase: 6 — concurrency. Phases 0 through 5 are complete**
-(see `docs/phases/`).
+**Phases 0 through 6 are complete** (see `docs/phases/`). Phase 7 has not started, and
+its scope is the user's to set.
 
 ---
 
@@ -171,6 +171,21 @@ This project outlasts any single context window.
 
 ## Status
 
+**Phase 6 is complete** (`docs/phases/6-complete.md`). Origin has green threads, channels
+and a mutex; `Send` is derived structurally by the checker rather than promised by a
+document; and every program in §12's worked-examples table runs byte-identically on the
+interpreter, the virtual machine and native code at every optimization level, trap messages
+and their spans included. `concurrencyCases` is empty, the way `nativeSkips` emptied in
+Phase 5.
+
+Read `docs/phases/6-complete.md` before touching the scheduler or the collector's root walk.
+The thing most likely to matter later is the list of five root-set holes recorded there:
+every one was invisible until a collection actually moved objects, and two of them predate
+the phase entirely. `internal/backend/collect_test.go` is where that lesson lives — it
+shrinks `heapSize` around a single build so a real collection is something a five-minute
+suite can reach, and every one of those bugs has a test there that fails on the code it
+replaced.
+
 **Phase 5 is complete** (`docs/phases/5-complete.md`). `originc build` produces native
 x86-64 executables for Linux and macOS with no linker and no libc; the differential suite
 agrees byte for byte across the interpreter, the VM and native code at every optimization
@@ -184,23 +199,6 @@ own output — there is no linker to do it), and the lesson recorded there about
 structurally", which had concealed the fact that every Mach-O the project produced was
 unrunnable.
 
-**In flight:** Phase 6, concurrency. Nothing has been built yet. The design is already
-decided and must be read before any code:
-
-- **ADR-0014** — no data races in safe Origin: a channel send requires `Send`, derived
-  from the absence of `mut` fields; `Mutex` is the only shared mutable thing. Read this
-  first; it constrains everything else.
-- **ADR-0006** — errors are values, no unwinding. Per-green-thread panic isolation is
-  `docs/deferred.md`'s single largest deferred item and is Phase 6's to decide: it needs
-  either unwinding or a supervisor model, and ADR-0006 closed the door on the first.
-- **spec/08-memory-model.md** — what the collector already guarantees. The native
-  collector is stop-the-world and single-space (ADR-0022); a scheduler with more than one
-  thread changes what a safepoint has to mean, and `internal/layout` owns that agreement.
-
-Process rule 1 applies with full force: the concurrency specification in `docs/spec/`
-must exist, with worked examples and expected output, before any implementation. Rule 7
-applies too — the semantics belong to the user, not to the implementer.
-
 **Known-broken / deferred**, all recorded in `docs/deferred.md` with a phase: integer
 arithmetic is 64-bit only in every engine and `u64::MAX` has no run-time representation;
 `match` compiles to a linear chain of arm tests; `to_str` on a `Float` is unimplemented in
@@ -208,69 +206,16 @@ native code (no spec fixes a rendering — Phase 7); a struct or enum declared i
 function body fails loudly in `internal/compile` rather than being checked (Phase 8); a
 function used both as a direct callee and as an escaping value loses its direct-call fast
 path for every use (ADR-0020); native collection is single-space, non-generational, with
-no write barrier (ADR-0022); and DWARF is a line table and a symbol table only, so
-`frame variable` does not work (ADR-0023).
+no write barrier (ADR-0022); DWARF is a line table and a symbol table only, so
+`frame variable` does not work (ADR-0023); no engine runs threads in parallel; and the
+native runtime never reclaims what it maps for a channel, a mutex or a finished thread's
+stack.
 
-**Landed so far in Phase 6:**
-
-- `docs/spec/12-concurrency.md`, ADR-0025 (concurrency is a library, not syntax) and
-  ADR-0026 (a panic kills the process; per-thread isolation stays deferred, now blocked
-  on ADR-0006 rather than scheduled). The user delegated both design questions; see
-  `docs/design-questions.md`.
-- **`Send` is derived structurally** (`internal/check/send.go`), which is what makes
-  ADR-0014's no-data-races claim a compiler rule rather than a document. E0700/E0701/E0702
-  name the offending field and chain through nesting; E0701 checks a spawned closure's
-  *captures*, which no type can express and without which a mutable aggregate reaches
-  another thread by capture instead of by channel.
-- **The surface**: `JoinHandle[T]`, `Sender[T]`, `Receiver[T]` and `Mutex[T]` in the
-  prelude, with methods calling compiler-provided operations. Those operations return a
-  bare handle; the wrapping into a prelude type happens in Origin or in
-  `internal/compile`, never in a runtime — the native backend could not build one.
-- **The interpreter and the virtual machine ran it first**, with the cases native code
-  could not yet reach skipped by name and with the reason (`concurrencyCases`), the same
-  ledger `nativeSkips` kept in Phase 5. It emptied the same way.
-- **`spawn` and `join` run natively**, on a real green thread: an mmap'd stack, a saved
-  register set and `rt_switch` (`internal/backend/thread.go`). The collector's root walk
-  runs once per thread.
-- **A run queue** (`internal/backend/sched.go`) replaced `join`'s switch-and-run, because a
-  thread parked on a channel is waiting for something no one can name when it parks.
-  Cooperative and single-processor; `main` returning drains the threads nobody joined; "no
-  thread is runnable" is §12's total deadlock, detected rather than hung on.
-- **Channels and `Mutex` run natively** (`chan.go`, `mutex.go`), with the blocking
-  conditions written as the same expressions the VM tests, so the two engines agree on which
-  programs deadlock. Both live in raw mmap'd memory the collector does not move, and the
-  collector walks their contents from the outside — told by the compiler whether the element
-  type is a reference, since raw memory has no stack map and no header.
-- **Preemption at back edges** (§08), so a compute loop cannot starve a ready thread. A
-  countdown rather than a timer — no signal handler, and two runs of a program schedule
-  identically — and only in a program that contains a `spawn` at all, because the check
-  makes every back edge a call site and so pushes every loop-carried value into a
-  callee-saved register or a slot. A single-threaded program's loops are untouched.
-- **`concurrencyCases` is empty**: every case in §12 runs on all three engines at every
-  optimization level, trap messages and their spans included. That needed native traps to
-  name the *user's* line rather than the prelude's, which `spans.go` does by walking the rbp
-  chain against a table of user call sites — the same shape as the collector's own walk.
-
-**Bugs found and fixed along the way**, all with regression tests
-(`internal/backend/collect_test.go`, which shrinks `heapSize` to reach them at all):
-
-- A constructor parked its field values on the raw stack across its own allocator call, and
-  a closure body read its captures from `[rbp + 16]` every time. Neither place is in the
-  collector's root set. The rule is now in spec/11-codegen.md: a reference is never parked
-  outside a tracked register or a reference slot across a call that can allocate.
-- `main` was left off the thread list, so a collection triggered by a spawned thread never
-  walked `main`'s stack; and `rt_join` had no frame pointer, so the walk that did reach a
-  parked thread started one frame too high.
-- The thread trampoline called a spawned closure with the object in `rdi`, which works right
-  up until the closure captures something.
-- `-O2` moved a trap onto the line that *called* the function it was in: inlining stamped
-  the call site's span on every cloned instruction. spec/11-codegen.md now states the rule.
-
-**Next action:** `docs/phases/6-complete.md` and the phase gate. §12's worked-examples
-table claims every row is an end-to-end case; nine exist, so either the missing rows become
-cases or the table stops claiming it — the first, unless a row turns out to be
-scheduling-dependent and therefore not a valid differential case (§12's own determinism
-clause).
+**Next action:** Phase 7's scope is not decided. `docs/deferred.md` holds most of a
+candidate list — the standard library (collections, which need `Hash` and index syntax),
+`select`, float formatting, string interpolation, `?` on `Option` — and rule 7 puts the
+choice of what 0.1 actually ships with the user rather than the implementer. Nothing is in
+flight.
 
 **A note on the history:** the VM's concurrency runtime landed inside commit `6b073de`,
 whose message describes only ADR-0027 — the bug the VM work uncovered. The commit is
