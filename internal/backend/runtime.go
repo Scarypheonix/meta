@@ -52,8 +52,14 @@ const (
 	// control block parked (thread.go).
 	rtCurrentOff = 48
 	rtThreadsOff = 56
+	// rtSpanTableOff and rtSpanCountOff locate the user-call-site span table (spans.go),
+	// which a trap raised inside a runtime routine walks the stack against to name the
+	// programmer's own line rather than the prelude's. Compile-time constants, poked into
+	// the data segment like the stack map's own fields.
+	rtSpanTableOff = 64
+	rtSpanCountOff = 72
 	// rtBlockSize is the block's size in bytes; it lives in the writable segment.
-	rtBlockSize = 64
+	rtBlockSize = 80
 
 	// wordSize is the size of everything the machine holds in a register.
 	wordSize = 8
@@ -97,6 +103,10 @@ type runtimeLabels struct {
 	schedWakeAll x86.Label
 	schedPark    x86.Label
 	schedDrain   x86.Label
+	// trapSpan and spanLookup report a trap whose message is known while compiling but
+	// whose line is only knowable at run time (spans.go).
+	trapSpan   x86.Label
+	spanLookup x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -130,6 +140,8 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.schedWakeAll = e.a.NewLabel("rt_wake_all")
 	e.rt.schedPark = e.a.NewLabel("rt_park")
 	e.rt.schedDrain = e.a.NewLabel("rt_drain")
+	e.rt.trapSpan = e.a.NewLabel("rt_trap_span")
+	e.rt.spanLookup = e.a.NewLabel("rt_span_lookup")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -153,6 +165,8 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitSchedWakeAll()
 	e.emitSchedPark()
 	e.emitSchedDrain()
+	e.emitSpanLookup()
+	e.emitTrapSpan()
 	e.emitCollect()
 }
 

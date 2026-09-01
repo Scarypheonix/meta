@@ -34,6 +34,7 @@ type pendingSafepoint struct {
 func (e *emitter) recordCall(v *ir.Value) {
 	label := e.a.NewLabel("safepoint")
 	e.a.Bind(label)
+	e.recordUserSpan(v, label)
 
 	var mask uint8
 	for _, r := range e.regs.callSiteRegs[v] {

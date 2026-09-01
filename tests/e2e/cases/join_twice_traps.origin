@@ -1,0 +1,12 @@
+use std::io;
+use std::thread;
+
+fn main() {
+    let h = thread::spawn(|| -> i64 { 7 });
+    io::println(h.join().to_str());
+    // A handle names one result, and `join` takes it. The second call has nothing to
+    // wait for and no value to yield, so it is a programming error rather than a block
+    // that never ends (spec/12-concurrency.md).
+    io::println(h.join().to_str());
+    io::println("not reached");
+}

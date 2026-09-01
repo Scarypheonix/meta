@@ -130,12 +130,13 @@ type emitter struct {
 	stringType     layout.TypeID
 	newlineAddr    uint64
 	outOfMemoryMsg staticStr
-	// joinedTwiceMsg is §12's `handle already joined`.
-	joinedTwiceMsg staticStr
 	// deadlockMsg is §12's `all threads are blocked`, for the one place that detects it
 	// with no user code left on the stack to name: the drain loop `_start` runs after
 	// `main` has returned (sched.go).
 	deadlockMsg staticStr
+	// runtimeLocMsg is the location a trap names when the stack walk finds no user call
+	// site to blame (spans.go).
+	runtimeLocMsg staticStr
 	// panicPrefix is the "origin: " a panic's message is wrapped in, so that the three
 	// engines print the same line.
 	panicPrefix staticStr
@@ -164,6 +165,10 @@ type emitter struct {
 	gcRuntimeEntryAddr uint64
 
 	fnLabels []x86.Label
+
+	// userSpans accumulates one entry per call site written outside the prelude, so that a
+	// trap a runtime routine raises can name the programmer's own line (spans.go).
+	userSpans []pendingUserSpan
 
 	// safepoints accumulates one entry per call site across every function in the
 	// program, in whatever order lowering visits them; buildStackMap sorts and encodes
@@ -211,13 +216,13 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 	e.newlineAddr = e.roDataAddr + uint64(len(e.roData))
 	e.roData = append(e.roData, '\n')
 	e.outOfMemoryMsg = e.rawString("origin: out of memory at <runtime>\n")
-	// A concurrency trap raised by the runtime rather than by a lowered instruction has
-	// no span of its own to name, the same way `out of memory` has none. The other two
-	// engines resolve such a trap to the user's own line by walking out of the prelude
-	// (interp/vm's userSpan); native code has no frame table to do that with yet, so it
-	// says `<runtime>` rather than inventing a location (docs/deferred.md).
-	e.joinedTwiceMsg = e.rawString("origin: handle already joined at <runtime>\n")
+	// A trap the runtime raises rather than a lowered instruction has no span of its own,
+	// and spans.go's stack walk finds the user's line for it. These two are what is left
+	// when even that finds nothing: the deadlock the drain loop detects after `main` has
+	// returned, which no user frame is on the stack for, and the location a walk that
+	// matched no call site prints.
 	e.deadlockMsg = e.rawString("origin: all threads are blocked at <runtime>\n")
+	e.runtimeLocMsg = e.rawString("<runtime>")
 	e.panicPrefix = e.rawString("origin: ")
 	e.emitTypeTable()
 	e.emitGCRuntimeFrameEntry()
@@ -247,9 +252,11 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 	}
 
 	mapAddr, mapCount := e.buildStackMap()
+	spanAddr, spanCount := e.buildSpanTable()
 
 	data := make([]byte, rtBlockSize)
 	writeStackMapFields(data, mapAddr, mapCount)
+	writeSpanTableFields(data, spanAddr, spanCount)
 
 	text := e.a.Code()
 	// The compile-unit DIE's own address range covers the whole of .text (there is
