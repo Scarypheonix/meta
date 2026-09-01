@@ -52,12 +52,13 @@ const (
 	// frames hold live references too, so the walk runs once per thread rather than once
 	// (spec/12-concurrency.md, thread.go).
 	gcThreadOff = -88
-	// gcChanOff and gcChanIdxOff are the channel walk's own cursor: which channel, and how
-	// far into its queue. Both live in the frame rather than in registers because every
-	// step of that walk is a call to rt_evacuate.
-	gcChanOff    = -96
-	gcChanIdxOff = -104
-	gcLocalsSz   = 112 // a multiple of 16: the ABI wants rsp aligned at every call
+	// gcRawCursorOff and gcRawIndexOff are the cursor the walks over raw runtime memory
+	// share -- the channel list and then the mutex list, one after the other: which block,
+	// and how far into it. Both live in the frame rather than in registers because every
+	// step of such a walk is a call to rt_evacuate.
+	gcRawCursorOff = -96
+	gcRawIndexOff  = -104
+	gcLocalsSz     = 112 // a multiple of 16: the ABI wants rsp aligned at every call
 )
 
 // gcTrackedRegs is rt_collect's own root-tracking registers, in RegMask/SavedMask's bit
@@ -424,6 +425,7 @@ func (e *emitter) emitCollect() {
 	a.Bind(walkDone)
 	e.gcNextThreadStack(walkLoop)
 	e.gcEvacuateChannels()
+	e.gcEvacuateMutexes()
 
 	// Cheney's scan: walk the destination space from its own start to its own (growing)
 	// bump position, evacuating every reference each already-copied object holds.
@@ -743,20 +745,20 @@ func (e *emitter) gcEvacuateChannels() {
 	noWrap := a.NewLabel("gc_chan_no_wrap")
 
 	a.MovRM(x86.RAX, x86.At(x86.R15, rtChannelsOff))
-	a.MovMR(x86.At(x86.RBP, gcChanOff), x86.RAX)
+	a.MovMR(x86.At(x86.RBP, gcRawCursorOff), x86.RAX)
 
 	a.Bind(loop)
-	a.MovRM(x86.RCX, x86.At(x86.RBP, gcChanOff))
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcRawCursorOff))
 	a.TestRR(x86.RCX, x86.RCX)
 	a.Jcc(x86.Equal, done)
 	a.MovRM(x86.RAX, x86.At(x86.RCX, chanElemIsRefOff))
 	a.TestRR(x86.RAX, x86.RAX)
 	a.Jcc(x86.Equal, next)
-	a.MovMI(x86.At(x86.RBP, gcChanIdxOff), 0)
+	a.MovMI(x86.At(x86.RBP, gcRawIndexOff), 0)
 
 	a.Bind(inner)
-	a.MovRM(x86.RCX, x86.At(x86.RBP, gcChanOff))
-	a.MovRM(x86.RAX, x86.At(x86.RBP, gcChanIdxOff))
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcRawCursorOff))
+	a.MovRM(x86.RAX, x86.At(x86.RBP, gcRawIndexOff))
 	a.MovRM(x86.RDX, x86.At(x86.RCX, chanLenOff))
 	a.CmpRR(x86.RAX, x86.RDX)
 	a.Jcc(x86.AboveEqual, innerDone)
@@ -781,16 +783,16 @@ func (e *emitter) gcEvacuateChannels() {
 	a.Pop(x86.RCX)
 	a.MovMR(x86.At(x86.RCX, 0), x86.RAX)
 
-	a.MovRM(x86.RAX, x86.At(x86.RBP, gcChanIdxOff))
+	a.MovRM(x86.RAX, x86.At(x86.RBP, gcRawIndexOff))
 	a.AddRI(x86.RAX, 1)
-	a.MovMR(x86.At(x86.RBP, gcChanIdxOff), x86.RAX)
+	a.MovMR(x86.At(x86.RBP, gcRawIndexOff), x86.RAX)
 	a.Jmp(inner)
 
 	a.Bind(innerDone)
 	a.Bind(next)
-	a.MovRM(x86.RCX, x86.At(x86.RBP, gcChanOff))
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcRawCursorOff))
 	a.MovRM(x86.RCX, x86.At(x86.RCX, chanNextOff))
-	a.MovMR(x86.At(x86.RBP, gcChanOff), x86.RCX)
+	a.MovMR(x86.At(x86.RBP, gcRawCursorOff), x86.RCX)
 	a.Jmp(loop)
 
 	a.Bind(done)

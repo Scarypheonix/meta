@@ -1,0 +1,14 @@
+use std::io;
+use std::sync;
+
+struct Counter { mut n: i64 }
+
+fn main() {
+    let m = sync::mutex(Counter { n: 0 });
+    io::println("locking");
+    // The thread asking for the lock is the one holding it, so no thread can ever release
+    // it. A hang would be defined behaviour and a useless one; the trap names the bug where
+    // it happens (spec/12-concurrency.md).
+    let x = m.with(|c: Counter| -> i64 { m.with(|c2: Counter| -> i64 { 0 }) });
+    io::println("not reached");
+}

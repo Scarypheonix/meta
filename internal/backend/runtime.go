@@ -62,8 +62,10 @@ const (
 	// the thread list, it exists for the collector: a queued value may be a reference, and
 	// no stack map covers a channel's own raw memory.
 	rtChannelsOff = 80
+	// rtMutexesOff heads the list of every mutex, for the same reason (mutex.go).
+	rtMutexesOff = 88
 	// rtBlockSize is the block's size in bytes; it lives in the writable segment.
-	rtBlockSize = 88
+	rtBlockSize = 96
 
 	// wordSize is the size of everything the machine holds in a register.
 	wordSize = 8
@@ -117,6 +119,10 @@ type runtimeLabels struct {
 	chanRecv  x86.Label
 	chanTaken x86.Label
 	chanClose x86.Label
+	// The mutex operations (mutex.go, ADR-0014).
+	mutexNew    x86.Label
+	mutexLock   x86.Label
+	mutexUnlock x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -157,6 +163,9 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.chanRecv = e.a.NewLabel("rt_chan_recv")
 	e.rt.chanTaken = e.a.NewLabel("rt_chan_taken")
 	e.rt.chanClose = e.a.NewLabel("rt_chan_close")
+	e.rt.mutexNew = e.a.NewLabel("rt_mutex_new")
+	e.rt.mutexLock = e.a.NewLabel("rt_mutex_lock")
+	e.rt.mutexUnlock = e.a.NewLabel("rt_mutex_unlock")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -187,6 +196,9 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitChanRecv()
 	e.emitChanTaken()
 	e.emitChanClose()
+	e.emitMutexNew()
+	e.emitMutexLock()
+	e.emitMutexUnlock()
 	e.emitCollect()
 }
 

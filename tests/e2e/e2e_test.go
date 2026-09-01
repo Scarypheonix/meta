@@ -113,25 +113,17 @@ var engines = []engineSpec{
 // engine — so a case landing here again is a real, temporary regression, not the norm.
 var nativeSkips = map[string]string{}
 
-// concurrencyCases are the cases the native backend cannot run yet -- the ones needing a
-// channel, a mutex, or a thread that parks without being joined. `spawn` and `join`
-// themselves run on all three engines now (thread.go), so they are deliberately absent
-// from this list.
+// concurrencyCases are the cases an engine cannot run yet for want of a scheduler, a
+// channel or a mutex.
 //
-// Skipping by name with the reason is how the suite stays honest about what is built,
-// exactly as `nativeSkips` did for Phase 5, and the list is meant to empty the same way.
-//
-// This list is the live record of how far Phase 6 has reached, exactly as `nativeSkips`
-// was for Phase 5, and it is meant to empty the same way: an entry disappears when the
-// engine can run it, and nothing else changes.
-var concurrencyCases = map[string]bool{
-	"mutex_guards_shared_mutation": true,
-}
+// It was the live record of how far Phase 6 had reached, exactly as `nativeSkips` was for
+// Phase 5, and it emptied the same way: an entry disappeared when the engine could run it.
+// Every case in §12 now runs on all three engines at every optimization level -- so a name
+// appearing here again is a real, temporary regression rather than the norm.
+var concurrencyCases = map[string]bool{}
 
 // concurrencySkips names the engines that cannot yet run a concurrent program.
-var concurrencySkips = map[driver.Engine]string{
-	driver.Native: "Phase 6: the native backend has no mutex yet",
-}
+var concurrencySkips = map[driver.Engine]string{}
 
 // runsNatively reports whether the host can execute what the backend produces. Only
 // x86-64 Linux can, which is the point of ADR-0003's second writer.

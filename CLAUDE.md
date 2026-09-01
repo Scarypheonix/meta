@@ -226,22 +226,45 @@ no write barrier (ADR-0022); and DWARF is a line table and a symbol table only, 
   prelude, with methods calling compiler-provided operations. Those operations return a
   bare handle; the wrapping into a prelude type happens in Origin or in
   `internal/compile`, never in a runtime — the native backend could not build one.
-- **The interpreter and the virtual machine both run it.** Five end-to-end cases pass on
-  both, skipped by name on native with the reason (`concurrencyCases`), the same ledger
-  `nativeSkips` kept in Phase 5 and meant to empty the same way.
+- **The interpreter and the virtual machine ran it first**, with the cases native code
+  could not yet reach skipped by name and with the reason (`concurrencyCases`), the same
+  ledger `nativeSkips` kept in Phase 5. It emptied the same way.
 - **`spawn` and `join` run natively**, on a real green thread: an mmap'd stack, a saved
-  register set and `rt_switch` (`internal/backend/thread.go`, commit `14bb976`). The
-  collector's root walk runs once per thread. Channels need a run queue and are next.
-- **Two native GC-root bugs, both silent until a collection actually moved objects**
-  (`internal/backend/collect_test.go` is the regression test, and it shrinks `heapSize` to
-  reach them at all). A constructor pushed its field values to the raw stack across its own
-  allocator call, and a closure body read its captures from `[rbp + 16]` every time; neither
-  place is in the collector's root set, so both handed back pre-collection addresses. The
-  rule is now written down in spec/11-codegen.md's "Stack frames": a reference is never
-  parked outside a tracked register or a reference slot across a call that can allocate.
+  register set and `rt_switch` (`internal/backend/thread.go`). The collector's root walk
+  runs once per thread.
+- **A run queue** (`internal/backend/sched.go`) replaced `join`'s switch-and-run, because a
+  thread parked on a channel is waiting for something no one can name when it parks.
+  Cooperative and single-processor; `main` returning drains the threads nobody joined; "no
+  thread is runnable" is §12's total deadlock, detected rather than hung on.
+- **Channels and `Mutex` run natively** (`chan.go`, `mutex.go`), with the blocking
+  conditions written as the same expressions the VM tests, so the two engines agree on which
+  programs deadlock. Both live in raw mmap'd memory the collector does not move, and the
+  collector walks their contents from the outside — told by the compiler whether the element
+  type is a reference, since raw memory has no stack map and no header.
+- **`concurrencyCases` is empty**: every case in §12 runs on all three engines at every
+  optimization level, trap messages and their spans included. That needed native traps to
+  name the *user's* line rather than the prelude's, which `spans.go` does by walking the rbp
+  chain against a table of user call sites — the same shape as the collector's own walk.
 
-**Next action:** channels on native, which need a run queue rather than `join`'s
-switch-and-run: a thread parked on a channel has nobody to switch back to it.
+**Bugs found and fixed along the way**, all with regression tests
+(`internal/backend/collect_test.go`, which shrinks `heapSize` to reach them at all):
+
+- A constructor parked its field values on the raw stack across its own allocator call, and
+  a closure body read its captures from `[rbp + 16]` every time. Neither place is in the
+  collector's root set. The rule is now in spec/11-codegen.md: a reference is never parked
+  outside a tracked register or a reference slot across a call that can allocate.
+- `main` was left off the thread list, so a collection triggered by a spawned thread never
+  walked `main`'s stack; and `rt_join` had no frame pointer, so the walk that did reach a
+  parked thread started one frame too high.
+- The thread trampoline called a spawned closure with the object in `rdi`, which works right
+  up until the closure captures something.
+- `-O2` moved a trap onto the line that *called* the function it was in: inlining stamped
+  the call site's span on every cloned instruction. spec/11-codegen.md now states the rule.
+
+**Next action:** Phase 6's exit criteria and `docs/phases/6-complete.md`. What is left
+before that: preemption at back edges in native code (§08 asks for it; the scheduler is
+cooperative), and a decision on whether §12's examples want more end-to-end cases than the
+seven that exist. Both are in `docs/deferred.md` with a phase.
 
 **A note on the history:** the VM's concurrency runtime landed inside commit `6b073de`,
 whose message describes only ADR-0027 — the bug the VM work uncovered. The commit is

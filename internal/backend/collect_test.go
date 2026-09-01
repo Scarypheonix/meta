@@ -366,3 +366,64 @@ fn main() {
 }
 `, "26100") // 60 lists of sum(0..29) = 435.
 }
+
+// TestACollectionForwardsAMutexsGuardedValue is the last of the runtime's own root sets. A
+// mutex holds its value in raw memory between calls to `with`, so nothing else names it
+// while no thread holds the lock -- and the threads that do hold it are allocating hard
+// enough to move it (mutex.go, collect.go's gcEvacuateMutexes).
+//
+// The guarded counter is a reference, and the two threads read it back through the lock
+// after collections that moved it, so a slot the collector failed to rewrite shows up as a
+// count that is wrong or a trap rather than as 400.
+func TestACollectionForwardsAMutexsGuardedValue(t *testing.T) {
+	checkRun(t, `
+use std::io;
+use std::thread;
+use std::sync;
+
+struct Counter { mut n: i64 }
+struct Node { value: i64, tail: Option[Node] }
+
+fn build(n: i64) -> Option[Node] {
+    let mut out = Option::None;
+    let mut i = 0;
+    while i < n { out = Option::Some(Node { value: i, tail: out }); i = i + 1; }
+    out
+}
+
+fn total(list: Option[Node]) -> i64 {
+    let mut sum = 0;
+    let mut cur = list;
+    while true {
+        match cur {
+            Option::Some(nd) => { sum = sum + nd.value; cur = nd.tail; },
+            Option::None => { return sum; },
+        }
+    }
+    sum
+}
+
+fn main() {
+    let m = sync::mutex(Counter { n: 0 });
+    let a = thread::spawn(|| -> i64 {
+        let mut i = 0;
+        while i < 200 {
+            m.with(|c: Counter| -> i64 { c.n = c.n + total(build(20)); 0 });
+            i = i + 1;
+        }
+        0
+    });
+    let b = thread::spawn(|| -> i64 {
+        let mut i = 0;
+        while i < 200 {
+            m.with(|c: Counter| -> i64 { c.n = c.n + total(build(20)); 0 });
+            i = i + 1;
+        }
+        0
+    });
+    let x = a.join();
+    let y = b.join();
+    io::println(m.with(|c: Counter| -> i64 { c.n }).to_str());
+}
+`, "76000") // 400 increments of sum(0..19) = 190.
+}

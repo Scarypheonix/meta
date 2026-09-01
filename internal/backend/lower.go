@@ -696,6 +696,23 @@ func (e *emitter) builtin(v *ir.Value) error {
 		e.def(v, scratchA)
 		return nil
 
+	case compile.BuiltinMutex:
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: mutex takes two arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.load(x86.RSI, v.Args[1])
+		e.a.Call(e.rt.mutexNew)
+		e.recordCall(v)
+		e.def(v, x86.RAX)
+		return nil
+
+	case compile.BuiltinWithLock:
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: with_lock takes two arguments, got %d", len(v.Args))
+		}
+		return e.withLock(v)
+
 	case compile.BuiltinPrint, compile.BuiltinPrintln:
 		if len(v.Args) != 1 {
 			return fmt.Errorf("this is a compiler bug: print takes one argument, got %d", len(v.Args))
@@ -747,6 +764,56 @@ func (e *emitter) builtin(v *ir.Value) error {
 		return e.buildOrdering(v)
 	}
 	return fmt.Errorf("unimplemented: builtin %d in native code", v.Const)
+}
+
+// withLock lowers `Mutex::with`: take the lock, call the body with the guarded value,
+// release the lock, and yield what the body returned.
+//
+// All three land at this one call site rather than in a runtime routine, because the middle
+// one is a call into Origin code -- with its own frame, its own stack map and its own
+// closure convention -- and because there is then no path out of the body that skips the
+// release. A panic inside it ends the process (ADR-0026), which is the only other exit and
+// needs no lock dropped.
+//
+// The body's call gets its own safepoint entry. It is a call in the middle of an operation
+// the register allocator sees as one instruction, so the live references at it are exactly
+// the ones it recorded for that instruction -- but the collector still has to find an entry
+// for its return address, or a collection inside the body walks this frame as though it were
+// a runtime routine's, with no roots of its own.
+func (e *emitter) withLock(v *ir.Value) error {
+	a := e.a
+
+	e.load(x86.RDI, v.Args[0])
+	a.MovRM(x86.RDI, x86.At(x86.RDI, objHeaderSize)) // the mutex, out of `Mutex[T]`
+	a.Call(e.rt.mutexLock)
+	e.recordCall(v)
+	e.schedStatus(v, "mutex re-entered by the same thread")
+
+	// The guarded value came back in rdx and is the body's only argument. The closure goes
+	// on the stack where a closure's own body reads it (callClosure above), twice for the
+	// alignment a call wants.
+	a.MovRR(x86.RDI, x86.RDX)
+	e.load(scratchA, v.Args[1])
+	a.MovRM(scratchB, x86.At(scratchA, fieldOffset(0)))
+	a.Push(scratchA)
+	a.Push(scratchA)
+	a.CallReg(scratchB)
+	e.recordCall(v)
+	a.AddRI(x86.RSP, 16)
+
+	// The result rides the stack across the release, which is sound only because
+	// rt_mutex_unlock cannot allocate: it drops the owner and wakes the waiters. A
+	// reference parked on the raw stack across anything that *can* collect is exactly the
+	// bug construct above was fixed for.
+	a.Push(x86.RAX)
+	a.Push(x86.RAX)
+	e.load(x86.RDI, v.Args[0])
+	a.MovRM(x86.RDI, x86.At(x86.RDI, objHeaderSize))
+	a.Call(e.rt.mutexUnlock)
+	a.Pop(x86.RAX)
+	a.Pop(x86.RAX)
+	e.def(v, x86.RAX)
+	return nil
 }
 
 // schedStatus turns a blocking runtime routine's status (sched.go) into a trap, and falls
