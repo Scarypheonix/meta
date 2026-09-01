@@ -2,7 +2,9 @@ package opt
 
 import (
 	"github.com/scarypheonix/meta/internal/bytecode"
+	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/ir"
+	"github.com/scarypheonix/meta/internal/prelude"
 )
 
 // inlineBudget is the cost model: a callee is inlined when it is no larger than this,
@@ -252,6 +254,26 @@ func (c *cloner) cloneBlocks(callee *ir.Func) *ir.Block {
 	return c.blocks[callee.Entry]
 }
 
+// inlinedSpan is which line a cloned instruction reports if it traps.
+//
+// The callee's own, because that is the line the trap is on and inlining is not allowed to
+// change what a program prints (spec/11-codegen.md: identical output at every level).
+// Stamping the call site onto every cloned instruction, as this used to, moved a `divide by
+// zero` inside a small helper onto the line that called the helper as soon as -O2 inlined
+// it, which is an optimization the program can see.
+//
+// A span in the prelude is the exception, and not a special case so much as the same rule:
+// an operation the prelude performs on the caller's behalf already reports the caller's
+// line when it is *not* inlined, because both other engines walk out of the prelude to find
+// one (interp/vm's userSpan). Keeping the prelude's own span here would make -O2 the level
+// that names `<prelude>` in a message about the user's program.
+func inlinedSpan(callee, site diag.Span) diag.Span {
+	if callee.Valid() && callee.File != nil && callee.File.Name != prelude.Name {
+		return callee
+	}
+	return site
+}
+
 // cloneValue copies one value, or returns nil for a parameter, which is replaced by the
 // call's argument rather than cloned.
 func (c *cloner) cloneValue(v *ir.Value) *ir.Value {
@@ -261,7 +283,7 @@ func (c *cloner) cloneValue(v *ir.Value) *ir.Value {
 			return nil
 		}
 	}
-	nv := c.f.NewValue(v.Op, c.call.Span)
+	nv := c.f.NewValue(v.Op, inlinedSpan(v.Span, c.call.Span))
 	nv.Const = v.Const
 	nv.Aux = v.Aux
 	nv.Kind = v.Kind

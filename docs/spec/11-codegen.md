@@ -243,6 +243,14 @@ virtual machine produce for the same program. That is what makes the three engin
 comparable, and the end-to-end suite asserts it for every case at every optimization
 level.
 
+Inlining MUST NOT change that text. An instruction the optimizer clones into a caller
+keeps the line it had, so a trap inside a function `-O2` inlined still names that
+function's own line rather than the line that called it. A span in the **prelude** is the
+one exception, and it is the same rule rather than a special case: an operation the prelude
+performs on the caller's behalf reports the caller's line when it is not inlined — both
+other engines resolve it that way at run time (`userSpan`) — so an inlined copy of it
+reports the caller's line too.
+
 ## Code signing (macOS)
 
 A Mach-O executable MUST carry an ad-hoc code signature, and its `__LINKEDIT` segment

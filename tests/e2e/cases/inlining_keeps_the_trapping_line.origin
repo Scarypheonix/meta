@@ -1,0 +1,17 @@
+use std::io;
+
+// A trap names the line the operation is on, whatever the optimizer did to get there.
+//
+// `half` is small enough for -O2 to inline, and inlining used to stamp the call site's
+// span onto every instruction it cloned. This program then said line 16 at -O2 and line 10
+// everywhere else -- an optimization the program can see, which spec/11-codegen.md does not
+// allow. The prelude is the one exception, and the same rule: an operation the prelude
+// performs for the caller already reports the caller's line when it is not inlined.
+fn half(a: i64, b: i64) -> i64 {
+    a / b
+}
+
+fn main() {
+    io::println(half(10, 2).to_str());
+    io::println(half(1, 0).to_str());
+}
