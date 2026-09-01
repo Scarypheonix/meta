@@ -58,8 +58,12 @@ const (
 	// the data segment like the stack map's own fields.
 	rtSpanTableOff = 64
 	rtSpanCountOff = 72
+	// rtChannelsOff heads the list of every channel the program has made (chan.go). Like
+	// the thread list, it exists for the collector: a queued value may be a reference, and
+	// no stack map covers a channel's own raw memory.
+	rtChannelsOff = 80
 	// rtBlockSize is the block's size in bytes; it lives in the writable segment.
-	rtBlockSize = 80
+	rtBlockSize = 88
 
 	// wordSize is the size of everything the machine holds in a register.
 	wordSize = 8
@@ -107,6 +111,12 @@ type runtimeLabels struct {
 	// whose line is only knowable at run time (spans.go).
 	trapSpan   x86.Label
 	spanLookup x86.Label
+	// The channel operations (chan.go, spec/12-concurrency.md).
+	chanNew   x86.Label
+	chanSend  x86.Label
+	chanRecv  x86.Label
+	chanTaken x86.Label
+	chanClose x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -142,6 +152,11 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.schedDrain = e.a.NewLabel("rt_drain")
 	e.rt.trapSpan = e.a.NewLabel("rt_trap_span")
 	e.rt.spanLookup = e.a.NewLabel("rt_span_lookup")
+	e.rt.chanNew = e.a.NewLabel("rt_chan_new")
+	e.rt.chanSend = e.a.NewLabel("rt_chan_send")
+	e.rt.chanRecv = e.a.NewLabel("rt_chan_recv")
+	e.rt.chanTaken = e.a.NewLabel("rt_chan_taken")
+	e.rt.chanClose = e.a.NewLabel("rt_chan_close")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -167,6 +182,11 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitSchedDrain()
 	e.emitSpanLookup()
 	e.emitTrapSpan()
+	e.emitChanNew()
+	e.emitChanSend()
+	e.emitChanRecv()
+	e.emitChanTaken()
+	e.emitChanClose()
 	e.emitCollect()
 }
 

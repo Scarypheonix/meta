@@ -239,11 +239,21 @@ func (e *emitter) emitThreadEntry() {
 	a.MovRM(x86.RBX, x86.At(x86.R15, rtCurrentOff))
 	a.MovMI(x86.At(x86.RBX, tcbStateOff), threadRunning)
 
-	// Call the closure. Origin's calling convention passes a closure's own reference in
-	// rdi (ADR-0020) and reads the function's address out of its first word.
+	// Call the closure exactly as lower.go's callClosure does, because the body was
+	// compiled expecting that and nothing else: the code address comes out of the object's
+	// first field, and the object itself goes on the stack just above the return address,
+	// where OpCapture reads it. Twice, for the alignment a call wants.
+	//
+	// Passing it in rdi instead -- which this did, on the strength of a stale reading of
+	// ADR-0020 -- works for exactly as long as the spawned closure captures nothing. The
+	// first one that captured a value read its capture from whatever the stack happened to
+	// hold at [rbp + 16], which was zero.
 	a.MovRM(x86.RDI, x86.At(x86.RBX, tcbClosureOff))
 	a.MovRM(x86.RAX, x86.At(x86.RDI, objHeaderSize))
+	a.Push(x86.RDI)
+	a.Push(x86.RDI)
 	a.CallReg(x86.RAX)
+	a.AddRI(x86.RSP, 16)
 
 	// Publish the result before the state, so that a thread observing `done` never reads
 	// a result that has not been written. Only one thread runs at a time here, so this is

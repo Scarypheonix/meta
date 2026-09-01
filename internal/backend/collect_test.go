@@ -308,3 +308,61 @@ fn main() {
 }
 `, "1225\n46800\n1225")
 }
+
+// TestACollectionForwardsValuesSittingInAChannel is the channel half of the root set. A
+// value crossing a channel is an ordinary heap reference, but the queue holding it is raw
+// mmap'd memory with no stack map over it and no header to read a shape from -- so the
+// collector walks it from the outside, told by the compiler whether this channel's element
+// type is a reference at all (chan.go, collect.go's gcEvacuateChannels).
+//
+// The producer allocates hard enough to collect many times over with lists queued behind
+// it, so a queue slot the collector failed to rewrite is a list that reads back as garbage
+// rather than as a sum.
+func TestACollectionForwardsValuesSittingInAChannel(t *testing.T) {
+	checkRun(t, `
+use std::io;
+use std::thread;
+use std::chan;
+
+struct Node { value: i64, tail: Option[Node] }
+
+fn build(n: i64) -> Option[Node] {
+    let mut out = Option::None;
+    let mut i = 0;
+    while i < n { out = Option::Some(Node { value: i, tail: out }); i = i + 1; }
+    out
+}
+
+fn total(list: Option[Node]) -> i64 {
+    let mut sum = 0;
+    let mut cur = list;
+    while true {
+        match cur {
+            Option::Some(nd) => { sum = sum + nd.value; cur = nd.tail; },
+            Option::None => { return sum; },
+        }
+    }
+    sum
+}
+
+fn main() {
+    let (s, r) = chan::channel[Option[Node]](4);
+    let h = thread::spawn(|| -> i64 {
+        let mut i = 0;
+        while i < 60 {
+            s.send(build(30));
+            i = i + 1;
+        }
+        s.close();
+        0
+    });
+    let mut acc = 0;
+    while true {
+        match r.recv() {
+            Option::Some(list) => { acc = acc + total(list); },
+            Option::None => { io::println(acc.to_str()); return; },
+        }
+    }
+}
+`, "26100") // 60 lists of sum(0..29) = 435.
+}

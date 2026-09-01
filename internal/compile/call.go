@@ -58,15 +58,16 @@ func (c *Compiler) call(v *ast.Call) error {
 				}
 			}
 			argc := len(v.Args)
-			if idx == BuiltinSpawn {
-				// `spawn` takes one more argument than it is written with: whether the
-				// thread's result is a reference. Native code keeps that result in a
-				// thread control block, which is raw memory with no stack map over it, so
-				// the collector cannot tell a reference from an integer there. Only the
-				// compiler knows -- it has the checker's own T -- so it says. The other
-				// two engines ignore the argument; their hosts find references without
-				// being told (spec/12-concurrency.md).
-				isRef, err := c.spawnResultIsRef(v)
+			if wantsIsRef(idx) {
+				// These three take one more argument than they are written with: whether
+				// the value they will hold on the program's behalf is a reference. Native
+				// code keeps a thread's result, a channel's queue and a mutex's guarded
+				// value in raw memory with no stack map over it, so the collector cannot
+				// tell a reference from an integer there. Only the compiler knows -- it has
+				// the checker's own T -- so it says. The other two engines ignore the
+				// argument; their hosts find references without being told
+				// (spec/12-concurrency.md).
+				isRef, err := c.concurrencyElemIsRef(idx, v)
 				if err != nil {
 					return err
 				}
@@ -325,16 +326,33 @@ func (c *Compiler) wrapConcurrencyHandle(idx int, v *ast.Call) error {
 	return nil
 }
 
-// spawnResultIsRef reports whether the T in `spawn`'s own `JoinHandle[T]` is something
-// the collector must treat as a reference.
-func (c *Compiler) spawnResultIsRef(v *ast.Call) (int64, error) {
-	named, ok := types.AsNamed(c.concreteType(c.typeOf(v)))
+// wantsIsRef reports whether a builtin takes the extra "is this a reference" argument.
+func wantsIsRef(idx int) bool {
+	return idx == BuiltinSpawn || idx == BuiltinChannel || idx == BuiltinMutex
+}
+
+// concurrencyElemIsRef reports whether the value the runtime will hold for this call is
+// something the collector must treat as a reference.
+//
+// Which type that is depends on the call: `spawn` has `JoinHandle[T]`, `mutex` has
+// `Mutex[T]`, and `channel` has `(Sender[T], Receiver[T])` -- a pair, whose first end names
+// the same T the queue will hold.
+func (c *Compiler) concurrencyElemIsRef(idx int, v *ast.Call) (int64, error) {
+	t := c.concreteType(c.typeOf(v))
+	if idx == BuiltinChannel {
+		tup, ok := t.(*types.TupleT)
+		if !ok || len(tup.Elems) != 2 {
+			return 0, unsupported("a channel whose type is not a pair of ends", v.Span())
+		}
+		t = c.concreteType(tup.Elems[0])
+	}
+	named, ok := types.AsNamed(t)
 	if !ok || len(named.Args) != 1 {
-		return 0, unsupported("a spawn whose handle type is not JoinHandle[T]", v.Span())
+		return 0, unsupported("a concurrency handle that is not of the form Handle[T]", v.Span())
 	}
 	k, ok := wordKindFor(c.concreteType(named.Args[0]))
 	if !ok {
-		return 0, unsupported("a spawned thread whose result type has no object layout", v.Span())
+		return 0, unsupported("a concurrency handle whose element type has no object layout", v.Span())
 	}
 	if k == layout.WordRef {
 		return 1, nil

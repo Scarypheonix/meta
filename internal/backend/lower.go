@@ -628,6 +628,74 @@ func (e *emitter) builtin(v *ir.Value) error {
 		e.def(v, x86.RDX)
 		return nil
 
+	case compile.BuiltinChannel:
+		// rt_chan_new(capacity, elemIsRef) -> handle, with the second argument the one
+		// internal/compile adds (spec/12-concurrency.md): a queued value may be a
+		// reference, and a channel is raw memory the collector reads from the outside.
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: channel takes two arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.load(x86.RSI, v.Args[1])
+		e.a.Call(e.rt.chanNew)
+		e.recordCall(v)
+		e.schedStatus(v, "channel capacity is negative")
+		e.def(v, x86.RDX)
+		return nil
+
+	case compile.BuiltinSend:
+		// The argument is the `Sender[T]` object; the channel is its first field, exactly
+		// as `join`'s handle is.
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: send takes two arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.a.MovRM(x86.RDI, x86.At(x86.RDI, objHeaderSize))
+		e.load(x86.RSI, v.Args[1])
+		e.a.Call(e.rt.chanSend)
+		e.recordCall(v)
+		e.schedStatus(v, "send on a closed channel")
+		e.a.XorRR(scratchA, scratchA)
+		e.def(v, scratchA)
+		return nil
+
+	case compile.BuiltinAwait:
+		if len(v.Args) != 1 {
+			return fmt.Errorf("this is a compiler bug: await takes one argument, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.a.MovRM(x86.RDI, x86.At(x86.RDI, objHeaderSize))
+		e.a.Call(e.rt.chanRecv)
+		e.recordCall(v)
+		e.schedStatus(v, "receive on a channel that does not exist")
+		e.def(v, x86.RDX)
+		return nil
+
+	case compile.BuiltinTaken:
+		// The value the receive above took, held on this thread until now so that asking
+		// "is there one?" and taking it are one step (the prelude's own `recv`).
+		if len(v.Args) != 1 {
+			return fmt.Errorf("this is a compiler bug: taken takes one argument, got %d", len(v.Args))
+		}
+		e.a.Call(e.rt.chanTaken)
+		e.recordCall(v)
+		e.schedStatus(v, "no value was taken from this channel")
+		e.def(v, x86.RDX)
+		return nil
+
+	case compile.BuiltinCloseChan:
+		if len(v.Args) != 1 {
+			return fmt.Errorf("this is a compiler bug: close takes one argument, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.a.MovRM(x86.RDI, x86.At(x86.RDI, objHeaderSize))
+		e.a.Call(e.rt.chanClose)
+		e.recordCall(v)
+		e.schedStatus(v, "channel already closed")
+		e.a.XorRR(scratchA, scratchA)
+		e.def(v, scratchA)
+		return nil
+
 	case compile.BuiltinPrint, compile.BuiltinPrintln:
 		if len(v.Args) != 1 {
 			return fmt.Errorf("this is a compiler bug: print takes one argument, got %d", len(v.Args))

@@ -52,7 +52,12 @@ const (
 	// frames hold live references too, so the walk runs once per thread rather than once
 	// (spec/12-concurrency.md, thread.go).
 	gcThreadOff = -88
-	gcLocalsSz  = 96 // a multiple of 16: the ABI wants rsp aligned at every call
+	// gcChanOff and gcChanIdxOff are the channel walk's own cursor: which channel, and how
+	// far into its queue. Both live in the frame rather than in registers because every
+	// step of that walk is a call to rt_evacuate.
+	gcChanOff    = -96
+	gcChanIdxOff = -104
+	gcLocalsSz   = 112 // a multiple of 16: the ABI wants rsp aligned at every call
 )
 
 // gcTrackedRegs is rt_collect's own root-tracking registers, in RegMask/SavedMask's bit
@@ -418,6 +423,7 @@ func (e *emitter) emitCollect() {
 
 	a.Bind(walkDone)
 	e.gcNextThreadStack(walkLoop)
+	e.gcEvacuateChannels()
 
 	// Cheney's scan: walk the destination space from its own start to its own (growing)
 	// bump position, evacuating every reference each already-copied object holds.
@@ -626,13 +632,6 @@ func (e *emitter) gcNextThreadStack(walkLoop x86.Label) {
 	a.Jcc(x86.Equal, finished)
 	a.MovMR(x86.At(x86.RBP, gcThreadOff), x86.RCX)
 
-	// The running thread's stack was walked first, from its live registers. Walking it
-	// again through a control block that describes where it last parked would evacuate
-	// stale copies of roots this collection has already moved.
-	a.MovRM(x86.RAX, x86.At(x86.R15, rtCurrentOff))
-	a.CmpRR(x86.RCX, x86.RAX)
-	a.Jcc(x86.Equal, advance)
-
 	// Whatever its state, the closure it was handed is reachable from the control block
 	// alone until the thread has run it.
 	e.gcEvacuateTCBSlot(tcbClosureOff)
@@ -647,6 +646,26 @@ func (e *emitter) gcNextThreadStack(walkLoop x86.Label) {
 	a.Jcc(x86.Equal, skipResult)
 	e.gcEvacuateTCBSlot(tcbResultOff)
 	a.Bind(skipResult)
+
+	// A value a receive took but the program has not read back yet (chan.go): 2 means it
+	// is a reference, 1 that it is raw, 0 that the slot holds nothing at all.
+	skipTaken := a.NewLabel("gc_thread_no_taken")
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcThreadOff))
+	a.MovRM(x86.RAX, x86.At(x86.RCX, tcbTakenIsRefOff))
+	a.CmpRI(x86.RAX, 2)
+	a.Jcc(x86.NotEqual, skipTaken)
+	e.gcEvacuateTCBSlot(tcbTakenOff)
+	a.Bind(skipTaken)
+
+	// The running thread's stack was walked first, from its live registers. Walking it
+	// again through a control block that describes where it last parked would evacuate
+	// stale copies of roots this collection has already moved. Its control block's own
+	// slots above are visited all the same: they are roots wherever the thread is, and
+	// evacuating one twice is what the forwarding pointer is for.
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcThreadOff))
+	a.MovRM(x86.RAX, x86.At(x86.R15, rtCurrentOff))
+	a.CmpRR(x86.RCX, x86.RAX)
+	a.Jcc(x86.Equal, advance)
 
 	// Only a parked thread has a frame chain to walk.
 	a.MovRM(x86.RCX, x86.At(x86.RBP, gcThreadOff))
@@ -699,4 +718,80 @@ func (e *emitter) gcEvacuateTCBSlot(off int32) {
 	a.MovRM(x86.RCX, x86.At(x86.RBP, gcThreadOff))
 	a.MovMR(x86.At(x86.RCX, off), x86.RAX)
 	a.Bind(skip)
+}
+
+// gcEvacuateChannels visits what is sitting in every channel's queue.
+//
+// A value crossing a channel is an ordinary reference into the collected heap
+// (spec/12-concurrency.md: values cross by reference, like every aggregate), but a channel
+// is raw mmap'd memory with no stack map over it and no object header to read a shape from.
+// So the queue is walked from the outside: the compiler wrote down whether this channel's
+// element type is a reference (chan.go's chanElemIsRefOff), and the ring's own head and
+// length say which slots are occupied.
+//
+// A channel nothing refers to any more is still walked. Its queue would keep dead objects
+// alive, which is a leak rather than a corruption, and closing that gap needs the collector
+// to trace the channel objects themselves -- which it cannot, since the handle a program
+// holds is an integer, not a reference (the prelude's own `Sender[T]`). docs/deferred.md.
+func (e *emitter) gcEvacuateChannels() {
+	a := e.a
+	loop := a.NewLabel("gc_chan_loop")
+	next := a.NewLabel("gc_chan_next")
+	done := a.NewLabel("gc_chan_done")
+	inner := a.NewLabel("gc_chan_slot_loop")
+	innerDone := a.NewLabel("gc_chan_slot_done")
+	noWrap := a.NewLabel("gc_chan_no_wrap")
+
+	a.MovRM(x86.RAX, x86.At(x86.R15, rtChannelsOff))
+	a.MovMR(x86.At(x86.RBP, gcChanOff), x86.RAX)
+
+	a.Bind(loop)
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcChanOff))
+	a.TestRR(x86.RCX, x86.RCX)
+	a.Jcc(x86.Equal, done)
+	a.MovRM(x86.RAX, x86.At(x86.RCX, chanElemIsRefOff))
+	a.TestRR(x86.RAX, x86.RAX)
+	a.Jcc(x86.Equal, next)
+	a.MovMI(x86.At(x86.RBP, gcChanIdxOff), 0)
+
+	a.Bind(inner)
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcChanOff))
+	a.MovRM(x86.RAX, x86.At(x86.RBP, gcChanIdxOff))
+	a.MovRM(x86.RDX, x86.At(x86.RCX, chanLenOff))
+	a.CmpRR(x86.RAX, x86.RDX)
+	a.Jcc(x86.AboveEqual, innerDone)
+
+	// The occupied slots run from head, wrapping once at the end of the ring.
+	a.MovRM(x86.R8, x86.At(x86.RCX, chanHeadOff))
+	a.AddRR(x86.R8, x86.RAX)
+	a.MovRM(x86.R9, x86.At(x86.RCX, chanSlotsOff))
+	a.CmpRR(x86.R8, x86.R9)
+	a.Jcc(x86.Below, noWrap)
+	a.SubRR(x86.R8, x86.R9)
+	a.Bind(noWrap)
+	a.ShlI(x86.R8, 3)
+	a.AddRI(x86.R8, chanQueueOff)
+	a.AddRR(x86.R8, x86.RCX) // the slot's address
+
+	a.MovRM(x86.RDI, x86.At(x86.R8, 0))
+	a.Push(x86.R8)
+	a.Push(x86.R8) // twice, so rsp keeps the alignment the call wants
+	a.Call(e.rt.evacuate)
+	a.Pop(x86.RCX)
+	a.Pop(x86.RCX)
+	a.MovMR(x86.At(x86.RCX, 0), x86.RAX)
+
+	a.MovRM(x86.RAX, x86.At(x86.RBP, gcChanIdxOff))
+	a.AddRI(x86.RAX, 1)
+	a.MovMR(x86.At(x86.RBP, gcChanIdxOff), x86.RAX)
+	a.Jmp(inner)
+
+	a.Bind(innerDone)
+	a.Bind(next)
+	a.MovRM(x86.RCX, x86.At(x86.RBP, gcChanOff))
+	a.MovRM(x86.RCX, x86.At(x86.RCX, chanNextOff))
+	a.MovMR(x86.At(x86.RBP, gcChanOff), x86.RCX)
+	a.Jmp(loop)
+
+	a.Bind(done)
 }

@@ -125,15 +125,12 @@ var nativeSkips = map[string]string{}
 // was for Phase 5, and it is meant to empty the same way: an entry disappears when the
 // engine can run it, and nothing else changes.
 var concurrencyCases = map[string]bool{
-	"channel_rendezvous_and_close": true,
 	"mutex_guards_shared_mutation": true,
-	"channel_send_on_closed_traps": true,
-	"deadlock_is_a_trap":           true,
 }
 
 // concurrencySkips names the engines that cannot yet run a concurrent program.
 var concurrencySkips = map[driver.Engine]string{
-	driver.Native: "Phase 6: the native backend has no scheduler yet",
+	driver.Native: "Phase 6: the native backend has no mutex yet",
 }
 
 // runsNatively reports whether the host can execute what the backend produces. Only
