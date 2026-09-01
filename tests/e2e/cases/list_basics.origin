@@ -1,0 +1,42 @@
+use std::io;
+use std::list;
+
+// A list is Origin source in the prelude over one compiler-provided array (ADR-0028), so
+// this program is also a test that the language can carry its own standard library.
+fn show(v: Option[i64]) {
+    match v {
+        Option::Some(n) => { io::println(n.to_str()); },
+        Option::None => { io::println("none"); },
+    }
+}
+
+fn main() {
+    let xs = list::new[i64]();
+    io::println(xs.is_empty().to_str());
+
+    let mut i = 0;
+    while i < 100 {
+        xs.push(i);
+        i = i + 1;
+    }
+    io::println(xs.len().to_str());
+    io::println(xs.at(0).to_str());
+    io::println(xs.at(99).to_str());
+    show(xs.get(50));
+    show(xs.get(100));
+
+    // `for` walks it front to back, through the same Iterator trait a user type uses.
+    let mut sum = 0;
+    for v in xs {
+        sum = sum + v;
+    }
+    io::println(sum.to_str());
+
+    xs.set(0, 1000);
+    io::println(xs.at(0).to_str());
+    show(xs.pop());
+    io::println(xs.len().to_str());
+    xs.clear();
+    io::println(xs.len().to_str());
+    io::println(xs.is_empty().to_str());
+}

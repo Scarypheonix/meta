@@ -43,6 +43,10 @@ func (c *Checker) arrayBuiltinType(name string, targs []ast.Type, span diag.Span
 	array := func(t types.Type) types.Type { return &types.Named{Def: types.ArrayDef, Args: []types.Type{t}} }
 
 	switch name {
+	case "list::new":
+		// list::new[T]() -> List[T]
+		return &types.FnT{Ret: c.named("List", elem())}
+
 	case "array::new":
 		t := elem()
 		return &types.FnT{Params: []types.Type{i64}, Ret: array(t)}

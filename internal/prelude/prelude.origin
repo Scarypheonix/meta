@@ -12,6 +12,7 @@
 use std::thread;
 use std::chan;
 use std::sync;
+use std::array;
 
 pub enum Option[T] {
     None,
@@ -154,5 +155,120 @@ impl[T] Mutex[T] {
     /// returns what `body` returned. TRAPS if the calling thread already holds this lock.
     pub fn with[R](self, body: fn(T) -> R) -> R {
         sync::with_lock(self, body)
+    }
+}
+
+// --- Collections (spec/13-collections.md, ADR-0028) --------------------------------
+//
+// A list is Origin source over one compiler-provided primitive, `Array[T]`: a run of
+// elements with a length and a capacity, where a slot exists only once something has been
+// pushed to it. That is the whole reason the primitive is shaped that way -- it is what
+// lets a growable structure hold no value that nothing wrote, which ADR-0007 leaves no
+// room for, and it is what makes `==` on two lists compare their elements rather than
+// their spare room.
+//
+// `list::new[T]()` is the constructor. It is a compiler-provided operation only because a
+// language without associated functions has nowhere to put `List::new` (docs/deferred.md);
+// what it builds is this struct, from Origin's own `Array`.
+
+/// A growable sequence of `T`.
+///
+/// It has a `mut` field, so it is not `Send` (ADR-0014): a list cannot cross a channel,
+/// because two threads sharing a growable buffer is exactly the race `Send` refuses. A
+/// `Mutex[List[T]]` is how a list is shared.
+pub struct List[T] {
+    mut buf: Array[T],
+}
+
+impl[T] List[T] {
+    /// How many elements the list holds.
+    pub fn len(self) -> i64 {
+        array::len(self.buf)
+    }
+
+    /// Whether the list holds none.
+    pub fn is_empty(self) -> bool {
+        array::len(self.buf) == 0
+    }
+
+    /// Appends an element, growing the buffer when it is full. The capacity doubles, so
+    /// `n` pushes cost O(n) rather than O(n²).
+    pub fn push(self, v: T) {
+        if array::push(self.buf, v) {
+            return;
+        }
+        let n = array::len(self.buf);
+        let bigger = array::new[T](n * 2 + 4);
+        let mut i = 0;
+        while i < n {
+            array::push(bigger, array::at(self.buf, i));
+            i = i + 1;
+        }
+        array::push(bigger, v);
+        self.buf = bigger;
+    }
+
+    /// The element at `i`, or `None` when there is none there.
+    pub fn get(self, i: i64) -> Option[T] {
+        if i < 0 {
+            return Option::None;
+        }
+        if i >= array::len(self.buf) {
+            return Option::None;
+        }
+        Option::Some(array::at(self.buf, i))
+    }
+
+    /// The element at `i`. TRAPS `index out of range` when there is none there.
+    pub fn at(self, i: i64) -> T {
+        array::at(self.buf, i)
+    }
+
+    /// Replaces the element at `i`. TRAPS `index out of range` when there is none there.
+    pub fn set(self, i: i64, v: T) {
+        array::set(self.buf, i, v)
+    }
+
+    /// Removes and returns the last element, or `None` when the list is empty.
+    pub fn pop(self) -> Option[T] {
+        let n = array::len(self.buf);
+        if n == 0 {
+            return Option::None;
+        }
+        let last = array::at(self.buf, n - 1);
+        array::truncate(self.buf, n - 1);
+        Option::Some(last)
+    }
+
+    /// Drops every element, keeping the room they were in.
+    pub fn clear(self) {
+        array::truncate(self.buf, 0)
+    }
+}
+
+/// Walks a list front to back. It reads the list as it goes, so it yields what the list
+/// holds when each step runs.
+pub struct ListIter[T] {
+    list: List[T],
+    mut i: i64,
+}
+
+impl[T] Iterator for ListIter[T] {
+    type Item = T;
+    fn next(mut self) -> Option[T] {
+        if self.i >= self.list.len() {
+            return Option::None;
+        }
+        let v = self.list.at(self.i);
+        self.i = self.i + 1;
+        Option::Some(v)
+    }
+}
+
+impl[T] IntoIterator for List[T] {
+    type Item = T;
+    type Iter = ListIter[T];
+    fn into_iter(self) -> ListIter[T] {
+        ListIter { list: self, i: 0 }
     }
 }

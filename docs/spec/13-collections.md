@@ -28,7 +28,7 @@ fn array::len[T](a: Array[T]) -> i64
 fn array::cap[T](a: Array[T]) -> i64
 fn array::at[T](a: Array[T], i: i64) -> T          // TRAPS `index out of range`
 fn array::set[T](a: Array[T], i: i64, v: T) -> ()  // TRAPS `index out of range`
-fn array::push[T](a: Array[T], v: T) -> Bool       // false when the array is full
+fn array::push[T](a: Array[T], v: T) -> bool       // false when the array is full
 fn array::truncate[T](a: Array[T], n: i64) -> ()   // no-op when n >= len
 ```
 
@@ -59,10 +59,19 @@ pub struct List[T]
 
 A growable sequence. The capacity doubles when it runs out, so *n* pushes cost O(*n*).
 
+The constructor is a free function rather than `List::new`, because Origin has no
+associated functions: `impl` blocks hold methods, and a path like `List::new` resolves to
+nothing (`docs/deferred.md`, Phase 8). `list::new` is the same thing under a name the
+language can express, and it is compiler-provided only in the sense that the compiler
+writes out the two operations it stands for -- an empty array, and the prelude's own struct
+around it. No engine implements it.
+
 ```origin
-fn List::new[T]() -> List[T]
+use std::list;
+
+fn list::new[T]() -> List[T]
 fn (l: List[T]) len() -> i64
-fn (l: List[T]) is_empty() -> Bool
+fn (l: List[T]) is_empty() -> bool
 fn (l: List[T]) push(v: T) -> ()
 fn (l: List[T]) pop() -> Option[T]
 fn (l: List[T]) get(i: i64) -> Option[T]
@@ -88,12 +97,14 @@ A keyed lookup. Keys are compared with `==` — structural equality, which every
 (§04, ADR-0011) — so any type may be a key.
 
 ```origin
-fn Map::new[K, V]() -> Map[K, V]
+use std::map;
+
+fn map::new[K, V]() -> Map[K, V]
 fn (m: Map[K, V]) len() -> i64
-fn (m: Map[K, V]) is_empty() -> Bool
+fn (m: Map[K, V]) is_empty() -> bool
 fn (m: Map[K, V]) insert(k: K, v: V) -> Option[V]   // the value it replaced, if any
 fn (m: Map[K, V]) get(k: K) -> Option[V]
-fn (m: Map[K, V]) contains(k: K) -> Bool
+fn (m: Map[K, V]) contains(k: K) -> bool
 fn (m: Map[K, V]) remove(k: K) -> Option[V]
 fn (m: Map[K, V]) keys() -> List[K]
 fn (m: Map[K, V]) values() -> List[V]
@@ -146,7 +157,7 @@ out-of-range read to return whatever is next in memory.
 
 | Program | Output |
 |---|---|
-| `let mut xs = List::new[i64](); xs.push(1); xs.push(2); io::println(xs.len().to_str());` | `2` |
+| `let xs = list::new[i64](); xs.push(1); xs.push(2); io::println(xs.len().to_str());` | `2` |
 | push 0..99, then sum with `for` | `4950` |
 | `xs.get(7)` on a three-element list | `None` |
 | `array::at(a, 7)` on a three-element array | TRAPS `index out of range`, exit 101 |

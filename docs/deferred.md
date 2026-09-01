@@ -29,6 +29,7 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Fixed-size arrays `[T; N]` | needs const generics | Phase 7 |
 | `const fn` / calls in const initializers | needs the const evaluator to run real code | Phase 5 |
 | The never type `!` written in source | exists in the checker, no syntax for it | Phase 7 |
+| Associated functions (`Type::new()`) | an `impl` block holds methods, and a path naming one of its functions without a receiver resolves to nothing. It is what a constructor wants to be called, and `spec/13-collections.md` says `list::new` instead. Adding it is resolver work (a `Type::member` path against an impl's items) plus the inference question of where the impl's type arguments come from when no receiver supplies them | Phase 8 |
 | Doc comment capture | needed by LSP hover, not before | Phase 8 |
 | Effect checking for `match` guards | closes the one "unspecified" clause in the spec (§05) | Phase 5 |
 | Cycle detection in structural `==` | a cyclic graph makes `==` diverge (§04) | Phase 7 |

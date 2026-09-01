@@ -35,6 +35,7 @@ var builtinIndex = map[string]int{
 	"array::set":      BuiltinArraySet,
 	"array::push":     BuiltinArrayPush,
 	"array::truncate": BuiltinArrayTruncate,
+	"list::new":       BuiltinListNew,
 }
 
 func (c *Compiler) call(v *ast.Call) error {
@@ -59,6 +60,9 @@ func (c *Compiler) call(v *ast.Call) error {
 			idx, ok := builtinIndex[ref.Builtin]
 			if !ok {
 				return unsupported("builtin `"+ref.Builtin+"`", v.Span())
+			}
+			if idx == BuiltinListNew {
+				return c.listNew(v)
 			}
 			for _, a := range v.Args {
 				if err := c.expr(a); err != nil {
@@ -108,6 +112,36 @@ func (c *Compiler) call(v *ast.Call) error {
 		}
 	}
 	c.emitAK(bytecode.OpCall, len(v.Args), c.kindOf(v), v.Span())
+	return nil
+}
+
+// listNew compiles `list::new[T]()`: an empty array, wrapped in the prelude's `List[T]`.
+//
+// No engine implements this. It is bytecode the compiler writes out of operations that
+// already exist -- the same arrangement `wrapConcurrencyHandle` uses, and for the same
+// reason: the runtime has no business knowing what a prelude type is, and here it does not
+// even have to know that a list was made.
+func (c *Compiler) listNew(v *ast.Call) error {
+	list, ok := types.AsNamed(c.concreteType(c.typeOf(v)))
+	if !ok || len(list.Args) != 1 {
+		return unsupported("a `list::new` whose type is not List[T]", v.Span())
+	}
+	elem := &types.Named{Def: types.ArrayDef, Args: []types.Type{list.Args[0]}}
+	id, err := c.arrayInst(elem, v.Span())
+	if err != nil {
+		return err
+	}
+	// An empty array with no room: the first push grows it, which is one allocation
+	// nobody pays for until a list is actually used.
+	c.emitA(bytecode.OpConst, c.intConst(0), v.Span())
+	c.emitA(bytecode.OpConst, c.intConst(int64(id)), v.Span())
+	c.emitABK(bytecode.OpCallBuiltin, BuiltinNewArray, 2, bytecode.KindRef, v.Span())
+
+	si, err := c.structInst(c.typeOf(v), v.Span())
+	if err != nil {
+		return err
+	}
+	c.emitAB(bytecode.OpStruct, si, 1, v.Span())
 	return nil
 }
 

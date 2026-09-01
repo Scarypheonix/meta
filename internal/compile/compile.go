@@ -74,6 +74,11 @@ const (
 	BuiltinArraySet
 	BuiltinArrayPush
 	BuiltinArrayTruncate
+	// BuiltinListNew has no runtime behind it at all: internal/compile emits an empty
+	// array and the prelude's own struct around it (call.go's listNew). It is a builtin
+	// because `List::new` needs somewhere to live in a language with no associated
+	// functions, not because any engine implements it.
+	BuiltinListNew
 )
 
 // Compiler holds the state of one program's lowering.

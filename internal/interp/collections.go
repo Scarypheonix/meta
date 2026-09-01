@@ -27,6 +27,16 @@ func (*Array) isValue() {}
 // is ignored: the interpreter has no object layouts to be told about.
 func (in *Interp) arrayBuiltin(name string, args []Value, span diag.Span) (Value, bool) {
 	switch name {
+	case "list::new":
+		// The other two engines never reach a `list::new` at all: internal/compile
+		// writes it out as an empty array wrapped in the prelude's own struct. The
+		// interpreter walks the syntax tree, so it builds the same thing here.
+		def := in.res.Structs["List"]
+		if def == nil {
+			in.trap(span, "the prelude does not define `List`")
+		}
+		return &Struct{Def: def, Vals: []Value{&Array{}}}, true
+
 	case "array::new":
 		n, ok := args[0].(Int)
 		if !ok {

@@ -304,6 +304,11 @@ var stdModules = map[string][]string{
 	// Phase 7 (spec/13-collections.md). The operations on the one built-in collection;
 	// `List` and `Map` are Origin source in the prelude, written in terms of these.
 	"std::array": {"new", "len", "cap", "at", "set", "push", "truncate"},
+	// `list::new` is the constructor `List::new` would be if the language had
+	// associated functions (docs/deferred.md). It builds the prelude's own struct: the
+	// operation exists to have somewhere to write the name, not because a runtime does
+	// anything special for it.
+	"std::list": {"new"},
 	// Phase 6 (spec/12-concurrency.md). `spawn` and `channel` are what a program calls;
 	// the rest are the operations the prelude's own methods are written in terms of,
 	// since a method body cannot otherwise reach an operation the runtime provides.

@@ -481,3 +481,47 @@ fn main() {
 }
 `, "7600") // 40 lists of sum(0..19) = 190.
 }
+
+// TestACollectionForwardsAListsElements is the same root set one level up: `List` is Origin
+// source in the prelude over an `Array`, so what the collector has to get right is the
+// array inside the struct inside the list, while the list is being grown -- every growth
+// allocating a bigger array and copying the elements across, with the old one becoming
+// garbage the very next collection moves everything out from under.
+func TestACollectionForwardsAListsElements(t *testing.T) {
+	checkRun(t, `
+use std::io;
+use std::list;
+
+struct Node { value: i64, tail: Option[Node] }
+
+fn build(n: i64) -> Option[Node] {
+    let mut out = Option::None;
+    let mut i = 0;
+    while i < n { out = Option::Some(Node { value: i, tail: out }); i = i + 1; }
+    out
+}
+
+fn total(l: Option[Node]) -> i64 {
+    let mut sum = 0;
+    let mut cur = l;
+    while true {
+        match cur {
+            Option::Some(nd) => { sum = sum + nd.value; cur = nd.tail; },
+            Option::None => { return sum; },
+        }
+    }
+    sum
+}
+
+fn main() {
+    let xs = list::new[Option[Node]]();
+    let mut i = 0;
+    while i < 40 { xs.push(build(20)); i = i + 1; }
+
+    let mut acc = 0;
+    for l in xs { acc = acc + total(l); }
+    io::println(acc.to_str());
+    io::println(xs.len().to_str());
+}
+`, "7600\n40")
+}

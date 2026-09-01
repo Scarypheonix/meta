@@ -1,0 +1,12 @@
+use std::io;
+use std::list;
+
+fn main() {
+    let xs = list::new[i64]();
+    xs.push(1);
+    xs.push(2);
+    io::println(xs.at(1).to_str());
+    // `get` answers `None` here; `at` says the program asked for something that is not
+    // there, which §04 makes a trap rather than whatever is next in memory.
+    io::println(xs.at(2).to_str());
+}
