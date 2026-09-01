@@ -83,7 +83,28 @@ const (
 	// bytes, and the bytes follow. It holds no references, which is what makes a
 	// `String` cheap for the collector to skip.
 	ByteArray
+	// RawArray is a length-prefixed run of words that are not references: an `Array[i64]`
+	// or an `Array[f64]` (spec/13-collections.md, ADR-0028). Payload word 0 is the count,
+	// exactly as RefArray's is, and the collector skips the rest as it skips a ByteArray's
+	// bytes. Which of the two an array instantiation gets is decided while compiling, from
+	// its element type, so the collector never has to guess whether a word is a pointer.
+	RawArray
 )
+
+// ArrayDescriptor builds the descriptor for one array instantiation: a length-prefixed run
+// whose shape says, once and for all, whether its elements are references (ADR-0028).
+//
+// The count in payload word 0 is the array's *length*, not its capacity: the object is as
+// large as its header says, and everything above the length is room a push has not used
+// yet. The collector traces exactly the length, which is what makes those spare slots cost
+// nothing and hold nothing.
+func ArrayDescriptor(name string, elem WordKind) *Descriptor {
+	shape := RawArray
+	if elem == WordRef {
+		shape = RefArray
+	}
+	return &Descriptor{Name: name, Shape: shape, Kind: ObjArray, Elem: elem}
+}
 
 // ValueTag identifies a VM stack value's runtime kind. It has no bearing on heap object
 // layout since ADR-0019 retired the `Tagged` shape; it lives here only because the VM
@@ -128,6 +149,8 @@ const (
 	ObjClosure
 	// ObjBytes is a String.
 	ObjBytes
+	// ObjArray is an `Array[T]` (spec/13-collections.md).
+	ObjArray
 )
 
 // WordKind says how one payload word is to be read.
@@ -168,6 +191,11 @@ type Descriptor struct {
 	Words uint64
 	// Kinds gives the kind of each payload word for a Fixed shape.
 	Kinds []WordKind
+	// Elem is the kind of every element for a RefArray or a RawArray, which have one
+	// kind for the whole run rather than one per word (ADR-0028). The collector reads
+	// Shape and never this; the virtual machine reads this to compare and render an
+	// element without a per-value tag.
+	Elem WordKind
 	// Kind says what the object is, for equality and rendering.
 	Kind ObjKind
 	// FieldNames names a struct's or a struct variant's slots, in declaration order.

@@ -65,7 +65,7 @@ func CommonSubexpressions(f *ir.Func, prog *bytecode.Program) bool {
 
 	for _, b := range f.Blocks {
 		for _, v := range b.Instr {
-			if !v.Op.Shareable() {
+			if !v.Shareable() {
 				continue
 			}
 			key := valueKey(v)

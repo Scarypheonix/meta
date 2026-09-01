@@ -20,8 +20,10 @@ import (
 // internal/gc's own scanning already answers it -- the object's header.
 
 // typeTableEntryWords is the table's per-TypeID record size, in words:
-// [shape, objKind, kindsAddr, padding]. A power-of-two size keeps the row address a
-// shift rather than a multiply; the fourth word is unused headroom.
+// [shape, objKind, kindsAddr, elem]. A power-of-two size keeps the row address a shift
+// rather than a multiply. The fourth word is an array's single element kind (ADR-0028),
+// which is what a run of elements has instead of one kind per word; it is zero for every
+// other shape, and nothing reads it for one.
 const typeTableEntryWords = 4
 
 // typeTableRowShift is log2(typeTableEntryWords*8): a row is 32 bytes, so a TypeID's
@@ -63,7 +65,7 @@ func (e *emitter) emitTypeTable() {
 		e.roData = appendU64(e.roData, uint64(d.Shape))
 		e.roData = appendU64(e.roData, uint64(d.Kind))
 		e.roData = appendU64(e.roData, kindsAddr[id])
-		e.roData = appendU64(e.roData, 0)
+		e.roData = appendU64(e.roData, uint64(d.Elem))
 	}
 }
 
@@ -129,8 +131,13 @@ func (e *emitter) emitEqualObjects() {
 
 	a.MovRM(x86.RAX, x86.At(x86.RCX, 0)) // shape
 	bytesCase := a.NewLabel("eq_bytes")
+	arrayCase := a.NewLabel("eq_array")
 	a.CmpRI(x86.RAX, int32(layout.ByteArray))
 	a.Jcc(x86.Equal, bytesCase)
+	a.CmpRI(x86.RAX, int32(layout.RefArray))
+	a.Jcc(x86.Equal, arrayCase)
+	a.CmpRI(x86.RAX, int32(layout.RawArray))
+	a.Jcc(x86.Equal, arrayCase)
 
 	a.MovRM(x86.RAX, x86.At(x86.RCX, 8)) // objKind
 	trapFn := a.NewLabel("eq_trap_fn")
@@ -166,39 +173,7 @@ func (e *emitter) emitEqualObjects() {
 	a.AddRR(x86.RAX, x86.R13)
 	a.MovRM(x86.R9, x86.At(x86.RAX, 0)) // field word from b
 
-	wordRef := a.NewLabel("eq_word_ref")
-	wordFloat := a.NewLabel("eq_word_float")
-	next := a.NewLabel("eq_next")
-	a.CmpRI(x86.R14, int32(layout.WordRef))
-	a.Jcc(x86.Equal, wordRef)
-	a.CmpRI(x86.R14, int32(layout.WordFloat))
-	a.Jcc(x86.Equal, wordFloat)
-
-	// Every other Kind (int, bool, char, unit, or a test's bare "raw") compares as
-	// raw bits, exactly as internal/vm's equal() treats them.
-	a.CmpRR(x86.R8, x86.R9)
-	a.Jcc(x86.NotEqual, isFalse)
-	a.Jmp(next)
-
-	a.Bind(wordRef)
-	a.MovRR(x86.RDI, x86.R8)
-	a.MovRR(x86.RSI, x86.R9)
-	a.Call(e.rt.equalObjects)
-	a.TestRR(x86.RAX, x86.RAX)
-	a.Jcc(x86.Equal, isFalse)
-	a.Jmp(next)
-
-	a.Bind(wordFloat)
-	// IEEE equality: unordered (either operand NaN) is never equal, which
-	// spec/04-expressions.md pins for a float at top level and inside an aggregate
-	// alike (floatCompare's comment explains the parity-flag reasoning in full).
-	a.MovqXR(x86.XMM0, x86.R8)
-	a.MovqXR(x86.XMM1, x86.R9)
-	a.UcomisdXX(x86.XMM0, x86.XMM1)
-	a.Jcc(x86.Parity, isFalse)
-	a.Jcc(x86.NotEqual, isFalse)
-
-	a.Bind(next)
+	e.eqWordPair(isFalse)
 	a.AddRI(x86.R12, 1)
 	a.Jmp(fixedLoop)
 
@@ -236,6 +211,40 @@ func (e *emitter) emitEqualObjects() {
 	a.Jcc(x86.NotEqual, isFalse)
 	a.AddRI(x86.R12, 1)
 	a.Jmp(bytesLoop)
+
+	// An array (ADR-0028): equal lengths and pairwise-equal elements, with the room above
+	// the length no part of the value. One kind for the whole run, from the table's fourth
+	// word, rather than one per word.
+	a.Bind(arrayCase)
+	a.MovRM(x86.RAX, x86.At(x86.RCX, 24))
+	a.MovMR(kindsSlot, x86.RAX) // the element kind, for every element
+	a.MovRM(x86.RAX, x86.At(x86.RBX, objHeaderSize))
+	a.MovRM(x86.RDX, x86.At(x86.R13, objHeaderSize))
+	a.CmpRR(x86.RAX, x86.RDX)
+	a.Jcc(x86.NotEqual, isFalse)
+	a.MovMR(wordsSlot, x86.RAX)
+
+	a.XorRR(x86.R12, x86.R12)
+	arrayLoop := a.NewLabel("eq_array_loop")
+	a.Bind(arrayLoop)
+	a.MovRM(x86.RAX, wordsSlot)
+	a.CmpRR(x86.R12, x86.RAX)
+	a.Jcc(x86.GreaterEqual, isTrue)
+
+	a.MovRR(x86.RCX, x86.R12)
+	a.ShlI(x86.RCX, 3)
+	a.AddRI(x86.RCX, objHeaderSize+wordSize) // past the header and the length word
+	a.MovRR(x86.RAX, x86.RCX)
+	a.AddRR(x86.RAX, x86.RBX)
+	a.MovRM(x86.R8, x86.At(x86.RAX, 0))
+	a.MovRR(x86.RAX, x86.RCX)
+	a.AddRR(x86.RAX, x86.R13)
+	a.MovRM(x86.R9, x86.At(x86.RAX, 0))
+	a.MovRM(x86.R14, kindsSlot)
+
+	e.eqWordPair(isFalse)
+	a.AddRI(x86.R12, 1)
+	a.Jmp(arrayLoop)
 
 	a.Bind(trapFn)
 	// No native OpClosure lowering exists yet (internal/backend/lower.go), so no
@@ -337,4 +346,49 @@ func (e *emitter) emitCompareBytes() {
 	a.Pop(x86.R12)
 	a.Pop(x86.RBX)
 	a.Ret()
+}
+
+// eqWordPair compares one pair of words -- a's in r8, b's in r9 -- by the WordKind in r14,
+// jumping to isFalse when they differ and falling through when they do not.
+//
+// Both loops in emitEqualObjects need exactly this, over a struct's per-word kinds and over
+// an array's single element kind, and the three cases have to stay identical to the virtual
+// machine's own `equal` for the differential to hold. So it is written once here and emitted
+// at both sites rather than being two pieces of Go that must be kept in step.
+func (e *emitter) eqWordPair(isFalse x86.Label) {
+	a := e.a
+	wordRef := a.NewLabel("eq_word_ref")
+	wordFloat := a.NewLabel("eq_word_float")
+	done := a.NewLabel("eq_word_done")
+
+	a.CmpRI(x86.R14, int32(layout.WordRef))
+	a.Jcc(x86.Equal, wordRef)
+	a.CmpRI(x86.R14, int32(layout.WordFloat))
+	a.Jcc(x86.Equal, wordFloat)
+
+	// Every other Kind (int, bool, char, unit, or a test's bare "raw") compares as raw
+	// bits, exactly as internal/vm's equal() treats them.
+	a.CmpRR(x86.R8, x86.R9)
+	a.Jcc(x86.NotEqual, isFalse)
+	a.Jmp(done)
+
+	a.Bind(wordRef)
+	a.MovRR(x86.RDI, x86.R8)
+	a.MovRR(x86.RSI, x86.R9)
+	a.Call(e.rt.equalObjects)
+	a.TestRR(x86.RAX, x86.RAX)
+	a.Jcc(x86.Equal, isFalse)
+	a.Jmp(done)
+
+	a.Bind(wordFloat)
+	// IEEE equality: unordered (either operand NaN) is never equal, which
+	// spec/04-expressions.md pins for a float at top level and inside an aggregate alike
+	// (floatCompare's comment explains the parity-flag reasoning in full).
+	a.MovqXR(x86.XMM0, x86.R8)
+	a.MovqXR(x86.XMM1, x86.R9)
+	a.UcomisdXX(x86.XMM0, x86.XMM1)
+	a.Jcc(x86.Parity, isFalse)
+	a.Jcc(x86.NotEqual, isFalse)
+
+	a.Bind(done)
 }

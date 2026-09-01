@@ -27,6 +27,14 @@ var builtinIndex = map[string]int{
 	"chan::close_sender":  BuiltinCloseChan,
 	"sync::mutex":         BuiltinMutex,
 	"sync::with_lock":     BuiltinWithLock,
+
+	"array::new":      BuiltinNewArray,
+	"array::len":      BuiltinArrayLen,
+	"array::cap":      BuiltinArrayCap,
+	"array::at":       BuiltinArrayAt,
+	"array::set":      BuiltinArraySet,
+	"array::push":     BuiltinArrayPush,
+	"array::truncate": BuiltinArrayTruncate,
 }
 
 func (c *Compiler) call(v *ast.Call) error {
@@ -58,6 +66,18 @@ func (c *Compiler) call(v *ast.Call) error {
 				}
 			}
 			argc := len(v.Args)
+			if idx == BuiltinNewArray {
+				// `array::new` takes one more argument than it is written with: the
+				// layout of the array it is about to make. An array's shape says
+				// whether its elements are references, which only the compiler knows
+				// and every collector must (ADR-0028, spec/13-collections.md).
+				id, err := c.arrayInst(c.typeOf(v), v.Span())
+				if err != nil {
+					return err
+				}
+				c.emitA(bytecode.OpConst, c.intConst(int64(id)), v.Span())
+				argc++
+			}
 			if wantsIsRef(idx) {
 				// These three take one more argument than they are written with: whether
 				// the value they will hold on the program's behalf is a reference. Native

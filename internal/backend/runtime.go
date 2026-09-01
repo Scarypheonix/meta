@@ -130,6 +130,14 @@ type runtimeLabels struct {
 	mutexUnlock x86.Label
 	// preempt is the back edge's own safepoint (sched.go).
 	preempt x86.Label
+	// The array operations (array.go, spec/13-collections.md).
+	arrayNew      x86.Label
+	arrayLen      x86.Label
+	arrayCap      x86.Label
+	arrayAt       x86.Label
+	arraySet      x86.Label
+	arrayPush     x86.Label
+	arrayTruncate x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -174,6 +182,13 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.mutexLock = e.a.NewLabel("rt_mutex_lock")
 	e.rt.mutexUnlock = e.a.NewLabel("rt_mutex_unlock")
 	e.rt.preempt = e.a.NewLabel("rt_preempt")
+	e.rt.arrayNew = e.a.NewLabel("rt_array_new")
+	e.rt.arrayLen = e.a.NewLabel("rt_array_len")
+	e.rt.arrayCap = e.a.NewLabel("rt_array_cap")
+	e.rt.arrayAt = e.a.NewLabel("rt_array_at")
+	e.rt.arraySet = e.a.NewLabel("rt_array_set")
+	e.rt.arrayPush = e.a.NewLabel("rt_array_push")
+	e.rt.arrayTruncate = e.a.NewLabel("rt_array_truncate")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -208,6 +223,13 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitMutexLock()
 	e.emitMutexUnlock()
 	e.emitPreempt()
+	e.emitArrayNew()
+	e.emitArrayLen()
+	e.emitArrayCap()
+	e.emitArrayAt()
+	e.emitArraySet()
+	e.emitArrayPush()
+	e.emitArrayTruncate()
 	e.emitCollect()
 }
 

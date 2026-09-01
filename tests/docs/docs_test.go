@@ -22,7 +22,7 @@ func TestEverySpecDocumentExists(t *testing.T) {
 		"00-overview.md", "01-lexical.md", "02-grammar.md", "03-types.md",
 		"04-expressions.md", "05-patterns.md", "06-traits-generics.md",
 		"07-modules.md", "08-memory-model.md", "09-errors.md", "10-examples.md",
-		"11-codegen.md", "12-concurrency.md", "codes.md",
+		"11-codegen.md", "12-concurrency.md", "13-collections.md", "codes.md",
 	}
 	for _, name := range required {
 		if _, err := os.Stat(filepath.Join(specDir(t), name)); err != nil {

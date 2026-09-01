@@ -1,0 +1,8 @@
+use std::io;
+use std::array;
+
+fn main() {
+    io::println("before");
+    let a = array::new[i64](-1);
+    io::println("not reached");
+}

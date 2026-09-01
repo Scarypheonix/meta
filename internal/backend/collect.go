@@ -271,8 +271,13 @@ func (e *emitter) emitScanObject() {
 
 	a.MovRM(x86.RAX, x86.At(x86.RCX, 0)) // shape
 	bytesCase := a.NewLabel("scan_bytes")
+	refArrayCase := a.NewLabel("scan_ref_array")
 	a.CmpRI(x86.RAX, int32(layout.ByteArray))
 	a.Jcc(x86.Equal, bytesCase)
+	a.CmpRI(x86.RAX, int32(layout.RawArray))
+	a.Jcc(x86.Equal, bytesCase) // an array of non-references holds none, like a String
+	a.CmpRI(x86.RAX, int32(layout.RefArray))
+	a.Jcc(x86.Equal, refArrayCase)
 
 	// Fixed shape: recurse over each reference-kind word.
 	a.MovRM(x86.RAX, x86.At(x86.RBX, 0)) // header again (rax was clobbered)
@@ -314,6 +319,34 @@ func (e *emitter) emitScanObject() {
 	a.AddRI(x86.RAX, 1)
 	a.ShlI(x86.RAX, 3) // (words+1)*8
 	a.Jmp(epilogue)
+
+	// A RefArray (ADR-0028): payload word 0 is the length, and that many references
+	// follow it. The room above the length holds nothing -- a push writes the element
+	// before it grows the length -- so tracing exactly the length is both correct and all
+	// that is correct: a word above it may still hold a reference an earlier truncate
+	// abandoned, and evacuating that would resurrect it.
+	a.Bind(refArrayCase)
+	a.MovRM(x86.RAX, x86.At(x86.RBX, 0))
+	a.ShrI(x86.RAX, 32)
+	a.MovRR(x86.R13, x86.RAX)                        // r13 = words, for the size below
+	a.MovRM(x86.R14, x86.At(x86.RBX, objHeaderSize)) // r14 = the length
+	a.XorRR(x86.R12, x86.R12)                        // i = 0
+
+	elemLoop := a.NewLabel("scan_elem_loop")
+	a.Bind(elemLoop)
+	a.CmpRR(x86.R12, x86.R14)
+	a.Jcc(x86.GreaterEqual, fieldsDone)
+	a.MovRR(x86.RAX, x86.R12)
+	a.ShlI(x86.RAX, 3)
+	a.AddRI(x86.RAX, objHeaderSize+wordSize) // past the header and the length word
+	a.AddRR(x86.RAX, x86.RBX)
+	a.MovRM(x86.RDI, x86.At(x86.RAX, 0))
+	a.Push(x86.RAX)
+	a.Call(e.rt.evacuate)
+	a.Pop(x86.RCX)
+	a.MovMR(x86.At(x86.RCX, 0), x86.RAX)
+	a.AddRI(x86.R12, 1)
+	a.Jmp(elemLoop)
 
 	a.Bind(bytesCase)
 	// A String holds no references; its total size is (header.Words()+1)*8 exactly like

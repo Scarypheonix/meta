@@ -125,6 +125,9 @@ var PrimitiveNames = []string{
 	"u8", "u16", "u32", "u64",
 	"f32", "f64",
 	"bool", "char", "String",
+	// Array is generic, unlike every other name here, and is a primitive for the same
+	// reason String is: the compiler provides it and no source declares it (ADR-0028).
+	"Array",
 }
 
 type scope struct {
@@ -298,6 +301,9 @@ var globalBuiltins = map[string]bool{
 // instead of a special case. Phase 7 replaces them with Origin source.
 var stdModules = map[string][]string{
 	"std::io": {"print", "println"},
+	// Phase 7 (spec/13-collections.md). The operations on the one built-in collection;
+	// `List` and `Map` are Origin source in the prelude, written in terms of these.
+	"std::array": {"new", "len", "cap", "at", "set", "push", "truncate"},
 	// Phase 6 (spec/12-concurrency.md). `spawn` and `channel` are what a program calls;
 	// the rest are the operations the prelude's own methods are written in terms of,
 	// since a method body cannot otherwise reach an operation the runtime provides.

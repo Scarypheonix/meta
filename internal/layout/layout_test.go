@@ -143,3 +143,25 @@ func TestAddIsIdempotentForTheSameShape(t *testing.T) {
 		t.Errorf("the same shape registered twice got ids %d and %d", a, b)
 	}
 }
+
+// TestArrayDescriptorShapeFollowsItsElement is ADR-0028's own rule: an array of references
+// and an array of anything else are different shapes, decided while compiling, so that the
+// collector reads which one it has rather than inferring it from a value.
+func TestArrayDescriptorShapeFollowsItsElement(t *testing.T) {
+	refs := ArrayDescriptor("Array[Node]", WordRef)
+	if refs.Shape != RefArray || refs.Elem != WordRef {
+		t.Errorf("an array of references is %v/%v, want RefArray/WordRef", refs.Shape, refs.Elem)
+	}
+	for _, k := range []WordKind{WordInt, WordFloat, WordBool, WordChar} {
+		d := ArrayDescriptor("Array", k)
+		if d.Shape != RawArray {
+			t.Errorf("an array of %v is %v, want RawArray", k, d.Shape)
+		}
+		if d.Elem != k {
+			t.Errorf("an array of %v records %v as its element kind", k, d.Elem)
+		}
+	}
+	if ArrayDescriptor("Array", WordRef).Kind != ObjArray {
+		t.Error("an array descriptor is not ObjArray")
+	}
+}

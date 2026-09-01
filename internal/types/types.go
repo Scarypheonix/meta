@@ -122,7 +122,24 @@ const (
 	StructDef DefKind = iota
 	// EnumDef is an enum declaration.
 	EnumDef
+	// BuiltinDef is a nominal type the compiler provides rather than any source
+	// declares: `Array[T]` (ADR-0028). It has parameters and a name like any other
+	// nominal type, and no declaration behind it -- which is what makes
+	// `Array[i64] { }` the same error `String { }` already is, with nothing new to
+	// write for it.
+	BuiltinDef
 )
+
+// ArrayDef is the declaration `Array[T]` does not have.
+//
+// One value for the whole compiler, compared by pointer, so that "is this an array?" is a
+// question with one answer rather than a name match. spec/13-collections.md specifies what
+// it is; internal/compile gives each instantiation its layout.
+var ArrayDef = &Def{
+	Kind:   BuiltinDef,
+	Name:   "Array",
+	Params: []*Param{{Name: "T", ID: -1}},
+}
 
 // Def is a nominal type declaration: a struct or an enum, with its generic parameters.
 type Def struct {

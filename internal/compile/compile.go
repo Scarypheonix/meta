@@ -64,6 +64,16 @@ const (
 	BuiltinCloseChan
 	BuiltinMutex
 	BuiltinWithLock
+	// The array operations (spec/13-collections.md). `List` and `Map` are Origin source
+	// in the prelude written in terms of these, so a program reaches them through
+	// `push`, `get` and the rest rather than by naming them.
+	BuiltinNewArray
+	BuiltinArrayLen
+	BuiltinArrayCap
+	BuiltinArrayAt
+	BuiltinArraySet
+	BuiltinArrayPush
+	BuiltinArrayTruncate
 )
 
 // Compiler holds the state of one program's lowering.
@@ -90,6 +100,7 @@ type Compiler struct {
 	structCache  map[string]int
 	variantCache map[string]int
 	tupleCache   map[string]layout.TypeID
+	arrayCache   map[string]layout.TypeID
 	closureCache map[string]layout.TypeID
 
 	// Per-function state.
@@ -143,6 +154,7 @@ func Program(res *resolve.Result, tys *check.Result, mo *mono.Result, files ...*
 		structCache:  map[string]int{},
 		variantCache: map[string]int{},
 		tupleCache:   map[string]layout.TypeID{},
+		arrayCache:   map[string]layout.TypeID{},
 		closureCache: map[string]layout.TypeID{},
 	}
 	c.prog.StringType = c.prog.Types.Add(&layout.Descriptor{
@@ -517,6 +529,40 @@ func (c *Compiler) tupleInst(t types.Type, span diag.Span) (layout.TypeID, error
 	d.Kind = layout.ObjTuple
 	id := c.prog.Types.Add(d)
 	c.tupleCache[key] = id
+	return id, nil
+}
+
+// arrayInst returns the layout of one array instantiation, building it on first use.
+//
+// An array's shape is decided here and nowhere else (ADR-0028): a run of references when
+// its elements are references, a run of raw words when they are not. The collector reads
+// that shape rather than inferring anything from a value, which is the whole reason the
+// answer has to be settled while compiling.
+func (c *Compiler) arrayInst(t types.Type, span diag.Span) (layout.TypeID, error) {
+	named, ok := types.AsNamed(c.concreteType(t))
+	if !ok || named.Def != types.ArrayDef || len(named.Args) != 1 {
+		return 0, unsupported(fmt.Sprintf("an array of type %s, which is not a concrete Array[T]", t), span)
+	}
+	elem := c.concreteType(named.Args[0])
+	if _, stillVar := types.Prune(elem).(*types.Var); stillVar {
+		// wordKindFor would answer "raw" for a type variable, and an array of references
+		// the collector believes is raw is a heap it silently corrupts. Monomorphization
+		// gives every instance concrete arguments, so reaching this is a compiler bug
+		// rather than a program the language rejects.
+		return 0, unsupported("an array whose element type is not known here", span)
+	}
+	k, ok := wordKindFor(elem)
+	if !ok {
+		return 0, unsupported(fmt.Sprintf("an array of %s, which has no object layout yet", elem), span)
+	}
+	key := "array:" + typeKey(elem)
+	if id, ok := c.arrayCache[key]; ok {
+		return id, nil
+	}
+	d := layout.ArrayDescriptor(key, k)
+	d.TypeName = "Array"
+	id := c.prog.Types.Add(d)
+	c.arrayCache[key] = id
 	return id, nil
 }
 

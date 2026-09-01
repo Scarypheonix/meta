@@ -1,0 +1,12 @@
+use std::io;
+use std::array;
+
+fn main() {
+    let a = array::new[i64](8);
+    array::push(a, 1);
+    io::println(array::at(a, 0).to_str());
+    // Room is not the same as an element: index 1 is inside the capacity and outside the
+    // length, and reading it would be exactly the undefined behaviour §04 leaves no room
+    // for (spec/13-collections.md).
+    io::println(array::at(a, 1).to_str());
+}

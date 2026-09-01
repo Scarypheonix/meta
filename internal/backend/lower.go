@@ -713,6 +713,79 @@ func (e *emitter) builtin(v *ir.Value) error {
 		}
 		return e.withLock(v)
 
+	case compile.BuiltinNewArray:
+		// rt_array_new(capacity, typeid): the second argument is the layout
+		// internal/compile chose for this instantiation, which is what tells the
+		// collector whether the elements are references (ADR-0028).
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: array::new takes two arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.load(x86.RSI, v.Args[1])
+		e.a.Call(e.rt.arrayNew)
+		e.recordCall(v)
+		e.refusedStatus(v, "array capacity is negative")
+		e.def(v, x86.RDX)
+		return nil
+
+	case compile.BuiltinArrayLen, compile.BuiltinArrayCap:
+		if len(v.Args) != 1 {
+			return fmt.Errorf("this is a compiler bug: an array length takes one argument, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		if v.Const == compile.BuiltinArrayLen {
+			e.a.Call(e.rt.arrayLen)
+		} else {
+			e.a.Call(e.rt.arrayCap)
+		}
+		e.def(v, x86.RAX)
+		return nil
+
+	case compile.BuiltinArrayAt:
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: array::at takes two arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.load(x86.RSI, v.Args[1])
+		e.a.Call(e.rt.arrayAt)
+		e.refusedStatus(v, "index out of range")
+		e.def(v, x86.RDX)
+		return nil
+
+	case compile.BuiltinArraySet:
+		if len(v.Args) != 3 {
+			return fmt.Errorf("this is a compiler bug: array::set takes three arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.load(x86.RSI, v.Args[1])
+		e.load(x86.RDX, v.Args[2])
+		e.a.Call(e.rt.arraySet)
+		e.refusedStatus(v, "index out of range")
+		e.a.XorRR(scratchA, scratchA)
+		e.def(v, scratchA)
+		return nil
+
+	case compile.BuiltinArrayPush:
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: array::push takes two arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.load(x86.RSI, v.Args[1])
+		e.a.Call(e.rt.arrayPush)
+		e.def(v, x86.RAX)
+		return nil
+
+	case compile.BuiltinArrayTruncate:
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: array::truncate takes two arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.load(x86.RSI, v.Args[1])
+		e.a.Call(e.rt.arrayTruncate)
+		e.a.XorRR(scratchA, scratchA)
+		e.def(v, scratchA)
+		return nil
+
 	case compile.BuiltinPrint, compile.BuiltinPrintln:
 		if len(v.Args) != 1 {
 			return fmt.Errorf("this is a compiler bug: print takes one argument, got %d", len(v.Args))
@@ -814,6 +887,18 @@ func (e *emitter) withLock(v *ir.Value) error {
 	a.Pop(x86.RAX)
 	e.def(v, x86.RAX)
 	return nil
+}
+
+// refusedStatus traps when a runtime routine reported the one error it can have, and falls
+// through when it did not. The message names the user's own line, which spans.go finds when
+// the call being lowered is one the prelude makes.
+func (e *emitter) refusedStatus(v *ir.Value, refused string) {
+	a := e.a
+	ok := a.NewLabel("refused_status_ok")
+	a.TestRR(x86.RAX, x86.RAX)
+	a.Jcc(x86.Equal, ok)
+	e.trapAtUserSpan(v, refused)
+	a.Bind(ok)
 }
 
 // schedStatus turns a blocking runtime routine's status (sched.go) into a trap, and falls

@@ -70,6 +70,11 @@ func (c *Checker) pathType(v *ast.PathType) types.Type {
 
 	switch ref.Kind {
 	case resolve.Prim:
+		// `Array[T]` is the one primitive that is generic (ADR-0028): the compiler
+		// provides the type, and applyDef checks its arity like any nominal type's.
+		if ref.Name == "Array" {
+			return c.applyDef(v, types.ArrayDef, args)
+		}
 		if len(args) > 0 {
 			c.bag.Errorf("E0109", v.Span(), "`%s` takes no type arguments", ref.Name).
 				Label("primitive types are not generic").

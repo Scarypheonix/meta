@@ -94,8 +94,8 @@ func (h *Heap) scanObject(r layout.Ref) {
 	base := uint64(r) + 1
 
 	switch desc.Shape {
-	case layout.ByteArray:
-		return // no references, which is what makes a String cheap to skip
+	case layout.ByteArray, layout.RawArray:
+		return // no references: a String's bytes, or an array of a non-reference type
 
 	case layout.RefArray:
 		n := h.mem[base]
@@ -213,7 +213,7 @@ func (h *Heap) scanObjectMajor(r layout.Ref, fromStart, fromEnd uint64) {
 	base := uint64(r) + 1
 
 	switch desc.Shape {
-	case layout.ByteArray:
+	case layout.ByteArray, layout.RawArray:
 		return
 	case layout.RefArray:
 		n := h.mem[base]

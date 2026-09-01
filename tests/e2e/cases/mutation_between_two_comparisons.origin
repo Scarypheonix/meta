@@ -1,0 +1,19 @@
+use std::io;
+
+struct Cell { mut n: i64 }
+
+// `==` on an aggregate is structural (ADR-0011), so it reads the fields the two references
+// point at -- which an assignment between two comparisons can change. That makes it a heap
+// read rather than a pure function of its operands, and a common-subexpression pass that
+// treats it as pure answers the first comparison three times. -O2 did, and said `false
+// false false`: an optimization the program can see, which spec/11-codegen.md does not
+// allow.
+fn main() {
+    let a = Cell { n: 1 };
+    let b = Cell { n: 2 };
+    io::println((a == b).to_str());
+    b.n = 1;
+    io::println((a == b).to_str());
+    b.n = 5;
+    io::println((a == b).to_str());
+}

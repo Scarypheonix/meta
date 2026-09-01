@@ -203,6 +203,31 @@ func (o Op) Movable() bool {
 	return o.Shareable() && !o.MayTrapOnValues()
 }
 
+// Shareable reports whether two occurrences of this value necessarily compute the same
+// thing, which is what a common-subexpression pass replaces one with the other on.
+//
+// The opcode alone almost decides it, and `Op.Shareable` is that part. What it cannot see
+// is a structural `==` on an aggregate: the operands are two references, and the answer
+// depends on the *fields* they point at, which an assignment between the two occurrences
+// can change (spec/04-expressions.md makes `==` structural, ADR-0011). That makes it a heap
+// read, exactly like OpGetField, which is already excluded for the same reason. On anything
+// else -- an integer, a float, a String, which is immutable -- it is a pure function of its
+// operands and stays shareable.
+func (v *Value) Shareable() bool {
+	if !v.Op.Shareable() {
+		return false
+	}
+	if v.Op == OpEq || v.Op == OpNe {
+		return bytecode.Kind(v.Const) != bytecode.KindRef
+	}
+	return true
+}
+
+// Movable reports whether this value may be hoisted out of a loop.
+func (v *Value) Movable() bool {
+	return v.Shareable() && !v.Op.MayTrapOnValues()
+}
+
 // Value is a single SSA definition.
 type Value struct {
 	// ID is unique within a function and stable for the life of the value.

@@ -53,6 +53,21 @@ func (v *VM) equalObjects(a, b layout.Ref, span diag.Span) bool {
 	if desc.Shape == layout.ByteArray {
 		return v.heap.Bytes(a) == v.heap.Bytes(b)
 	}
+	if desc.Shape == layout.RefArray || desc.Shape == layout.RawArray {
+		// Element-wise, and capacity-blind: what an array holds is its length's worth of
+		// elements, and the room above that is not part of the value
+		// (spec/13-collections.md).
+		na, nb := v.heap.Get(a, 0), v.heap.Get(b, 0)
+		if na != nb {
+			return false
+		}
+		for i := uint64(0); i < na; i++ {
+			if !v.equal(v.arrayElem(desc, a, i), v.arrayElem(desc, b, i), span) {
+				return false
+			}
+		}
+		return true
+	}
 	if desc.Kind == layout.ObjClosure {
 		v.trap(span, "function values cannot be compared with `==`")
 	}
@@ -141,6 +156,14 @@ func (v *VM) displayObject(r layout.Ref) string {
 	desc := v.prog.Types.Get(v.heap.TypeOf(r))
 	if desc.Shape == layout.ByteArray {
 		return v.heap.Bytes(r)
+	}
+	if desc.Shape == layout.RefArray || desc.Shape == layout.RawArray {
+		n := v.heap.Get(r, 0)
+		parts := make([]string, 0, n)
+		for i := uint64(0); i < n; i++ {
+			parts = append(parts, v.display(v.arrayElem(desc, r, i)))
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
 	}
 	slots := make([]string, 0, len(desc.Kinds))
 	for i := range desc.Kinds {
@@ -261,6 +284,10 @@ func (v *VM) callBuiltin(index, argCount int, span diag.Span) {
 	defer func() { v.temps = v.temps[:base] }()
 
 	if val, handled := v.concurrencyBuiltin(index, args, span); handled {
+		v.push(val)
+		return
+	}
+	if val, handled := v.arrayBuiltin(index, args, span); handled {
 		v.push(val)
 		return
 	}

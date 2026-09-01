@@ -143,6 +143,8 @@ func TypeName(v Value) string {
 		return t.Def.Name.Name
 	case *Enum:
 		return t.Def.Name.Name
+	case *Array:
+		return "Array"
 	case *Closure, *Builtin:
 		return "function"
 	}
@@ -182,6 +184,12 @@ func Display(v Value) string {
 		return t.Def.Name.Name + " { " + strings.Join(parts, ", ") + " }"
 	case *Enum:
 		return displayEnum(t)
+	case *Array:
+		var parts []string
+		for _, e := range t.Elems {
+			parts = append(parts, Display(e))
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
 	case *Closure, *Builtin:
 		return "<function>"
 	}
@@ -274,6 +282,20 @@ func equal(a, b Value) (bool, error) {
 		}
 		for i := range x.Vals {
 			eq, err := equal(x.Vals[i], y.Vals[i])
+			if err != nil || !eq {
+				return false, err
+			}
+		}
+		return true, nil
+	case *Array:
+		// Element-wise, and capacity-blind: two arrays holding the same elements are
+		// equal whatever room they have left (spec/13-collections.md).
+		y, ok := b.(*Array)
+		if !ok || len(x.Elems) != len(y.Elems) {
+			return false, nil
+		}
+		for i := range x.Elems {
+			eq, err := equal(x.Elems[i], y.Elems[i])
 			if err != nil || !eq {
 				return false, err
 			}

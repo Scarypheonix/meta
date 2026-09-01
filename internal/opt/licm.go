@@ -59,7 +59,7 @@ func LoopInvariantCodeMotion(f *ir.Func, prog *bytecode.Program) bool {
 // invariant reports whether a value can be computed once before the loop instead of on
 // every iteration.
 func invariant(v *ir.Value, loop *ir.Loop) bool {
-	if !v.Op.Movable() {
+	if !v.Movable() {
 		return false
 	}
 	if len(v.Args) == 0 {

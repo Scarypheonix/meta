@@ -1,0 +1,22 @@
+use std::io;
+use std::array;
+
+// Two arrays are equal when they hold the same elements. The room above the length is not
+// part of the value, which is what makes `==` on a list mean what it should once `List` is
+// written on top of this (spec/13-collections.md).
+fn main() {
+    let small = array::new[i64](2);
+    let roomy = array::new[i64](64);
+    io::println((small == roomy).to_str());
+
+    array::push(small, 7);
+    array::push(roomy, 7);
+    io::println((small == roomy).to_str());
+
+    array::push(small, 8);
+    array::push(roomy, 9);
+    io::println((small == roomy).to_str());
+
+    array::set(roomy, 1, 8);
+    io::println((small == roomy).to_str());
+}

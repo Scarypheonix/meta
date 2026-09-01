@@ -427,3 +427,57 @@ fn main() {
 }
 `, "76000") // 400 increments of sum(0..19) = 190.
 }
+
+// TestACollectionForwardsAnArraysElements covers the shape ADR-0028 added. An array of
+// references is a run the collector traces from the outside -- length first, then that many
+// elements -- rather than a struct whose per-word kinds it looks up, and the room above the
+// length holds nothing it may touch.
+//
+// The program keeps every list it builds in one array while allocating hard enough to move
+// them many times over, so an element the collector failed to rewrite is a sum that is
+// wrong or a trap, and a slot above the length that it traced anyway is a crash.
+func TestACollectionForwardsAnArraysElements(t *testing.T) {
+	checkRun(t, `
+use std::io;
+use std::array;
+
+struct Node { value: i64, tail: Option[Node] }
+
+fn build(n: i64) -> Option[Node] {
+    let mut out = Option::None;
+    let mut i = 0;
+    while i < n { out = Option::Some(Node { value: i, tail: out }); i = i + 1; }
+    out
+}
+
+fn total(list: Option[Node]) -> i64 {
+    let mut sum = 0;
+    let mut cur = list;
+    while true {
+        match cur {
+            Option::Some(nd) => { sum = sum + nd.value; cur = nd.tail; },
+            Option::None => { return sum; },
+        }
+    }
+    sum
+}
+
+fn main() {
+    // Room for far more than is pushed: the spare slots must stay untraced.
+    let kept = array::new[Option[Node]](64);
+    let mut i = 0;
+    while i < 40 {
+        array::push(kept, build(20));
+        i = i + 1;
+    }
+
+    let mut acc = 0;
+    let mut j = 0;
+    while j < array::len(kept) {
+        acc = acc + total(array::at(kept, j));
+        j = j + 1;
+    }
+    io::println(acc.to_str());
+}
+`, "7600") // 40 lists of sum(0..19) = 190.
+}

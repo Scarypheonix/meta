@@ -1,0 +1,29 @@
+use std::io;
+use std::array;
+
+// The one thing the compiler provides underneath `List` and `Map` (ADR-0028): a run of
+// elements with room to grow into, where a slot exists only once something has been pushed
+// to it -- which is what keeps "no uninitialized bindings" true for a structure that grows.
+fn main() {
+    let a = array::new[i64](3);
+    io::println(array::len(a).to_str());
+    io::println(array::cap(a).to_str());
+
+    io::println(array::push(a, 10).to_str());
+    io::println(array::push(a, 20).to_str());
+    io::println(array::push(a, 30).to_str());
+    // Full: an array never grows, and says so rather than trapping.
+    io::println(array::push(a, 40).to_str());
+    io::println(array::len(a).to_str());
+
+    io::println(array::at(a, 0).to_str());
+    io::println(array::at(a, 2).to_str());
+    array::set(a, 1, 99);
+    io::println(array::at(a, 1).to_str());
+
+    array::truncate(a, 1);
+    io::println(array::len(a).to_str());
+    io::println(array::cap(a).to_str());
+    io::println(array::push(a, 50).to_str());
+    io::println(array::at(a, 1).to_str());
+}
