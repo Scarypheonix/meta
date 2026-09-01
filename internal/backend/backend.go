@@ -370,6 +370,14 @@ func (e *emitter) function(index int, f *ir.Func) error {
 		e.a.MovMI(e.mem(inSlot(i)), 0)
 	}
 
+	// A closure body's own object arrives just above the return address (lower.go's
+	// callClosure). Copying it into the slot regalloc.go reserved is what makes it a root
+	// the collector can find and update; every OpCapture reads it from there afterwards.
+	if e.regs.closureSlot != 0 {
+		e.a.MovRM(scratchA, x86.At(x86.RBP, 16))
+		e.a.MovMR(e.mem(inSlot(e.regs.closureSlot)), scratchA)
+	}
+
 	blocks := order(f)
 	for _, b := range blocks {
 		e.blockLbl[b] = e.a.NewLabel(fmt.Sprintf("fn%d %s", index, b))

@@ -229,10 +229,19 @@ no write barrier (ADR-0022); and DWARF is a line table and a symbol table only, 
 - **The interpreter and the virtual machine both run it.** Five end-to-end cases pass on
   both, skipped by name on native with the reason (`concurrencyCases`), the same ledger
   `nativeSkips` kept in Phase 5 and meant to empty the same way.
+- **`spawn` and `join` run natively**, on a real green thread: an mmap'd stack, a saved
+  register set and `rt_switch` (`internal/backend/thread.go`, commit `14bb976`). The
+  collector's root walk runs once per thread. Channels need a run queue and are next.
+- **Two native GC-root bugs, both silent until a collection actually moved objects**
+  (`internal/backend/collect_test.go` is the regression test, and it shrinks `heapSize` to
+  reach them at all). A constructor pushed its field values to the raw stack across its own
+  allocator call, and a closure body read its captures from `[rbp + 16]` every time; neither
+  place is in the collector's root set, so both handed back pre-collection addresses. The
+  rule is now written down in spec/11-codegen.md's "Stack frames": a reference is never
+  parked outside a tracked register or a reference slot across a call that can allocate.
 
-**Next action:** the native backend's scheduler, which is the last engine and much the
-hardest: green threads in hand-written x86 mean context switching and growable stacks
-with no libc, and ADR-0022's collector is stop-the-world and single-space.
+**Next action:** channels on native, which need a run queue rather than `join`'s
+switch-and-run: a thread parked on a channel has nobody to switch back to it.
 
 **A note on the history:** the VM's concurrency runtime landed inside commit `6b073de`,
 whose message describes only ADR-0027 — the bug the VM work uncovered. The commit is

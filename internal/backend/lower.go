@@ -502,27 +502,22 @@ func (e *emitter) call(v *ir.Value) error {
 // closure lowers OpClosure: allocate a closure object and fill it. Field 0 is always
 // the underlying function's entry address -- computed the same way OpFunc's own
 // lowering computes it, not read from Args, since bytecode.OpClosure never pushes it --
-// and fields 1.. are the captures, in Args order. The captures are pushed to the stack
-// before the allocator call for the same reason construct's fields are: the call
-// clobbers the caller-saved registers, and nothing here may assume an operand's home
-// survives across it.
+// and fields 1.. are the captures, in Args order. The captures are read after the
+// allocator call for the same reason construct's fields are: the call can collect, and a
+// capture parked on the raw stack across it is not in the collector's root set.
 func (e *emitter) closure(v *ir.Value) error {
 	if v.Const < 0 || v.Const >= len(e.prog.Closures) {
 		return fmt.Errorf("this is a compiler bug: closure index %d is out of range", v.Const)
 	}
 	ci := e.prog.Closures[v.Const]
 	desc := e.prog.Types.Get(ci.Type)
-	for _, a := range v.Args {
-		e.load(scratchA, a)
-		e.a.Push(scratchA)
-	}
 	e.a.MovRI(x86.RDI, desc.Words)
 	e.a.MovRI(x86.RSI, uint64(ci.Type))
 	e.a.Call(e.rt.alloc)
 	e.recordCall(v)
-	e.a.MovRR(scratchB, x86.RAX) // the new object's reference, saved across the pops
-	for i := len(v.Args) - 1; i >= 0; i-- {
-		e.a.Pop(scratchA)
+	e.a.MovRR(scratchB, x86.RAX) // the new object's reference, held while the fields land
+	for i, a := range v.Args {
+		e.load(scratchA, a)
 		e.a.MovMR(x86.At(scratchB, fieldOffset(i+1)), scratchA)
 	}
 	e.a.LeaLabel(scratchA, e.fnLabels[ci.FnIndex])
@@ -531,15 +526,18 @@ func (e *emitter) closure(v *ir.Value) error {
 	return nil
 }
 
-// capture lowers OpCapture: read one of the current closure's fields. There is no
-// per-function register or frame slot holding the closure reference -- callClosure
-// below leaves it on the stack, in the fixed spot a call always leaves just above the
-// return address, so it is read from there directly, as many times as the body needs
-// it. Field 0 is the function's own entry address, so a capture at index i sits at
-// field i+1 (bytecode.OpLoadCapture's own VM lowering, internal/vm/exec.go, reads the
-// same offset).
+// capture lowers OpCapture: read one of the current closure's fields. The closure
+// reference itself comes from the frame slot regalloc.go reserved for it and the
+// prologue filled from [rbp+16], never from [rbp+16] again: a collection during the body
+// moves the object, and only the slot -- inside the reference area the stack map
+// describes -- is updated to say where it went. Field 0 is the function's own entry
+// address, so a capture at index i sits at field i+1 (bytecode.OpLoadCapture's own VM
+// lowering, internal/vm/exec.go, reads the same offset).
 func (e *emitter) capture(v *ir.Value) error {
-	e.a.MovRM(scratchA, x86.At(x86.RBP, 16))
+	if e.regs.closureSlot == 0 {
+		return fmt.Errorf("this is a compiler bug: %s reads a capture in a function declaring none", e.fn.Name)
+	}
+	e.a.MovRM(scratchA, e.mem(inSlot(e.regs.closureSlot)))
 	e.a.MovRM(scratchB, x86.At(scratchA, fieldOffset(int(v.Aux)+1)))
 	e.def(v, scratchB)
 	return nil
@@ -767,10 +765,15 @@ func fieldOffset(i int) int32 { return int32(objHeaderSize + wordSize*i) }
 // construct lowers OpStruct, OpTuple and OpVariant: allocate an object of the given
 // exact layout (ADR-0019) and fill its fields from the operands, in order.
 //
-// Every field value is pushed to the stack before the call to the allocator, rather
-// than kept in a register: the allocator call clobbers the caller-saved registers, and
-// nothing here may assume an operand's home survives across it (the same reason
-// e.call pushes its arguments).
+// Every field value is read from its own home *after* the allocator call, never parked
+// on the stack across it. The allocator can collect (ADR-0022), and a collection moves
+// objects: the collector's root set is this frame's tracked registers and its
+// reference-kind spill slots (ADR-0021's stack map), and a reference pushed to the raw
+// stack is in neither, so it would come back pointing into the space just vacated.
+// Reading afterwards is also what makes the clobbering harmless: an operand of a
+// call-clobbering operation is live across that call by construction, so regalloc.go
+// already gave it a callee-saved register or a spill slot, both of which the collector
+// updates in place.
 func (e *emitter) construct(v *ir.Value, t layout.TypeID) error {
 	desc := e.prog.Types.Get(t)
 	for i, a := range v.Args {
@@ -785,16 +788,14 @@ func (e *emitter) construct(v *ir.Value, t layout.TypeID) error {
 			// struct/tuple/variant construction included.
 			return fmt.Errorf("this is a compiler bug: an unboxed function value reached a reference-shaped field")
 		}
-		e.load(scratchA, a)
-		e.a.Push(scratchA)
 	}
 	e.a.MovRI(x86.RDI, desc.Words)
 	e.a.MovRI(x86.RSI, uint64(t))
 	e.a.Call(e.rt.alloc)
 	e.recordCall(v)
-	e.a.MovRR(scratchB, x86.RAX) // the new object's reference, saved across the pops
-	for i := len(v.Args) - 1; i >= 0; i-- {
-		e.a.Pop(scratchA)
+	e.a.MovRR(scratchB, x86.RAX) // the new object's reference, held while the fields land
+	for i, a := range v.Args {
+		e.load(scratchA, a)
 		e.a.MovMR(x86.At(scratchB, fieldOffset(i)), scratchA)
 	}
 	e.def(v, scratchB)

@@ -13,13 +13,18 @@ import (
 // result in rax, and rcx, rdx, r10 and r11 free to clobber. Anything a routine needs
 // beyond that it pushes. Origin code never calls them directly; lowering does.
 
-const (
-	// heapSize is the size of each of the two semispaces the runtime asks mmap for at
-	// start-up (ADR-0022): one is "current" (rtBumpOff/rtEndOff bound it) and the other
-	// is where the next collection copies live objects into. Total mapped memory is
-	// therefore 2*heapSize, trivial against the 8 GiB target machine.
-	heapSize = 64 << 20
+// heapSize is the size of each of the two semispaces the runtime asks mmap for at
+// start-up (ADR-0022): one is "current" (rtBumpOff/rtEndOff bound it) and the other is
+// where the next collection copies live objects into. Total mapped memory is therefore
+// 2*heapSize, trivial against the 8 GiB target machine.
+//
+// It is a variable only so that collect_test.go can shrink it around a single build:
+// a bug that only appears once a collection actually moves objects is otherwise reachable
+// only by allocating tens of megabytes, which no test in a five-minute suite can afford.
+// Nothing else ever assigns it.
+var heapSize int32 = 64 << 20
 
+const (
 	// rtBumpOff and rtEndOff are the runtime block's fields, addressed through r15.
 	rtBumpOff = 0
 	rtEndOff  = 8
@@ -191,7 +196,7 @@ func (e *emitter) mmapHeap() {
 	// mmap(NULL, heapSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
 	a.MovRI(x86.RAX, e.target.SysMmap)
 	a.XorRR(x86.RDI, x86.RDI)
-	a.MovRI(x86.RSI, heapSize)
+	a.MovRI(x86.RSI, uint64(heapSize))
 	a.MovRI(x86.RDX, 3)
 	a.MovRI(x86.R10, e.target.MapAnonPrivate)
 	a.MovRI(x86.R8, ^uint64(0))

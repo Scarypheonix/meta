@@ -106,6 +106,22 @@ A value that the register allocator spills keeps its slot for the whole function
 are not reused between values of different reference-ness, because a slot whose meaning
 changes mid-function cannot be described by one stack map entry.
 
+A function with captures reserves the **first reference slot** for its own closure
+object, which its prologue copies there from `[rbp + 16]`, and every capture read goes
+through that slot rather than through `[rbp + 16]` again. The word the caller left above
+the return address is a live reference in a place no stack map can name; the reserved
+slot is inside the reference area a stack map already describes, so a collection moving
+the closure updates it like any other spilled reference.
+
+**A reference is never parked anywhere else across a call.** The collector's whole root
+set is the registers a stack map names plus that reference area, so a value pushed to the
+raw stack across a call that can allocate is invisible to it and comes back naming the
+space the collection just vacated. Lowering therefore reads a value from its own home
+after such a call, never from a stack temporary saved before it: a constructor allocates
+first and fills its fields afterwards, which is safe because an operand of a
+call-clobbering operation is live across that call by construction and so already has a
+callee-saved register or a reference slot.
+
 ## Safepoints and stack maps
 
 Per §08 a collection may begin only at a safepoint, and the compiler inserts one at

@@ -61,6 +61,9 @@ type alloc struct {
 	// bitmap (ADR-0021 is what gives every spilled value's Kind the register allocator
 	// now reads to keep that grouping).
 	refSlots int
+	// closureSlot is the reference slot holding this function's own closure object, or
+	// 0 for a function that has no captures to read one for. See allocate's own comment.
+	closureSlot int
 	// used lists the callee-saved registers the function actually assigned, so the
 	// prologue saves those and no others.
 	used []x86.Reg
@@ -444,14 +447,26 @@ func allocate(f *ir.Func) *alloc {
 		sort.Slice(active, func(i, j int) bool { return active[i].end < active[j].end })
 	}
 
+	// A function with captures is only ever entered through lower.go's callClosure, which
+	// leaves the closure object one word above the return address rather than in any
+	// register or slot -- a live reference sitting where a stack map has no way to name it,
+	// so a collection during the body would move the object and leave every later capture
+	// read pointing into the space just vacated. Reserving the first reference slot for it,
+	// which the prologue fills from [rbp+16] and OpCapture reads from thereafter, puts it
+	// inside the reference area the stack map already describes: the collector then updates
+	// it in place like any other spilled reference.
+	a.closureSlot = 0
+	if f.Captures > 0 {
+		a.closureSlot = 1
+	}
 	for i, iv := range refSpills {
-		a.where[iv.val] = inSlot(i + 1)
+		a.where[iv.val] = inSlot(a.closureSlot + i + 1)
 	}
 	for i, iv := range rawSpills {
-		a.where[iv.val] = inSlot(len(refSpills) + i + 1)
+		a.where[iv.val] = inSlot(a.closureSlot + len(refSpills) + i + 1)
 	}
-	a.refSlots = len(refSpills)
-	a.slots = len(refSpills) + len(rawSpills)
+	a.refSlots = a.closureSlot + len(refSpills)
+	a.slots = a.closureSlot + len(refSpills) + len(rawSpills)
 
 	for _, r := range calleeSaved {
 		if usedCallee[r] {
