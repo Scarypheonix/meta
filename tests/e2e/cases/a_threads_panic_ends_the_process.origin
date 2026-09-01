@@ -1,0 +1,15 @@
+use std::io;
+use std::thread;
+
+// A panic is not per-thread (ADR-0026): the process ends, including every green thread,
+// because a thread that dies inside `Mutex::with` leaves a half-mutated value under a
+// lock nobody can tell is poisoned. §09's exit status is the whole program's.
+fn main() {
+    let h = thread::spawn(|| -> i64 {
+        panic("the thread gave up");
+        0
+    });
+    io::println("spawned");
+    let v = h.join();
+    io::println("not reached");
+}

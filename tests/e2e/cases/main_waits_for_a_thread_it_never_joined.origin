@@ -1,0 +1,13 @@
+use std::thread;
+use std::io;
+
+// `main` returning is not the end of the program: §12 says it waits for every spawned
+// thread, deliberately unlike Go, where the race between exit and a goroutine is a
+// familiar bug. Nothing here joins, and `main` prints nothing, so the output is the
+// thread's alone -- and is the same whenever the thread happens to run.
+fn main() {
+    let h = thread::spawn(|| -> i64 {
+        io::println("the thread ran");
+        0
+    });
+}

@@ -2,33 +2,32 @@ use std::io;
 use std::thread;
 use std::sync;
 
+// `Counter` has a `mut` field, so it cannot cross a thread boundary on its own
+// (ADR-0014). A `Mutex` is what makes it shareable, and the total is the same whatever
+// order the eight threads interleave in -- which is what makes this a valid differential
+// case rather than a race the engines would each resolve differently.
 struct Counter { mut n: i64 }
 
+fn bump(m: Mutex[Counter]) -> i64 {
+    let mut i = 0;
+    while i < 1000 {
+        m.with(|c: Counter| -> i64 { c.n = c.n + 1; 0 });
+        i = i + 1;
+    }
+    0
+}
+
 fn main() {
-    // `Counter` has a `mut` field, so it cannot cross a thread boundary on its own
-    // (ADR-0014). A `Mutex` is what makes it shareable, and the total is the same
-    // whatever order the threads interleave in -- which is what makes this a valid
-    // differential case.
     let m = sync::mutex(Counter { n: 0 });
-
-    let a = thread::spawn(|| -> i64 {
-        let mut i = 0;
-        while i < 500 {
-            m.with(|c: Counter| -> i64 { c.n = c.n + 1; 0 });
-            i = i + 1;
-        }
-        0
-    });
-    let b = thread::spawn(|| -> i64 {
-        let mut i = 0;
-        while i < 500 {
-            m.with(|c: Counter| -> i64 { c.n = c.n + 1; 0 });
-            i = i + 1;
-        }
-        0
-    });
-
-    let x = a.join();
-    let y = b.join();
+    let a = thread::spawn(|| -> i64 { bump(m) });
+    let b = thread::spawn(|| -> i64 { bump(m) });
+    let c = thread::spawn(|| -> i64 { bump(m) });
+    let d = thread::spawn(|| -> i64 { bump(m) });
+    let e = thread::spawn(|| -> i64 { bump(m) });
+    let f = thread::spawn(|| -> i64 { bump(m) });
+    let g = thread::spawn(|| -> i64 { bump(m) });
+    let h = thread::spawn(|| -> i64 { bump(m) });
+    let r1 = a.join(); let r2 = b.join(); let r3 = c.join(); let r4 = d.join();
+    let r5 = e.join(); let r6 = f.join(); let r7 = g.join(); let r8 = h.join();
     io::println(m.with(|c: Counter| -> i64 { c.n }).to_str());
 }

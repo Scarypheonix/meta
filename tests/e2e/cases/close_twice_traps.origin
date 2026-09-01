@@ -1,0 +1,12 @@
+use std::io;
+use std::chan;
+
+fn main() {
+    let (s, r) = chan::channel[i64](1);
+    s.close();
+    io::println("closed");
+    // Closing marks the channel closed; closing a closed one is the sender losing track
+    // of the channel's lifetime, which §12 makes a programming error rather than a no-op.
+    s.close();
+    io::println("not reached");
+}

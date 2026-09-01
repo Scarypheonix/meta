@@ -1,0 +1,22 @@
+use std::io;
+use std::thread;
+use std::chan;
+
+// Both threads block in the same place, so whichever of them the scheduler happens to
+// park last is the one that notices -- and names the same line either way, which is what
+// keeps this a valid differential case (spec/12-concurrency.md's determinism clause).
+fn wait_for(r: Receiver[i64]) -> i64 {
+    match r.recv() {
+        Option::Some(n) => n,
+        Option::None => 0,
+    }
+}
+
+fn main() {
+    let (s1, r1) = chan::channel[i64](0);
+    let (s2, r2) = chan::channel[i64](0);
+    let h = thread::spawn(|| -> i64 { wait_for(r2) });
+    io::println("waiting");
+    let v = wait_for(r1);
+    io::println("not reached");
+}

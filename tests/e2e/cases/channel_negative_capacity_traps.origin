@@ -1,0 +1,11 @@
+use std::io;
+use std::chan;
+
+fn main() {
+    io::println("before");
+    // A queue of minus one values is not a channel this runtime can build, and rounding
+    // it up to zero would silently give rendezvous semantics to a program that asked for
+    // something else (spec/12-concurrency.md).
+    let (s, r) = chan::channel[i64](-1);
+    io::println("not reached");
+}

@@ -1,0 +1,16 @@
+use std::io;
+use std::thread;
+
+// Four threads, each returning its own index, joined in order. §12's determinism clause
+// is what makes this a valid differential case: the joins impose the order, so no engine's
+// scheduling can change the output.
+fn main() {
+    let a = thread::spawn(|| -> i64 { 0 });
+    let b = thread::spawn(|| -> i64 { 1 });
+    let c = thread::spawn(|| -> i64 { 2 });
+    let d = thread::spawn(|| -> i64 { 3 });
+    io::println(a.join().to_str());
+    io::println(b.join().to_str());
+    io::println(c.join().to_str());
+    io::println(d.join().to_str());
+}

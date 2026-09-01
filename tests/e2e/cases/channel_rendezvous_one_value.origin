@@ -1,0 +1,18 @@
+use std::io;
+use std::thread;
+use std::chan;
+
+// Capacity 0: the send completes only when the receive is there to take it, so this
+// prints 7 however the two threads are scheduled.
+fn main() {
+    let (s, r) = chan::channel[i64](0);
+    let h = thread::spawn(|| -> i64 {
+        s.send(7);
+        0
+    });
+    match r.recv() {
+        Option::Some(n) => { io::println(n.to_str()); },
+        Option::None => { io::println("closed"); },
+    }
+    let z = h.join();
+}

@@ -177,7 +177,7 @@ Each names the offending type and the field or capture that makes it non-`Send`,
 |---|---|
 | `let h = thread::spawn(\|\| -> i64 { 40 + 2 }); io::println(h.join().to_str());` | `42` |
 | spawn 4 threads each returning their index, join all in order | `0 1 2 3` |
-| `let (s, r) = chan::channel[i64](0); thread::spawn(\|\| { s.send(7); }); io::println(r.recv().unwrap().to_str());` | `7` |
+| `let (s, r) = chan::channel[i64](0); thread::spawn(\|\| { s.send(7); }); match r.recv() { ... }` | `7` |
 | send 3 values then `close`, receive until `None` | the 3 values, in send order |
 | `recv` on a closed, drained channel | `None`, every time |
 | `send` after `close` | TRAPS `send on a closed channel`, exit 101 |
@@ -193,9 +193,16 @@ Each names the offending type and the field or capture that makes it non-`Send`,
 | `main` returns while a spawned thread still runs | the program waits for it, then exits |
 | a compute loop with no calls, another thread ready | the other thread runs — safepoint on the back-edge (§08) |
 
-Every one of these is an end-to-end case under `tests/e2e/cases/`, asserting exact stdout,
-stderr and exit status on all three engines — which is what makes the table normative
-rather than aspirational.
+Every row is a case in the corpus, which is what makes this table normative rather than
+aspirational. The two rows that are verdicts rather than runs — the rejected capture and the
+accepted `Mutex[C]` — are `tests/conformance/` cases, asserting the diagnostic and its code;
+every other row is a `tests/e2e/cases/` case asserting exact stdout, stderr and exit status
+on all three engines at every optimization level.
+
+A row's program is written here in the shortest form that shows the point, and in the corpus
+in whatever form the language actually has: the receive above is a `match` and not an
+`unwrap`, because `Option` has no `unwrap` — opening one is what `match` is for, and adding
+a method that traps on `None` is a decision for the prelude and not for this document.
 
 ## Determinism and the differential
 

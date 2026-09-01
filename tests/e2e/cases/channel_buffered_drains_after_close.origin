@@ -1,0 +1,24 @@
+use std::io;
+use std::chan;
+
+// Values already queued stay receivable after the close; `None` comes once the queue is
+// drained, and permanently thereafter (spec/12-concurrency.md).
+fn show(v: Option[i64]) {
+    match v {
+        Option::Some(n) => { io::println(n.to_str()); },
+        Option::None => { io::println("closed"); },
+    }
+}
+
+fn main() {
+    let (s, r) = chan::channel[i64](3);
+    s.send(1);
+    s.send(2);
+    s.send(3);
+    s.close();
+    show(r.recv());
+    show(r.recv());
+    show(r.recv());
+    show(r.recv());
+    show(r.recv());
+}
