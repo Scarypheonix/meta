@@ -17,8 +17,8 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Generic associated types | needs higher-kinded machinery | — (not planned) |
 | Specialization | interacts badly with coherence; open problem elsewhere | — (not planned) |
 | Operator overloading | `+` on user types needs traits in the operator path; `==` is already structural | Phase 7 |
-| Index syntax `v[i]` | must not reintroduce parse ambiguity (ADR-0013); likely spelled `v.[i]` | Phase 7 |
-| Collection literals | same ambiguity constraint as index syntax | Phase 7 |
+| Index syntax `v[i]` | ADR-0028 closed this rather than doing it: collections are a library, `xs.get(i)` returns `Option[T]` and `xs.at(i)` traps, and neither needs a production ADR-0013 ruled out. Adding `v.[i]` later is additive sugar over the same method call | — (not planned: ADR-0028 decided against it) |
+| Collection literals | same ambiguity constraint as index syntax, and the same answer: a list is built by pushing to it (ADR-0028). The reason to revisit is ergonomics -- a test that wants three elements writes three pushes -- rather than capability | Phase 8 |
 | Attributes and `derive` | mostly unnecessary because `==` is compiler-generated (ADR-0011) | Phase 7 |
 | Range patterns (`1..=9`) | exhaustiveness over integer ranges needs interval splitting in Maranget | Phase 7 |
 | Labelled `break` / `continue` | needs loop labels in the resolver | Phase 7 |

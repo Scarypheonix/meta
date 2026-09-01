@@ -1,0 +1,20 @@
+use std::io;
+use std::list;
+
+// `pop` takes the last element and shortens the list, so popping until `None` walks it
+// backwards and leaves it empty (spec/13-collections.md).
+fn main() {
+    let xs = list::new[String]();
+    xs.push("first");
+    xs.push("second");
+    xs.push("third");
+
+    while true {
+        match xs.pop() {
+            Option::Some(s) => { io::println(s); },
+            Option::None => { break; },
+        }
+    }
+    io::println(xs.len().to_str());
+    io::println(xs.is_empty().to_str());
+}

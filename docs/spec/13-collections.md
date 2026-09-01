@@ -221,4 +221,7 @@ out-of-range read to return whatever is next in memory.
 
 Every row is a case in `tests/e2e/cases/`, asserting exact stdout, stderr and exit status on
 all three engines at every optimization level — which is what makes this table normative
-rather than aspirational.
+rather than aspirational. The one exception is the last row: a collection that actually moves
+a live collection needs a heap smaller than any shipped program has, so it is a backend test
+(`internal/backend/collect_test.go`) that shrinks the heap around a single build. There is
+one for an array, a list and a map each, and they fail on the code they replaced.

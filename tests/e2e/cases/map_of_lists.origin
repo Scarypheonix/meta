@@ -1,0 +1,37 @@
+use std::io;
+use std::map;
+use std::list;
+
+// A map whose values are lists, built, mutated through and printed: the value a `get`
+// returns is the list itself, not a copy, so pushing to it is a mutation of what the map
+// holds (ADR-0008 -- an aggregate is a reference).
+fn add(m: Map[String, List[i64]], k: String, v: i64) {
+    match m.get(k) {
+        Option::Some(xs) => { xs.push(v); },
+        Option::None => {
+            let fresh = list::new[i64]();
+            fresh.push(v);
+            m.insert(k, fresh);
+        },
+    }
+}
+
+fn main() {
+    let m = map::new[String, List[i64]]();
+    add(m, "odd", 1);
+    add(m, "even", 2);
+    add(m, "odd", 3);
+    add(m, "even", 4);
+    add(m, "odd", 5);
+
+    io::println(m.len().to_str());
+    for e in m {
+        let mut sum = 0;
+        for v in e.value {
+            sum = sum + v;
+        }
+        io::println(e.key);
+        io::println(e.value.len().to_str());
+        io::println(sum.to_str());
+    }
+}

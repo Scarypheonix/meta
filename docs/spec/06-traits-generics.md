@@ -112,12 +112,17 @@ Defined in `std::prelude` and in scope in every module without a `use`:
 |---|---|---|
 | `Ord` | `fn cmp(self, other: Self) -> Ordering` | `<` on user types goes through `.cmp`, not the operator |
 | `Show` | `fn to_str(self) -> String` | used by `io::println` |
-| `Hash` | `fn hash(self, h: mut Hasher)` | Phase 7, for `Map` |
+| ~~`Hash`~~ | — | not a trait: hashing is structural and total, exactly as `==` is (§13) |
 | `Iterator` | `type Item; fn next(mut self) -> Option[Self::Item]` | drives `for` |
 | `IntoIterator` | `type Item; type Iter: Iterator; fn into_iter(self) -> Self::Iter` | drives `for` |
 | `Send` | (marker, no methods) | §08; required to cross a channel |
 
-`Eq` is **not** a trait: `==` is structural and total for every non-function type (§04).
+`Eq` is **not** a trait: `==` is structural and total for every non-function type (§04). Nor
+is `Hash`, for the same reason and by the same argument ADR-0011 makes about `==`: Phase 7
+found that `Map` needs one function over any key at all, not one trait implemented per key
+type, so `hash::of` is compiler-provided and specified (§13's "Hashing"). A `Hasher` to write
+into, and a trait for a type that wants its own hash, would both be additions rather than
+corrections — and neither is needed while hashing agrees with equality by construction.
 This removes the most common reason to want `derive` and is why 0.1 has no attribute
 syntax.
 
