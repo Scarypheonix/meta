@@ -53,10 +53,25 @@ fn main() { let x = add(1, 2); }
 	if mo.Entry == nil {
 		t.Fatal("no instance was recorded for main")
 	}
-	got := namesOf(mo)
+	// The prelude's own non-generic functions are instances too -- `root` compiles every
+	// function with no generic parameters whether or not anything calls it, which
+	// docs/deferred.md carries as a Phase 8 item. This is about the case's own two.
+	got := userInstances(mo)
 	if len(got) != 2 {
-		t.Fatalf("got %d instances (%v), want 2 (add, main)", len(got), got)
+		t.Fatalf("got %d instances of the program's own functions (%v), want 2 (add, main)", len(got), got)
 	}
+}
+
+// userInstances is namesOf without the prelude's, which every program carries.
+func userInstances(r *Result) []string {
+	var out []string
+	for _, inst := range r.Instances {
+		if s := inst.Decl.Span(); s.Valid() && s.File != nil && s.File.Name == prelude.Name {
+			continue
+		}
+		out = append(out, inst.Name)
+	}
+	return out
 }
 
 func TestEachCallSiteGetsItsOwnInstance(t *testing.T) {

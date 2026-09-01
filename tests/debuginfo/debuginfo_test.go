@@ -98,16 +98,47 @@ func haveTool(t *testing.T, name string) {
 
 // lineRows maps a source line to every machine-code address the compiler's own line table
 // gives it, read back out of the binary with llvm-dwarfdump.
-func lineRows(t *testing.T, binary string) map[int][]uint64 {
+// lineRows reads the line table's rows for one source file, keyed by line number.
+//
+// The file matters: a program carries rows for the prelude too, since the prelude is
+// Origin source compiled into it like any other. Asking lldb for `--file prog.origin
+// --line 755` because a prelude row happened to name line 755 is a question with no
+// answer, so the rows are filtered to the file that asked for them -- which means reading
+// the prologue's own file table, whose indices are what each row carries.
+func lineRows(t *testing.T, binary, file string) map[int][]uint64 {
 	t.Helper()
 	out, err := exec.Command("llvm-dwarfdump", "--debug-line", binary).Output()
 	if err != nil {
 		t.Fatalf("llvm-dwarfdump --debug-line: %v", err)
 	}
+
+	// file_names[  N]:
+	//            name: "<the file>"
+	want := -1
+	lines := strings.Split(string(out), "\n")
+	for i, ln := range lines {
+		m := fileNameRe.FindStringSubmatch(ln)
+		if m == nil || i+1 >= len(lines) {
+			continue
+		}
+		n := nameRe.FindStringSubmatch(lines[i+1])
+		if n == nil || filepath.Base(n[1]) != file {
+			continue
+		}
+		idx, err := strconv.Atoi(m[1])
+		if err != nil {
+			t.Fatalf("unparseable file index %q", m[1])
+		}
+		want = idx
+	}
+	if want < 0 {
+		t.Fatalf("the line table's file list does not mention %s:\n%s", file, out)
+	}
+
 	rows := map[int][]uint64{}
-	for _, ln := range strings.Split(string(out), "\n") {
+	for _, ln := range lines {
 		f := strings.Fields(ln)
-		if len(f) < 3 || !strings.HasPrefix(f[0], "0x") {
+		if len(f) < 4 || !strings.HasPrefix(f[0], "0x") {
 			continue
 		}
 		addr, err := strconv.ParseUint(f[0], 0, 64)
@@ -118,10 +149,18 @@ func lineRows(t *testing.T, binary string) map[int][]uint64 {
 		if err != nil {
 			continue
 		}
+		if idx, err := strconv.Atoi(f[3]); err != nil || idx != want {
+			continue
+		}
 		rows[line] = append(rows[line], addr)
 	}
 	return rows
 }
+
+var (
+	fileNameRe = regexp.MustCompile(`^file_names\[\s*(\d+)\]:`)
+	nameRe     = regexp.MustCompile(`^\s*name:\s*"(.*)"\s*$`)
+)
 
 // TestDWARFPassesLLVMsOwnVerifier runs the validity checker LLVM ships, which is a far
 // stricter reader than "debug/dwarf parsed it without erroring".
@@ -158,7 +197,7 @@ func TestLLDBResolvesEverySourceLineToItsOwnAddress(t *testing.T) {
 	for name, src := range programs {
 		for _, target := range []string{"linux", "macos"} {
 			binary := build(t, dir, name, src, target)
-			rows := lineRows(t, binary)
+			rows := lineRows(t, binary, name+".origin")
 			if len(rows) == 0 {
 				t.Errorf("%s/%s: the binary has no line rows at all", name, target)
 				continue

@@ -47,9 +47,29 @@ type Func struct {
 // row. Both are addresses the caller already has (backend.Build's own text layout), so
 // this package never needs to know anything about segments or files beyond the strings
 // in Line.File.
-func Build(lines []Line, lowPC, highPC uint64) (abbrev, info, line []byte) {
+func Build(main string, lines []Line, lowPC, highPC uint64) (abbrev, info, line []byte) {
 	files := fileTable(lines)
-	return buildAbbrev(), buildInfo(files, lowPC, highPC), buildLineProgram(lines, files, highPC)
+	return buildAbbrev(), buildInfo(primary(main, files), lowPC, highPC), buildLineProgram(lines, files, highPC)
+}
+
+// primary is what the compile unit is named after: the file `main` is written in.
+//
+// It is passed in rather than taken from the line table, because the line table is in
+// address order and the lowest address is whichever function the code generator emitted
+// first -- which is a prelude one as soon as the prelude contributes any non-generic
+// function at all, and would name every Origin program `<prelude>`. An empty name, or one
+// that contributed no line at all, falls back to the first file, which is what this did
+// before there was anything to get wrong.
+func primary(main string, files []string) string {
+	for _, f := range files {
+		if f == main {
+			return f
+		}
+	}
+	if len(files) > 0 {
+		return files[0]
+	}
+	return "<unknown>"
 }
 
 // fileTable returns every distinct file name in lines, in order of first appearance —

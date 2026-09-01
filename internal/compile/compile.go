@@ -85,6 +85,15 @@ const (
 	// BuiltinHash is spec/13-collections.md's `hash::of`: 64-bit FNV-1a over a specified
 	// encoding, which is what makes it the same number on all three engines.
 	BuiltinHash
+	// The string operations (spec/14-strings.md). The prelude's `Str` trait is written in
+	// terms of these six, so a program reaches them through `slice`, `find`, `split` and
+	// the rest rather than by naming them.
+	BuiltinStrLen
+	BuiltinStrByteAt
+	BuiltinStrSlice
+	BuiltinStrConcat
+	BuiltinStrCharAt
+	BuiltinStrCharWidth
 )
 
 // Compiler holds the state of one program's lowering.

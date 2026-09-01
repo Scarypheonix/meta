@@ -9,7 +9,7 @@ import "encoding/binary"
 //
 // 32-bit DWARF (a 4-byte unit_length): the whole program is nowhere near 4 GiB of debug
 // info, so the 64-bit DWARF escape (0xffffffff plus an 8-byte length) buys nothing.
-func buildInfo(files []string, lowPC, highPC uint64) []byte {
+func buildInfo(primary string, lowPC, highPC uint64) []byte {
 	var body []byte
 	body = binary.LittleEndian.AppendUint16(body, dwVersion4)
 	body = binary.LittleEndian.AppendUint32(body, 0) // debug_abbrev_offset: the only table
@@ -18,7 +18,7 @@ func buildInfo(files []string, lowPC, highPC uint64) []byte {
 	// The DIE itself: abbreviation code 1 (abbrev.go's only entry), then its attributes
 	// in the exact order the abbreviation declared them.
 	body = uleb128(body, 1)
-	body = cString(body, files[0]) // DW_AT_name: the program's primary source file
+	body = cString(body, primary) // DW_AT_name: the file `main` is written in
 	body = binary.LittleEndian.AppendUint64(body, lowPC)
 	body = binary.LittleEndian.AppendUint64(body, highPC-lowPC) // DW_AT_high_pc as an offset (§2.17.2)
 	body = binary.LittleEndian.AppendUint32(body, 0)            // DW_AT_stmt_list: offset 0 into .debug_line

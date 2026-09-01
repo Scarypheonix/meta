@@ -310,6 +310,10 @@ var stdModules = map[string][]string{
 	// spec/13-collections.md fixes the algorithm and the encoding rather than leaving
 	// them to whoever writes the runtime.
 	"std::hash": {"of"},
+	// Phase 7 (spec/14-strings.md). The six operations on `String` whose bodies read or
+	// allocate raw bytes; everything else about a string is Origin source in the prelude,
+	// as the `Str` trait's default method bodies.
+	"std::str": {"len", "byte_at", "slice", "concat", "char_at", "char_width"},
 	// Phase 6 (spec/12-concurrency.md). `spawn` and `channel` are what a program calls;
 	// the rest are the operations the prelude's own methods are written in terms of,
 	// since a method body cannot otherwise reach an operation the runtime provides.

@@ -302,7 +302,12 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 	// above), so this needs nothing e.a doesn't already expose.
 	lowPC := plan.TextAddr
 	highPC := lowPC + uint64(len(text))
-	abbrev, info, line := dwarf.Build(e.debugLines, lowPC, highPC)
+	// The compile unit is named for the file `main` is written in, which is what a
+	// debugger shows and what `breakpoint set --file` is matched against. It is not the
+	// first line row's file: rows are in address order, and the lowest address belongs to
+	// whichever function was emitted first -- a prelude one, as soon as the prelude
+	// contributes a function with no generic parameters of its own.
+	abbrev, info, line := dwarf.Build(mainFile(e.prog), e.debugLines, lowPC, highPC)
 
 	return &result{
 		text:   text,
@@ -497,6 +502,19 @@ func (e *emitter) function(index int, f *ir.Func) error {
 		Size:    e.a.PC() - startAddr,
 	})
 	return nil
+}
+
+// mainFile is the source file `main` is declared in, or "" when the program has no usable
+// entry (which emitProgram has already rejected by the time this runs).
+func mainFile(prog *bytecode.Program) string {
+	if prog.Entry < 0 || prog.Entry >= len(prog.Fns) {
+		return ""
+	}
+	fn := prog.Fns[prog.Entry]
+	if fn == nil || !fn.Span.Valid() || fn.Span.File == nil {
+		return ""
+	}
+	return fn.Span.File.Name
 }
 
 // recordLine appends a dwarf.Line row for v's own source position, but only when it names

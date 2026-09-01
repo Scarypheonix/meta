@@ -291,6 +291,10 @@ func (v *VM) callBuiltin(index, argCount int, span diag.Span) {
 		v.push(val)
 		return
 	}
+	if val, handled := v.strBuiltin(index, args, span); handled {
+		v.push(val)
+		return
+	}
 
 	switch index {
 	case compile.BuiltinPrint, compile.BuiltinPrintln:

@@ -1,32 +1,92 @@
-fn 0 classify(params=1 locals=1 captures=0)
+fn 0 len(params=1 locals=1 captures=0)
      0  load 0
-     1  const 0  ; 0
+     1  call_builtin 33 1
+     2  return
+
+fn 1 byte_at(params=2 locals=2 captures=0)
+     0  load 0
+     1  load 1
+     2  call_builtin 34 2
+     3  return
+
+fn 2 slice(params=3 locals=3 captures=0)
+     0  load 0
+     1  load 1
+     2  load 2
+     3  call_builtin 35 3
+     4  return
+
+fn 3 concat(params=2 locals=2 captures=0)
+     0  load 0
+     1  load 1
+     2  call_builtin 36 2
+     3  return
+
+fn 4 char_at(params=2 locals=2 captures=0)
+     0  load 0
+     1  load 1
+     2  call_builtin 37 2
+     3  return
+
+fn 5 char_width(params=2 locals=2 captures=0)
+     0  load 0
+     1  load 1
+     2  call_builtin 38 2
+     3  return
+
+fn 6 is_ascii_space(params=1 locals=1 captures=0)
+     0  load 0
+     1  const 0  ; 32
+     2  eq
+     3  jump_if_true 8
+     4  load 0
+     5  const 1  ; 9
+     6  eq
+     7  jump 9
+     8  true
+     9  jump_if_true 14
+    10  load 0
+    11  const 2  ; 10
+    12  eq
+    13  jump 15
+    14  true
+    15  jump_if_true 20
+    16  load 0
+    17  const 3  ; 13
+    18  eq
+    19  jump 21
+    20  true
+    21  return
+
+fn 7 classify(params=1 locals=1 captures=0)
+     0  load 0
+     1  const 4  ; 0
      2  lt
      3  jump_if_false 8
-     4  const 0  ; 0
-     5  const 1  ; 1
+     4  const 4  ; 0
+     5  const 5  ; 1
      6  sub
      7  jump 15
      8  load 0
-     9  const 0  ; 0
+     9  const 4  ; 0
     10  eq
     11  jump_if_false 14
-    12  const 0  ; 0
+    12  const 4  ; 0
     13  jump 15
-    14  const 1  ; 1
+    14  const 5  ; 1
     15  return
 
-fn 1 main(params=0 locals=2 captures=0)
-     0  const 0  ; 0
+fn 8 main(params=0 locals=2 captures=0)
+     0  const 4  ; 0
      1  store 0
-     2  const 0  ; 0
+     2  const 4  ; 0
      3  store 1
      4  load 0
-     5  const 2  ; 3
+     5  const 6  ; 3
      6  lt
      7  jump_if_false 25
      8  load 1
-     9  func 0
+     9  func 7
     10  load 0
     11  call 1  ; kind=int
     12  add
@@ -34,7 +94,7 @@ fn 1 main(params=0 locals=2 captures=0)
     14  unit
     15  pop
     16  load 0
-    17  const 1  ; 1
+    17  const 5  ; 1
     18  add
     19  store 0
     20  unit

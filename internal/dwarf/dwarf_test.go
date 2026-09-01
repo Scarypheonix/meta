@@ -1,6 +1,7 @@
 package dwarf
 
 import (
+	"bytes"
 	stddwarf "debug/dwarf"
 	"testing"
 )
@@ -15,7 +16,7 @@ func TestBuildRoundTripsThroughTheStandardLibraryReader(t *testing.T) {
 		{Address: 0x401000, File: "hello.origin", Line: 3, Col: 5},
 		{Address: 0x401010, File: "hello.origin", Line: 4, Col: 5},
 	}
-	abbrev, info, line := Build(lines, 0x401000, 0x401030)
+	abbrev, info, line := Build("hello.origin", lines, 0x401000, 0x401030)
 
 	d, err := stddwarf.New(abbrev, nil, nil, info, line, nil, nil, nil)
 	if err != nil {
@@ -100,8 +101,8 @@ func TestBuildIsDeterministic(t *testing.T) {
 		{Address: 0x401000, File: "a.origin", Line: 1, Col: 1},
 		{Address: 0x401010, File: "b.origin", Line: 9, Col: 3},
 	}
-	a1, i1, l1 := Build(lines, 0x401000, 0x401020)
-	a2, i2, l2 := Build(lines, 0x401000, 0x401020)
+	a1, i1, l1 := Build("a.origin", lines, 0x401000, 0x401020)
+	a2, i2, l2 := Build("a.origin", lines, 0x401000, 0x401020)
 	if string(a1) != string(a2) || string(i1) != string(i2) || string(l1) != string(l2) {
 		t.Error("building the same lines twice produced different bytes")
 	}
@@ -115,7 +116,7 @@ func TestBuildHandlesMultipleFiles(t *testing.T) {
 		{Address: 0x401010, File: "util.origin", Line: 2, Col: 1},
 		{Address: 0x401020, File: "main.origin", Line: 5, Col: 1},
 	}
-	abbrev, info, line := Build(lines, 0x401000, 0x401030)
+	abbrev, info, line := Build("main.origin", lines, 0x401000, 0x401030)
 
 	d, err := stddwarf.New(abbrev, nil, nil, info, line, nil, nil, nil)
 	if err != nil {
@@ -147,5 +148,40 @@ func TestBuildHandlesMultipleFiles(t *testing.T) {
 	}
 	if !names["main.origin"] || !names["util.origin"] {
 		t.Errorf("rows named %v, want both main.origin and util.origin", names)
+	}
+}
+
+// TestCompileUnitIsNamedForMainNotTheLowestAddress: the compile unit takes its name from
+// the file it is told is the program's, not from the first row of a table that is sorted
+// by address. Which function lands lowest in .text is the code generator's business, and
+// once the prelude contributes a function of its own it is a prelude one -- naming every
+// Origin program `<prelude>` in every debugger that reads it.
+func TestCompileUnitIsNamedForMainNotTheLowestAddress(t *testing.T) {
+	lines := []Line{
+		{Address: 0x401000, File: "<prelude>", Line: 12, Col: 5},
+		{Address: 0x401010, File: "main.origin", Line: 3, Col: 5},
+	}
+	abbrev, info, line := Build("main.origin", lines, 0x401000, 0x401020)
+
+	d, err := stddwarf.New(abbrev, nil, nil, info, line, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("debug/dwarf rejected the encoded sections: %v", err)
+	}
+	cu, err := d.Reader().Next()
+	if err != nil || cu == nil {
+		t.Fatalf("reading the compile-unit DIE: %v", err)
+	}
+	if name, _ := cu.Val(stddwarf.AttrName).(string); name != "main.origin" {
+		t.Errorf("DW_AT_name = %q, want %q", name, "main.origin")
+	}
+}
+
+// A name that contributed no line row at all falls back to the first file, which is what
+// this did before there was anything to get wrong.
+func TestCompileUnitFallsBackToTheFirstFile(t *testing.T) {
+	lines := []Line{{Address: 0x401000, File: "only.origin", Line: 1, Col: 1}}
+	_, info, _ := Build("", lines, 0x401000, 0x401010)
+	if !bytes.Contains(info, []byte("only.origin\x00")) {
+		t.Error("the compile unit does not name the only file there is")
 	}
 }

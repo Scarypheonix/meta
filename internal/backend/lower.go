@@ -727,6 +727,57 @@ func (e *emitter) builtin(v *ir.Value) error {
 		e.def(v, x86.RAX)
 		return nil
 
+	case compile.BuiltinStrLen:
+		if len(v.Args) != 1 {
+			return fmt.Errorf("this is a compiler bug: str::len takes one argument, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.a.Call(e.rt.strLen)
+		e.def(v, x86.RAX)
+		return nil
+
+	case compile.BuiltinStrByteAt, compile.BuiltinStrCharAt, compile.BuiltinStrCharWidth:
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: a string index takes two arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.load(x86.RSI, v.Args[1])
+		switch v.Const {
+		case compile.BuiltinStrByteAt:
+			e.a.Call(e.rt.strByteAt)
+		case compile.BuiltinStrCharAt:
+			e.a.Call(e.rt.strCharAt)
+		default:
+			e.a.Call(e.rt.strCharWidth)
+		}
+		e.strStatus(v)
+		e.def(v, x86.RDX)
+		return nil
+
+	case compile.BuiltinStrSlice:
+		if len(v.Args) != 3 {
+			return fmt.Errorf("this is a compiler bug: str::slice takes three arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.load(x86.RSI, v.Args[1])
+		e.load(x86.RDX, v.Args[2])
+		e.a.Call(e.rt.strSlice)
+		e.recordCall(v)
+		e.strStatus(v)
+		e.def(v, x86.RDX)
+		return nil
+
+	case compile.BuiltinStrConcat:
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: str::concat takes two arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.load(x86.RSI, v.Args[1])
+		e.a.Call(e.rt.strConcat)
+		e.recordCall(v)
+		e.def(v, x86.RAX)
+		return nil
+
 	case compile.BuiltinNewArray:
 		// rt_array_new(capacity, typeid): the second argument is the layout
 		// internal/compile chose for this instantiation, which is what tells the
@@ -849,6 +900,18 @@ func (e *emitter) builtin(v *ir.Value) error {
 			return fmt.Errorf("this is a compiler bug: cmp takes two arguments, got %d", len(v.Args))
 		}
 		return e.buildOrdering(v)
+
+	case compile.BuiltinCheckedAdd, compile.BuiltinCheckedSub, compile.BuiltinCheckedMul:
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: a checked operation takes two arguments, got %d", len(v.Args))
+		}
+		return e.checkedArith(v)
+
+	case compile.BuiltinSaturatingAdd, compile.BuiltinSaturatingSub, compile.BuiltinSaturatingMul:
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: a saturating operation takes two arguments, got %d", len(v.Args))
+		}
+		return e.saturatingArith(v)
 	}
 	return fmt.Errorf("unimplemented: builtin %d in native code", v.Const)
 }
@@ -912,6 +975,27 @@ func (e *emitter) refusedStatus(v *ir.Value, refused string) {
 	a.TestRR(x86.RAX, x86.RAX)
 	a.Jcc(x86.Equal, ok)
 	e.trapAtUserSpan(v, refused)
+	a.Bind(ok)
+}
+
+// strStatus turns a string routine's status (strings.go) into one of the two traps
+// spec/14-strings.md distinguishes, and falls through when the index was legal.
+//
+// Two messages rather than one, because a string index fails in two ways that mean
+// different things: an index outside the string is arithmetic the caller got wrong, and one
+// inside it that splits a character is a byte index used where a character index was meant.
+func (e *emitter) strStatus(v *ir.Value) {
+	a := e.a
+	ok := a.NewLabel("str_status_ok")
+	notBoundary := a.NewLabel("str_status_not_boundary")
+
+	a.TestRR(x86.RAX, x86.RAX)
+	a.Jcc(x86.Equal, ok)
+	a.CmpRI(x86.RAX, strNotBoundary)
+	a.Jcc(x86.Equal, notBoundary)
+	e.trapAtUserSpan(v, "index out of range")
+	a.Bind(notBoundary)
+	e.trapAtUserSpan(v, "string index is not a character boundary")
 	a.Bind(ok)
 }
 
@@ -1059,6 +1143,109 @@ func (e *emitter) construct(v *ir.Value, t layout.TypeID) error {
 	return nil
 }
 
+// checkedArith lowers `checked_add`, `checked_sub` and `checked_mul` (§06's `Int`): the
+// same instruction the trapping operator uses, with the overflow flag turned into an
+// `Option` instead of a trap.
+//
+// It builds a prelude value, which the backend does for `cmp`'s `Ordering` too: the variant
+// indices came from the compiler, so nothing is looked up by name and `Option[i64]`'s exact
+// layout is the one this instantiation actually uses (ADR-0019).
+func (e *emitter) checkedArith(v *ir.Value) error {
+	if !e.prog.Prelude.Found {
+		return fmt.Errorf("this is a compiler bug: checked arithmetic without the prelude's `Option`")
+	}
+	a := e.a
+	e.load(scratchA, v.Args[0])
+	e.load(scratchB, v.Args[1])
+	switch v.Const {
+	case compile.BuiltinCheckedAdd:
+		a.AddRR(scratchA, scratchB)
+	case compile.BuiltinCheckedSub:
+		a.SubRR(scratchA, scratchB)
+	default:
+		a.ImulRR(scratchA, scratchB)
+	}
+
+	none := a.NewLabel("checked_none")
+	done := a.NewLabel("checked_done")
+	a.Jcc(x86.Overflow, none)
+
+	// Some(result). The payload has to survive the allocation, and there is nowhere in
+	// the register file to put it: every scratch register is clobbered by the call, and
+	// every other one may hold a value the allocator put there. So it goes on the stack,
+	// twice, which keeps rsp 16-byte aligned for the call -- the same shape `shift` uses
+	// to borrow cl. It is an integer, so no stack map has to describe it.
+	a.Push(scratchA)
+	a.Push(scratchA)
+	e.allocPreludeVariant(v, e.prog.Prelude.OptionSome)
+	a.Pop(scratchB)
+	a.Pop(scratchB)
+	a.MovMR(x86.At(x86.RAX, fieldOffset(0)), scratchB)
+	a.Jmp(done)
+
+	a.Bind(none)
+	e.allocPreludeVariant(v, e.prog.Prelude.OptionNone)
+	a.Bind(done)
+	e.def(v, x86.RAX)
+	return nil
+}
+
+// allocPreludeVariant allocates one variant of a prelude enum, by the index the compiler
+// recorded. The payload, if any, is the caller's to write.
+func (e *emitter) allocPreludeVariant(v *ir.Value, idx int) {
+	info := e.prog.Types.Get(e.prog.Variants[idx].Type)
+	e.a.MovRI(x86.RDI, info.Words)
+	e.a.MovRI(x86.RSI, uint64(e.prog.Variants[idx].Type))
+	e.a.Call(e.rt.alloc)
+	e.recordCall(v)
+}
+
+// saturatingArith lowers `saturating_add`, `saturating_sub` and `saturating_mul`: the same
+// instruction again, with overflow clamped to the end of the range it ran off.
+//
+// Which end that is follows from the sign of the *true* result, and the wrapped answer is
+// exactly the thing that does not say. The operands do:
+//
+//   - `a + b` overflows only when the operands share a sign, and the true sum has it.
+//   - `a - b` overflows only when they differ, and the true difference has `a`'s.
+//   - `a * b` is negative exactly when the operands' signs differ, which is the sign of
+//     their xor -- and that stays true when the product wraps.
+//
+// So the deciding value is computed *before* the operation, from operands the operation is
+// about to consume, and read after the flag it must not disturb.
+func (e *emitter) saturatingArith(v *ir.Value) error {
+	a := e.a
+	e.load(scratchA, v.Args[0])
+	e.load(scratchB, v.Args[1])
+
+	// rax rather than rcx: rcx is in the allocator's pool and would need saving, and rax
+	// is scratch the allocator never hands out. Nothing here calls anything, so it stays
+	// untouched until it is read.
+	a.MovRR(x86.RAX, scratchA)
+	if v.Const == compile.BuiltinSaturatingMul {
+		a.XorRR(x86.RAX, scratchB)
+	}
+	switch v.Const {
+	case compile.BuiltinSaturatingAdd:
+		a.AddRR(scratchA, scratchB)
+	case compile.BuiltinSaturatingSub:
+		a.SubRR(scratchA, scratchB)
+	default:
+		a.ImulRR(scratchA, scratchB)
+	}
+
+	done := a.NewLabel("saturating_done")
+	a.Jcc(x86.NoOverflow, done)
+
+	a.MovRI(scratchA, 0x7FFFFFFFFFFFFFFF)
+	a.MovRI(scratchB, 0x8000000000000000)
+	a.CmpRI(x86.RAX, 0)
+	a.Cmov(x86.Less, scratchA, scratchB)
+	a.Bind(done)
+	e.def(v, scratchA)
+	return nil
+}
+
 // toStr renders a value as a String.
 func (e *emitter) toStr(v *ir.Value) error {
 	kind := bytecode.Kind(v.Const)
@@ -1082,6 +1269,14 @@ func (e *emitter) toStr(v *ir.Value) error {
 		e.a.MovRI(scratchB, e.stringLiteral("false").addr)
 		e.a.TestRR(scratchA, scratchA)
 		e.a.Cmov(x86.Equal, x86.RAX, scratchB)
+		e.def(v, x86.RAX)
+		return nil
+	case bytecode.KindChar:
+		// A char renders as its UTF-8 encoding: one to four bytes in a fresh String
+		// (spec/14-strings.md's table, read the other way round).
+		e.load(x86.RDI, v.Args[0])
+		e.a.Call(e.rt.charToStr)
+		e.recordCall(v)
 		e.def(v, x86.RAX)
 		return nil
 	case bytecode.KindUnknown:

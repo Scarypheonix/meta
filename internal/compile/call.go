@@ -39,6 +39,13 @@ var builtinIndex = map[string]int{
 	"list::new":       BuiltinListNew,
 	"map::new":        BuiltinMapNew,
 	"hash::of":        BuiltinHash,
+
+	"str::len":        BuiltinStrLen,
+	"str::byte_at":    BuiltinStrByteAt,
+	"str::slice":      BuiltinStrSlice,
+	"str::concat":     BuiltinStrConcat,
+	"str::char_at":    BuiltinStrCharAt,
+	"str::char_width": BuiltinStrCharWidth,
 }
 
 func (c *Compiler) call(v *ast.Call) error {

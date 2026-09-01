@@ -66,7 +66,7 @@ func helloProgram(t *testing.T, target Target, msg string, status int32) *Image 
 func withDebug(img *Image, funcName string) *Image {
 	lines := []dwarf.Line{{Address: img.Entry, File: "hello.origin", Line: 1, Col: 1}}
 	lowPC, highPC := img.TextAddr, img.TextAddr+uint64(len(img.Text))
-	abbrev, info, line := dwarf.Build(lines, lowPC, highPC)
+	abbrev, info, line := dwarf.Build("hello.origin", lines, lowPC, highPC)
 	img.DebugAbbrev, img.DebugInfo, img.DebugLine = abbrev, info, line
 	img.Funcs = []dwarf.Func{{Name: funcName, Address: img.TextAddr, Size: uint64(len(img.Text))}}
 	return img

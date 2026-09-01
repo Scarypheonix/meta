@@ -388,6 +388,9 @@ func (c *Checker) builtinType(name string, targs []ast.Type, span diag.Span) typ
 	if t := c.arrayBuiltinType(name, targs, span); t != nil {
 		return t
 	}
+	if t := c.strBuiltinType(name); t != nil {
+		return t
+	}
 	str := types.P(types.String)
 	switch name {
 	case "io::print", "io::println":

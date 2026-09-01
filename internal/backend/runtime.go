@@ -142,6 +142,15 @@ type runtimeLabels struct {
 	hashMix    x86.Label
 	hashWord   x86.Label
 	hashObject x86.Label
+	// The string operations (strings.go, spec/14-strings.md).
+	strLen       x86.Label
+	strByteAt    x86.Label
+	strSlice     x86.Label
+	strConcat    x86.Label
+	strCharAt    x86.Label
+	strCharWidth x86.Label
+	strAlloc     x86.Label
+	charToStr    x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -196,6 +205,14 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.hashMix = e.a.NewLabel("rt_hash_mix")
 	e.rt.hashWord = e.a.NewLabel("rt_hash_word")
 	e.rt.hashObject = e.a.NewLabel("rt_hash_object")
+	e.rt.strLen = e.a.NewLabel("rt_str_len")
+	e.rt.strByteAt = e.a.NewLabel("rt_str_byte_at")
+	e.rt.strSlice = e.a.NewLabel("rt_str_slice")
+	e.rt.strConcat = e.a.NewLabel("rt_str_concat")
+	e.rt.strCharAt = e.a.NewLabel("rt_str_char_at")
+	e.rt.strCharWidth = e.a.NewLabel("rt_str_char_width")
+	e.rt.strAlloc = e.a.NewLabel("rt_str_alloc")
+	e.rt.charToStr = e.a.NewLabel("rt_char_to_str")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -240,6 +257,14 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitHashMix()
 	e.emitHashWord()
 	e.emitHashObject()
+	e.emitStrLen()
+	e.emitStrByteAt()
+	e.emitStrCharWidth()
+	e.emitStrCharAt()
+	e.emitStrAlloc()
+	e.emitStrSlice()
+	e.emitStrConcat()
+	e.emitCharToStr()
 	e.emitCollect()
 }
 

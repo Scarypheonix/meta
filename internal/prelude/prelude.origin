@@ -15,6 +15,7 @@ use std::sync;
 use std::array;
 use std::list;
 use std::hash;
+use std::str;
 
 pub enum Option[T] {
     None,
@@ -494,4 +495,272 @@ impl[K, V] IntoIterator for Map[K, V] {
     fn into_iter(self) -> MapIter[K, V] {
         MapIter { entries: self.entries, i: 0 }
     }
+}
+
+// --- Strings (spec/14-strings.md) --------------------------------------------------
+//
+// `String` is a primitive, so there is no struct to hang an inherent impl on and no way to
+// write `s.len()` without a trait. `Str` is that trait: six operations the compiler
+// provides, because their bodies read or allocate raw bytes, and everything else written
+// here in Origin over exactly those six.
+//
+// The division is the same one ADR-0028 drew for collections, and the claim is the same:
+// from outside, the two halves are indistinguishable. `slice` is machine code and `split`
+// is the twenty lines below it, and a program cannot tell which is which.
+
+/// Text operations on `String` (spec/14-strings.md).
+///
+/// Indices are **byte** indices unless a method says otherwise. Byte indexing is O(1) and
+/// is what a tokenizer wants; `char_at` and `chars` are how the characters are reached. An
+/// index that would split a character TRAPS rather than producing invalid UTF-8, because
+/// `==`, ordering, hashing and printing all assume a `String` is valid text.
+pub trait Str {
+    /// The length in bytes.
+    fn len(self) -> i64;
+
+    /// The byte at `i`, in `0..=255`. TRAPS `index out of range`.
+    fn byte_at(self, i: i64) -> i64;
+
+    /// The bytes in `[start, end)`. TRAPS `index out of range`, or
+    /// `string index is not a character boundary`.
+    fn slice(self, start: i64, end: i64) -> String;
+
+    /// `self` followed by `other`.
+    fn concat(self, other: String) -> String;
+
+    /// The character whose encoding starts at byte `i`. TRAPS `index out of range`, or
+    /// `string index is not a character boundary`.
+    fn char_at(self, i: i64) -> char;
+
+    /// How many bytes the character at `i` occupies: 1, 2, 3 or 4. Same traps as `char_at`.
+    fn char_width(self, i: i64) -> i64;
+
+    /// Whether there are no bytes at all.
+    fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// `self` as a `String`.
+    ///
+    /// Inside a default body `self` has type `Self`, not `String`, so this is what the
+    /// bodies below use wherever one is called for. For `String` itself it is a copy of
+    /// the whole thing, which is what makes it total for a future implementor whose
+    /// representation is not a `String` at all.
+    fn as_string(self) -> String {
+        self.slice(0, self.len())
+    }
+
+    /// How many characters. This is `len()` only for text that is entirely ASCII.
+    fn char_count(self) -> i64 {
+        let mut n = 0;
+        let mut i = 0;
+        while i < self.len() {
+            i = i + self.char_width(i);
+            n = n + 1;
+        }
+        n
+    }
+
+    /// Whether `self` begins with the bytes of `prefix`.
+    fn starts_with(self, prefix: String) -> bool {
+        if prefix.len() > self.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < prefix.len() {
+            if self.byte_at(i) != prefix.byte_at(i) {
+                return false;
+            }
+            i = i + 1;
+        }
+        true
+    }
+
+    /// Whether `self` ends with the bytes of `suffix`.
+    fn ends_with(self, suffix: String) -> bool {
+        if suffix.len() > self.len() {
+            return false;
+        }
+        let base = self.len() - suffix.len();
+        let mut i = 0;
+        while i < suffix.len() {
+            if self.byte_at(base + i) != suffix.byte_at(i) {
+                return false;
+            }
+            i = i + 1;
+        }
+        true
+    }
+
+    /// The byte index where `needle` first occurs, or `None`.
+    ///
+    /// Searching by bytes gives the same answer as searching by characters: UTF-8 is
+    /// self-synchronizing, so a valid encoding never occurs inside another one.
+    fn find(self, needle: String) -> Option[i64] {
+        if needle.len() > self.len() {
+            return Option::None;
+        }
+        let last = self.len() - needle.len();
+        let mut at = 0;
+        while at <= last {
+            let mut i = 0;
+            let mut same = true;
+            while i < needle.len() {
+                if self.byte_at(at + i) != needle.byte_at(i) {
+                    same = false;
+                    i = needle.len();
+                } else {
+                    i = i + 1;
+                }
+            }
+            if same {
+                return Option::Some(at);
+            }
+            at = at + 1;
+        }
+        Option::None
+    }
+
+    /// Whether `needle` occurs anywhere in `self`.
+    fn contains(self, needle: String) -> bool {
+        match self.find(needle) {
+            Option::Some(_) => true,
+            Option::None => false,
+        }
+    }
+
+    /// The pieces between occurrences of `sep`: one more piece than separators found.
+    ///
+    /// An empty separator has no occurrences to find, so the whole string is one piece.
+    fn split(self, sep: String) -> List[String] {
+        let out = list::new[String]();
+        if sep.is_empty() {
+            out.push(self.as_string());
+            return out;
+        }
+        let mut start = 0;
+        let mut at = 0;
+        while at + sep.len() <= self.len() {
+            if self.slice(at, at + sep.len()) == sep {
+                out.push(self.slice(start, at));
+                at = at + sep.len();
+                start = at;
+            } else {
+                at = at + self.char_width(at);
+            }
+        }
+        out.push(self.slice(start, self.len()));
+        out
+    }
+
+    /// The characters, in order.
+    fn chars(self) -> List[char] {
+        let out = list::new[char]();
+        let mut i = 0;
+        while i < self.len() {
+            out.push(self.char_at(i));
+            i = i + self.char_width(i);
+        }
+        out
+    }
+
+    /// `self` joined to itself `n` times. `n <= 0` gives the empty string.
+    fn repeat(self, n: i64) -> String {
+        let piece = self.as_string();
+        let mut out = "";
+        let mut k = 0;
+        while k < n {
+            out = out.concat(piece);
+            k = k + 1;
+        }
+        out
+    }
+
+    /// `self` without leading ASCII whitespace: space, tab, newline, carriage return.
+    fn trim_start(self) -> String {
+        let mut i = 0;
+        while i < self.len() && is_ascii_space(self.byte_at(i)) {
+            i = i + 1;
+        }
+        self.slice(i, self.len())
+    }
+
+    /// `self` without trailing ASCII whitespace.
+    fn trim_end(self) -> String {
+        let mut n = self.len();
+        while n > 0 && is_ascii_space(self.byte_at(n - 1)) {
+            n = n - 1;
+        }
+        self.slice(0, n)
+    }
+
+    /// `self` without whitespace at either end.
+    fn trim(self) -> String {
+        self.trim_start().trim_end()
+    }
+
+    /// The decimal integer `self` denotes, or `None`.
+    ///
+    /// An optional `-` or `+`, then one or more ASCII digits, then nothing. A value too
+    /// large for an `i64` is `None` rather than a trap: overflow here is a property of the
+    /// input, and `checked_mul`/`checked_add` are what keep it one.
+    fn parse_int(self) -> Option[i64] {
+        if self.is_empty() {
+            return Option::None;
+        }
+        let mut i = 0;
+        let mut negative = false;
+        let first = self.byte_at(0);
+        if first == 45 {
+            negative = true;
+            i = 1;
+        } else {
+            if first == 43 {
+                i = 1;
+            }
+        }
+        if i >= self.len() {
+            return Option::None;
+        }
+        // Accumulating the magnitude as a negative number is what lets `i64::MIN` parse:
+        // its magnitude has no positive representation, and its own negation is itself.
+        let mut acc = 0;
+        while i < self.len() {
+            let b = self.byte_at(i);
+            if b < 48 || b > 57 {
+                return Option::None;
+            }
+            let digit = b - 48;
+            match acc.checked_mul(10) {
+                Option::None => { return Option::None; }
+                Option::Some(scaled) => {
+                    match scaled.checked_sub(digit) {
+                        Option::None => { return Option::None; }
+                        Option::Some(next) => { acc = next; }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        if negative {
+            return Option::Some(acc);
+        }
+        // `acc` is the magnitude, accumulated negative; negating it is the only step that
+        // can fail, and only for `i64::MIN`, whose magnitude has no positive value.
+        0.checked_sub(acc)
+    }
+}
+
+impl Str for String {
+    fn len(self) -> i64 { str::len(self) }
+    fn byte_at(self, i: i64) -> i64 { str::byte_at(self, i) }
+    fn slice(self, start: i64, end: i64) -> String { str::slice(self, start, end) }
+    fn concat(self, other: String) -> String { str::concat(self, other) }
+    fn char_at(self, i: i64) -> char { str::char_at(self, i) }
+    fn char_width(self, i: i64) -> i64 { str::char_width(self, i) }
+}
+
+/// Whether a byte is ASCII space, tab, newline or carriage return.
+fn is_ascii_space(b: i64) -> bool {
+    b == 32 || b == 9 || b == 10 || b == 13
 }

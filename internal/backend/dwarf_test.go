@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/scarypheonix/meta/internal/obj"
+	"github.com/scarypheonix/meta/internal/prelude"
 )
 
 // TestNativeBuildCarriesValidDebugInfo compiles a real program through the whole pipeline
@@ -114,6 +115,12 @@ func checkELFDebugInfo(t *testing.T, img *obj.Image) {
 	if len(rows) < 2 {
 		t.Fatalf("only %d line rows, want at least one real row plus the end-of-sequence row", len(rows))
 	}
+	// Every row names one of the program's two source files, and the user's own file is
+	// among them. Both files are real: the prelude is Origin source and is compiled into
+	// the program like any other, so a debugger stepping into one of its methods should
+	// be told so rather than shown a line of the user's file that has nothing to do with
+	// where it stopped.
+	sawUserFile := false
 	for i, e := range rows {
 		if e.EndSequence {
 			continue
@@ -122,9 +129,18 @@ func checkELFDebugInfo(t *testing.T, img *obj.Image) {
 			t.Errorf("row %d's address %#x is outside .text [%#x, %#x)",
 				i, e.Address, img.TextAddr, img.TextAddr+uint64(len(img.Text)))
 		}
-		if e.File == nil || e.File.Name != "case.origin" {
-			t.Errorf("row %d's file is %v, want case.origin", i, e.File)
+		switch {
+		case e.File == nil:
+			t.Errorf("row %d has no file at all", i)
+		case e.File.Name == "case.origin":
+			sawUserFile = true
+		case e.File.Name == prelude.Name:
+		default:
+			t.Errorf("row %d's file is %v, want case.origin or %s", i, e.File, prelude.Name)
 		}
+	}
+	if !sawUserFile {
+		t.Error("no line row names the program's own source file")
 	}
 	last := rows[len(rows)-1]
 	if !last.EndSequence || last.Address != img.TextAddr+uint64(len(img.Text)) {
