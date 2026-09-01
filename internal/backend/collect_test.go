@@ -203,3 +203,58 @@ func TestAClosureBodyReservesAReferenceSlotForItsOwnObject(t *testing.T) {
 		t.Errorf("a function with no captures reserved slot %d", b.closureSlot)
 	}
 }
+
+// TestACollectionWalksAJoiningThreadsOwnFrames covers the other half of the root set: a
+// stack that is not the one that allocated. `main` parks inside `join` while the thread it
+// joined runs and allocates, so every reference `main` was holding is reachable only
+// through its own parked frames.
+//
+// Two separate defects made that fail, and both had to be fixed to make it pass. `main`
+// was deliberately left off the runtime's thread list, on the reasoning that the running
+// thread's stack is walked from its live registers -- true only while `main` is the thread
+// running, and it is not while it waits inside `join`. And `rt_join` set up no frame
+// pointer, so the rbp `rt_switch` saved for the parked thread was `main`'s rather than
+// `rt_join`'s: the walk then described `main`'s frame with the synthetic entry a runtime
+// frame gets (no roots, all four registers saved) instead of `main`'s own stack map, and
+// read its roots out of the wrong slots.
+func TestACollectionWalksAJoiningThreadsOwnFrames(t *testing.T) {
+	checkRun(t, `
+use std::io;
+use std::thread;
+
+struct Node { value: i64, tail: Option[Node] }
+
+fn build(n: i64) -> Option[Node] {
+    let mut out = Option::None;
+    let mut i = 0;
+    while i < n { out = Option::Some(Node { value: i, tail: out }); i = i + 1; }
+    out
+}
+
+fn total(list: Option[Node]) -> i64 {
+    let mut sum = 0;
+    let mut cur = list;
+    while true {
+        match cur {
+            Option::Some(nd) => { sum = sum + nd.value; cur = nd.tail; },
+            Option::None => { return sum; },
+        }
+    }
+    sum
+}
+
+fn main() {
+    // Held across the join, and reachable only through main's own parked frames.
+    let keep = build(50);
+    let h = thread::spawn(|| -> i64 {
+        let mut acc = 0;
+        let mut k = 0;
+        while k < 200 { acc = acc + total(build(60)); k = k + 1; }
+        acc
+    });
+    let got = h.join();
+    io::println(total(keep).to_str());
+    io::println(got.to_str());
+}
+`, "1225\n354000")
+}

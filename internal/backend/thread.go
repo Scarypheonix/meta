@@ -277,12 +277,26 @@ func (e *emitter) emitThreadSpawn() {
 // spawn and join, and deliberately not one for anything else: a thread that parks on a
 // channel has nobody to switch back to it, which is why channels arrive with a run queue
 // rather than on top of this.
+//
+// The full prologue is load-bearing, not habit. This frame is what a parked joining
+// thread's stack chain starts at (the rbp rt_switch saved is this one), and the collector
+// reads a frame it finds no stack-map entry for as the synthetic runtime entry
+// (collect.go's emitGCRuntimeFrameEntry): no roots of its own, all four callee-saved
+// registers pushed. Without the `push rbp` this frame would not exist in the chain at all,
+// the saved rbp would be the *caller's*, and that caller -- ordinary Origin code, holding
+// its own live references -- would be described by the synthetic entry instead of by its
+// own. Its roots would then never be evacuated, silently, exactly while another thread is
+// allocating hard enough to move them.
 func (e *emitter) emitThreadJoin() {
 	a := e.a
 	a.Bind(e.rt.threadJoin)
 
+	a.Push(x86.RBP)
+	a.MovRR(x86.RBP, x86.RSP)
 	a.Push(x86.RBX)
 	a.Push(x86.R12)
+	a.Push(x86.R13)
+	a.Push(x86.R14)
 	a.MovRR(x86.RBX, x86.RDI) // the thread being joined
 
 	// Joining twice is a programming error, like sending on a closed channel: the second
@@ -321,8 +335,11 @@ func (e *emitter) emitThreadJoin() {
 
 	a.Bind(done)
 	a.MovRM(x86.RAX, x86.At(x86.RBX, tcbResultOff))
+	a.Pop(x86.R14)
+	a.Pop(x86.R13)
 	a.Pop(x86.R12)
 	a.Pop(x86.RBX)
+	a.Pop(x86.RBP)
 	a.Ret()
 }
 
@@ -357,11 +374,15 @@ func (e *emitter) emitMainThread() {
 	a.MovMI(x86.At(x86.RAX, tcbResultOff), 0)
 	a.MovMI(x86.At(x86.RAX, tcbResultIsRefOff), 0)
 	a.MovMI(x86.At(x86.RAX, tcbWaiterOff), 0)
-	// Main is deliberately *not* on rtThreadsOff's list: the collector walks that list
-	// for threads other than the running one, and main's own stack is walked first, from
-	// its live registers. Listing it would either duplicate that walk or, worse, walk it
-	// a second time through a control block describing a park that never happened.
-	a.MovMI(x86.At(x86.RAX, tcbNextOff), 0)
+	// Main goes on rtThreadsOff's list like every other thread. The walk skips whichever
+	// thread is running (gcNextThreadStack compares each against rtCurrentOff), so listing
+	// main costs nothing while main is the thread that allocated -- and while main is
+	// parked inside `join`, that list is the collector's only way to reach its stack at
+	// all. Leaving it off meant a spawned thread's collection never walked main's frames,
+	// so a list main held across the join was not evacuated and came back corrupt.
+	a.MovRM(x86.RCX, x86.At(x86.R15, rtThreadsOff))
+	a.MovMR(x86.At(x86.RAX, tcbNextOff), x86.RCX)
+	a.MovMR(x86.At(x86.R15, rtThreadsOff), x86.RAX)
 	a.MovMR(x86.At(x86.R15, rtCurrentOff), x86.RAX)
 	a.Ret()
 }
