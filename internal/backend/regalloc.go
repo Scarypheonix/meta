@@ -67,6 +67,11 @@ type alloc struct {
 	// used lists the callee-saved registers the function actually assigned, so the
 	// prologue saves those and no others.
 	used []x86.Reg
+	// backEdges names the blocks whose terminator jumps backwards in the emission order.
+	// A loop that calls nothing yields nowhere, so when the program can have more than one
+	// thread these are where the preemption check goes (sched.go), which makes them call
+	// sites like any other: an interval crossing one has to survive a call.
+	backEdges map[*ir.Block]bool
 	// callSiteRegs maps a value whose lowering emits a call (clobbersCallerSaved) to
 	// the callee-saved registers holding a live reference at that exact point --
 	// necessarily a subset of the four callee-saved registers, never a caller-saved
@@ -111,16 +116,20 @@ type numbering struct {
 	end    map[*ir.Block]int
 	// callAt marks the indices where the caller-saved registers are destroyed.
 	callAt map[int]bool
-	next   int
+	// backEdge marks the terminators that jump backwards, which are call sites too when
+	// the program is preemptible.
+	backEdge map[*ir.Value]bool
+	next     int
 }
 
-func number(f *ir.Func) *numbering {
+func number(f *ir.Func, preempts bool) *numbering {
 	n := &numbering{
-		blocks: order(f),
-		index:  map[*ir.Value]int{},
-		start:  map[*ir.Block]int{},
-		end:    map[*ir.Block]int{},
-		callAt: map[int]bool{},
+		blocks:   order(f),
+		index:    map[*ir.Value]int{},
+		start:    map[*ir.Block]int{},
+		end:      map[*ir.Block]int{},
+		callAt:   map[int]bool{},
+		backEdge: map[*ir.Value]bool{},
 	}
 	for _, b := range n.blocks {
 		n.start[b] = n.next
@@ -141,7 +150,28 @@ func number(f *ir.Func) *numbering {
 		}
 		n.end[b] = n.next
 	}
+	if preempts {
+		for _, b := range n.blocks {
+			if b.Term == nil || !jumpsBackwards(n, b) {
+				continue
+			}
+			n.backEdge[b.Term] = true
+			n.callAt[n.index[b.Term]] = true
+		}
+	}
 	return n
+}
+
+// jumpsBackwards reports whether any of a block's outgoing edges lands at or before the
+// block itself in the emission order -- the shape of every loop, and the only way control
+// can repeat without a call.
+func jumpsBackwards(n *numbering, b *ir.Block) bool {
+	for _, s := range b.Succs {
+		if start, ok := n.start[s]; ok && start <= n.index[b.Term] {
+			return true
+		}
+	}
+	return false
 }
 
 // clobbersCallerSaved reports whether lowering an operation emits a `call`. Every
@@ -353,9 +383,10 @@ func intervals(f *ir.Func, n *numbering) []*interval {
 	return out
 }
 
-// allocate assigns every value a register or a frame slot.
-func allocate(f *ir.Func) *alloc {
-	n := number(f)
+// allocate assigns every value a register or a frame slot. preempts says whether this
+// program's loops carry a preemption check, which makes every back edge a call site.
+func allocate(f *ir.Func, preempts bool) *alloc {
+	n := number(f, preempts)
 	ivs := intervals(f, n)
 
 	a := &alloc{where: map[*ir.Value]loc{}}
@@ -474,9 +505,14 @@ func allocate(f *ir.Func) *alloc {
 		}
 	}
 
+	a.backEdges = map[*ir.Block]bool{}
+	for v := range n.backEdge {
+		a.backEdges[v.Block] = true
+	}
+
 	a.callSiteRegs = map[*ir.Value][]x86.Reg{}
 	for v, at := range n.index {
-		if !clobbersCallerSaved(v.Op) {
+		if !clobbersCallerSaved(v.Op) && !n.backEdge[v] {
 			continue
 		}
 		var regs []x86.Reg

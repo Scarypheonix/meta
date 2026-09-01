@@ -1014,11 +1014,13 @@ func (e *emitter) terminator(b *ir.Block) error {
 		return nil
 
 	case ir.OpJump:
+		e.preemptCheck(b)
 		e.phiCopies(b, b.Succs[0])
 		e.a.Jmp(e.blockLbl[b.Succs[0]])
 		return nil
 
 	case ir.OpBranch:
+		e.preemptCheck(b)
 		// The φ copies differ per edge, so each edge gets its own landing pad when it
 		// has any: jumping straight to a shared successor would run the wrong copies.
 		e.load(scratchA, b.Term.Args[0])
@@ -1031,6 +1033,28 @@ func (e *emitter) terminator(b *ir.Block) error {
 		return nil
 	}
 	return fmt.Errorf("unimplemented: terminator %s in native code", b.Term.Op)
+}
+
+// preemptCheck emits the back edge's own safepoint: count down, and when the budget runs
+// out let another thread run (sched.go).
+//
+// Nothing at all for a program that never spawns, and two instructions plus an untaken
+// branch for one that does. It goes before the φ copies deliberately: the copies write into
+// the loop's own carried values, and the call must not land between writing one and reading
+// another.
+func (e *emitter) preemptCheck(b *ir.Block) {
+	if !e.preempts || !e.regs.backEdges[b] {
+		return
+	}
+	a := e.a
+	skip := a.NewLabel("preempt_skip")
+	a.MovRM(x86.RAX, x86.At(x86.R15, rtBudgetOff))
+	a.SubRI(x86.RAX, 1)
+	a.MovMR(x86.At(x86.R15, rtBudgetOff), x86.RAX)
+	a.Jcc(x86.NotEqual, skip)
+	a.Call(e.rt.preempt)
+	e.recordCall(b.Term)
+	a.Bind(skip)
 }
 
 // edgeTarget returns a label to jump to for one edge: the successor itself when the edge

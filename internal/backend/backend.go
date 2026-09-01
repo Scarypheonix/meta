@@ -17,6 +17,7 @@ import (
 	"fmt"
 
 	"github.com/scarypheonix/meta/internal/bytecode"
+	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/dwarf"
 	"github.com/scarypheonix/meta/internal/ir"
 	"github.com/scarypheonix/meta/internal/layout"
@@ -75,6 +76,33 @@ func Build(prog *bytecode.Program, target obj.Target) (*obj.Image, error) {
 		return nil, err
 	}
 	return img, nil
+}
+
+// canSpawn reports whether the program contains a `spawn` at all.
+//
+// A program that never spawns has exactly one thread for its whole life, so nothing can
+// ever want the processor while a loop of its own is running, and the preemption check
+// every back edge would otherwise carry is pure cost -- not just the two instructions, but
+// the call site it makes of every back edge, which pushes each loop-carried value into one
+// of four callee-saved registers or onto the stack. The virtual machine draws the same line
+// at run time (its `singleThreaded`); here it is a static property of the program, so the
+// loops of a single-threaded one are exactly what they were before Phase 6.
+func canSpawn(funcs []*ir.Func) bool {
+	for _, f := range funcs {
+		if f == nil {
+			continue
+		}
+		found := false
+		f.Values(func(v *ir.Value) {
+			if v.Op == ir.OpCallBuiltin && v.Const == compile.BuiltinSpawn {
+				found = true
+			}
+		})
+		if found {
+			return true
+		}
+	}
+	return false
 }
 
 // buildIR lowers every function to SSA. A function with no code is a declaration the
@@ -170,6 +198,13 @@ type emitter struct {
 	// trap a runtime routine raises can name the programmer's own line (spans.go).
 	userSpans []pendingUserSpan
 
+	// preempts says this program can have more than one thread, so its loops carry a
+	// preemption check (sched.go). It is a whole-program property because a program that
+	// never spawns has nothing to be preempted for, and the check is not free: it makes
+	// every back edge a call site, which pushes every loop-carried value into a
+	// callee-saved register or a frame slot.
+	preempts bool
+
 	// safepoints accumulates one entry per call site across every function in the
 	// program, in whatever order lowering visits them; buildStackMap sorts and encodes
 	// them once every function's code exists (ADR-0021, spec/11-codegen.md's
@@ -209,6 +244,7 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 		constStr:   map[int]staticStr{},
 		trapMsg:    map[string]staticStr{},
 		literals:   map[string]staticStr{},
+		preempts:   canSpawn(funcs),
 	}
 
 	// The two constants the runtime itself needs come first, so their addresses do not
@@ -257,6 +293,7 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 	data := make([]byte, rtBlockSize)
 	writeStackMapFields(data, mapAddr, mapCount)
 	writeSpanTableFields(data, spanAddr, spanCount)
+	writePreemptBudget(data)
 
 	text := e.a.Code()
 	// The compile-unit DIE's own address range covers the whole of .text (there is
@@ -334,7 +371,7 @@ var argRegs = []x86.Reg{x86.RDI, x86.RSI, x86.RDX, x86.RCX, x86.R8, x86.R9}
 // function emits one function: prologue, blocks in reverse postorder, epilogue.
 func (e *emitter) function(index int, f *ir.Func) error {
 	e.fn = f
-	e.regs = allocate(f)
+	e.regs = allocate(f, e.preempts)
 	e.saved = e.regs.used
 	e.slotBase = int32(8 * len(e.saved))
 	e.blockLbl = map[*ir.Block]x86.Label{}

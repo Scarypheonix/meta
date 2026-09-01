@@ -64,8 +64,13 @@ const (
 	rtChannelsOff = 80
 	// rtMutexesOff heads the list of every mutex, for the same reason (mutex.go).
 	rtMutexesOff = 88
+	// rtBudgetOff is how many back edges the running thread may still cross before it must
+	// offer the processor to another (sched.go). One counter for the program rather than
+	// one per thread: only one thread runs at a time, and what the count is measuring is
+	// how long the current one has held on.
+	rtBudgetOff = 96
 	// rtBlockSize is the block's size in bytes; it lives in the writable segment.
-	rtBlockSize = 96
+	rtBlockSize = 104
 
 	// wordSize is the size of everything the machine holds in a register.
 	wordSize = 8
@@ -123,6 +128,8 @@ type runtimeLabels struct {
 	mutexNew    x86.Label
 	mutexLock   x86.Label
 	mutexUnlock x86.Label
+	// preempt is the back edge's own safepoint (sched.go).
+	preempt x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -166,6 +173,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.mutexNew = e.a.NewLabel("rt_mutex_new")
 	e.rt.mutexLock = e.a.NewLabel("rt_mutex_lock")
 	e.rt.mutexUnlock = e.a.NewLabel("rt_mutex_unlock")
+	e.rt.preempt = e.a.NewLabel("rt_preempt")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -199,6 +207,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitMutexNew()
 	e.emitMutexLock()
 	e.emitMutexUnlock()
+	e.emitPreempt()
 	e.emitCollect()
 }
 

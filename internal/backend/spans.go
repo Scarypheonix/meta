@@ -84,6 +84,14 @@ func writeSpanTableFields(data []byte, addr uint64, count int) {
 	binary.LittleEndian.PutUint64(data[rtSpanCountOff:], uint64(count))
 }
 
+// writePreemptBudget starts the countdown a back edge decrements (sched.go). Zero would
+// work -- the first check would wrap to -1 and fire -- but starting it where every later
+// reset starts it means the first thread is not preempted on its first loop iteration for
+// no reason.
+func writePreemptBudget(data []byte) {
+	binary.LittleEndian.PutUint64(data[rtBudgetOff:], preemptBudget)
+}
+
 // emitTrapSpan writes `rt_trap_span(prefix rdi, prefixLen rsi)`: report a trap whose
 // message is known but whose line is not, and exit 101.
 //

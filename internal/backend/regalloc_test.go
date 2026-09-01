@@ -61,7 +61,7 @@ func twoPhiLoop(t *testing.T) (f *ir.Func, header, body *ir.Block, iPhi, accPhi,
 // returned the wrong one.
 func TestIntervalsKeepAPhiSourceAliveToTheBlocksEnd(t *testing.T) {
 	f, _, body, _, _, accNext := twoPhiLoop(t)
-	n := number(f)
+	n := number(f, false)
 	ivs := intervals(f, n)
 
 	var got *interval
@@ -87,7 +87,7 @@ func TestIntervalsKeepAPhiSourceAliveToTheBlocksEnd(t *testing.T) {
 // one silently overwrites the other on every iteration.
 func TestAllocateGivesLoopCarriedPhisDistinctLocations(t *testing.T) {
 	f, _, _, iPhi, accPhi, _ := twoPhiLoop(t)
-	a := allocate(f)
+	a := allocate(f, false)
 
 	li, ok := a.where[iPhi]
 	if !ok {
@@ -133,7 +133,7 @@ func TestReferenceSpillSlotsAreContiguousAndBelowRawOnes(t *testing.T) {
 	f.RecomputeUses()
 
 	propagateKinds(f, &bytecode.Program{})
-	a := allocate(f)
+	a := allocate(f, false)
 
 	if a.slots == 0 {
 		t.Fatal("expected at least some spilling: twelve values share four callee-saved registers")
@@ -182,7 +182,7 @@ func TestCallSiteRegsNamesOnlyTheLiveReferenceInACalleeSavedRegister(t *testing.
 	f.RecomputeUses()
 
 	propagateKinds(f, &bytecode.Program{})
-	a := allocate(f)
+	a := allocate(f, false)
 
 	refLoc, ok := a.where[ref]
 	if !ok || refLoc.spilled() {
@@ -234,6 +234,39 @@ func TestAllocatePanicsRatherThanGuessAnUnknownKindAcrossACall(t *testing.T) {
 			t.Fatal("allocate did not panic on a call-spanning value with no known kind")
 		}
 	}()
-	allocate(f)
+	allocate(f, false)
 	t.Fatal("unreachable: allocate should have panicked")
+}
+
+// TestPreemptionMakesABackEdgeACallSite pins down what the preemption check costs and who
+// pays it (sched.go, spec/11-codegen.md).
+//
+// A back edge in a program that can spawn is a call site: the check calls into the
+// scheduler, so a value carried around the loop has to survive a call, which means a
+// callee-saved register or a frame slot and never a caller-saved one. A program with no
+// `spawn` in it has nothing that could want the processor, so its loops keep the
+// caller-saved registers they had before Phase 6 -- which is the whole reason the flag
+// exists rather than the check being unconditional.
+func TestPreemptionMakesABackEdgeACallSite(t *testing.T) {
+	f, _, body, iPhi, accPhi, _ := twoPhiLoop(t)
+
+	plain := allocate(f, false)
+	if len(plain.backEdges) != 0 {
+		t.Errorf("a program that cannot spawn marked %d back edges as call sites", len(plain.backEdges))
+	}
+
+	preemptible := allocate(f, true)
+	if !preemptible.backEdges[body] {
+		t.Fatalf("the loop body's back edge is not a call site: %v", preemptible.backEdges)
+	}
+	for name, v := range map[string]*ir.Value{"counter": iPhi, "accumulator": accPhi} {
+		l, ok := preemptible.where[v]
+		if !ok {
+			t.Fatalf("the %s phi has no location", name)
+		}
+		if !l.spilled() && !isCalleeSaved(l.reg) {
+			t.Errorf("the %s is carried around the loop in %v, which the preemption check clobbers",
+				name, l.reg)
+		}
+	}
 }

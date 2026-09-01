@@ -1,0 +1,23 @@
+use std::io;
+use std::thread;
+use std::sync;
+
+struct Flag { mut done: i64 }
+
+fn main() {
+    let m = sync::mutex(Flag { done: 0 });
+    let h = thread::spawn(|| -> i64 {
+        m.with(|f: Flag| -> i64 { f.done = 1; 0 });
+        7
+    });
+    // A loop with nothing in it that can block: the mutex is free every time round, so
+    // no engine parks this thread here. §08 says a safepoint on the back edge is what
+    // stops it starving the thread that is ready to run, and this is the program that
+    // holds all three engines to it -- without preemption it never finishes.
+    let mut waiting = true;
+    while waiting {
+        if m.with(|f: Flag| -> i64 { f.done }) > 0 { waiting = false; }
+    }
+    io::println("released");
+    io::println(h.join().to_str());
+}

@@ -10,13 +10,12 @@ import "github.com/scarypheonix/meta/internal/x86"
 // thread eventually sends, which nobody knows at the moment it parks -- so parking has to
 // mean "hand the processor to whoever can use it" rather than "run this one".
 //
-// The scheduler is cooperative and single-processor: every switch is explicit, at a park,
-// a wake, or a thread's end. That is not a limitation the specification objects to (§12's
-// determinism clause says a program whose output depends on which thread wins a race is
-// not a valid case) and it is what keeps ADR-0022's stop-the-world collector correct
-// without a single lock: no thread is ever halfway through an instruction while another
-// runs. Preemption at back edges, which §08 does specify, needs a safepoint check in
-// compiled code and is recorded in docs/deferred.md rather than pretended at here.
+// The scheduler is single-processor: one thread runs at a time, and every switch is
+// explicit -- at a park, a wake, a thread's end, or a back edge whose budget ran out
+// (emitPreempt below, which is §08's preemption at safepoints). That is what keeps
+// ADR-0022's stop-the-world collector correct without a single lock: no thread is ever
+// halfway through an instruction while another runs. It is not parallelism, which §12's
+// determinism clause already says no valid differential case can observe.
 //
 // Waking is a broadcast, exactly as it is in the virtual machine: a state change clears
 // every thread's blocked flag, each re-checks its own condition on the way out, and one
@@ -206,6 +205,57 @@ func (e *emitter) runtimeEpilogue() {
 	a.Pop(x86.R12)
 	a.Pop(x86.RBX)
 	a.Pop(x86.RBP)
+}
+
+// preemptBudget is how many back edges a thread may cross before it must offer the
+// processor to somebody else.
+//
+// A count rather than a clock, because a timer means a signal handler and a signal handler
+// means a great deal of runtime this phase does not otherwise need. What §08 asks for is
+// that a compute loop cannot starve a ready thread, and a deterministic count delivers that
+// -- with the side benefit that two runs of the same program schedule identically, which a
+// timer would not give.
+const preemptBudget = 1024
+
+// emitPreempt writes `rt_preempt()`: the budget ran out, so let another thread run.
+//
+// This is a yield, not a park. The thread stays runnable, so the scheduler may well hand
+// the processor straight back -- which is what happens when nothing else can use it, and
+// costs a scan of the thread list.
+//
+// It saves nothing the caller might be holding, and does not have to: a back edge is a call
+// site for the register allocator when a program is preemptible (regalloc.go), so anything
+// live across one is already in a callee-saved register or a frame slot, and the collector
+// has a stack map for the return address.
+func (e *emitter) emitPreempt() {
+	a := e.a
+	a.Align(16)
+	a.Bind(e.rt.preempt)
+
+	e.runtimePrologue()
+	done := a.NewLabel("preempt_done")
+
+	a.MovRI(x86.RAX, preemptBudget)
+	a.MovMR(x86.At(x86.R15, rtBudgetOff), x86.RAX)
+
+	a.MovRM(x86.RBX, x86.At(x86.R15, rtCurrentOff))
+	a.Call(e.rt.schedNext)
+	a.TestRR(x86.RAX, x86.RAX)
+	a.Jcc(x86.Equal, done)
+	a.CmpRR(x86.RAX, x86.RBX)
+	a.Jcc(x86.Equal, done)
+
+	a.MovMI(x86.At(x86.RBX, tcbStateOff), threadParked)
+	a.MovMR(x86.At(x86.R15, rtCurrentOff), x86.RAX)
+	a.MovRR(x86.RSI, x86.RAX)
+	a.MovRR(x86.RDI, x86.RBX)
+	a.Call(e.rt.threadSwitch)
+	a.MovMR(x86.At(x86.R15, rtCurrentOff), x86.RBX)
+	a.MovMI(x86.At(x86.RBX, tcbStateOff), threadRunning)
+
+	a.Bind(done)
+	e.runtimeEpilogue()
+	a.Ret()
 }
 
 // emitSchedDrain writes `rt_drain()`: run every spawned thread that has not finished, and

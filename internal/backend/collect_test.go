@@ -188,7 +188,7 @@ func TestAClosureBodyReservesAReferenceSlotForItsOwnObject(t *testing.T) {
 	body := ir.NewFunc("closure body", 0, 2)
 	body.Entry.SetTerminator(body.NewValue(ir.OpReturn, diag.Span{},
 		body.Entry.Append(body.NewValue(ir.OpUnit, diag.Span{}))))
-	a := allocate(body)
+	a := allocate(body, false)
 	if a.closureSlot != 1 {
 		t.Errorf("closureSlot is %d, want 1", a.closureSlot)
 	}
@@ -199,7 +199,7 @@ func TestAClosureBodyReservesAReferenceSlotForItsOwnObject(t *testing.T) {
 	plain := ir.NewFunc("plain", 0, 0)
 	plain.Entry.SetTerminator(plain.NewValue(ir.OpReturn, diag.Span{},
 		plain.Entry.Append(plain.NewValue(ir.OpUnit, diag.Span{}))))
-	if b := allocate(plain); b.closureSlot != 0 {
+	if b := allocate(plain, false); b.closureSlot != 0 {
 		t.Errorf("a function with no captures reserved slot %d", b.closureSlot)
 	}
 }

@@ -127,6 +127,15 @@ callee-saved register or a reference slot.
 Per §08 a collection may begin only at a safepoint, and the compiler inserts one at
 every function entry, every loop back edge, and every allocation.
 
+A **back edge** carries a preemption check in native code, but only in a program that
+contains a `spawn` at all: a single-threaded program has nothing that could want the
+processor, and the check is not free. It makes every back edge a call site for the register
+allocator, so a value carried around a loop must live in a callee-saved register or a frame
+slot rather than in a caller-saved one. The check itself is a countdown in the runtime
+block; when it reaches zero the thread offers the processor to the scheduler and the
+countdown restarts (§12). A count rather than a clock, so that two runs of one program
+schedule identically.
+
 A **stack map** describes a frame at one safepoint: the frame size, the offset of the
 reference area, and the number of reference slots live there. Stack maps are emitted
 into a table in the read-only data section, sorted by the code address of the safepoint,

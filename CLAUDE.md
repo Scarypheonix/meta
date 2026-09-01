@@ -241,6 +241,11 @@ no write barrier (ADR-0022); and DWARF is a line table and a symbol table only, 
   programs deadlock. Both live in raw mmap'd memory the collector does not move, and the
   collector walks their contents from the outside — told by the compiler whether the element
   type is a reference, since raw memory has no stack map and no header.
+- **Preemption at back edges** (§08), so a compute loop cannot starve a ready thread. A
+  countdown rather than a timer — no signal handler, and two runs of a program schedule
+  identically — and only in a program that contains a `spawn` at all, because the check
+  makes every back edge a call site and so pushes every loop-carried value into a
+  callee-saved register or a slot. A single-threaded program's loops are untouched.
 - **`concurrencyCases` is empty**: every case in §12 runs on all three engines at every
   optimization level, trap messages and their spans included. That needed native traps to
   name the *user's* line rather than the prelude's, which `spans.go` does by walking the rbp
@@ -261,10 +266,11 @@ no write barrier (ADR-0022); and DWARF is a line table and a symbol table only, 
 - `-O2` moved a trap onto the line that *called* the function it was in: inlining stamped
   the call site's span on every cloned instruction. spec/11-codegen.md now states the rule.
 
-**Next action:** Phase 6's exit criteria and `docs/phases/6-complete.md`. What is left
-before that: preemption at back edges in native code (§08 asks for it; the scheduler is
-cooperative), and a decision on whether §12's examples want more end-to-end cases than the
-seven that exist. Both are in `docs/deferred.md` with a phase.
+**Next action:** `docs/phases/6-complete.md` and the phase gate. §12's worked-examples
+table claims every row is an end-to-end case; nine exist, so either the missing rows become
+cases or the table stops claiming it — the first, unless a row turns out to be
+scheduling-dependent and therefore not a valid differential case (§12's own determinism
+clause).
 
 **A note on the history:** the VM's concurrency runtime landed inside commit `6b073de`,
 whose message describes only ADR-0027 — the bug the VM work uncovered. The commit is
