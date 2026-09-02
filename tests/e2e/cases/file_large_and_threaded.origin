@@ -1,0 +1,49 @@
+use std::io;
+use std::thread;
+use std::chan;
+
+// Two things the small round trip does not reach: a file big enough that the read has to
+// come back in more than one system call, and two threads each reading their own file.
+//
+// The second is what the per-thread slot exists for (spec/15-files.md): `fs::read_file`
+// leaves its bytes where `fs::taken_text` will find them, and "where" is the running
+// thread's own, so two threads doing this at once cannot take each other's.
+
+fn write_or_die(path: String, contents: String) {
+    match write_string(path, contents) {
+        Result::Ok(_) => {},
+        Result::Err(e) => panic("write failed: \(e.to_str())"),
+    }
+}
+
+fn read_or_die(path: String) -> String {
+    match read_to_string(path) {
+        Result::Ok(t) => t,
+        Result::Err(e) => panic("read failed: \(e.to_str())"),
+    }
+}
+
+fn main() {
+    let big = "0123456789abcdef".repeat(8192); // 128 KiB, past any one read
+    write_or_die("tests/e2e/scratch/big.txt", big);
+    let back = read_or_die("tests/e2e/scratch/big.txt");
+    io::println(back.len().to_str());
+    io::println((back == big).to_str());
+    io::println(back.slice(0, 8));
+    io::println(back.slice(back.len() - 8, back.len()));
+
+    write_or_die("tests/e2e/scratch/one.txt", "first");
+    write_or_die("tests/e2e/scratch/two.txt", "second");
+
+    let (s, r) = chan::channel[String](1);
+    let h = thread::spawn(|| -> i64 {
+        s.send(read_or_die("tests/e2e/scratch/two.txt"));
+        0
+    });
+    let mine = read_or_die("tests/e2e/scratch/one.txt");
+    match r.recv() {
+        Option::Some(theirs) => io::println("\(mine) then \(theirs)"),
+        Option::None => io::println("nothing came back"),
+    }
+    let x = h.join();
+}

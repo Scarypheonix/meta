@@ -152,6 +152,12 @@ type runtimeLabels struct {
 	strCharWidth  x86.Label
 	strAlloc      x86.Label
 	charToStr     x86.Label
+	// The file operations (files.go, spec/15-files.md).
+	fsCopyPath x86.Label
+	fsRead     x86.Label
+	fsWrite    x86.Label
+	fsExists   x86.Label
+	fsTaken    x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -215,6 +221,11 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.strCharWidth = e.a.NewLabel("rt_str_char_width")
 	e.rt.strAlloc = e.a.NewLabel("rt_str_alloc")
 	e.rt.charToStr = e.a.NewLabel("rt_char_to_str")
+	e.rt.fsCopyPath = e.a.NewLabel("rt_fs_copy_path")
+	e.rt.fsRead = e.a.NewLabel("rt_fs_read")
+	e.rt.fsWrite = e.a.NewLabel("rt_fs_write")
+	e.rt.fsExists = e.a.NewLabel("rt_fs_exists")
+	e.rt.fsTaken = e.a.NewLabel("rt_fs_taken")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -268,6 +279,11 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitStrSliceInto()
 	e.emitStrConcatInto()
 	e.emitCharToStr()
+	e.emitFsCopyPath()
+	e.emitFsRead()
+	e.emitFsWrite()
+	e.emitFsExists()
+	e.emitFsTaken()
 	e.emitCollect()
 }
 

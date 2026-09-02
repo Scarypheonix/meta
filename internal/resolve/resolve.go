@@ -314,6 +314,10 @@ var stdModules = map[string][]string{
 	// allocate raw bytes; everything else about a string is Origin source in the prelude,
 	// as the `Str` trait's default method bodies.
 	"std::str": {"len", "byte_at", "slice", "concat", "char_at", "char_width"},
+	// Phase 7 (spec/15-files.md). Four operations whose bodies are system calls. The
+	// prelude's `read_to_string`, `write_string` and `file_exists` are what a program
+	// calls; these are what those are written in terms of.
+	"std::fs": {"read_file", "taken_text", "write_file", "file_exists"},
 	// Phase 6 (spec/12-concurrency.md). `spawn` and `channel` are what a program calls;
 	// the rest are the operations the prelude's own methods are written in terms of,
 	// since a method body cannot otherwise reach an operation the runtime provides.

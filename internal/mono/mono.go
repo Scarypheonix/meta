@@ -18,6 +18,7 @@ import (
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/check"
 	"github.com/scarypheonix/meta/internal/diag"
+	"github.com/scarypheonix/meta/internal/prelude"
 	"github.com/scarypheonix/meta/internal/types"
 )
 
@@ -103,6 +104,16 @@ func Program(bag *diag.Bag, tys *check.Result, files ...*ast.File) *Result {
 	// have no code of their own and appear only through a call site.
 	for _, f := range files {
 		for _, it := range f.Items {
+			// The prelude is a library, not a program: a declaration in it is compiled
+			// because something reaches it, and one nothing reaches is not compiled at
+			// all. Rooting it the way a user's own declaration is rooted was free while
+			// the prelude's non-generic items were a handful, and stopped being free the
+			// moment it grew -- every program, string-free ones included, carried
+			// `impl Str for String`'s six methods and the UTF-8 validator behind
+			// `read_to_string`.
+			if isPrelude(it) {
+				continue
+			}
 			switch v := it.(type) {
 			case *ast.FnDecl:
 				w.root(v)
@@ -124,6 +135,14 @@ func Program(bag *diag.Bag, tys *check.Result, files ...*ast.File) *Result {
 		w.walkBody(inst)
 	}
 	return w.out
+}
+
+// isPrelude reports whether an item was declared in the prelude, by the file its span
+// names. It is the same test internal/check's DeclaredInPrelude makes, for the same
+// reason: the prelude is source like any other and is told apart by where it came from.
+func isPrelude(it ast.Item) bool {
+	s := it.Span()
+	return s.Valid() && s.File != nil && s.File.Name == prelude.Name
 }
 
 func (w *walker) root(decl *ast.FnDecl) {

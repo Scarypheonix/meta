@@ -46,6 +46,11 @@ var builtinIndex = map[string]int{
 	"str::concat":     BuiltinStrConcat,
 	"str::char_at":    BuiltinStrCharAt,
 	"str::char_width": BuiltinStrCharWidth,
+
+	"fs::read_file":   BuiltinReadFile,
+	"fs::taken_text":  BuiltinTakenText,
+	"fs::write_file":  BuiltinWriteFile,
+	"fs::file_exists": BuiltinFileExists,
 }
 
 func (c *Compiler) call(v *ast.Call) error {

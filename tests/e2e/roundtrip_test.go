@@ -30,7 +30,15 @@ func TestIRRoundTrip(t *testing.T) {
 			defer func() { _ = os.Chdir(wd) }()
 
 			var stdout, stderr bytes.Buffer
-			code := driver.RunRoundTrip(c.RelPath, &stdout, &stderr)
+			var code int
+			run := func() { code = driver.RunRoundTrip(c.RelPath, &stdout, &stderr) }
+			// A case that touches the filesystem gets the same fresh scratch directory
+			// every other engine's run of it gets (e2e_test.go's withScratch).
+			if usesFiles(c) {
+				withScratch(t, root, run)
+			} else {
+				run()
+			}
 
 			if got := stdout.String(); got != c.WantOut {
 				t.Errorf("stdout mismatch\n--- want ---\n%s\n--- got ---\n%s", c.WantOut, got)

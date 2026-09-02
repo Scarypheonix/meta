@@ -94,6 +94,26 @@ const (
 	BuiltinStrConcat
 	BuiltinStrCharAt
 	BuiltinStrCharWidth
+	// The file operations (spec/15-files.md). The prelude's `read_to_string`,
+	// `write_string` and `file_exists` are written in terms of these four.
+	BuiltinReadFile
+	BuiltinTakenText
+	BuiltinWriteFile
+	BuiltinFileExists
+)
+
+// The file-operation statuses (spec/15-files.md), which `fs::read_file` and
+// `fs::write_file` return and the prelude's `io_error_of` turns into an `IoError`.
+//
+// They live here rather than in any one engine because all three have to agree on them and
+// the prelude reads them as plain numbers: the interpreter and the VM classify a Go error,
+// the native runtime classifies an errno, and this is the vocabulary the two answers have
+// to meet in.
+const (
+	IOOk         = 0
+	IONotFound   = 1
+	IOPermission = 2
+	IOOther      = 3
 )
 
 // Compiler holds the state of one program's lowering.

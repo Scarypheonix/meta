@@ -32,6 +32,19 @@ func (c *Checker) strBuiltinType(name string) types.Type {
 		return &types.FnT{Params: []types.Type{str, i64, i64}, Ret: str}
 	case "str::concat":
 		return &types.FnT{Params: []types.Type{str, str}, Ret: str}
+
+	// The file operations (spec/15-files.md). Each returns a status or a primitive, for
+	// the reason every other compiler-provided operation does: a runtime that had to
+	// build a `Result` would have to know what the prelude's `Result` is, and the native
+	// backend has no way to construct a prelude type.
+	case "fs::read_file":
+		return &types.FnT{Params: []types.Type{str}, Ret: i64}
+	case "fs::taken_text":
+		return &types.FnT{Ret: str}
+	case "fs::write_file":
+		return &types.FnT{Params: []types.Type{str, str}, Ret: i64}
+	case "fs::file_exists":
+		return &types.FnT{Params: []types.Type{str}, Ret: types.P(types.Bool)}
 	}
 	return nil
 }

@@ -117,6 +117,10 @@ func (in *Interp) callBuiltin(name string, args []Value, c *ast.Call) Value {
 	if v, ok := in.strBuiltin(name, args, span); ok {
 		return v
 	}
+	// The file operations (spec/15-files.md).
+	if v, ok := in.fsBuiltin(name, args, span); ok {
+		return v
+	}
 	switch name {
 	case "io::print", "io::println":
 		if len(args) != 1 {

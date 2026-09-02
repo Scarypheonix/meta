@@ -10,3 +10,4 @@
 # Editors
 .DS_Store
 *.swp
+tests/e2e/scratch/

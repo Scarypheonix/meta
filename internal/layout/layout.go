@@ -44,6 +44,15 @@ const (
 	maxWordSize = sizeMask
 )
 
+// MaxStringBytes is the longest run of bytes one String object can hold: the header's own
+// 24-bit size field, less the length word, times eight bytes to the word.
+//
+// It is here rather than in whichever subsystem happened to need it first because it is a
+// fact about the header this package owns, and because three engines have to agree on it:
+// spec/15-files.md makes a file too large for a `String` an `Err(Other)` rather than a
+// trap on one engine and a success on another.
+const MaxStringBytes = (int64(maxWordSize) - 1) * 8
+
 // MakeHeader builds a header for an object of the given type and payload size.
 func MakeHeader(t TypeID, words uint64) Header {
 	if words > maxWordSize {

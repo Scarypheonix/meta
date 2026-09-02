@@ -1,0 +1,59 @@
+use std::io;
+
+// Reading and writing whole files (spec/15-files.md). The harness makes `tests/e2e/scratch`
+// fresh around every engine's run of this case and removes it afterwards, so the suite
+// leaves nothing behind and depends on nothing it did not create.
+
+fn show(r: Result[String, IoError]) -> String {
+    match r {
+        Result::Ok(t) => "ok \(t.len()) [\(t)]",
+        Result::Err(e) => "err \(e.to_str())",
+    }
+}
+
+fn showUnit(r: Result[(), IoError]) -> String {
+    match r {
+        Result::Ok(_) => "ok",
+        Result::Err(e) => "err \(e.to_str())",
+    }
+}
+
+fn main() {
+    let path = "tests/e2e/scratch/a.txt";
+
+    io::println(file_exists(path).to_str());
+    io::println(show(read_to_string(path)));
+
+    io::println(showUnit(write_string(path, "hello, files")));
+    io::println(file_exists(path).to_str());
+    io::println(show(read_to_string(path)));
+
+    // Overwriting with something shorter leaves only the second contents.
+    io::println(showUnit(write_string(path, "hi")));
+    io::println(show(read_to_string(path)));
+
+    // The empty file is a file.
+    io::println(showUnit(write_string(path, "")));
+    io::println(show(read_to_string(path)));
+    io::println(file_exists(path).to_str());
+
+    // Text, not bytes: a file of multi-byte characters comes back as characters.
+    io::println(showUnit(write_string(path, "héllo 日本 😀")));
+    match read_to_string(path) {
+        Result::Ok(t) => io::println("\(t.len()) bytes, \(t.char_count()) characters"),
+        Result::Err(e) => io::println("err \(e.to_str())"),
+    }
+
+    // A directory is not a file, and neither is a path that does not exist.
+    io::println(show(read_to_string("tests/e2e/scratch")));
+    io::println(show(read_to_string("tests/e2e/scratch/nope.txt")));
+    io::println(file_exists("tests/e2e/scratch/nope.txt").to_str());
+
+    // A path holding a NUL byte names nothing, and is refused rather than truncated.
+    io::println(show(read_to_string("tests/e2e/scratch/a\u{0}.txt")));
+    io::println(showUnit(write_string("tests/e2e/scratch/a\u{0}.txt", "x")));
+    io::println(file_exists("tests/e2e/scratch/a\u{0}.txt").to_str());
+
+    // A path that cannot be created is an error, not a trap.
+    io::println(showUnit(write_string("tests/e2e/scratch/no/such/dir/x.txt", "x")));
+}

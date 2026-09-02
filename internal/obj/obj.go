@@ -63,6 +63,20 @@ type Target struct {
 	SysWrite uint64
 	SysExit  uint64
 	SysMmap  uint64
+	// The file operations (spec/15-files.md). `lseek` is what gives a file's size without
+	// an `fstat`, whose struct layout is one of the few things the two systems genuinely
+	// disagree about -- seeking to the end and back is portable arithmetic instead.
+	SysOpen  uint64
+	SysRead  uint64
+	SysClose uint64
+	SysLseek uint64
+	// OpenWriteFlags is O_WRONLY|O_CREAT|O_TRUNC, which the two systems number
+	// differently for O_CREAT and O_TRUNC.
+	OpenWriteFlags uint64
+	// ErrNotFound and ErrPermission are the errno values spec/15-files.md's first two
+	// statuses correspond to. A syscall reports failure as -errno in rax on both systems.
+	ErrNotFound   uint64
+	ErrPermission uint64
 	// MapAnonPrivate is the mmap flag pair for a private anonymous mapping, which is
 	// how the runtime asks for a heap. The two systems number MAP_ANONYMOUS
 	// differently, so it joins the syscall numbers as a per-target constant.
@@ -77,6 +91,14 @@ var Linux = Target{
 	SysWrite: 1,
 	SysExit:  231, // exit_group: exits every thread, which is what a program's end means
 	SysMmap:  9,
+	SysOpen:  2,
+	SysRead:  0,
+	SysClose: 3,
+	SysLseek: 8,
+	// O_WRONLY | O_CREAT | O_TRUNC
+	OpenWriteFlags: 0o1 | 0o100 | 0o1000,
+	ErrNotFound:    2,  // ENOENT
+	ErrPermission:  13, // EACCES
 	// MAP_PRIVATE | MAP_ANONYMOUS
 	MapAnonPrivate: 0x02 | 0x20,
 }
@@ -89,6 +111,14 @@ var MacOS = Target{
 	SysWrite: 0x2000004,
 	SysExit:  0x2000001,
 	SysMmap:  0x20000C5,
+	SysOpen:  0x2000005,
+	SysRead:  0x2000003,
+	SysClose: 0x2000006,
+	SysLseek: 0x20000C7,
+	// O_WRONLY | O_CREAT | O_TRUNC, which BSD numbers differently from Linux
+	OpenWriteFlags: 0x0001 | 0x0200 | 0x0400,
+	ErrNotFound:    2,  // ENOENT
+	ErrPermission:  13, // EACCES
 	// MAP_PRIVATE | MAP_ANON
 	MapAnonPrivate: 0x0002 | 0x1000,
 }

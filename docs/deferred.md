@@ -64,13 +64,17 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Lock-free data structures in safe Origin | impossible under ADR-0014; would need an `unsafe` escape hatch | — (not planned) |
 | `unsafe` blocks | nothing in the design needs one yet; adding one is a spec-pillar change | — (not planned) |
 
+| File I/O | delivered in Phase 7 (spec/15-files.md, ADR-0030): `read_to_string`, `write_string` and `file_exists` in the prelude over four compiler-provided operations. A whole file at a time and no handle, because a handle is a resource Origin cannot close automatically | done |
+| Directory listing, metadata, rename, delete, the current directory, streaming reads and writes | spec/15-files.md scoped a compiler's needs: read a source file, write an object file, ask whether a path is there. Each of these is additive -- a new operation beside the four, with the same status-to-`IoError` shape -- and none is needed before something asks for it | Phase 8 |
+| A `Path` type | a path is a `String` passed to the system unchanged (spec/15-files.md). Joining, normalizing and splitting are string operations until something needs them to be more, and making them more early would mean deciding what a path *is* on two systems that disagree | Phase 8 |
+
 ## Toolchain
 
 | Item | Why deferred | Phase |
 |---|---|---|
 | Instantiation deduplication by signature hash | mitigation for monomorphization code size (ADR-0010) | Phase 5 |
 | Cross-build instantiation caching | mitigation for monomorphization compile time (ADR-0010) | Phase 8 |
-| Dropping prelude functions nothing reaches | `internal/mono`'s `root` compiles every function with no generic parameters of its own, whether or not anything calls it -- which was free while the prelude's only non-generic items were a handful, and stops being free as it grows. Phase 7 made it visible: `impl Str for String` is the prelude's first non-generic impl, so its six one-line methods are now in every program's bytecode, string-free ones included. Making a prelude declaration reachable-only needs mono to resolve *non-generic* calls too, which the checker records nowhere today (`instantiateFn` writes an `Insts` entry only for a generic use site) and `internal/compile` covers with a `rootIndex` fallback instead | Phase 8 |
+| Dropping prelude functions nothing reaches | delivered in Phase 7, once it started costing: `impl Str for String` was the prelude's first non-generic impl, and `internal/mono`'s `root` put its six methods -- and, later, `read_to_string`'s UTF-8 validator -- into every program's bytecode, string-free ones included. It also made the DWARF compile unit name every binary `<prelude>` and broke a folding test that counts arithmetic across a whole program. The prelude is a library, not a program, so its declarations are no longer roots: `internal/check`'s `instantiateFn` records a *non-generic* call site too (with no arguments, saying only that the site reaches the callee at all), and `mono` walks from `main`. The snapshots shrank by 1546 lines | done |
 | Cross-compilation | explicitly out of scope; two object writers is not cross-compilation (ADR-0003) | — (not planned) |
 | Incremental compilation in the LSP | needs the query architecture; full recheck first | Phase 8 |
 | Closures in native code | delivered in Phase 5 (ADR-0020): `internal/backend/closures.go`'s `resolveClosureCalls` boxes an escaping bare function reference into the same one-word closure shape `internal/vm/fields.go`'s `boxIfFn` builds dynamically, and repoints a call whose callee is not a bare function value at a new `OpCallClosure`, which passes the closure reference on the stack rather than shifting argument registers | done |

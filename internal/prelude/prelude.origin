@@ -16,6 +16,7 @@ use std::array;
 use std::list;
 use std::hash;
 use std::str;
+use std::fs;
 
 pub enum Option[T] {
     None,
@@ -661,12 +662,25 @@ pub trait Str {
 
     /// `self` joined to itself `n` times. `n <= 0` gives the empty string.
     fn repeat(self, n: i64) -> String {
-        let piece = self.as_string();
+        // By doubling, not by `n` concatenations. Each `concat` copies both operands, so
+        // appending one piece at a time copies the whole accumulated string every time --
+        // quadratic, and visibly so: a 128 KiB string took longer to build than the rest
+        // of the end-to-end suite took to run. Binary exponentiation makes it O(log n)
+        // concatenations of geometrically growing pieces instead.
+        if n <= 0 {
+            return "";
+        }
         let mut out = "";
-        let mut k = 0;
-        while k < n {
-            out = out.concat(piece);
-            k = k + 1;
+        let mut acc = self.as_string();
+        let mut k = n;
+        while k > 0 {
+            if k - (k / 2) * 2 == 1 {
+                out = out.concat(acc);
+            }
+            k = k / 2;
+            if k > 0 {
+                acc = acc.concat(acc);
+            }
         }
         out
     }
@@ -758,4 +772,137 @@ impl Str for String {
 /// Whether a byte is ASCII space, tab, newline or carriage return.
 fn is_ascii_space(b: i64) -> bool {
     b == 32 || b == 9 || b == 10 || b == 13
+}
+
+// --- Files (spec/15-files.md) ------------------------------------------------------
+//
+// A whole file at a time, and no handle. A handle would be a resource Origin has no way to
+// close automatically -- there are no destructors and no `defer`, and the collector is not
+// a schedule -- so a leaked descriptor would be exactly the quiet failure this language
+// exists to not have.
+//
+// The compiler provides four operations whose bodies are system calls. Each returns a
+// status or a primitive rather than a `Result`, for the reason every other one does: the
+// native backend has no way to construct a prelude type, so the `Result` is built here.
+
+/// What went wrong with a file operation (spec/15-files.md).
+///
+/// Three cases, because they are the three a program acts on differently. There is no
+/// errno: a number the system happened to use is not something a program should branch on.
+pub enum IoError {
+    NotFound,
+    PermissionDenied,
+    Other,
+}
+
+impl Show for IoError {
+    fn to_str(self) -> String {
+        match self {
+            IoError::NotFound => "not found",
+            IoError::PermissionDenied => "permission denied",
+            IoError::Other => "I/O error",
+        }
+    }
+}
+
+/// The status codes `std::fs` returns, turned into the error a program matches on.
+fn io_error_of(status: i64) -> IoError {
+    match status {
+        1 => IoError::NotFound,
+        2 => IoError::PermissionDenied,
+        _ => IoError::Other,
+    }
+}
+
+/// Whether a run of bytes is well-formed UTF-8 (spec/14-strings.md's encoding table).
+///
+/// It is written here, in Origin, rather than three times over in three runtimes: the
+/// answer has to be the same on every engine, and one implementation is how that is made
+/// true rather than checked. Overlong encodings, surrogates and anything past U+10FFFF are
+/// rejected, which is what makes "a `String` is valid UTF-8" mean something.
+fn is_valid_utf8(s: String) -> bool {
+    let mut i = 0;
+    while i < s.len() {
+        let b = s.byte_at(i);
+        let mut width = 0;
+        let mut lo = 0;
+        let mut scalar = 0;
+        if b < 128 {
+            i = i + 1;
+            continue;
+        }
+        if b >= 194 && b <= 223 {
+            width = 2;
+            lo = 128;
+            scalar = b - 192;
+        } else {
+            if b >= 224 && b <= 239 {
+                width = 3;
+                lo = 2048;
+                scalar = b - 224;
+            } else {
+                if b >= 240 && b <= 244 {
+                    width = 4;
+                    lo = 65536;
+                    scalar = b - 240;
+                } else {
+                    return false;
+                }
+            }
+        }
+        if i + width > s.len() {
+            return false;
+        }
+        let mut k = 1;
+        while k < width {
+            let c = s.byte_at(i + k);
+            if c < 128 || c > 191 {
+                return false;
+            }
+            scalar = scalar * 64 + (c - 128);
+            k = k + 1;
+        }
+        if scalar < lo {
+            return false; // an overlong encoding of something shorter
+        }
+        if scalar > 1114111 {
+            return false;
+        }
+        if scalar >= 55296 && scalar <= 57343 {
+            return false; // a surrogate, which is not a scalar value
+        }
+        i = i + width;
+    }
+    true
+}
+
+/// The whole file, as text.
+///
+/// A file whose bytes are not valid UTF-8 is `Err(Other)` rather than a `String` that
+/// lies: every other part of the language assumes a `String` is valid text (spec/14).
+pub fn read_to_string(path: String) -> Result[String, IoError] {
+    let status = fs::read_file(path);
+    if status != 0 {
+        return Result::Err(io_error_of(status));
+    }
+    let text = fs::taken_text();
+    if !is_valid_utf8(text) {
+        return Result::Err(IoError::Other);
+    }
+    Result::Ok(text)
+}
+
+/// Writes the whole file, creating it if it does not exist and truncating it if it does.
+pub fn write_string(path: String, contents: String) -> Result[(), IoError] {
+    let status = fs::write_file(path, contents);
+    if status != 0 {
+        return Result::Err(io_error_of(status));
+    }
+    Result::Ok(())
+}
+
+/// Whether the path can be opened for reading. Never an error: a path that cannot be read
+/// is exactly what `false` means here.
+pub fn file_exists(path: String) -> bool {
+    fs::file_exists(path)
 }

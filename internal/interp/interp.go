@@ -102,6 +102,10 @@ type Interp struct {
 	// reads it with `chan::taken_value`. It is per-thread, which is what makes the pair
 	// atomic with respect to another receiver.
 	taken Value
+	// takenText is the same arrangement for `fs::read_file` (spec/15-files.md): the bytes
+	// it read, held on this thread until the prelude's `read_to_string` takes them with
+	// `fs::taken_text`.
+	takenText string
 }
 
 // New returns an interpreter writing program output to stdout and trap messages to

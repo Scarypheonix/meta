@@ -148,7 +148,14 @@ func TestPrograms(t *testing.T) {
 					if skip, ok := skipNative(c, e); ok {
 						t.Skip(skip)
 					}
-					stdout, stderr, code := runCase(t, root, c, e)
+					var stdout, stderr string
+					var code int
+					run := func() { stdout, stderr, code = runCase(t, root, c, e) }
+					if usesFiles(c) {
+						withScratch(t, root, run)
+					} else {
+						run()
+					}
 
 					if stdout != c.WantOut {
 						t.Errorf("stdout mismatch\n--- want ---\n%s\n--- got ---\n%s", c.WantOut, stdout)
@@ -179,12 +186,23 @@ func TestEnginesAgree(t *testing.T) {
 	root := testutil.RepoRoot(t)
 	for _, c := range loadCases(t) {
 		t.Run(c.Name, func(t *testing.T) {
-			baseOut, baseErr, baseCode := runCase(t, root, c, engines[0])
+			runOne := func(e engineSpec) (string, string, int) {
+				var out, errText string
+				var code int
+				run := func() { out, errText, code = runCase(t, root, c, e) }
+				if usesFiles(c) {
+					withScratch(t, root, run)
+				} else {
+					run()
+				}
+				return out, errText, code
+			}
+			baseOut, baseErr, baseCode := runOne(engines[0])
 			for _, e := range engines[1:] {
 				if _, skipped := skipNative(c, e); skipped {
 					continue
 				}
-				out, errText, code := runCase(t, root, c, e)
+				out, errText, code := runOne(e)
 				if out != baseOut {
 					t.Errorf("stdout differs between %s and %s\n--- %s ---\n%s\n--- %s ---\n%s",
 						engines[0].name, e.name, engines[0].name, baseOut, e.name, out)
@@ -200,6 +218,33 @@ func TestEnginesAgree(t *testing.T) {
 			}
 		})
 	}
+}
+
+// scratchDir is where a case that touches the filesystem writes.
+//
+// A case named `file_*` (spec/15-files.md) needs somewhere to write, and the repository is
+// not it: the suite must leave nothing behind and must not depend on anything it did not
+// create. So those cases run with `tests/e2e/scratch` freshly made and removed around each
+// one, and write into it by that relative path -- which works because runCase runs from
+// the repository root, the same reason a diagnostic can name `tests/e2e/cases/x.origin`.
+const scratchDir = "tests/e2e/scratch"
+
+// usesFiles reports whether a case writes to the filesystem, by its name.
+func usesFiles(c caseFile) bool { return strings.HasPrefix(c.Name, "file_") }
+
+// withScratch makes the scratch directory, runs f, and removes it again. Every engine's
+// run of a file case gets a clean one, so the seven runs cannot see each other's writes.
+func withScratch(t *testing.T, root string, f func()) {
+	t.Helper()
+	dir := filepath.Join(root, scratchDir)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("clearing %s: %v", dir, err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("creating %s: %v", dir, err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	f()
 }
 
 // runCase executes one case from the repository root, so that diagnostics name the case

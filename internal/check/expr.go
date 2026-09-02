@@ -287,16 +287,18 @@ func (c *Checker) instantiateFn(v *ast.PathExpr, fn *ast.FnDecl) types.Type {
 	for _, b := range sig.Bounds {
 		c.requireBound(types.Substitute(b.Type, subst), b.Trait, v.Span())
 	}
-	if len(sig.Params) > 0 {
-		// The arguments are recorded unresolved: inference has not run yet. They are
-		// pruned when monomorphization reads them, which is after the whole program has
-		// been checked.
-		inst := &Inst{Decl: fn, Params: sig.Params}
-		for _, p := range sig.Params {
-			inst.Args = append(inst.Args, subst[p])
-		}
-		c.out.Insts[v.NodeID()] = inst
+	// The arguments are recorded unresolved: inference has not run yet. They are pruned
+	// when monomorphization reads them, which is after the whole program has been checked.
+	//
+	// A *non-generic* callee is recorded too, with no arguments. It has exactly one
+	// instance either way, so this says nothing new about which copy runs -- what it says
+	// is that this call site reaches it at all, which is how monomorphization knows a
+	// prelude function is used and every other one is not (internal/mono's Program).
+	inst := &Inst{Decl: fn, Params: sig.Params}
+	for _, p := range sig.Params {
+		inst.Args = append(inst.Args, subst[p])
 	}
+	c.out.Insts[v.NodeID()] = inst
 	params := make([]types.Type, 0, len(sig.ParamTypes))
 	for _, p := range sig.ParamTypes {
 		params = append(params, types.Substitute(p, subst))

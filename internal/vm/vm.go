@@ -105,8 +105,12 @@ type VM struct {
 	tid int64
 	// taken holds what BuiltinAwait dequeued, until BuiltinTaken reads it. Per-thread,
 	// which is what makes the pair atomic with respect to another receiver.
-	taken    Value
-	hasTaken bool
+	taken Value
+	// takenText is the same arrangement for `fs::read_file` (spec/15-files.md). It is a
+	// Go string rather than a heap object, so unlike `taken` it is not a collection root:
+	// nothing in the heap points at it until `fs::taken_text` allocates the String.
+	takenText string
+	hasTaken  bool
 }
 
 // Config sizes the VM.

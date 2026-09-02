@@ -766,6 +766,40 @@ func (e *emitter) builtin(v *ir.Value) error {
 		}
 		return e.strConcat(v)
 
+	case compile.BuiltinReadFile, compile.BuiltinFileExists:
+		if len(v.Args) != 1 {
+			return fmt.Errorf("this is a compiler bug: a path operation takes one argument, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		if v.Const == compile.BuiltinReadFile {
+			e.a.Call(e.rt.fsRead)
+			// It allocates the String it reads into, so the call site is a safepoint
+			// like any other allocation in user code (ADR-0021).
+			e.recordCall(v)
+		} else {
+			e.a.Call(e.rt.fsExists)
+		}
+		e.def(v, x86.RAX)
+		return nil
+
+	case compile.BuiltinWriteFile:
+		if len(v.Args) != 2 {
+			return fmt.Errorf("this is a compiler bug: fs::write_file takes two arguments, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.load(x86.RSI, v.Args[1])
+		e.a.Call(e.rt.fsWrite)
+		e.def(v, x86.RAX)
+		return nil
+
+	case compile.BuiltinTakenText:
+		if len(v.Args) != 0 {
+			return fmt.Errorf("this is a compiler bug: fs::taken_text takes no arguments, got %d", len(v.Args))
+		}
+		e.a.Call(e.rt.fsTaken)
+		e.def(v, x86.RAX)
+		return nil
+
 	case compile.BuiltinNewArray:
 		// rt_array_new(capacity, typeid): the second argument is the layout
 		// internal/compile chose for this instantiation, which is what tells the
