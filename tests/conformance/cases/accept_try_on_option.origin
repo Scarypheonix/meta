@@ -1,0 +1,19 @@
+// EXPECT: accept
+// spec: 09-errors.md — `?` unwraps `Some` and returns `None` early, in a function
+// returning `Option`. The two instantiations need not match.
+
+use std::list;
+
+fn head(xs: List[i64]) -> Option[i64] {
+    xs.get(0)
+}
+
+fn head_str(xs: List[i64]) -> Option[String] {
+    let n = head(xs)?;
+    Option::Some(n.to_str())
+}
+
+fn main() {
+    let xs = list::new[i64]();
+    let s = head_str(xs);
+}

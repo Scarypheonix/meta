@@ -1,0 +1,11 @@
+// EXPECT: reject E0277
+// spec: 09-errors.md — `?` applies to a `Result` or an `Option`, and to nothing else.
+
+fn f() -> Option[i64] {
+    let n = 1?;
+    Option::Some(n)
+}
+
+fn main() {
+    let o = f();
+}

@@ -1,0 +1,43 @@
+use std::io;
+
+// A φ's operands are positional: operand i is the value arriving along the block's i-th
+// predecessor. The inliner cloned a callee's φs with their operands in the callee's own
+// predecessor order, and then rebuilt the edges by walking the callee's blocks and
+// appending -- a different order whenever the predecessors do not happen to appear in that
+// sequence. The two lists held the same edges either way, so nothing that counted them
+// noticed; a merge block whose two arms arrived the other way round silently swapped its
+// two values.
+//
+// The shape that triggers it: a `match` whose arms are a call and a constant, in a function
+// small enough to be inlined, called from a function that is itself inlined. `-O0` and
+// `-O1` print the right answer; `-O2` used to print the other arm's.
+
+fn wrap(n: i64) -> Option[i64] {
+    if n < 0 {
+        return Option::None;
+    }
+    Option::Some(n)
+}
+
+fn tag(s: String) -> String { s }
+
+fn label(n: i64) -> Option[String] {
+    match wrap(n) {
+        Option::Some(m) => Option::Some(m.to_str()),
+        Option::None => Option::None,
+    }
+}
+
+fn show(o: Option[String]) -> String {
+    match o {
+        Option::Some(s) => tag(s),
+        Option::None => "none",
+    }
+}
+
+fn main() {
+    io::println(show(label(3)));
+    io::println(show(label(-1)));
+    io::println(show(label(0)));
+    io::println(show(label(-99)));
+}

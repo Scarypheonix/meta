@@ -1,0 +1,13 @@
+// EXPECT: reject E0277
+// spec: 09-errors.md — and not the other way round either.
+
+fn fallible() -> Result[i64, String] { Result::Err("no") }
+
+fn f() -> Option[i64] {
+    let n = fallible()?;
+    Option::Some(n)
+}
+
+fn main() {
+    let o = f();
+}

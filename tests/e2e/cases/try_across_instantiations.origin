@@ -1,0 +1,72 @@
+use std::io;
+
+// `?` on both `Result` and `Option`, in the case that used to be silently wrong: the value
+// it returns early is built at the *enclosing* function's return type, not carried over
+// from the value it was given.
+//
+// `Result[i64, String]::Err` and `Result[String, String]::Err` are different types with
+// different object layouts (ADR-0019), even though both carry one `String`. Handing the
+// caller an object of the wrong one gives it a variant tag from a different instantiation,
+// and its `match` matches no arm at all -- which is exactly what the VM and native code
+// used to do here, while the interpreter, which has no layouts, got it right.
+
+fn inner() -> Result[i64, String] {
+    Result::Err("boom")
+}
+
+fn ok_inner() -> Result[i64, String] {
+    Result::Ok(7)
+}
+
+fn outer(fail: bool) -> Result[String, String] {
+    let n = if fail { inner()? } else { ok_inner()? };
+    Result::Ok("got ".concat(n.to_str()))
+}
+
+fn first_char(s: String) -> Option[char] {
+    if s.is_empty() {
+        return Option::None;
+    }
+    Option::Some(s.char_at(0))
+}
+
+fn initial(s: String) -> Option[String] {
+    let c = first_char(s)?;
+    Option::Some(c.to_str())
+}
+
+// The same instantiation on both sides, which is the case that never needed rebuilding.
+fn passthrough(s: String) -> Option[char] {
+    let c = first_char(s)?;
+    Option::Some(c)
+}
+
+fn showR(r: Result[String, String]) -> String {
+    match r {
+        Result::Ok(s) => "ok ".concat(s),
+        Result::Err(e) => "err ".concat(e),
+    }
+}
+
+fn showO(o: Option[String]) -> String {
+    match o {
+        Option::Some(s) => "some ".concat(s),
+        Option::None => "none",
+    }
+}
+
+fn showC(o: Option[char]) -> String {
+    match o {
+        Option::Some(c) => "some ".concat(c.to_str()),
+        Option::None => "none",
+    }
+}
+
+fn main() {
+    io::println(showR(outer(true)));
+    io::println(showR(outer(false)));
+    io::println(showO(initial("hello")));
+    io::println(showO(initial("")));
+    io::println(showC(passthrough("xyz")));
+    io::println(showC(passthrough("")));
+}

@@ -192,6 +192,14 @@ func runPasses(f *ir.Func, prog *bytecode.Program, level Level) error {
 			if p.Run(f, prog) {
 				changed = true
 			}
+			// A pass that leaves a φ disagreeing with its block's predecessors has
+			// miscompiled the program, and the symptom is a wrong *value* rather than a
+			// crash -- so it is checked here, after every pass, rather than left to
+			// whichever engine reads the result. spec/11-codegen.md's "identical output
+			// at every optimization level" is what this protects.
+			if err := ir.CheckPhis(f); err != nil {
+				return fmt.Errorf("this is a compiler bug: the %s pass %w", p.Name, err)
+			}
 		}
 		f.RecomputeUses()
 		if !changed {

@@ -1,0 +1,14 @@
+// EXPECT: reject E0277
+// spec: 09-errors.md — the two forms do not mix: there is nothing `?` could build out of
+// an `Option` to satisfy a `Result`.
+
+fn maybe() -> Option[i64] { Option::None }
+
+fn f() -> Result[i64, String] {
+    let n = maybe()?;
+    Result::Ok(n)
+}
+
+fn main() {
+    let r = f();
+}

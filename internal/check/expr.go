@@ -1225,26 +1225,40 @@ func (c *Checker) inferField(v *ast.FieldAccess) types.Type {
 	return types.Error
 }
 
-// inferTry types the `?` operator. In 0.1 the error types must match exactly; automatic
-// conversion via `Into` is deferred to Phase 7 (docs/deferred.md).
+// inferTry types the `?` operator (spec/09-errors.md).
+//
+// It applies to `Result[T, E]` and to `Option[T]`, and in both cases the *enclosing*
+// function must return the same enum: `?` returns early with a value of the function's own
+// return type, and there is nothing it could build out of an `Option` to satisfy a
+// `Result` or the other way round.
+//
+// For a `Result` the error types must match exactly. Automatic conversion via `Into` is
+// still deferred (docs/deferred.md): it needs a blanket-impl story that interacts with
+// coherence (ADR-0011).
 func (c *Checker) inferTry(v *ast.Try) types.Type {
 	got := c.normalize(c.infer(v.X))
 	if types.IsError(got) {
 		return types.Error
 	}
 	inner, ok := types.AsNamed(got)
-	if !ok || inner.Def.Name != "Result" || len(inner.Args) != 2 {
-		c.bag.Errorf("E0277", v.Span(), "`?` applies to a `Result`, found `%s`", got).
-			Label("not a `Result`").
-			Note("`?` returns early on `Err` and unwraps `Ok`")
+	if !ok || (inner.Def.Name != "Result" && inner.Def.Name != "Option") {
+		c.bag.Errorf("E0277", v.Span(), "`?` applies to a `Result` or an `Option`, found `%s`", got).
+			Label("neither a `Result` nor an `Option`").
+			Note("`?` returns early on `Err` or `None`, and unwraps `Ok` or `Some`")
+		return types.Error
+	}
+	if inner.Def.Name == "Option" {
+		return c.inferTryOption(v, inner)
+	}
+	if len(inner.Args) != 2 {
 		return types.Error
 	}
 
 	outer, ok := types.AsNamed(c.ret)
 	if !ok || outer.Def.Name != "Result" || len(outer.Args) != 2 {
-		c.bag.Errorf("E0277", v.Span(), "`?` is only allowed in a function returning `Result`").
+		c.bag.Errorf("E0277", v.Span(), "`?` on a `Result` is only allowed in a function returning `Result`").
 			Label("this function returns `%s`", c.ret).
-			Help("change the return type to `Result[%s, %s]`", outer2(c.ret), inner.Args[1])
+			Help("change the return type to `Result[%s, %s]`", tryOkType(c.ret), inner.Args[1])
 		return inner.Args[0]
 	}
 	if !c.unify(outer.Args[1], inner.Args[1], v.Span(), "the error types must match") {
@@ -1256,9 +1270,26 @@ func (c *Checker) inferTry(v *ast.Try) types.Type {
 	return inner.Args[0]
 }
 
-// outer2 renders the current return type for the `?` help text.
-func outer2(t types.Type) string {
-	if n, ok := types.AsNamed(t); ok && n.Def.Name == "Result" && len(n.Args) == 2 {
+// inferTryOption is the `Option[T]` half: the enclosing function must return an `Option`,
+// and there is no second type argument for the two to disagree about.
+func (c *Checker) inferTryOption(v *ast.Try, inner *types.Named) types.Type {
+	if len(inner.Args) != 1 {
+		return types.Error
+	}
+	outer, ok := types.AsNamed(c.ret)
+	if !ok || outer.Def.Name != "Option" || len(outer.Args) != 1 {
+		c.bag.Errorf("E0277", v.Span(), "`?` on an `Option` is only allowed in a function returning `Option`").
+			Label("this function returns `%s`", c.ret).
+			Note("`?` returns early with `None`, which is not a value of `%s`", c.ret).
+			Help("change the return type to `Option[%s]`, or `match` on it instead", tryOkType(c.ret))
+	}
+	return inner.Args[0]
+}
+
+// tryOkType renders the current return type's payload for the `?` help text.
+func tryOkType(t types.Type) string {
+	if n, ok := types.AsNamed(t); ok && len(n.Args) > 0 &&
+		(n.Def.Name == "Result" || n.Def.Name == "Option") {
 		return n.Args[0].String()
 	}
 	return t.String()

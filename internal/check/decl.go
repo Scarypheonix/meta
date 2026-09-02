@@ -87,6 +87,10 @@ type Result struct {
 	// Methods maps a method-call node to the declaration it resolves to, so the
 	// interpreter and later the backend do not repeat the search.
 	Methods map[ast.NodeID]*ast.FnDecl
+	// FnRets is each function's declared return type, still in terms of its own generic
+	// parameters. `?` needs it: the value it returns early is built at the *enclosing*
+	// function's type, which is not the type of any expression the programmer wrote.
+	FnRets map[*ast.FnDecl]types.Type
 	// Generics lists the type parameters a function's body may mention: the enclosing
 	// impl's or trait's, then `Self` for a trait method, then the function's own. A
 	// function with none is compiled once; a function with some is compiled once per
@@ -238,6 +242,7 @@ func Program(bag *diag.Bag, res *resolve.Result, files ...*ast.File) *Result {
 			PatTypes:   map[ast.NodeID]types.Type{},
 			LocalTypes: map[*resolve.Local]types.Type{},
 			Methods:    map[ast.NodeID]*ast.FnDecl{},
+			FnRets:     map[*ast.FnDecl]types.Type{},
 			Insts:      map[ast.NodeID]*Inst{},
 			IterInsts:  map[ast.NodeID]*Inst{},
 			Generics:   map[*ast.FnDecl][]*types.Param{},
@@ -450,6 +455,7 @@ func (c *Checker) signature(fn *ast.FnDecl, outerParams []*types.Param, self typ
 	if fn.Ret != nil {
 		sig.Ret = c.toType(fn.Ret)
 	}
+	c.out.FnRets[fn] = sig.Ret
 	return sig
 }
 

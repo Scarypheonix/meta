@@ -351,38 +351,100 @@ func (c *Compiler) methodCall(v *ast.MethodCall) error {
 }
 
 // tryExpr compiles `?`: unwrap `Ok`, or return `Err` from the enclosing function.
+// tryExpr compiles `?` (spec/09-errors.md): unwrap the success variant, or return early.
+//
+// The early return does not hand back the value it was given. `Result[i64, E]::Err(e)` and
+// `Result[String, E]::Err(e)` are different types with different layouts (ADR-0019), and a
+// function returning the second cannot return an object of the first -- its caller's own
+// `match` tests variant indices belonging to *its* instantiation and would match none of
+// them. So the payload is unwrapped and rebuilt at the enclosing function's return type.
+// `None` is rebuilt for the same reason, and carries no payload to move.
 func (c *Compiler) tryExpr(v *ast.Try) error {
 	if err := c.expr(v.X); err != nil {
 		return err
 	}
-	inner := c.typeOf(v.X)
-	okVariant, errVariant, err := c.resultVariants(inner, v.Span())
+	inner := c.concreteType(c.typeOf(v.X))
+	named, isNamed := types.AsNamed(inner)
+	if !isNamed || named.Def == nil {
+		return unsupported("`?` on something that is not a `Result` or an `Option`", v.Span())
+	}
+	isOption := named.Def.Name == "Option"
+
+	someVariant, failVariant, err := c.tryVariants(inner, v.Span())
 	if err != nil {
 		return err
 	}
-	okKind := bytecode.KindUnknown
-	if n, ok := types.AsNamed(c.concreteType(inner)); ok && len(n.Args) == 2 {
-		okKind = kindOfType(c.concreteType(n.Args[0]))
+	// The enclosing function's own return type, which is what the early return builds.
+	ret := c.concreteType(c.tys.FnRets[c.inst.Decl])
+	_, retFail, err := c.tryVariants(ret, v.Span())
+	if err != nil {
+		return err
+	}
+
+	payloadKind := bytecode.KindUnknown
+	if len(named.Args) > 0 {
+		payloadKind = kindOfType(c.concreteType(named.Args[0]))
+	}
+	failKind := bytecode.KindUnknown
+	if len(named.Args) > 1 {
+		failKind = kindOfType(c.concreteType(named.Args[1]))
 	}
 
 	slot := c.temp()
 	c.emitA(bytecode.OpStore, slot, v.Span())
 	c.emitA(bytecode.OpLoad, slot, v.Span())
-	c.emitA(bytecode.OpIsVariant, okVariant, v.Span())
-	toErr := c.emitA(bytecode.OpJumpIfFalse, 0, v.Span())
+	c.emitA(bytecode.OpIsVariant, someVariant, v.Span())
+	toFail := c.emitA(bytecode.OpJumpIfFalse, 0, v.Span())
 
 	c.emitA(bytecode.OpLoad, slot, v.Span())
-	c.emitAK(bytecode.OpGetPayload, 0, okKind, v.Span())
+	c.emitAK(bytecode.OpGetPayload, 0, payloadKind, v.Span())
 	toEnd := c.emitA(bytecode.OpJump, 0, v.Span())
 
-	c.patch(toErr)
-	c.emitA(bytecode.OpLoad, slot, v.Span())
+	c.patch(toFail)
+	if retFail == failVariant {
+		// The two instantiations agree, so the value already has the right layout and
+		// rebuilding it would only cost an allocation.
+		c.emitA(bytecode.OpLoad, slot, v.Span())
+	} else if isOption {
+		c.emitAB(bytecode.OpVariant, retFail, 0, v.Span())
+	} else {
+		c.emitA(bytecode.OpLoad, slot, v.Span())
+		c.emitAK(bytecode.OpGetPayload, 0, failKind, v.Span())
+		c.emitAB(bytecode.OpVariant, retFail, 1, v.Span())
+	}
 	c.emit(bytecode.OpReturn, v.Span())
 	c.emit(bytecode.OpUnit, v.Span())
-	_ = errVariant
 
 	c.patch(toEnd)
 	return nil
+}
+
+// tryVariants finds the two variant indices `?` needs for a concrete `Result` or `Option`:
+// the one it unwraps, and the one it returns early with.
+func (c *Compiler) tryVariants(t types.Type, span diag.Span) (some, fail int, err error) {
+	n, isNamed := types.AsNamed(c.concreteType(t))
+	if !isNamed || n.Def == nil || n.Def.Enum == nil {
+		return 0, 0, unsupported("`?` on something that is not a `Result` or an `Option`", span)
+	}
+	var someVar, failVar *ast.Variant
+	for _, v := range n.Def.Enum.Variants {
+		switch v.Name.Name {
+		case "Ok", "Some":
+			someVar = v
+		case "Err", "None":
+			failVar = v
+		}
+	}
+	if someVar == nil || failVar == nil {
+		return 0, 0, unsupported("`?` on something that is not a `Result` or an `Option`", span)
+	}
+	if some, err = c.variantInst(someVar, n); err != nil {
+		return 0, 0, err
+	}
+	if fail, err = c.variantInst(failVar, n); err != nil {
+		return 0, 0, err
+	}
+	return some, fail, nil
 }
 
 // optionSomeVariant returns the bytecode variant index of `Option::Some` at a concrete
@@ -396,34 +458,6 @@ func (c *Compiler) optionSomeVariant(item types.Type, span diag.Span) (int, erro
 	}
 	optionT := &types.Named{Def: c.optionDef, Args: []types.Type{item}}
 	return c.variantInst(c.optionSome, optionT)
-}
-
-// resultVariants finds, building on first use, the instantiated indices of `Ok` and
-// `Err` for a concrete Result type.
-func (c *Compiler) resultVariants(t types.Type, span diag.Span) (ok, errIdx int, err error) {
-	n, isNamed := types.AsNamed(c.concreteType(t))
-	if !isNamed || n.Def == nil || n.Def.Enum == nil {
-		return 0, 0, unsupported("`?` on something that is not a Result", span)
-	}
-	var okVar, errVar *ast.Variant
-	for _, v := range n.Def.Enum.Variants {
-		switch v.Name.Name {
-		case "Ok":
-			okVar = v
-		case "Err":
-			errVar = v
-		}
-	}
-	if okVar == nil || errVar == nil {
-		return 0, 0, unsupported("`?` on something that is not a Result", span)
-	}
-	if ok, err = c.variantInst(okVar, n); err != nil {
-		return 0, 0, err
-	}
-	if errIdx, err = c.variantInst(errVar, n); err != nil {
-		return 0, 0, err
-	}
-	return ok, errIdx, nil
 }
 
 // wrapConcurrencyHandle turns the bare handle a concurrency builtin returns into the

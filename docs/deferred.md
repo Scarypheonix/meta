@@ -10,8 +10,8 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Item | Why deferred | Phase |
 |---|---|---|
 | `if let` / `while let` | pure sugar over a two-arm `match`; needs the match lowering first | Phase 3 |
-| `?` on `Option[T]` | needs a shared "try" abstraction or a second desugaring rule | Phase 7 |
-| Error conversion in `?` via `Into` | needs a blanket-impl story that interacts with coherence (ADR-0011) | Phase 7 |
+| `?` on `Option[T]` | delivered in Phase 7: no shared "try" abstraction was needed, only a second arm in the one rule -- `?` unwraps `Some` and returns `Option::None` early, exactly as it unwraps `Ok` and returns `Err`. Building it turned up a real bug in the `Result` half: the early return handed back the value it was given, and `Result[i64, E]::Err` and `Result[String, E]::Err` are different layouts (ADR-0019), so a caller's `match` matched no arm. It rebuilds at the enclosing function's own return type now | done |
+| Error conversion in `?` via `Into` | needs a blanket-impl story that interacts with coherence (ADR-0011) | Phase 8 |
 | Trait objects / `dyn` | needs the uniform value representation monomorphization avoids (ADR-0010) | Phase 7 |
 | Multi-parameter traits | inference ambiguity; not needed for the stdlib as designed | Phase 7 |
 | Generic associated types | needs higher-kinded machinery | — (not planned) |

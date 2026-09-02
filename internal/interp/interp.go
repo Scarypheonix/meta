@@ -750,24 +750,31 @@ func (in *Interp) evalFor(fo *ast.For) (Value, ctrl) {
 	}
 }
 
+// evalTry implements `?` (spec/09-errors.md), on a `Result` or an `Option`.
+//
+// The early return hands back the value it was given rather than rebuilding it, which the
+// other two engines cannot do: `Result[i64, E]::Err` and `Result[String, E]::Err` are two
+// layouts there, and the enclosing function's own is the one that has to come back. Here
+// an enum value is a pointer to the declaration plus a payload, and the declaration is the
+// same one for every instantiation, so the distinction does not exist.
 func (in *Interp) evalTry(t *ast.Try) (Value, ctrl) {
 	val, c := in.evalExpr(t.X)
 	if c.stops() {
 		return Unit{}, c
 	}
 	e, ok := val.(*Enum)
-	if !ok || e.Def.Name.Name != "Result" {
-		in.trap(t.Span(), "`?` applies to a `Result`, found %s", TypeName(val))
+	if !ok || (e.Def.Name.Name != "Result" && e.Def.Name.Name != "Option") {
+		in.trap(t.Span(), "`?` applies to a `Result` or an `Option`, found %s", TypeName(val))
 	}
 	switch e.Variant.Name.Name {
-	case "Ok":
+	case "Ok", "Some":
 		if len(e.Vals) != 1 {
-			in.trap(t.Span(), "`Ok` must carry exactly one value")
+			in.trap(t.Span(), "`%s` must carry exactly one value", e.Variant.Name.Name)
 		}
 		return e.Vals[0], normal
-	case "Err":
+	case "Err", "None":
 		return Unit{}, ctrl{kind: ctrlReturn, val: e}
 	}
-	in.trap(t.Span(), "`?` applies to `Ok` or `Err`, found `%s`", e.Variant.Name.Name)
+	in.trap(t.Span(), "`?` applies to `Ok`, `Err`, `Some` or `None`, found `%s`", e.Variant.Name.Name)
 	return Unit{}, normal
 }

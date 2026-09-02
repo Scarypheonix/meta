@@ -39,12 +39,59 @@ match e {
 ```
 
 `?` inside a lambda applies to the lambda's return type, not the enclosing function's.
-`?` on `Option[T]` is DEFERRED (Phase 7). Automatic error conversion via an `Into` bound
-on `E` is DEFERRED (Phase 7); until then, convert explicitly:
-`fs::read(p).map_err(|e| MyError::Io(e))?`.
+Automatic error conversion via an `Into` bound on `E` is DEFERRED (Phase 8); until then,
+convert explicitly: `fs::read(p).map_err(|e| MyError::Io(e))?`.
 
 Using `?` in a function that does not return `Result` is REJECTED with a note showing
 the signature change that would fix it.
+
+### `?` on `Option`
+
+`?` applies to `Option[T]` as well, in a function returning `Option[U]`:
+
+```origin
+fn initial(s: String) -> Option[String] {
+    let c = s.chars().get(0)?;      // returns early on None
+    Option::Some(c.to_str())
+}
+```
+
+It evaluates to `T` on `Some`, and on `None` it immediately returns `Option::None` from
+the enclosing function. Exactly:
+
+```origin
+match e {
+    Option::Some(v) => v,
+    Option::None    => return Option::None,
+}
+```
+
+The two forms do not mix: `?` on an `Option` in a function returning `Result` is REJECTED,
+and so is the other way round. There is nothing `?` could build out of an `Option` to
+satisfy a `Result`, and inventing one — a `None` becoming `Err` of some default — would be
+a conversion the signature does not mention.
+
+### What the early return returns
+
+The value `?` returns is built at the **enclosing function's** return type, not carried
+over from the value it was given.
+
+That is not a detail. `Result[i64, E]::Err(e)` and `Result[String, E]::Err(e)` are
+different types with different object layouts (ADR-0019), even though both carry one `E`:
+
+```origin
+fn inner() -> Result[i64, String] { Result::Err("boom") }
+
+fn outer() -> Result[String, String] {
+    let n = inner()?;              // the Err returned here is `Result[String, String]`'s
+    Result::Ok("fine")
+}
+```
+
+Handing `outer`'s caller an object of `inner`'s type would give it a value whose variant
+tag belongs to a different instantiation, and its own `match` would match no arm at all.
+So `?` unwraps the payload and rebuilds — except when the two instantiations coincide, in
+which case there is nothing to rebuild.
 
 ## Panics and traps
 

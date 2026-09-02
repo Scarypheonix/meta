@@ -251,6 +251,24 @@ func (c *cloner) cloneBlocks(callee *ir.Func) *ir.Block {
 			nb.SetTerminator(nt, c.blocks[b.Succs[0]], c.blocks[b.Succs[1]])
 		}
 	}
+
+	// A φ's operands are positional: operand i is the value arriving from Preds[i]
+	// (internal/ir's OpPhi). The φs above were cloned with their operands in the
+	// *callee's* pred order, but the edges were just created by walking the callee's
+	// blocks and appending to each successor's Preds -- which is a different order
+	// whenever a block's predecessors do not happen to appear in that same sequence.
+	//
+	// So the pred lists are rebuilt from the originals, in the originals' order. The two
+	// lists hold the same edges either way, which is why nothing that only counts them
+	// ever noticed: a merge block whose two arms arrived the other way round silently
+	// swapped its two values.
+	for _, b := range callee.Blocks {
+		nb := c.blocks[b]
+		nb.Preds = nb.Preds[:0]
+		for _, p := range b.Preds {
+			nb.Preds = append(nb.Preds, c.blocks[p])
+		}
+	}
 	return c.blocks[callee.Entry]
 }
 

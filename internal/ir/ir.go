@@ -621,16 +621,28 @@ func (f *Func) DropBlocks(keep map[*Block]bool) bool {
 	}
 	f.Blocks = kept
 	for _, b := range f.Blocks {
-		var preds []*Block
+		// A φ's operands are positional, so a dropped predecessor takes the operand at
+		// its own index with it. Both lists are rebuilt in one pass rather than deleting
+		// from the operand list by an index into the *pred* list: after the first
+		// deletion those two indices no longer agree, and the second dropped predecessor
+		// would take the wrong operand -- or, past the end, none at all.
+		preds := make([]*Block, 0, len(b.Preds))
+		var keptIdx []int
 		for i, p := range b.Preds {
 			if keep[p] {
 				preds = append(preds, p)
-				continue
+				keptIdx = append(keptIdx, i)
 			}
+		}
+		if len(preds) != len(b.Preds) {
 			for _, phi := range b.Phis {
-				if i < len(phi.Args) {
-					phi.Args = append(phi.Args[:i], phi.Args[i+1:]...)
+				args := make([]*Value, 0, len(keptIdx))
+				for _, i := range keptIdx {
+					if i < len(phi.Args) {
+						args = append(args, phi.Args[i])
+					}
 				}
+				phi.Args = args
 			}
 		}
 		b.Preds = preds
@@ -676,4 +688,36 @@ func (b *Block) ReplacePred(old, with *Block) {
 			return
 		}
 	}
+}
+
+// CheckPhis verifies the one invariant every optimizer pass has to preserve and none of
+// them state: a φ's operands are positional, so operand i is the value arriving along
+// Preds[i], and the two lists must therefore have the same length.
+//
+// It is a structural check, not a dataflow one -- it cannot see an operand that is the
+// right count but the wrong edge. What it does catch is a pass that adds or drops an edge
+// without touching the φs on the other end, which is the shape of every bug of this kind
+// found so far, and it catches it where it happened rather than three passes later.
+func CheckPhis(f *Func) error {
+	for _, b := range f.Blocks {
+		for _, phi := range b.Phis {
+			if len(phi.Args) != len(b.Preds) {
+				return fmt.Errorf("left %s's v%d with %d operands for %d predecessors",
+					b, phi.ID, len(phi.Args), len(b.Preds))
+			}
+		}
+		for _, p := range b.Preds {
+			found := false
+			for _, s := range p.Succs {
+				if s == b {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("left %s listing %s as a predecessor with no edge back", b, p)
+			}
+		}
+	}
+	return nil
 }
