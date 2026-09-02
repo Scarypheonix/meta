@@ -1,0 +1,6 @@
+// EXPECT: reject E0001
+// spec: 01-lexical.md — `\(` runs to the `)` that matches it.
+
+fn main() {
+    let s = "\(1";
+}

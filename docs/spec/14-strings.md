@@ -148,6 +148,31 @@ nothing else — no whitespace, no underscores, no radix prefix. A value that do
 an `i64` is `None`, not a trap: overflow inside `parse_int` is a property of the input, and
 the prelude uses `checked_mul` and `checked_add` (§06's `Int`) so it stays one.
 
+## Interpolation
+
+A string literal may embed an expression, written `\(expr)` (§01 gives the lexical rule).
+It is *desugared*, in the parser, into the calls it means:
+
+| Written | Means |
+|---|---|
+| `"hello, \(name)!"` | `"hello, ".concat(name.to_str()).concat("!")` |
+| `"\(n)"` | `n.to_str()` |
+| `"a\(x)\(y)b"` | `"a".concat(x.to_str()).concat(y.to_str()).concat("b")` |
+
+That is the whole definition. Interpolation adds no node to the syntax tree, no rule to
+the type checker and nothing at all to the three engines: what a program gets is the
+expression above, checked and compiled like any other.
+
+Two consequences follow from the desugaring rather than being extra rules:
+
+- **An interpolated value must implement `Show`** (§06), because `to_str` is what renders
+  it. `"\(v)"` where `v` implements nothing is the same error as `v.to_str()` is, in the
+  same place.
+- **The pieces are joined left to right**, so evaluation order is §04's, unremarkably.
+
+An interpolation is a complete expression context: a struct literal needs no parentheses
+inside one, because `\(` and `)` already delimit it.
+
 ## Errors
 
 | Condition | Result |
@@ -231,6 +256,12 @@ boundary error and never a malformed-input error. There is no fifth row.
 | `"hello".slice(3, 1)` | TRAPS `index out of range`, exit 101 |
 | `"héllo".slice(0, 2)` | TRAPS `string index is not a character boundary`, exit 101 |
 | `"héllo".char_at(2)` | TRAPS `string index is not a character boundary`, exit 101 |
+| `"hello, \(name)!"` with `name = "world"` | `hello, world` + `!` |
+| `"\(n) + 1 = \(n + 1)"` with `n = 41` | `41 + 1 = 42` |
+| `"nested: \("inner \(n)")"` | `nested: inner 41` |
+| `"\(p)"` for a `p` with a user `Show` impl | whatever that impl returns |
+| `"\(v)"` where `v` implements nothing | REJECTED — no method `to_str` |
+| `"\()"`, `"\(1 2)"` | REJECTED at the lexer and the parser respectively |
 | a string built by 1000 `concat`s, then `len()` | the same number on all three engines |
 | `hash::of(s)` for a sliced and a literal string with the same bytes | equal (§13) |
 | a `List[String]` surviving a collection that moves every element | the same strings |

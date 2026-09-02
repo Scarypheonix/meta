@@ -123,12 +123,11 @@ A `char` is a Unicode scalar value: `0..=0x10FFFF` excluding the surrogate range
 ### String literals
 
 ```
-StringLit = '"' { Escape | any scalar value except '"' or "\\" } '"' ;
+StringLit = '"' { Escape | Interpolation | any scalar value except '"' or "\\" } '"' ;
 ```
 
 String literals are `String` values (§08: heap-allocated, immutable, UTF-8). A literal
-may span lines; the newline is part of the value. There are no raw strings and no
-interpolation in 0.1 (DEFERRED, Phase 7).
+may span lines; the newline is part of the value. There are no raw strings.
 
 ### Escapes
 
@@ -142,6 +141,29 @@ Escape = "\\" ( "n" | "r" | "t" | "0" | "\\" | "'" | '"'
 (it would be ambiguous between a byte and a scalar value). `\u{...}` accepts 1 to 6 hex
 digits and MUST denote a Unicode scalar value. Any other escape is REJECTED with a
 diagnostic naming the offending character.
+
+### Interpolation
+
+```
+Interpolation = "\\" "(" Expr ")" ;
+```
+
+A string literal may embed an expression, which is rendered with `to_str` and joined to
+the text around it. What that means is §14's; what it *is* is lexical, and the escape is
+where it lives for a reason: `\(` was a rejected escape before this existed, so no literal
+that used to be valid changes meaning, and there is no doubling rule to remember — `{`,
+`}` and `$` are ordinary characters in a string.
+
+```origin
+let name = "world";
+io::println("hello, \(name)!");        // hello, world!
+io::println("\(1 + 2) items");         // 3 items
+io::println("nested: \("inner \(1)")"); // nested: inner 1
+```
+
+The expression runs to the `)` that matches its own `(`, counted in **tokens**: a `)`
+inside a nested string literal or a character literal closes nothing. An interpolation
+holds exactly one expression; `\()` and `\(1 2)` are REJECTED.
 
 ## Punctuation and operators
 

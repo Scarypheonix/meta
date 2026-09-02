@@ -1,0 +1,61 @@
+use std::io;
+
+// `match` against literal patterns, on every type that has them.
+//
+// An arm test is a comparison the programmer never wrote, and it needs the same thing a
+// written one does: the operand's static kind (ADR-0021). A register holds sixty-four bits
+// and nothing in it says whether they are a signed integer, an unsigned one, a `char` or a
+// pointer to a `String` -- so the comparison carries the kind, and `internal/compile` reads
+// it off the pattern's own type.
+//
+// Native code used to receive these comparisons with no kind at all and refuse to lower
+// them. It went unnoticed because the two places a literal pattern appears in this suite
+// matched enum variants (which lower to `is_variant`, not a comparison) and because at
+// `-O1` and above a match on a *constant* scrutinee folds away before the backend sees it.
+
+const LIMIT: i64 = 7;
+
+fn classify(n: i64) -> String {
+    match n {
+        0 => "zero",
+        1 => "one",
+        LIMIT => "the limit",
+        _ => "other",
+    }
+}
+
+fn word(c: char) -> String {
+    match c { 'a' => "ay", 'z' => "zed", _ => "?" }
+}
+
+fn flag(b: bool) -> String {
+    match b { true => "yes", false => "no" }
+}
+
+fn name(s: String) -> String {
+    match s { "red" => "warm", "blue" => "cool", _ => "unknown" }
+}
+
+fn tag(u: u8) -> String {
+    match u { 0 => "none", 255 => "max", _ => "mid" }
+}
+
+fn main() {
+    // A scrutinee the optimizer cannot fold, so every level reaches the same code.
+    let mut i = 0;
+    while i < 9 {
+        io::println(classify(i));
+        i = i + 1;
+    }
+    io::println(word('a'));
+    io::println(word('z'));
+    io::println(word('q'));
+    io::println(flag(true));
+    io::println(flag(false));
+    io::println(name("red"));
+    io::println(name("blue"));
+    io::println(name("green"));
+    io::println(tag(0u8));
+    io::println(tag(255u8));
+    io::println(tag(7u8));
+}

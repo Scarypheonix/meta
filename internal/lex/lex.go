@@ -33,6 +33,29 @@ type Token struct {
 	Char rune
 	// Suffix is the literal's type suffix ("i32", "f64"), or "" if absent.
 	Suffix string
+	// Parts is a string literal's interpolation structure, and is nil for a literal with
+	// no `\(...)` in it -- which is every literal the language had before Phase 7, so a
+	// plain string is exactly the token it always was, with Str holding the whole thing.
+	//
+	// A literal *with* interpolations is a run of alternating pieces: Str still holds the
+	// text with the interpolations removed (which is what a diagnostic wants to show),
+	// and Parts is what the parser desugars (spec/14-strings.md).
+	Parts []StrPart
+}
+
+// StrPart is one piece of an interpolated string literal: either literal text, or the
+// tokens of an expression that was written between `\(` and its matching `)`.
+//
+// The lexer produces the expression's tokens itself rather than handing the parser a
+// source range to re-lex. They are ordinary tokens with ordinary spans in the same file,
+// so a diagnostic inside an interpolation points at the source the programmer wrote, and
+// the parser needs nothing it does not already have.
+type StrPart struct {
+	// Text is the literal chunk, with escapes decoded. Expr is nil for such a part.
+	Text string
+	// Expr is the interpolated expression's tokens, ending with an EOF token so a
+	// sub-parser can run over them unchanged. Text is "" for such a part.
+	Expr []Token
 }
 
 // String renders a token for diagnostics and test failures.
@@ -442,18 +465,53 @@ func (l *Lexer) lexString() Token {
 	start := l.pos
 	l.pos++ // opening quote
 	var sb strings.Builder
+	var parts []StrPart
+	// interpolated is what marks the literal, rather than `parts != nil`: `"\(x)"` has an
+	// interpolation and no literal chunk at all.
+	interpolated := false
+
+	// flush ends the literal chunk being accumulated. An empty chunk is dropped rather
+	// than recorded: there is nothing between `"` and `\(` in `"\(x)"`, and nothing
+	// between two adjacent interpolations, and a part holding "" would only be something
+	// for the parser to skip.
+	flush := func() {
+		if sb.Len() > 0 {
+			parts = append(parts, StrPart{Text: sb.String()})
+			sb.Reset()
+		}
+	}
+
 	for {
 		if l.atEnd() || l.src[l.pos] == '\n' {
 			l.errorf(start, min(l.pos, len(l.src)), "unterminated string literal").
 				Label("this string is never closed").
 				Note("a string literal may span lines, but this one reaches the end of the file")
+			if interpolated {
+				flush()
+				return l.strToken(start, parts)
+			}
 			return Token{Kind: Str, Span: l.span(start, l.pos), Str: sb.String()}
 		}
 		if l.src[l.pos] == '"' {
 			l.pos++
+			if interpolated {
+				flush()
+				return l.strToken(start, parts)
+			}
 			return Token{Kind: Str, Span: l.span(start, l.pos), Str: sb.String()}
 		}
 		if l.src[l.pos] == '\\' {
+			// `\(` opens an interpolation (spec/14-strings.md). Every other escape is
+			// lexEscape's, and `\(` was an error before this existed, so no string that
+			// used to be valid changes meaning.
+			if l.pos+1 < len(l.src) && l.src[l.pos+1] == '(' {
+				interpolated = true
+				flush()
+				if toks, ok := l.lexInterpolation(); ok {
+					parts = append(parts, StrPart{Expr: toks})
+				}
+				continue
+			}
 			r, ok := l.lexEscape()
 			if ok {
 				sb.WriteRune(r)
@@ -462,6 +520,63 @@ func (l *Lexer) lexString() Token {
 		}
 		sb.WriteRune(l.nextRune())
 	}
+}
+
+// strToken assembles an interpolated literal's token, with Str holding the text of its
+// literal chunks so that a diagnostic naming the literal has something to show.
+//
+// Parts is never nil here even when every chunk was empty, because nil is what tells the
+// parser the literal is an ordinary one.
+func (l *Lexer) strToken(start int, parts []StrPart) Token {
+	if parts == nil {
+		parts = []StrPart{}
+	}
+	var sb strings.Builder
+	for _, p := range parts {
+		sb.WriteString(p.Text)
+	}
+	return Token{Kind: Str, Span: l.span(start, l.pos), Str: sb.String(), Parts: parts}
+}
+
+// lexInterpolation consumes `\(` through its matching `)` and returns the tokens between
+// them, terminated by EOF so that a sub-parser can run over them unchanged.
+//
+// The nesting is counted in *tokens*, not bytes, so a `)` inside a nested string literal
+// or a character literal closes nothing -- Next handles those, and this only ever sees
+// the LParen and RParen they are not.
+func (l *Lexer) lexInterpolation() ([]Token, bool) {
+	open := l.pos
+	l.pos += 2 // `\(`
+
+	var toks []Token
+	depth := 1
+	for {
+		t := l.Next()
+		if t.Kind == EOF {
+			l.errorf(open, l.pos, "unterminated interpolation").
+				Label("this `\\(` is never closed").
+				Help("write `)` to end the expression")
+			return nil, false
+		}
+		if t.Kind == LParen {
+			depth++
+		}
+		if t.Kind == RParen {
+			depth--
+			if depth == 0 {
+				toks = append(toks, Token{Kind: EOF, Span: t.Span})
+				break
+			}
+		}
+		toks = append(toks, t)
+	}
+	if len(toks) == 1 { // only the EOF: nothing between the parentheses
+		l.errorf(open, l.pos, "empty interpolation").
+			Label("there is no expression here").
+			Help("write the value to interpolate, as in `\"total: \\(n)\"`")
+		return nil, false
+	}
+	return toks, true
 }
 
 func (l *Lexer) lexChar() Token {

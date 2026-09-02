@@ -23,7 +23,7 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Range patterns (`1..=9`) | exhaustiveness over integer ranges needs interval splitting in Maranget | Phase 7 |
 | Labelled `break` / `continue` | needs loop labels in the resolver | Phase 7 |
 | Glob imports, `use ... as` | ambiguity rules and rename bookkeeping | Phase 7 |
-| String interpolation | needs a formatting trait and a lexer mode | Phase 7 |
+| String interpolation | delivered in Phase 7: `"\\(expr)"`, specified in §01 (lexical) and §14 (meaning). No formatting trait was needed in the end -- `Show` already renders a value and `Str::concat` already joins two strings, so the parser desugars a literal into those calls and nothing downstream learns a new form. The escape is where it lives because `\\(` was a rejected escape before this existed, so no literal that used to be valid changes meaning, and there is no `{{` doubling rule | done |
 | Raw string literals | trivial, but no consumer yet | Phase 7 |
 | `isize` / `usize` | add only if the Mach-O writer needs them in Origin source | Phase 5 |
 | Fixed-size arrays `[T; N]` | needs const generics | Phase 7 |

@@ -1,0 +1,17 @@
+hello, world!
+41 + 1 = 42
+world
+bare: 41
+nested: inner 41
+paren inside a nested string: a)b
+braces { } and a backslash \ and a quote " are ordinary
+tab:	after
+second line 41
+call: 12
+if: big
+match: forty-one
+struct: (1, 2)
+point (3, 4) again (3, 4)
+true false z 41
+3 parts, first a
+len of "hello" is 5

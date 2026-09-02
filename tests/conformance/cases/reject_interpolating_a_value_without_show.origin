@@ -1,0 +1,9 @@
+// EXPECT: reject E0599
+// spec: 14-strings.md — `"\(v)"` desugars to `v.to_str()`, so a value with no `Show` impl
+// fails exactly where the call it stands for would.
+
+struct NoShow { x: i64 }
+
+fn main() {
+    let s = "\(NoShow { x: 1 })";
+}

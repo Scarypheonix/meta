@@ -1,0 +1,18 @@
+// EXPECT: accept
+// spec: 14-strings.md — an interpolated value is rendered with `to_str`, so `Show` is the
+// bound it needs, and nothing else about the literal changes.
+
+struct P { x: i64 }
+
+impl Show for P {
+    fn to_str(self) -> String { "P(\(self.x))" }
+}
+
+fn main() {
+    let n = 1;
+    let s = "a\(n)b";
+    let t = "\(n)";
+    let u = "\("nested \(n)")";
+    let v = "\(P { x: 2 })";
+    let w = "no interpolation, and { } are ordinary";
+}

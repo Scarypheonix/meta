@@ -1,0 +1,54 @@
+use std::io;
+use std::list;
+
+// `\(expr)` inside any string literal (spec/01-lexical.md, spec/14-strings.md). It is
+// desugared in the parser into `concat` and `to_str`, so nothing downstream learns a new
+// form -- which is also why an interpolated value has to implement `Show` like any other
+// value that gets rendered, and why the pieces are joined left to right.
+
+struct Point { x: i64, y: i64 }
+
+impl Show for Point {
+    fn to_str(self) -> String { "(\(self.x), \(self.y))" }
+}
+
+fn twice(n: i64) -> i64 { n * 2 }
+
+fn main() {
+    let name = "world";
+    let n = 41;
+
+    io::println("hello, \(name)!");
+    io::println("\(n) + 1 = \(n + 1)");
+    io::println("\(name)");
+    io::println("bare: \(n)");
+
+    // Nesting: the inner literal is a literal like any other, and its own `)` closes
+    // nothing on the outside.
+    io::println("nested: \("inner \(n)")");
+    io::println("paren inside a nested string: \("a)b")");
+
+    // Ordinary escapes and ordinary braces are unaffected: there is no doubling rule.
+    io::println("braces { } and a backslash \\ and a quote \" are ordinary");
+    io::println("tab:\tafter\nsecond line \(n)");
+
+    // Any expression, including calls, blocks and matches.
+    io::println("call: \(twice(twice(3)))");
+    io::println("if: \(if n > 40 { "big" } else { "small" })");
+    io::println("match: \(match n { 41 => "forty-one", _ => "other" })");
+
+    // A struct literal needs no parentheses: `\(` and `)` already delimit it.
+    io::println("struct: \(Point { x: 1, y: 2 })");
+
+    // A user `Show` impl, itself written with interpolation.
+    let p = Point { x: 3, y: 4 };
+    io::println("point \(p) again \(p)");
+
+    // Every primitive `Show` covers.
+    io::println("\(true) \(false) \('z') \(n)");
+
+    // And it composes with the rest of §14.
+    let parts = "a,b,c".split(",");
+    io::println("\(parts.len()) parts, first \(parts.at(0))");
+    io::println("len of \"hello\" is \("hello".len())");
+}

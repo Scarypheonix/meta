@@ -1,0 +1,6 @@
+// EXPECT: reject E0001
+// spec: 01-lexical.md — an interpolation holds exactly one expression.
+
+fn main() {
+    let s = "\()";
+}

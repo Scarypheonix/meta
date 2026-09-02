@@ -52,6 +52,18 @@ func (c *Compiler) match(v *ast.Match) error {
 	return nil
 }
 
+// scrutineeKind is the static kind of the value an arm test compares against, which the
+// comparison has to carry for the same reason a source-level `==` does: a register holds
+// sixty-four bits and nothing in it says whether they are a signed integer, an unsigned
+// one, a float or a pointer to a String (ADR-0021).
+//
+// A `match` arm's test is a comparison the programmer never wrote, so there is no
+// expression to read a type from -- it is the *pattern's* type, which the checker recorded
+// under the pattern's own node.
+func (c *Compiler) scrutineeKind(id ast.NodeID) bytecode.Kind {
+	return kindOfType(c.patTypeOf(id))
+}
+
 // testPattern emits code that tests the value in slot against a pattern, binding as it
 // goes. Every way the test can fail is appended to fails as a jump to patch.
 func (c *Compiler) testPattern(p ast.Pattern, slot int, fails *[]int) error {
@@ -76,7 +88,7 @@ func (c *Compiler) testPattern(p ast.Pattern, slot int, fails *[]int) error {
 			if err := c.expr(ref.Const.Value); err != nil {
 				return err
 			}
-			c.emit(bytecode.OpEq, v.Span())
+			c.emitA(bytecode.OpEq, int(c.scrutineeKind(v.NodeID())), v.Span())
 			*fails = append(*fails, c.emitA(bytecode.OpJumpIfFalse, 0, v.Span()))
 			return nil
 		}
@@ -94,7 +106,7 @@ func (c *Compiler) testPattern(p ast.Pattern, slot int, fails *[]int) error {
 		if err := c.literal(v); err != nil {
 			return err
 		}
-		c.emit(bytecode.OpEq, v.Span())
+		c.emitA(bytecode.OpEq, int(c.scrutineeKind(v.NodeID())), v.Span())
 		*fails = append(*fails, c.emitA(bytecode.OpJumpIfFalse, 0, v.Span()))
 		return nil
 

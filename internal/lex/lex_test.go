@@ -1,6 +1,7 @@
 package lex
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -367,5 +368,76 @@ func TestKindStringsReadNaturallyInDiagnostics(t *testing.T) {
 		if got := tt.k.String(); got != tt.want {
 			t.Errorf("Kind(%d).String() = %q, want %q", int(tt.k), got, tt.want)
 		}
+	}
+}
+
+// String interpolation (spec/01-lexical.md): `\(` opens an expression, and the lexer
+// produces its tokens rather than a source range for the parser to re-lex.
+func TestStringInterpolation(t *testing.T) {
+	tests := []struct {
+		src string
+		// want is the parts, written as "text" for a literal chunk and "<n>" for an
+		// expression part of n tokens (the terminating EOF included).
+		want     []string
+		wantErrs bool
+	}{
+		{`"plain"`, nil, false},                            // no parts at all
+		{`"a\(x)b"`, []string{"a", "<2>", "b"}, false},     // x, EOF
+		{`"\(x)"`, []string{"<2>"}, false},                 // an empty chunk is not a part
+		{`"\(x)\(y)"`, []string{"<2>", "<2>"}, false},      // and neither is the one between
+		{`"a\(x + 1)"`, []string{"a", "<4>"}, false},       // x + 1 EOF
+		{`"a\(f(1))"`, []string{"a", "<5>"}, false},        // f ( 1 ) EOF
+		{`"a\("b)c")d"`, []string{"a", "<2>", "d"}, false}, // a `)` in a nested string closes nothing
+		{`"a\nb\(x)"`, []string{"a\nb", "<2>"}, false},     // ordinary escapes still work
+		{`"\("`, nil, true},                                // unterminated
+		{`"\()"`, nil, true},                               // empty
+		{`"\(x"`, nil, true},                               // never closed
+	}
+	for _, tt := range tests {
+		toks, bag := lexAll(t, tt.src)
+		if bag.HasErrors() != tt.wantErrs {
+			t.Errorf("%q: errors = %v, want %v\n%s", tt.src, bag.HasErrors(), tt.wantErrs, bag)
+			continue
+		}
+		if tt.wantErrs {
+			continue
+		}
+		if toks[0].Kind != Str {
+			t.Errorf("%q: first token is %v, want a string", tt.src, toks[0].Kind)
+			continue
+		}
+		if (toks[0].Parts != nil) != (tt.want != nil) {
+			t.Errorf("%q: Parts != nil is %v, want %v", tt.src, toks[0].Parts != nil, tt.want != nil)
+			continue
+		}
+		var got []string
+		for _, p := range toks[0].Parts {
+			if p.Expr == nil {
+				got = append(got, p.Text)
+			} else {
+				got = append(got, "<"+strconv.Itoa(len(p.Expr))+">")
+			}
+		}
+		if len(got) != len(tt.want) {
+			t.Errorf("%q: parts = %v, want %v", tt.src, got, tt.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("%q: part %d = %q, want %q", tt.src, i, got[i], tt.want[i])
+			}
+		}
+	}
+}
+
+// The text of an interpolated literal, with the interpolations removed, is what a
+// diagnostic naming the literal has to show.
+func TestInterpolatedLiteralKeepsItsText(t *testing.T) {
+	toks, bag := lexAll(t, `"a\(x)b\(y)c"`)
+	if bag.HasErrors() {
+		t.Fatalf("unexpected errors:\n%s", bag)
+	}
+	if toks[0].Str != "abc" {
+		t.Errorf("Str = %q, want %q", toks[0].Str, "abc")
 	}
 }

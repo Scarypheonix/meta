@@ -339,6 +339,9 @@ func (p *Parser) parsePrimary() ast.Expr {
 		return e
 	case lex.Str:
 		p.advance()
+		if t.Parts != nil {
+			return p.interpolated(t, start)
+		}
 		e := &ast.StrLit{Value: t.Str}
 		e.Base = p.base(start)
 		return e
