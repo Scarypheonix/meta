@@ -310,6 +310,57 @@ bug.
 
 ---
 
+## 17. A word-frequency report *(Phase 7)*
+
+```origin
+use std::io;
+use std::list;
+use std::map;
+
+fn count_words(text: String) -> Map[String, i64] {
+    let counts = map::new[String, i64]();
+    for line in text.split("\n") {
+        for word in line.split(" ") {
+            let w = word.trim();
+            if !w.is_empty() {
+                match counts.get(w) {
+                    Option::Some(n) => { counts.insert(w, n + 1); },
+                    Option::None => { counts.insert(w, 1); },
+                }
+            }
+        }
+    }
+    counts
+}
+
+fn report(path: String) -> Result[String, IoError] {
+    let text = read_to_string(path)?;
+    let counts = count_words(text);
+    let mut out = "\(counts.len()) distinct words in \(text.len()) bytes\n";
+    for word in ranked(counts) {
+        out = out.concat("  \(word): \(count_of(counts, word))\n");
+    }
+    Result::Ok(out)
+}
+```
+
+Given `the quick brown fox / jumps over the lazy dog / the fox sleeps`, stdout begins
+`9 distinct words in 59 bytes` and lists `the: 3`, `fox: 2`, then the singletons in
+alphabetical order. Reading a path that is not there prints `no report: not found`. Exit:
+`0`. The whole program is `tests/e2e/cases/word_frequency.origin`, including the sort,
+which is written in Origin.
+
+Nothing here is a language feature demonstration, and that is the point: every part of it
+needed something Origin did not have when Phase 7 began. `Map[String, i64]` and `List`
+needed collections and a hash the three engines agree on (§13); `split`, `trim` and
+`is_empty` needed strings (§14); `"\(word): \(n)"` needed interpolation; `read_to_string`
+needed files (§15); `?` on the `Result` it returns needed the early return to be built at
+the enclosing function's own type (§09); and `counts.get(w)` returning an `Option` needed
+`match` on a literal to compile at every optimization level. Reading it as ordinary code —
+rather than as a list of features — is what the phase was for.
+
+---
+
 ## Programs that must be REJECTED
 
 Each of these exits `1` with the named diagnostic and produces no binary.

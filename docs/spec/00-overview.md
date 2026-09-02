@@ -27,6 +27,9 @@ must be corrected in the same commit that changes behaviour.
 | `10-examples.md` | Worked examples with exact expected output |
 | `11-codegen.md` | Native code generation, object files, the runtime, debug info |
 | `12-concurrency.md` | Threads, channels, `Mutex`, deadlock, panics under concurrency |
+| `13-collections.md` | `Array`, `List`, `Map`, and the specified hash |
+| `14-strings.md` | `String`'s operations, character boundaries, interpolation |
+| `15-files.md` | Reading and writing whole files |
 
 ## Design pillars
 
@@ -63,7 +66,7 @@ Operator overloading, index syntax `a[i]`, collection literals, attributes/`deri
 macros, closures capturing by reference distinct from by value, lifetimes, borrow
 checking, const generics, higher-kinded types, generic associated types,
 specialization, weak references, finalizers, unwinding, `unsafe` blocks, variadics,
-default trait method type parameters, string interpolation.
+default trait method type parameters, a `Path` type, file handles.
 
 Each of these is listed in `docs/deferred.md` with a rationale and a target phase.
 Absence here is a decision, not an oversight.

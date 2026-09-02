@@ -1,0 +1,100 @@
+use std::io;
+use std::list;
+use std::map;
+
+// Phase 7's whole surface in one program: a file is read, split into words, counted in a
+// `Map`, sorted, and reported with interpolation. Every part of it needed something the
+// language did not have when the phase began.
+
+fn count_words(text: String) -> Map[String, i64] {
+    let counts = map::new[String, i64]();
+    for line in text.split("\n") {
+        for word in line.split(" ") {
+            let w = word.trim();
+            if !w.is_empty() {
+                match counts.get(w) {
+                    Option::Some(n) => { counts.insert(w, n + 1); },
+                    Option::None => { counts.insert(w, 1); },
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// The keys, sorted by count descending and then by the word, so the report does not
+/// depend on insertion order. An insertion sort: the input is small and the point is that
+/// the program is written in Origin, not that it is fast.
+fn ranked(counts: Map[String, i64]) -> List[String] {
+    let out = list::new[String]();
+    for word in counts.keys() {
+        let mut at = out.len();
+        let mut i = 0;
+        while i < out.len() {
+            if beats(counts, word, out.at(i)) {
+                at = i;
+                i = out.len();
+            } else {
+                i = i + 1;
+            }
+        }
+        out.push(word);
+        // Shuffle the new word down into place.
+        let mut j = out.len() - 1;
+        while j > at {
+            let tmp = out.at(j - 1);
+            out.set(j - 1, out.at(j));
+            out.set(j, tmp);
+            j = j - 1;
+        }
+    }
+    out
+}
+
+fn beats(counts: Map[String, i64], a: String, b: String) -> bool {
+    let ca = count_of(counts, a);
+    let cb = count_of(counts, b);
+    if ca != cb {
+        return ca > cb;
+    }
+    match a.cmp(b) {
+        Ordering::Less => true,
+        Ordering::Equal => false,
+        Ordering::Greater => false,
+    }
+}
+
+fn count_of(counts: Map[String, i64], word: String) -> i64 {
+    match counts.get(word) {
+        Option::Some(n) => n,
+        Option::None => 0,
+    }
+}
+
+/// The whole report, or the reason there is none. `?` is what makes the failure one line.
+fn report(path: String) -> Result[String, IoError] {
+    let text = read_to_string(path)?;
+    let counts = count_words(text);
+    let mut out = "\(counts.len()) distinct words in \(text.len()) bytes\n";
+    for word in ranked(counts) {
+        out = out.concat("  \(word): \(count_of(counts, word))\n");
+    }
+    Result::Ok(out)
+}
+
+fn main() {
+    let path = "tests/e2e/scratch/words.txt";
+    let text = "the quick brown fox\njumps over the lazy dog\nthe fox sleeps\n";
+    match write_string(path, text) {
+        Result::Ok(_) => {},
+        Result::Err(e) => panic("cannot write: \(e.to_str())"),
+    }
+    match report(path) {
+        Result::Ok(r) => io::print(r),
+        Result::Err(e) => io::println("no report: \(e.to_str())"),
+    }
+    match report("tests/e2e/scratch/missing.txt") {
+        Result::Ok(r) => io::print(r),
+        Result::Err(e) => io::println("no report: \(e.to_str())"),
+    }
+}

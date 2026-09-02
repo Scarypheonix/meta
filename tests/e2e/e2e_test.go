@@ -37,6 +37,9 @@ type caseFile struct {
 	WantErr  string
 	HasErr   bool
 	WantExit int
+	// Src is the case's own source, read so that the harness can tell whether the
+	// program touches the filesystem (usesFiles).
+	Src string
 }
 
 func loadCases(t *testing.T) []caseFile {
@@ -68,7 +71,12 @@ func loadCases(t *testing.T) []caseFile {
 			t.Errorf("%s.exit is %d, which is not a possible process exit status", name, code)
 			continue
 		}
-		c := caseFile{AbsPath: path, Name: name, WantOut: string(wantOut), WantExit: code}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		c := caseFile{AbsPath: path, Name: name, WantOut: string(wantOut), WantExit: code, Src: string(src)}
 		if rel, err := filepath.Rel(root, path); err == nil {
 			c.RelPath = rel
 		} else {
@@ -229,8 +237,10 @@ func TestEnginesAgree(t *testing.T) {
 // the repository root, the same reason a diagnostic can name `tests/e2e/cases/x.origin`.
 const scratchDir = "tests/e2e/scratch"
 
-// usesFiles reports whether a case writes to the filesystem, by its name.
-func usesFiles(c caseFile) bool { return strings.HasPrefix(c.Name, "file_") }
+// usesFiles reports whether a case writes to the filesystem, by whether its source names
+// the scratch directory. A marker in the source rather than in the file name, so that a
+// case cannot ask for a directory it never mentions or mention one it does not get.
+func usesFiles(c caseFile) bool { return strings.Contains(c.Src, scratchDir) }
 
 // withScratch makes the scratch directory, runs f, and removes it again. Every engine's
 // run of a file case gets a clean one, so the seven runs cannot see each other's writes.

@@ -4,7 +4,7 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Phases 0 through 6 are complete** (see `docs/phases/`). Phase 7 has not started, and
+**Phases 0 through 7 are complete** (see `docs/phases/`). Phase 8 has not started, and
 its scope is the user's to set.
 
 ---
@@ -51,7 +51,8 @@ internal/opt/         the optimizer: folding, CSE, LICM, escape analysis, inlini
 internal/mono/        monomorphization of call dispatch (ADR-0010)
 internal/compile/     AST -> bytecode, per monomorphized instance
 internal/vm/          the bytecode virtual machine
-internal/prelude/     Option, Result, Ordering — written in Origin
+internal/prelude/     the standard library, written in Origin: Option, Result, Ordering,
+                      the concurrency handles, List, Map, the Str trait, IoError and files
 internal/x86/         a hand-written encoder for the instructions the backend emits
 internal/dwarf/       the DWARF4 line table and its compile-unit DIE (ADR-0023)
 internal/codesign/    the ad-hoc Mach-O code signature, without which macOS will not
@@ -64,7 +65,8 @@ tests/e2e/            programs + exact expected stdout/stderr/exit
 tests/docs/           documentation invariants (ADR numbering, code registry, lints)
 tests/debuginfo/      lldb/llvm-dwarfdump on both formats; skips if they are absent
 tests/fuzz/           fuzz targets for the lexer and parser
-docs/spec/            THE language specification — normative
+docs/spec/            THE language specification — normative; §13 collections, §14
+                      strings, §15 files were added in Phase 7
 docs/adr/             architecture decision records — every irreversible choice
 docs/phases/          N-complete.md, written at each phase gate
 docs/deferred.md      everything deliberately left out, each tagged with a phase
@@ -108,7 +110,9 @@ RAM, macOS Monterey 12.7.6, x86-64. Development happens in a Linux x86-64 contai
    that agreement lives in **one** shared module with its own tests — never duplicated.
    Current shared-agreement modules: `internal/layout` owns object layout and headers
    for the GC and, from Phase 5, the backend; stack maps and safepoint placement join
-   it there (spec §08).
+   it there (spec §08), and from Phase 7 the longest run of bytes a `String` can hold
+   (§15). `internal/compile` owns the builtin indices and the file-operation statuses
+   every engine reads; `internal/obj` owns the per-target syscall numbers.
 6. **ADRs for irreversible choices.** Numbered file in `docs/adr/`: context, options
    considered, decision, consequences. If you cannot remember why something is the way
    it is, the ADR was missing — write it retroactively and say so in the file.
@@ -171,6 +175,22 @@ This project outlasts any single context window.
 
 ## Status
 
+**Phase 7 is complete** (`docs/phases/7-complete.md`). Origin has the standard library a
+program cannot be written without: `List` and `Map` over one compiler-provided `Array[T]`
+(ADR-0028), a hash the three engines agree on to the bit, a `String` with a real surface,
+string interpolation, and whole-file reading and writing with no handle (ADR-0030). `?`
+applies to `Option` as well as `Result`. The prelude is 908 lines of Origin and is now the
+largest body of Origin in the project.
+
+Read `docs/phases/7-complete.md` before adding anything to the prelude or to `std::`. The
+thing most likely to matter later is the shape of the six bugs recorded there: five of the
+six were found by *writing a library in Origin* rather than by testing the compiler, and
+four were invisible to a differential suite that had no case exercising them. Two are worth
+knowing before touching their subsystems — **ADR-0029** (every engine resolves a method
+through monomorphization; the interpreter is not "the engine without types") and the
+collector's sixth root-set hole, a string literal in read-only data that `rt_evacuate` tried
+to move.
+
 **Phase 6 is complete** (`docs/phases/6-complete.md`). Origin has green threads, channels
 and a mutex; `Send` is derived structurally by the checker rather than promised by a
 document; and every program in §12's worked-examples table runs byte-identically on the
@@ -202,20 +222,22 @@ unrunnable.
 **Known-broken / deferred**, all recorded in `docs/deferred.md` with a phase: integer
 arithmetic is 64-bit only in every engine and `u64::MAX` has no run-time representation;
 `match` compiles to a linear chain of arm tests; `to_str` on a `Float` is unimplemented in
-native code (no spec fixes a rendering — Phase 7); a struct or enum declared inside a
-function body fails loudly in `internal/compile` rather than being checked (Phase 8); a
-function used both as a direct callee and as an escaping value loses its direct-call fast
-path for every use (ADR-0020); native collection is single-space, non-generational, with
-no write barrier (ADR-0022); DWARF is a line table and a symbol table only, so
-`frame variable` does not work (ADR-0023); no engine runs threads in parallel; and the
-native runtime never reclaims what it maps for a channel, a mutex or a finished thread's
-stack.
+native code (no spec fixes a rendering, and a real one is a shortest-round-trip decimal
+algorithm — Phase 8); a struct or enum declared inside a function body fails loudly in
+`internal/compile` rather than being checked (Phase 8); a function used both as a direct
+callee and as an escaping value loses its direct-call fast path for every use (ADR-0020);
+native collection is single-space, non-generational, with no write barrier (ADR-0022);
+DWARF is a line table and a symbol table only, so `frame variable` does not work
+(ADR-0023); no engine runs threads in parallel; the native runtime never reclaims what it
+maps for a channel, a mutex or a finished thread's stack; `std::fs` has no directory
+listing, metadata, rename, delete or streaming, and there is no `Path` type (ADR-0030);
+and error conversion in `?` via `Into` needs a blanket-impl story (Phase 8).
 
-**Next action:** Phase 7's scope is not decided. `docs/deferred.md` holds most of a
-candidate list — the standard library (collections, which need `Hash` and index syntax),
-`select`, float formatting, string interpolation, `?` on `Option` — and rule 7 puts the
-choice of what 0.1 actually ships with the user rather than the implementer. Nothing is in
-flight.
+**Next action:** Phase 8's scope is not decided, and rule 7 puts that choice with the user.
+`docs/deferred.md` holds the candidates, and two stand out for what Phase 9 needs rather
+than for their own sake: the **package manager and multi-file compilation** (Phase 9's
+compiler will not be one file), and **float formatting**, which is the last `unimplemented:`
+in native code. Nothing is in flight.
 
 **A note on the history:** the VM's concurrency runtime landed inside commit `6b073de`,
 whose message describes only ADR-0027 — the bug the VM work uncovered. The commit is
