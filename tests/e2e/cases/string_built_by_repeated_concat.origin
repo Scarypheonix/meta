@@ -1,0 +1,22 @@
+use std::io;
+
+// A thousand concatenations: each one allocates a fresh `String` and copies both operands
+// into it, so this is also a thousand chances for a collection to move an operand out from
+// under the routine doing the copying (spec/14-strings.md, §08).
+fn main() {
+    let mut s = "";
+    let mut i = 0;
+    while i < 1000 {
+        s = s.concat("ab");
+        i = i + 1;
+    }
+    io::println(s.len().to_str());
+    io::println(s.slice(0, 6));
+    io::println(s.slice(1994, 2000));
+    io::println(s.starts_with("abab").to_str());
+    io::println(s.ends_with("abab").to_str());
+    io::println(s.char_count().to_str());
+
+    // And the same string built the other way round, which must compare equal.
+    io::println((s == "ab".repeat(1000)).to_str());
+}

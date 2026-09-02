@@ -296,117 +296,104 @@ func (e *emitter) strCopyBytes() {
 	a.Bind(done)
 }
 
-// emitStrSlice writes `rt_str_slice(s rdi, start rsi, end rdx) -> status rax, string rdx`.
+// emitStrSliceCheck writes `rt_str_slice_check(s rdi, start rsi, end rdx) -> status rax,
+// length rdx`: everything spec/14-strings.md says a slice's two indices must satisfy, and
+// how many bytes the result will hold. A leaf.
 //
-// It allocates, so the source string is held in a callee-saved register across the call and
-// re-read afterwards: a collection during the allocation may move it, and the register the
-// collector rewrote is the only place it is still correct.
-func (e *emitter) emitStrSlice() {
+// It is separate from the copy because of where the allocation between them has to happen.
+// A runtime routine that held the source string across its own allocation would be holding
+// it somewhere the collector does not look: the root walk substitutes a synthetic
+// all-saved, no-roots-of-its-own entry for any frame with no stack map (collect.go's
+// emitGCRuntimeFrameEntry), so a reference parked in one of its callee-saved registers is
+// never updated when a collection moves the object. Splitting the work leaves the
+// allocation at an ordinary call site in user code, where `recordCall` writes a real entry
+// and the register allocator has already given every operand of that call a home the
+// collector walks -- which is exactly what `construct` relies on for a struct's fields.
+func (e *emitter) emitStrSliceCheck() {
 	a := e.a
 	a.Align(16)
-	a.Bind(e.rt.strSlice)
-
-	e.runtimePrologue()
+	a.Bind(e.rt.strSliceCheck)
 
 	outOfRange := a.NewLabel("str_slice_range")
 	notBoundary := a.NewLabel("str_slice_boundary")
 
-	a.MovRR(x86.RBX, x86.RDI) // the source, across the allocation
-	a.MovRR(x86.R12, x86.RSI) // start
-	a.MovRR(x86.R13, x86.RDX) // end
-
 	// start <= end <= len, with start >= 0. Signed comparisons, because a negative index
 	// must fail rather than wrap into a very large one -- `end` is compared against the
 	// length, which an unsigned test would let a negative `start` slip past.
-	a.CmpRI(x86.R12, 0)
+	a.CmpRI(x86.RSI, 0)
 	a.Jcc(x86.Less, outOfRange)
-	a.CmpRR(x86.R12, x86.R13)
+	a.CmpRR(x86.RSI, x86.RDX)
 	a.Jcc(x86.Greater, outOfRange)
-	a.MovRM(x86.RCX, x86.At(x86.RBX, strLenOff))
-	a.CmpRR(x86.R13, x86.RCX)
+	a.MovRM(x86.R9, x86.At(x86.RDI, strLenOff))
+	a.CmpRR(x86.RDX, x86.R9)
 	a.Jcc(x86.Greater, outOfRange)
 
-	a.MovRR(x86.RDI, x86.RBX)
-	a.MovRR(x86.RSI, x86.R12)
+	// Both endpoints must fall between characters, not inside one. strBoundaryCheck reads
+	// the index from rsi, so `end` is moved there and `start` put back afterwards.
+	a.MovRR(x86.R9, x86.RDX) // end
 	e.strBoundaryCheck(notBoundary)
-	a.MovRR(x86.RSI, x86.R13)
+	a.MovRR(x86.R10, x86.RSI) // start
+	a.MovRR(x86.RSI, x86.R9)
 	e.strBoundaryCheck(notBoundary)
 
-	a.MovRR(x86.R14, x86.R13)
-	a.SubRR(x86.R14, x86.R12) // r14 = the length of the result
-	a.MovRR(x86.RDI, x86.R14)
-	a.Call(e.rt.strAlloc)
-
-	// rbx is where the source is *now*: the allocation above may have moved it, and the
-	// collector rewrote the callee-saved register rather than the argument it came in on.
-	a.MovRR(x86.RDI, x86.RAX)
-	a.AddRI(x86.RDI, strBytesOff)
-	a.MovRR(x86.RSI, x86.RBX)
-	a.AddRI(x86.RSI, strBytesOff)
-	a.AddRR(x86.RSI, x86.R12) // + start
-	a.MovRR(x86.RCX, x86.R14)
-	a.MovRR(x86.R12, x86.RAX) // the result, across the copy
-	e.strCopyBytes()
-
-	a.MovRR(x86.RDX, x86.R12)
+	a.MovRR(x86.RDX, x86.R9)
+	a.SubRR(x86.RDX, x86.R10) // end - start
 	a.MovRI(x86.RAX, strOK)
-	e.runtimeEpilogue()
 	a.Ret()
 
 	a.Bind(outOfRange)
 	a.MovRI(x86.RAX, strOutOfRange)
 	a.XorRR(x86.RDX, x86.RDX)
-	e.runtimeEpilogue()
 	a.Ret()
 
 	a.Bind(notBoundary)
 	a.MovRI(x86.RAX, strNotBoundary)
 	a.XorRR(x86.RDX, x86.RDX)
-	e.runtimeEpilogue()
 	a.Ret()
 }
 
-// emitStrConcat writes `rt_str_concat(a rdi, b rsi) -> rax`. It cannot fail.
-//
-// Both operands are held in callee-saved registers across the allocation, for the reason
-// `rt_str_slice` holds one: a collection may move either, and the collector rewrites the
-// registers it walks rather than the arguments they arrived in.
-func (e *emitter) emitStrConcat() {
+// emitStrSliceInto writes `rt_str_slice_into(dst rdi, s rsi, start rdx)`: copy the bytes
+// into a String the caller has already allocated, taking the count from the destination's
+// own length word. A leaf -- it allocates nothing, so neither operand can move under it.
+func (e *emitter) emitStrSliceInto() {
 	a := e.a
 	a.Align(16)
-	a.Bind(e.rt.strConcat)
+	a.Bind(e.rt.strSliceInto)
 
-	e.runtimePrologue()
-
-	a.MovRR(x86.RBX, x86.RDI) // a
-	a.MovRR(x86.R12, x86.RSI) // b
-
-	a.MovRM(x86.R13, x86.At(x86.RBX, strLenOff))
-	a.MovRM(x86.R14, x86.At(x86.R12, strLenOff))
-	a.MovRR(x86.RDI, x86.R13)
-	a.AddRR(x86.RDI, x86.R14)
-	a.Call(e.rt.strAlloc)
-
-	// rax carries the result through both copies: strCopyBytes touches only rdi, rsi,
-	// rcx and rdx, and makes no call, so nothing can move the object in between. rbx and
-	// r12 are where the *operands* are now -- the allocation above may have moved either,
-	// and the collector rewrote the callee-saved registers rather than rdi and rsi.
-	a.MovRR(x86.RDI, x86.RAX)
+	a.MovRM(x86.RCX, x86.At(x86.RDI, strLenOff))
 	a.AddRI(x86.RDI, strBytesOff)
-	a.MovRR(x86.RSI, x86.RBX)
 	a.AddRI(x86.RSI, strBytesOff)
-	a.MovRR(x86.RCX, x86.R13)
+	a.AddRR(x86.RSI, x86.RDX)
+	e.strCopyBytes()
+	a.Ret()
+}
+
+// emitStrConcatInto writes `rt_str_concat_into(dst rdi, a rsi, b rdx)`: both operands'
+// bytes, in order, into a String the caller has already allocated. A leaf, for the reason
+// emitStrSliceCheck explains.
+func (e *emitter) emitStrConcatInto() {
+	a := e.a
+	a.Align(16)
+	a.Bind(e.rt.strConcatInto)
+
+	a.MovRM(x86.R8, x86.At(x86.RSI, strLenOff)) // len(a)
+	a.MovRM(x86.R9, x86.At(x86.RDX, strLenOff)) // len(b)
+
+	a.MovRR(x86.R10, x86.RDI) // the destination's base, kept for the second copy
+	a.MovRR(x86.R11, x86.RDX) // b
+
+	a.AddRI(x86.RDI, strBytesOff)
+	a.AddRI(x86.RSI, strBytesOff)
+	a.MovRR(x86.RCX, x86.R8)
 	e.strCopyBytes()
 
-	a.MovRR(x86.RDI, x86.RAX)
+	a.MovRR(x86.RDI, x86.R10)
 	a.AddRI(x86.RDI, strBytesOff)
-	a.AddRR(x86.RDI, x86.R13)
-	a.MovRR(x86.RSI, x86.R12)
+	a.AddRR(x86.RDI, x86.R8)
+	a.MovRR(x86.RSI, x86.R11)
 	a.AddRI(x86.RSI, strBytesOff)
-	a.MovRR(x86.RCX, x86.R14)
+	a.MovRR(x86.RCX, x86.R9)
 	e.strCopyBytes()
-
-	e.runtimeEpilogue()
 	a.Ret()
 }
 

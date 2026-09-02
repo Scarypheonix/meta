@@ -758,25 +758,13 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 3 {
 			return fmt.Errorf("this is a compiler bug: str::slice takes three arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
-		e.load(x86.RSI, v.Args[1])
-		e.load(x86.RDX, v.Args[2])
-		e.a.Call(e.rt.strSlice)
-		e.recordCall(v)
-		e.strStatus(v)
-		e.def(v, x86.RDX)
-		return nil
+		return e.strSlice(v)
 
 	case compile.BuiltinStrConcat:
 		if len(v.Args) != 2 {
 			return fmt.Errorf("this is a compiler bug: str::concat takes two arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
-		e.load(x86.RSI, v.Args[1])
-		e.a.Call(e.rt.strConcat)
-		e.recordCall(v)
-		e.def(v, x86.RAX)
-		return nil
+		return e.strConcat(v)
 
 	case compile.BuiltinNewArray:
 		// rt_array_new(capacity, typeid): the second argument is the layout
@@ -976,6 +964,57 @@ func (e *emitter) refusedStatus(v *ir.Value, refused string) {
 	a.Jcc(x86.Equal, ok)
 	e.trapAtUserSpan(v, refused)
 	a.Bind(ok)
+}
+
+// strSlice and strConcat lower the two string operations that allocate.
+//
+// The allocation is emitted *here*, in user code, rather than inside a runtime routine --
+// which is the whole reason the runtime side of each is split into a check and a leaf copy
+// (strings.go's emitStrSliceCheck explains). A routine of its own would have to hold the
+// source string across its own allocation, and the collector's root walk substitutes a
+// no-roots-of-its-own entry for a frame with no stack map, so nothing would update it when
+// a collection moved the object. At a call site in user code, `recordCall` writes a real
+// entry and the register allocator has already given the operands homes the collector
+// walks -- the same thing `construct` relies on for a struct's fields, and the reason both
+// read their operands again *after* the allocation rather than before.
+func (e *emitter) strSlice(v *ir.Value) error {
+	a := e.a
+	e.load(x86.RDI, v.Args[0])
+	e.load(x86.RSI, v.Args[1])
+	e.load(x86.RDX, v.Args[2])
+	a.Call(e.rt.strSliceCheck)
+	e.strStatus(v)
+
+	a.MovRR(x86.RDI, x86.RDX) // the result's length in bytes
+	a.Call(e.rt.strAlloc)
+	e.recordCall(v)
+
+	a.MovRR(scratchA, x86.RAX) // the new String, held while its bytes land
+	e.load(x86.RSI, v.Args[0]) // wherever the source is *now*
+	e.load(x86.RDX, v.Args[1])
+	a.MovRR(x86.RDI, scratchA)
+	a.Call(e.rt.strSliceInto)
+	e.def(v, scratchA)
+	return nil
+}
+
+func (e *emitter) strConcat(v *ir.Value) error {
+	a := e.a
+	e.load(scratchA, v.Args[0])
+	a.MovRM(x86.RDI, x86.At(scratchA, strLenOff))
+	e.load(scratchA, v.Args[1])
+	a.MovRM(scratchB, x86.At(scratchA, strLenOff))
+	a.AddRR(x86.RDI, scratchB)
+	a.Call(e.rt.strAlloc)
+	e.recordCall(v)
+
+	a.MovRR(scratchA, x86.RAX)
+	e.load(x86.RSI, v.Args[0])
+	e.load(x86.RDX, v.Args[1])
+	a.MovRR(x86.RDI, scratchA)
+	a.Call(e.rt.strConcatInto)
+	e.def(v, scratchA)
+	return nil
 }
 
 // strStatus turns a string routine's status (strings.go) into one of the two traps

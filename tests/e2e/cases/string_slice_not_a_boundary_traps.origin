@@ -1,0 +1,11 @@
+use std::io;
+
+// A byte index that would split a character TRAPS rather than producing a `String` that
+// is not valid UTF-8 (spec/14-strings.md): `==`, ordering, hashing and printing all
+// assume a `String` is valid text, and an operation that could break that would make
+// every one of them undefined.
+fn main() {
+    io::println("before");
+    let s = "héllo".slice(0, 2);
+    io::println("unreachable");
+}

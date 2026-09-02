@@ -1,0 +1,38 @@
+use std::io;
+
+// `parse_int` (spec/14-strings.md): an optional sign, then digits, then nothing. Every
+// rejection is `None` rather than a trap, overflow included -- a number too large for an
+// `i64` is a property of the input, and `checked_mul`/`checked_sub` are what keep it one.
+fn show(o: Option[i64]) -> String {
+    match o {
+        Option::Some(n) => n.to_str(),
+        Option::None => "None",
+    }
+}
+
+fn main() {
+    io::println(show("42".parse_int()));
+    io::println(show("0".parse_int()));
+    io::println(show("-7".parse_int()));
+    io::println(show("+7".parse_int()));
+    io::println(show("007".parse_int()));
+
+    // The two ends of the range, which is the reason the magnitude is accumulated
+    // negative: `i64::MIN`'s magnitude has no positive value to accumulate.
+    io::println(show("9223372036854775807".parse_int()));
+    io::println(show("-9223372036854775808".parse_int()));
+    io::println(show("9223372036854775808".parse_int()));
+    io::println(show("-9223372036854775809".parse_int()));
+    io::println(show("99999999999999999999".parse_int()));
+
+    io::println(show("".parse_int()));
+    io::println(show("-".parse_int()));
+    io::println(show("+".parse_int()));
+    io::println(show("4x2".parse_int()));
+    io::println(show("x42".parse_int()));
+    io::println(show("42 ".parse_int()));
+    io::println(show(" 42".parse_int()));
+    io::println(show("4.2".parse_int()));
+    io::println(show("--4".parse_int()));
+    io::println(show("4_2".parse_int()));
+}

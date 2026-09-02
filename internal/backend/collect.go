@@ -169,6 +169,16 @@ func (e *emitter) emitLookupStackMap() {
 // space being collected out of, so the forwarding check alone is exactly the "already
 // evacuated this cycle" test.
 //
+// One reference is *not* in the space being collected out of, and would be a wild write
+// if it were treated as though it were: a string literal, which backend.go's stringConst
+// puts in read-only data as a complete String object so that a literal is a pointer
+// rather than an allocation. Copying it is pointless -- it is immortal and never moves --
+// and forwarding it means writing a forwarding header into a page mapped read-only, which
+// is a SIGSEGV rather than a wrong answer. So anything outside the current semispace is
+// returned unchanged. internal/gc's own evacuateMajor needs no such test because the
+// interpreter and the VM intern a literal into the heap like any other object; only
+// native code has objects the collector does not own.
+//
 // A leaf: it calls nothing and uses only rax, rcx, rdx, rdi, r8, r9, r10, r11 -- never
 // rbx/r12/r13/r14, which is what lets rt_collect call it freely while using those four
 // to carry a live root through untouched.
@@ -178,12 +188,22 @@ func (e *emitter) emitEvacuate() {
 	a.Bind(e.rt.evacuate)
 
 	isNil := a.NewLabel("evac_nil")
+	immortal := a.NewLabel("evac_immortal")
 	notForwarded := a.NewLabel("evac_not_forwarded")
 	copyDone := a.NewLabel("evac_copy_done")
 	copyLoop := a.NewLabel("evac_copy_loop")
 
 	a.TestRR(x86.RDI, x86.RDI)
 	a.Jcc(x86.Equal, isNil)
+
+	// The from-space is the semispace alloc just failed out of: [end - heapSize, end).
+	// Its start needs no field of its own, since heapSize is a compile-time constant.
+	a.MovRM(x86.RCX, x86.At(x86.R15, rtEndOff))
+	a.CmpRR(x86.RDI, x86.RCX)
+	a.Jcc(x86.AboveEqual, immortal)
+	a.SubRI(x86.RCX, heapSize)
+	a.CmpRR(x86.RDI, x86.RCX)
+	a.Jcc(x86.Below, immortal)
 
 	a.MovRM(x86.RAX, x86.At(x86.RDI, 0)) // header
 	a.MovRR(x86.RCX, x86.RAX)
@@ -234,6 +254,10 @@ func (e *emitter) emitEvacuate() {
 
 	a.Bind(isNil)
 	a.XorRR(x86.RAX, x86.RAX)
+	a.Ret()
+
+	a.Bind(immortal)
+	a.MovRR(x86.RAX, x86.RDI)
 	a.Ret()
 }
 

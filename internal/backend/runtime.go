@@ -143,14 +143,15 @@ type runtimeLabels struct {
 	hashWord   x86.Label
 	hashObject x86.Label
 	// The string operations (strings.go, spec/14-strings.md).
-	strLen       x86.Label
-	strByteAt    x86.Label
-	strSlice     x86.Label
-	strConcat    x86.Label
-	strCharAt    x86.Label
-	strCharWidth x86.Label
-	strAlloc     x86.Label
-	charToStr    x86.Label
+	strLen        x86.Label
+	strByteAt     x86.Label
+	strSliceCheck x86.Label
+	strSliceInto  x86.Label
+	strConcatInto x86.Label
+	strCharAt     x86.Label
+	strCharWidth  x86.Label
+	strAlloc      x86.Label
+	charToStr     x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -207,8 +208,9 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.hashObject = e.a.NewLabel("rt_hash_object")
 	e.rt.strLen = e.a.NewLabel("rt_str_len")
 	e.rt.strByteAt = e.a.NewLabel("rt_str_byte_at")
-	e.rt.strSlice = e.a.NewLabel("rt_str_slice")
-	e.rt.strConcat = e.a.NewLabel("rt_str_concat")
+	e.rt.strSliceCheck = e.a.NewLabel("rt_str_slice_check")
+	e.rt.strSliceInto = e.a.NewLabel("rt_str_slice_into")
+	e.rt.strConcatInto = e.a.NewLabel("rt_str_concat_into")
 	e.rt.strCharAt = e.a.NewLabel("rt_str_char_at")
 	e.rt.strCharWidth = e.a.NewLabel("rt_str_char_width")
 	e.rt.strAlloc = e.a.NewLabel("rt_str_alloc")
@@ -262,8 +264,9 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitStrCharWidth()
 	e.emitStrCharAt()
 	e.emitStrAlloc()
-	e.emitStrSlice()
-	e.emitStrConcat()
+	e.emitStrSliceCheck()
+	e.emitStrSliceInto()
+	e.emitStrConcatInto()
 	e.emitCharToStr()
 	e.emitCollect()
 }

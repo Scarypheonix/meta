@@ -1,0 +1,27 @@
+use std::io;
+use std::hash;
+
+// A `String` built by slicing and one written as a literal are the same value: equal,
+// equally ordered, and equally hashed (§13's hash is over the bytes, not the object).
+fn main() {
+    let literal = "ell";
+    let sliced = "hello".slice(1, 4);
+    let joined = "e".concat("l").concat("l");
+
+    io::println((literal == sliced).to_str());
+    io::println((literal == joined).to_str());
+    io::println((sliced == joined).to_str());
+    io::println((hash::of(literal) == hash::of(sliced)).to_str());
+    io::println((hash::of(literal) == hash::of(joined)).to_str());
+    io::println((literal < "elm").to_str());
+
+    // Reference identity is a different question, and says so.
+    io::println(ref_eq(literal, sliced).to_str());
+    io::println(ref_eq(literal, literal).to_str());
+
+    // The same number on all three engines: that is what makes §13's hash specified
+    // rather than an implementation detail.
+    io::println(hash::of("hello").to_str());
+    io::println(hash::of("").to_str());
+    io::println(hash::of("héllo").to_str());
+}

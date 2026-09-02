@@ -63,7 +63,9 @@ pub trait Str {
 
     // Written in Origin, as default method bodies over the six above.
     fn is_empty(self) -> bool { ... }
+    fn as_string(self) -> String { ... }
     fn char_count(self) -> i64 { ... }
+    fn matches_at(self, at: i64, needle: String) -> bool { ... }
     fn starts_with(self, prefix: String) -> bool { ... }
     fn ends_with(self, suffix: String) -> bool { ... }
     fn find(self, needle: String) -> Option[i64] { ... }
@@ -109,7 +111,9 @@ kind of quiet special case ADR-0005's trapping arithmetic exists to avoid.
 | Operation | Meaning |
 |---|---|
 | `s.is_empty()` | `s.len() == 0` |
+| `s.as_string()` | `s` as a `String` |
 | `s.char_count()` | how many characters, which is `len()` only for ASCII |
+| `s.matches_at(i, n)` | whether `n`'s bytes occur at byte index `i` |
 | `s.starts_with(p)` | whether `s` begins with the bytes of `p` |
 | `s.ends_with(p)` | whether `s` ends with the bytes of `p` |
 | `s.find(n)` | the **byte** index where `n` first occurs, or `None` |
@@ -123,7 +127,16 @@ kind of quiet special case ADR-0005's trapping arithmetic exists to avoid.
 
 `find` and `split` search by bytes, not by characters. That is the same answer either way:
 UTF-8 is self-synchronizing, so a valid encoding never occurs at a non-boundary inside
-another one, and a byte-wise match is therefore always a character-wise match.
+another one, and a byte-wise match is therefore always a character-wise match. They search
+with `matches_at` rather than by slicing, because a slice whose end fell inside a character
+would TRAP, and a search has to be able to ask about a position before it knows whether the
+answer is yes.
+
+`as_string` is there because inside a default method body `self` has type `Self`, not
+`String` — so `split`, which builds a `List[String]`, and `repeat`, which concatenates, both
+need a conversion the trait itself supplies. For `String` it is a copy of the whole thing,
+which is what makes it total for a future implementor whose representation is not a
+`String` at all.
 
 `split` on the empty separator is `None`-free but degenerate, and is defined: it returns a
 one-element list holding `s`. `split` of the empty string on any separator returns a
@@ -203,6 +216,7 @@ boundary error and never a malformed-input error. There is no fifth row.
 | `"hello".find("ll")` | `Some(2)` |
 | `"hello".find("z")` | `None` |
 | `"a,b,c".split(",")` joined by spaces | `a b c` |
+| `"héllo wörld".split(" ")` joined by `\|` | `héllo\|wörld` — a separator search never splits a character |
 | `"a,b,".split(",")` length | `3` |
 | `"abc".split("")` length | `1` |
 | `"ab".repeat(3)` | `ababab` |

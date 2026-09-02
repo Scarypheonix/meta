@@ -1,0 +1,70 @@
+use std::io;
+
+// The half of `Str` written in Origin (spec/14-strings.md): searching, splitting and
+// walking, all of it over the six the compiler provides.
+
+fn show(o: Option[i64]) -> String {
+    match o {
+        Option::Some(n) => n.to_str(),
+        Option::None => "None",
+    }
+}
+
+fn join(parts: List[String], sep: String) -> String {
+    let mut out = "";
+    let mut first = true;
+    for p in parts {
+        if first {
+            first = false;
+        } else {
+            out = out.concat(sep);
+        }
+        out = out.concat(p);
+    }
+    out
+}
+
+fn main() {
+    io::println("hello".starts_with("he").to_str());
+    io::println("hello".starts_with("hello").to_str());
+    io::println("hello".starts_with("hello!").to_str());
+    io::println("hello".starts_with("").to_str());
+    io::println("hello".ends_with("lo").to_str());
+    io::println("hello".ends_with("h").to_str());
+
+    // `find` is by byte, which is the same answer as by character: UTF-8 never encodes
+    // one scalar inside another.
+    io::println(show("hello".find("ll")));
+    io::println(show("hello".find("h")));
+    io::println(show("hello".find("o")));
+    io::println(show("hello".find("z")));
+    io::println(show("hello".find("")));
+    io::println(show("héllo".find("l")));
+    io::println("hello".contains("ell").to_str());
+    io::println("hello".contains("elo").to_str());
+
+    io::println(join("a,b,c".split(","), "|"));
+    io::println("a,b,".split(",").len().to_str());
+    io::println(join("a,b,".split(","), "|").concat("<"));
+    io::println("abc".split("").len().to_str());
+    io::println(join("abc".split(""), "|"));
+    io::println(join("".split(","), "|").concat("<"));
+    io::println(join("a::b::c".split("::"), " "));
+    io::println(join("héllo wörld".split(" "), "|"));
+
+    io::println("ab".repeat(3));
+    io::println("[".concat("ab".repeat(0)).concat("]"));
+    io::println("[".concat("ab".repeat(-2)).concat("]"));
+
+    io::println("[".concat("  hi  ".trim()).concat("]"));
+    io::println("[".concat("  hi  ".trim_start()).concat("]"));
+    io::println("[".concat("  hi  ".trim_end()).concat("]"));
+    io::println("[".concat("     ".trim()).concat("]"));
+    io::println("[".concat("hi".trim()).concat("]"));
+
+    let mut chars = "";
+    for c in "héllo".chars() {
+        chars = chars.concat(c.to_str()).concat(".");
+    }
+    io::println(chars);
+}

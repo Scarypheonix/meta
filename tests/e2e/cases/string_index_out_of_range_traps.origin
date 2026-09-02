@@ -1,0 +1,9 @@
+use std::io;
+
+// An index outside the string TRAPS with the caller's own line, never the prelude's
+// (spec/14-strings.md). §04 leaves no room for it to return whatever is next in memory.
+fn main() {
+    io::println("before");
+    let b = "hello".byte_at(9);
+    io::println("unreachable");
+}

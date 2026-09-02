@@ -563,17 +563,7 @@ pub trait Str {
 
     /// Whether `self` begins with the bytes of `prefix`.
     fn starts_with(self, prefix: String) -> bool {
-        if prefix.len() > self.len() {
-            return false;
-        }
-        let mut i = 0;
-        while i < prefix.len() {
-            if self.byte_at(i) != prefix.byte_at(i) {
-                return false;
-            }
-            i = i + 1;
-        }
-        true
+        self.matches_at(0, prefix)
     }
 
     /// Whether `self` ends with the bytes of `suffix`.
@@ -581,10 +571,21 @@ pub trait Str {
         if suffix.len() > self.len() {
             return false;
         }
-        let base = self.len() - suffix.len();
+        self.matches_at(self.len() - suffix.len(), suffix)
+    }
+
+    /// Whether `needle`'s bytes occur at byte index `at`.
+    ///
+    /// Comparing bytes rather than slicing is what makes this safe at any index: a slice
+    /// whose end fell inside a character would TRAP, and a search has to be able to ask
+    /// about a position before it knows whether the answer is yes.
+    fn matches_at(self, at: i64, needle: String) -> bool {
+        if at + needle.len() > self.len() {
+            return false;
+        }
         let mut i = 0;
-        while i < suffix.len() {
-            if self.byte_at(base + i) != suffix.byte_at(i) {
+        while i < needle.len() {
+            if self.byte_at(at + i) != needle.byte_at(i) {
                 return false;
             }
             i = i + 1;
@@ -603,17 +604,7 @@ pub trait Str {
         let last = self.len() - needle.len();
         let mut at = 0;
         while at <= last {
-            let mut i = 0;
-            let mut same = true;
-            while i < needle.len() {
-                if self.byte_at(at + i) != needle.byte_at(i) {
-                    same = false;
-                    i = needle.len();
-                } else {
-                    i = i + 1;
-                }
-            }
-            if same {
+            if self.matches_at(at, needle) {
                 return Option::Some(at);
             }
             at = at + 1;
@@ -638,10 +629,14 @@ pub trait Str {
             out.push(self.as_string());
             return out;
         }
+        // `at` only ever moves by a whole character or past a whole separator, so it is
+        // always a character boundary and every slice below is legal. Testing for the
+        // separator by bytes rather than by slicing is what makes that possible: a slice
+        // at a mid-character offset would TRAP before the comparison ever happened.
         let mut start = 0;
         let mut at = 0;
         while at + sep.len() <= self.len() {
-            if self.slice(at, at + sep.len()) == sep {
+            if self.matches_at(at, sep) {
                 out.push(self.slice(start, at));
                 at = at + sep.len();
                 start = at;

@@ -1,0 +1,9 @@
+use std::io;
+
+// `char_at` at a continuation byte is the same error: a byte index used where a character
+// index was meant (spec/14-strings.md).
+fn main() {
+    io::println("before");
+    let c = "héllo".char_at(2);
+    io::println("unreachable");
+}

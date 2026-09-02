@@ -585,3 +585,99 @@ fn main() {
 }
 `, "60\n6300\n0") // 60 lists of sum(0..14) = 105.
 }
+
+// A String held across the allocation that copies it (spec/14-strings.md).
+//
+// `rt_str_concat` and `rt_str_slice` are the only string routines that allocate, and each
+// one reads bytes out of an operand *after* the allocation that may have moved it. That is
+// exactly the shape of the constructor bug this file was written for, in a routine the
+// register allocator never sees: the operands arrive in rdi and rsi, which the collector
+// does not walk, so both are parked in callee-saved registers first and re-read from there
+// afterwards. Shrinking the heap around a thousand concatenations is what makes a
+// collection land in the middle of one.
+func TestStringsSurviveACollectionInsideTheirOwnCopy(t *testing.T) {
+	checkRun(t, `
+use std::io;
+
+fn main() {
+    let mut s = "";
+    let mut i = 0;
+    while i < 400 {
+        s = s.concat("ab");
+        i = i + 1;
+    }
+    io::println(s.len().to_str());
+    io::println(s.slice(0, 4));
+    io::println(s.slice(796, 800));
+    io::println((s == "ab".repeat(400)).to_str());
+}
+`, "800\nabab\nabab\ntrue")
+}
+
+// The same hazard with a live reference the *caller* holds: `parts` is a list of strings
+// that nothing but the list itself keeps alive, and every `concat` below can collect.
+func TestAListOfStringsSurvivesACollection(t *testing.T) {
+	checkRun(t, `
+use std::io;
+use std::list;
+
+fn main() {
+    let parts = list::new[String]();
+    let mut i = 0;
+    while i < 300 {
+        parts.push("x".repeat(i - (i / 7) * 7));
+        i = i + 1;
+    }
+
+    let mut total = 0;
+    for p in parts {
+        total = total + p.len();
+    }
+    io::println(parts.len().to_str());
+    io::println(total.to_str());
+    io::println(parts.at(9));
+    io::println(parts.at(299));
+}
+`, "300\n897\nxx\nxxxxx")
+}
+
+// A string literal is not in the heap, and the collector must not treat it as though it
+// were.
+//
+// backend.go's stringConst puts a literal in read-only data as a complete String object,
+// header and all, so that a literal is a pointer rather than an allocation. Every other
+// reference the root walk meets is in the semispace being collected out of, and
+// rt_evacuate used to assume that of all of them: it copied the object and overwrote its
+// header with a forwarding pointer -- a write to a page mapped read-only, which is a
+// SIGSEGV rather than a wrong answer.
+//
+// This is not a string bug and predates the string operations entirely: it needs only a
+// literal that stays live across an allocation, which a struct with a `String` field or a
+// binding held across a loop both produce. The interpreter and the VM never had it,
+// because they intern a literal into the heap like any other object; only native code has
+// objects the collector does not own.
+func TestAStringLiteralSurvivesACollectionWithoutBeingMoved(t *testing.T) {
+	checkRun(t, `
+use std::io;
+
+struct S { a: String }
+
+fn main() {
+    // A literal live across thousands of allocations: the root walk meets it at every
+    // safepoint, and the object it points at is in read-only data the whole time.
+    let held = "held";
+    let mut n = 0;
+    let mut i = 0;
+    while i < 20000 {
+        let t = S { a: "abcdefghijklmnop" };
+        n = n + t.a.len();
+        i = i + 1;
+    }
+    io::println(held);
+    io::println(n.to_str());
+
+    // And it is still the same object, not a copy: nothing moved it, so identity holds.
+    io::println(ref_eq(held, "held").to_str());
+}
+`, "held\n320000\ntrue")
+}

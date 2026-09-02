@@ -1,0 +1,44 @@
+use std::io;
+
+// The six operations the compiler provides (spec/14-strings.md), and the shape of the
+// division: `len`, `byte_at`, `slice`, `concat`, `char_at` and `char_width` are machine
+// code, and everything else about a string is Origin source in the prelude written over
+// exactly these. From here neither half is distinguishable from the other.
+fn main() {
+    io::println("hello".len().to_str());
+    io::println("".is_empty().to_str());
+    io::println("hello".is_empty().to_str());
+
+    // Bytes and characters are different questions, and a `String` answers both.
+    io::println("héllo".len().to_str());
+    io::println("héllo".char_count().to_str());
+
+    io::println("hello".byte_at(0).to_str());
+    io::println("hello".byte_at(1).to_str());
+    io::println("hello".byte_at(4).to_str());
+
+    io::println("hello".slice(1, 4));
+    io::println("hello".slice(0, 5));
+    // The empty slice, at either end and in the middle.
+    io::println("[".concat("hello".slice(2, 2)).concat("]"));
+    io::println("[".concat("hello".slice(0, 0)).concat("]"));
+    io::println("[".concat("hello".slice(5, 5)).concat("]"));
+
+    io::println("ab".concat("cd"));
+    io::println("[".concat("".concat("")).concat("]"));
+
+    io::println("héllo".char_at(0).to_str());
+    io::println("héllo".char_at(1).to_str());
+    io::println("héllo".char_width(0).to_str());
+    io::println("héllo".char_width(1).to_str());
+
+    // Every width in the encoding: one byte, two, three, four.
+    io::println("a".char_width(0).to_str());
+    io::println("é".char_width(0).to_str());
+    io::println("日".char_width(0).to_str());
+    io::println("😀".char_width(0).to_str());
+    io::println("a".char_at(0).to_str());
+    io::println("é".char_at(0).to_str());
+    io::println("日".char_at(0).to_str());
+    io::println("😀".char_at(0).to_str());
+}
