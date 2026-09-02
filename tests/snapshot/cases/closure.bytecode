@@ -13,7 +13,7 @@ fn 1 main(params=0 locals=2 captures=0)
      1  call 0  ; kind=ref
      2  store 0
      3  load 0
-     4  call 0  ; kind=int
+     4  call 0  ; kind=i64
      5  store 1
      6  unit
      7  return
@@ -22,7 +22,7 @@ fn 2 <lambda>(params=0 locals=2 captures=1)
      0  load_capture 0
      1  store 0
      2  load_capture 0
-     3  get_field 0  ; kind=int
+     3  get_field 0  ; kind=i64
      4  const 1  ; 1
      5  add
      6  store 1
@@ -32,6 +32,6 @@ fn 2 <lambda>(params=0 locals=2 captures=1)
     10  unit
     11  pop
     12  load_capture 0
-    13  get_field 0  ; kind=int
+    13  get_field 0  ; kind=i64
     14  return
 

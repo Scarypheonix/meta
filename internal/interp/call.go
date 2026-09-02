@@ -2,8 +2,11 @@ package interp
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/scarypheonix/meta/internal/arith"
 	"github.com/scarypheonix/meta/internal/ast"
+	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/resolve"
@@ -74,7 +77,7 @@ func (in *Interp) evalMethodCall(m *ast.MethodCall) (Value, ctrl) {
 		args = append(args, v)
 	}
 	target, _ := in.mo.Lookup(in.frame().inst, m.NodeID())
-	return in.callResolved(target, recv, m.Name.Name, args, m.Span()), normal
+	return in.callResolved(target, recv, m.Name.Name, in.kindOfExpr(m.Recv), args, m.Span()), normal
 }
 
 // callResolved runs the method a call site reaches.
@@ -88,11 +91,11 @@ func (in *Interp) evalMethodCall(m *ast.MethodCall) (Value, ctrl) {
 // A site with no instance reaches a compiler-provided impl -- `42.to_str()`,
 // `"a".cmp("b")` -- which is not Origin source to run, and falls through to the builtin
 // methods.
-func (in *Interp) callResolved(target *mono.Instance, recv Value, name string, args []Value, span diag.Span) Value {
+func (in *Interp) callResolved(target *mono.Instance, recv Value, name string, kind bytecode.Kind, args []Value, span diag.Span) Value {
 	if target != nil && target.Decl.Body != nil {
 		return in.callFunction(target.Decl, target, args, recv, true, span)
 	}
-	if v, ok := in.builtinMethod(recv, name, args, span); ok {
+	if v, ok := in.builtinMethod(recv, name, kind, args, span); ok {
 		return v
 	}
 	in.trap(span, "no method `%s` on %s", name, TypeName(recv))
@@ -164,7 +167,7 @@ func (in *Interp) callBuiltin(name string, args []Value, c *ast.Call) Value {
 // builtinMethod implements the methods the prelude will eventually declare in Origin.
 // Phase 7 replaces these with a real standard library; until then they live here so the
 // end-to-end suite can exercise the language.
-func (in *Interp) builtinMethod(recv Value, name string, args []Value, span diag.Span) (Value, bool) {
+func (in *Interp) builtinMethod(recv Value, name string, kind bytecode.Kind, args []Value, span diag.Span) (Value, bool) {
 	switch name {
 	case "to_str":
 		if len(args) != 0 {
@@ -174,22 +177,23 @@ func (in *Interp) builtinMethod(recv Value, name string, args []Value, span diag
 
 	case "wrapping_add", "wrapping_sub", "wrapping_mul":
 		a, b := in.twoInts(recv, args, name, span)
+		k := intKindOr(kind)
 		switch name {
 		case "wrapping_add":
-			return Int(a + b), true
+			return Int(arith.Wrap(k, a+b)), true
 		case "wrapping_sub":
-			return Int(a - b), true
+			return Int(arith.Wrap(k, a-b)), true
 		default:
-			return Int(a * b), true
+			return Int(arith.Wrap(k, a*b)), true
 		}
 
 	case "saturating_add", "saturating_sub", "saturating_mul":
 		a, b := in.twoInts(recv, args, name, span)
-		return Int(saturate(name, a, b)), true
+		return Int(arith.Saturating(intKindOr(kind), arithOpOf(name), a, b)), true
 
 	case "checked_add", "checked_sub", "checked_mul":
 		a, b := in.twoInts(recv, args, name, span)
-		v, ok := checkedOp(name, a, b)
+		v, ok := arith.Checked(intKindOr(kind), arithOpOf(name), a, b)
 		if !ok {
 			return in.optionNone(span), true
 		}
@@ -204,7 +208,27 @@ func (in *Interp) builtinMethod(recv Value, name string, args []Value, span diag
 	return nil, false
 }
 
-func (in *Interp) twoInts(recv Value, args []Value, name string, span diag.Span) (int64, int64) {
+// intKindOr falls back to `i64` when the caller could not name a width, which happens only
+// for a receiver the checker recorded no type for -- a shape no well-typed program has.
+func intKindOr(k bytecode.Kind) bytecode.Kind {
+	if k.IsInteger() {
+		return k
+	}
+	return bytecode.KindI64
+}
+
+// arithOpOf maps a `checked_*` or `saturating_*` method name to the operation it performs.
+func arithOpOf(name string) arith.Op {
+	switch {
+	case strings.HasSuffix(name, "_add"):
+		return arith.OpAdd
+	case strings.HasSuffix(name, "_sub"):
+		return arith.OpSub
+	}
+	return arith.OpMul
+}
+
+func (in *Interp) twoInts(recv Value, args []Value, name string, span diag.Span) (uint64, uint64) {
 	if len(args) != 1 {
 		in.trap(span, "`%s` takes exactly one argument", name)
 	}
@@ -216,67 +240,11 @@ func (in *Interp) twoInts(recv Value, args []Value, name string, span diag.Span)
 	if !ok {
 		in.trap(span, "`%s` takes an integer, found %s", name, TypeName(args[0]))
 	}
-	return int64(a), int64(b)
-}
-
-const (
-	maxI64 = 1<<63 - 1
-	minI64 = -1 << 63
-)
-
-func checkedOp(name string, a, b int64) (int64, bool) {
-	switch name {
-	case "checked_add":
-		s := a + b
-		if (a > 0 && b > 0 && s < 0) || (a < 0 && b < 0 && s >= 0) {
-			return 0, false
-		}
-		return s, true
-	case "checked_sub":
-		d := a - b
-		if (a >= 0 && b < 0 && d < 0) || (a < 0 && b > 0 && d >= 0) {
-			return 0, false
-		}
-		return d, true
-	default:
-		if a == 0 || b == 0 {
-			return 0, true
-		}
-		p := a * b
-		if p/b != a || (a == minI64 && b == -1) || (b == minI64 && a == -1) {
-			return 0, false
-		}
-		return p, true
-	}
-}
-
-func saturate(name string, a, b int64) int64 {
-	checked := "checked_" + name[len("saturating_"):]
-	if v, ok := checkedOp(checked, a, b); ok {
-		return v
-	}
-	// Overflowed: clamp in the direction the true result went.
-	switch name {
-	case "saturating_add":
-		if b > 0 {
-			return maxI64
-		}
-		return minI64
-	case "saturating_sub":
-		if b > 0 {
-			return minI64
-		}
-		return maxI64
-	default:
-		if (a > 0) == (b > 0) {
-			return maxI64
-		}
-		return minI64
-	}
+	return uint64(a), uint64(b)
 }
 
 // optionSome and optionNone build prelude `Option` values. They trap if the prelude is
-// missing rather than inventing a substitute.
+// missing, which is a compiler bug rather than a program's.
 func (in *Interp) optionSome(v Value, span diag.Span) Value {
 	def, va := in.preludeVariant("Option", "Some", span)
 	return &Enum{Def: def, Variant: va, Vals: []Value{v}}

@@ -96,7 +96,7 @@ fn readY(p: Point) -> String { p.y }
 fn main() {}
 `)
 	x := fnByName(t, prog, "readX")
-	if got := kindsAt(x, bytecode.OpGetField); len(got) != 1 || got[0] != bytecode.KindInt {
+	if got := kindsAt(x, bytecode.OpGetField); len(got) != 1 || got[0] != bytecode.KindI64 {
 		t.Errorf("readX's get_field kind = %v, want [KindInt]", got)
 	}
 	y := fnByName(t, prog, "readY")
@@ -124,7 +124,7 @@ fn main() {}
 	got := kindsAt(fn, bytecode.OpGetPayload)
 	// One payload read per field pattern tested: radius (float), then label (string)
 	// and count (int) for the second arm.
-	want := []bytecode.Kind{bytecode.KindFloat, bytecode.KindString, bytecode.KindInt}
+	want := []bytecode.Kind{bytecode.KindFloat, bytecode.KindString, bytecode.KindI64}
 	if len(got) != len(want) {
 		t.Fatalf("get_payload kinds = %v, want %v", got, want)
 	}
@@ -145,7 +145,7 @@ fn main() {}
 `)
 	fn := fnByName(t, prog, "firstOfPair")
 	got := kindsAt(fn, bytecode.OpGetTupleElem)
-	want := []bytecode.Kind{bytecode.KindInt, bytecode.KindString}
+	want := []bytecode.Kind{bytecode.KindI64, bytecode.KindString}
 	if len(got) != len(want) {
 		t.Fatalf("get_tuple_elem kinds = %v, want %v", got, want)
 	}
@@ -170,7 +170,7 @@ fn main() {
 `)
 	mainFn := fnByName(t, prog, "main")
 	got := kindsAt(mainFn, bytecode.OpCall)
-	want := []bytecode.Kind{bytecode.KindRef, bytecode.KindInt}
+	want := []bytecode.Kind{bytecode.KindRef, bytecode.KindI64}
 	if len(got) != len(want) {
 		t.Fatalf("call kinds = %v, want %v", got, want)
 	}
@@ -189,7 +189,7 @@ fn take(b: Box, n: i64, s: String) -> i64 { n }
 fn main() {}
 `)
 	fn := fnByName(t, prog, "take")
-	want := []bytecode.Kind{bytecode.KindRef, bytecode.KindInt, bytecode.KindString}
+	want := []bytecode.Kind{bytecode.KindRef, bytecode.KindI64, bytecode.KindString}
 	if len(fn.ParamKinds) != len(want) {
 		t.Fatalf("ParamKinds = %v, want %v", fn.ParamKinds, want)
 	}
@@ -214,7 +214,7 @@ fn main() {
 }
 `)
 	fn := fnByName(t, prog, "bump")
-	want := []bytecode.Kind{bytecode.KindRef, bytecode.KindInt}
+	want := []bytecode.Kind{bytecode.KindRef, bytecode.KindI64}
 	if len(fn.ParamKinds) != len(want) {
 		t.Fatalf("ParamKinds = %v, want %v (self, by)", fn.ParamKinds, want)
 	}
@@ -244,7 +244,7 @@ fn main() {
 		switch len(fn.CaptureKinds) {
 		case 1:
 			switch fn.CaptureKinds[0] {
-			case bytecode.KindInt:
+			case bytecode.KindI64:
 				fCount++
 			case bytecode.KindString:
 				gCount++

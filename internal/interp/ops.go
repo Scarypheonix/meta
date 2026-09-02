@@ -3,8 +3,11 @@ package interp
 import (
 	"math"
 
+	"github.com/scarypheonix/meta/internal/arith"
 	"github.com/scarypheonix/meta/internal/ast"
+	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/diag"
+	"github.com/scarypheonix/meta/internal/types"
 )
 
 func (in *Interp) evalUnary(u *ast.Unary) (Value, ctrl) {
@@ -16,10 +19,12 @@ func (in *Interp) evalUnary(u *ast.Unary) (Value, ctrl) {
 	case ast.Neg:
 		switch n := v.(type) {
 		case Int:
-			if int64(n) == math.MinInt64 {
-				in.trap(u.Span(), "arithmetic overflow")
+			// At the operand's own width: `-(-128i8)` has no `i8` value either.
+			r, trap := arith.Neg(in.intKind(u.X), uint64(n))
+			if trap != "" {
+				in.trap(u.Span(), "%s", trap)
 			}
-			return Int(-int64(n)), normal
+			return Int(r), normal
 		case Float:
 			return Float(-float64(n)), normal
 		}
@@ -93,7 +98,7 @@ func (in *Interp) applyBinary(b *ast.Binary, l, r Value) Value {
 		if !ok {
 			in.trapMixed(span, b, l, r)
 		}
-		return in.intOp(span, b.Op, int64(li), int64(ri))
+		return in.intOp(span, b.Op, in.intKind(b.L), uint64(li), uint64(ri))
 	case Float:
 		rf, ok := r.(Float)
 		if !ok {
@@ -156,64 +161,117 @@ func (in *Interp) orderOp(span diag.Span, op ast.BinaryOp, cmp int) Value {
 	return Unit{}
 }
 
-// intOp implements integer arithmetic with the trapping semantics of ADR-0005.
-func (in *Interp) intOp(span diag.Span, op ast.BinaryOp, a, b int64) Value {
+// intKind is the width and signedness an arithmetic node operates at.
+//
+// The interpreter carries no width on a value -- an Origin integer is a Go int64 here --
+// so it reads the operand's static type, which is what decides whether `255 + 1` is 256 or
+// a trap (spec/04-expressions.md). Arithmetic is never on a type parameter (`+` on one is
+// REJECTED), so the type is always a concrete primitive and no substitution is needed.
+func (in *Interp) intKind(e ast.Expr) bytecode.Kind {
+	if k := in.kindOfExpr(e); k.IsInteger() {
+		return k
+	}
+	return bytecode.KindI64
+}
+
+// kindOfExpr is the checked kind of an expression, with the running instance's own
+// substitution applied.
+//
+// Arithmetic never needs the substitution -- `+` on a type parameter is REJECTED -- but
+// `wrapping_add` and its siblings are trait methods, so `x.wrapping_add(y)` inside
+// `fn f[T: Int](x: T, ...)` has a receiver whose recorded type is `T`, and only the
+// instance says which width that is here (ADR-0010).
+func (in *Interp) kindOfExpr(e ast.Expr) bytecode.Kind {
+	if in.tys == nil || e == nil {
+		return bytecode.KindUnknown
+	}
+	t, ok := in.tys.ExprTypes[e.NodeID()]
+	if !ok {
+		return bytecode.KindUnknown
+	}
+	if len(in.frames) > 0 {
+		if inst := in.frame().inst; inst != nil && len(inst.Subst) > 0 {
+			t = types.Substitute(t, inst.Subst)
+		}
+	}
+	return kindOfType(t)
+}
+
+// kindOfType maps a checked type to the bytecode kind that names its width and
+// signedness. It mirrors internal/compile's own, and only the integer answers matter here.
+func kindOfType(t types.Type) bytecode.Kind {
+	p, ok := types.Prune(t).(*types.Prim)
+	if !ok || !p.Kind.IsInteger() {
+		return bytecode.KindUnknown
+	}
+	switch p.Kind {
+	case types.I8:
+		return bytecode.KindI8
+	case types.I16:
+		return bytecode.KindI16
+	case types.I32:
+		return bytecode.KindI32
+	case types.I64:
+		return bytecode.KindI64
+	case types.U8:
+		return bytecode.KindU8
+	case types.U16:
+		return bytecode.KindU16
+	case types.U32:
+		return bytecode.KindU32
+	}
+	return bytecode.KindU64
+}
+
+// intOp implements integer arithmetic at a declared width.
+//
+// The rules are internal/arith's rather than this file's: the virtual machine runs the
+// same code, and the native backend mirrors it, so `255u8 + 1` trapping is one decision
+// written once instead of three that happen to agree (spec/04-expressions.md).
+func (in *Interp) intOp(span diag.Span, op ast.BinaryOp, k bytecode.Kind, a, b uint64) Value {
+	var r uint64
+	var trap string
 	switch op {
 	case ast.Add:
-		s := a + b
-		if (a > 0 && b > 0 && s < 0) || (a < 0 && b < 0 && s >= 0) {
-			in.trap(span, "arithmetic overflow")
-		}
-		return Int(s)
+		r, trap = arith.Add(k, a, b)
 	case ast.Sub:
-		d := a - b
-		if (a >= 0 && b < 0 && d < 0) || (a < 0 && b > 0 && d >= 0) {
-			in.trap(span, "arithmetic overflow")
-		}
-		return Int(d)
+		r, trap = arith.Sub(k, a, b)
 	case ast.Mul:
-		if a != 0 && b != 0 {
-			p := a * b
-			if p/b != a || (a == math.MinInt64 && b == -1) || (b == math.MinInt64 && a == -1) {
-				in.trap(span, "arithmetic overflow")
-			}
-			return Int(p)
-		}
-		return Int(0)
+		r, trap = arith.Mul(k, a, b)
 	case ast.Div:
-		if b == 0 {
-			in.trap(span, "divide by zero")
-		}
-		if a == math.MinInt64 && b == -1 {
-			in.trap(span, "arithmetic overflow")
-		}
-		return Int(a / b) // Go truncates toward zero, as the specification requires
+		r, trap = arith.Div(k, a, b)
 	case ast.Rem:
-		if b == 0 {
-			in.trap(span, "remainder by zero")
-		}
-		if a == math.MinInt64 && b == -1 {
-			in.trap(span, "arithmetic overflow")
-		}
-		return Int(a % b) // Go's remainder takes the sign of the dividend
+		r, trap = arith.Rem(k, a, b)
 	case ast.BitAnd:
-		return Int(a & b)
+		r = arith.And(k, a, b)
 	case ast.BitOr:
-		return Int(a | b)
+		r = arith.Or(k, a, b)
 	case ast.BitXor:
-		return Int(a ^ b)
+		r = arith.Xor(k, a, b)
 	case ast.Shl:
-		if b < 0 || b >= 64 {
-			in.trap(span, "shift amount out of range")
-		}
-		return Int(a << uint(b))
+		r, trap = arith.Shl(k, a, b)
 	case ast.Shr:
-		if b < 0 || b >= 64 {
-			in.trap(span, "shift amount out of range")
-		}
-		return Int(a >> uint(b)) // arithmetic: Phase 1 integers are signed
+		r, trap = arith.Shr(k, a, b)
+	case ast.Lt, ast.Le, ast.Gt, ast.Ge:
+		return in.orderOp(span, op, compareAt(k, a, b))
+	default:
+		in.trap(span, "`%s` is not defined on an integer", op)
 	}
-	return in.orderOp(span, op, compareInt(a, b))
+	if trap != "" {
+		in.trap(span, "%s", trap)
+	}
+	return Int(r)
+}
+
+// compareAt orders two integers of kind k, signed or unsigned as k says.
+func compareAt(k bytecode.Kind, a, b uint64) int {
+	switch {
+	case arith.Less(k, a, b):
+		return -1
+	case arith.Less(k, b, a):
+		return 1
+	}
+	return 0
 }
 
 // floatOp implements IEEE-754 arithmetic. Floats never trap.
@@ -323,9 +381,14 @@ func (in *Interp) evalAssign(a *ast.Assign) (Value, ctrl) {
 }
 
 // applyCompound performs the arithmetic half of a compound assignment, with the same
-// trapping semantics as the corresponding operator.
+// trapping semantics as the corresponding operator -- including its width: `x += 1` on a
+// `u8` overflows exactly where `x = x + 1` does.
+//
+// The synthetic node stands in for an operator the programmer wrote without an expression
+// node of its own, so its left operand is the *place*, whose checked type is the width the
+// arithmetic happens at.
 func (in *Interp) applyCompound(a *ast.Assign, op ast.BinaryOp, cur, val Value) Value {
-	synthetic := &ast.Binary{Base: ast.Base{ID: a.NodeID(), Loc: a.Loc}, Op: op}
+	synthetic := &ast.Binary{Base: ast.Base{ID: a.NodeID(), Loc: a.Loc}, Op: op, L: a.Place, R: a.Value}
 	return in.applyBinary(synthetic, cur, val)
 }
 

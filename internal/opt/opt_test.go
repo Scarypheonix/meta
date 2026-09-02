@@ -23,6 +23,16 @@ func prog(consts ...int64) *bytecode.Program {
 	return p
 }
 
+// intOpAt builds an integer operation the way internal/compile does: with the operand kind
+// on the instruction. Arithmetic without one is not a well-formed instruction -- the
+// backend refuses it and the folder declines it -- because `255u8 + 1` and `255u32 + 1`
+// are different programs (spec/04-expressions.md).
+func intOpAt(f *ir.Func, b *ir.Block, op ir.Op, args ...*ir.Value) *ir.Value {
+	v := f.NewValue(op, diag.Span{}, args...)
+	v.Const = int(bytecode.KindI64)
+	return b.Append(v)
+}
+
 // konst appends an integer to the pool and returns the instruction reading it.
 func konst(f *ir.Func, b *ir.Block, p *bytecode.Program, val int64) *ir.Value {
 	idx := len(p.Consts)
@@ -60,7 +70,7 @@ func finish(f *ir.Func, b *ir.Block, result *ir.Value) {
 func TestConstantFoldEvaluatesArithmetic(t *testing.T) {
 	p := prog()
 	f, b := straight("fold")
-	sum := b.Append(f.NewValue(ir.OpAdd, diag.Span{}, konst(f, b, p, 2), konst(f, b, p, 40)))
+	sum := intOpAt(f, b, ir.OpAdd, konst(f, b, p, 2), konst(f, b, p, 40))
 	finish(f, b, sum)
 
 	if !ConstantFold(f, p) {
@@ -88,7 +98,7 @@ func TestConstantFoldFoldsToTheTrap(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			p := prog()
 			f, b := straight("trap")
-			bad := b.Append(f.NewValue(tc.op, diag.Span{}, konst(f, b, p, tc.x), konst(f, b, p, tc.y)))
+			bad := intOpAt(f, b, tc.op, konst(f, b, p, tc.x), konst(f, b, p, tc.y))
 			finish(f, b, bad)
 
 			if !ConstantFold(f, p) {
@@ -155,7 +165,7 @@ func TestDeadCodeRemovesAnUnusedValue(t *testing.T) {
 func TestDeadCodeKeepsAnUnusedTrappingOperation(t *testing.T) {
 	p := prog()
 	f, b := straight("keep")
-	sum := b.Append(f.NewValue(ir.OpAdd, diag.Span{}, konst(f, b, p, 1), konst(f, b, p, 2)))
+	sum := intOpAt(f, b, ir.OpAdd, konst(f, b, p, 1), konst(f, b, p, 2))
 	finish(f, b, nil)
 
 	DeadCodeElimination(f, p)
@@ -194,9 +204,9 @@ func TestCommonSubexpressionsMergesEqualComputations(t *testing.T) {
 	p := prog()
 	f, b := straight("cse")
 	x, y := konst(f, b, p, 3), konst(f, b, p, 4)
-	first := b.Append(f.NewValue(ir.OpWrapAdd, diag.Span{}, x, y))
-	second := b.Append(f.NewValue(ir.OpWrapAdd, diag.Span{}, x, y))
-	use := b.Append(f.NewValue(ir.OpWrapMul, diag.Span{}, first, second))
+	first := intOpAt(f, b, ir.OpWrapAdd, x, y)
+	second := intOpAt(f, b, ir.OpWrapAdd, x, y)
+	use := intOpAt(f, b, ir.OpWrapMul, first, second)
 	finish(f, b, use)
 
 	if !CommonSubexpressions(f, p) {
@@ -218,8 +228,8 @@ func TestCommonSubexpressionsIsIdempotentOnAnUnusedTrappingDuplicate(t *testing.
 	p := prog()
 	f, b := straight("idempotent")
 	x, y := konst(f, b, p, 3), konst(f, b, p, 4)
-	first := b.Append(f.NewValue(ir.OpAdd, diag.Span{}, x, y))
-	second := b.Append(f.NewValue(ir.OpAdd, diag.Span{}, x, y))
+	first := intOpAt(f, b, ir.OpAdd, x, y)
+	second := intOpAt(f, b, ir.OpAdd, x, y)
 	finish(f, b, second)
 
 	if !CommonSubexpressions(f, p) {
@@ -266,9 +276,9 @@ func TestCommonSubexpressionsRequiresDominance(t *testing.T) {
 	cond := f.Entry.Append(f.NewValue(ir.OpUnit, diag.Span{}))
 	f.Entry.SetTerminator(f.NewValue(ir.OpBranch, diag.Span{}, cond), then, els)
 
-	inThen := then.Append(f.NewValue(ir.OpWrapAdd, diag.Span{}, x, x))
+	inThen := intOpAt(f, then, ir.OpWrapAdd, x, x)
 	then.SetTerminator(f.NewValue(ir.OpReturn, diag.Span{}, inThen))
-	inElse := els.Append(f.NewValue(ir.OpWrapAdd, diag.Span{}, x, x))
+	inElse := intOpAt(f, els, ir.OpWrapAdd, x, x)
 	els.SetTerminator(f.NewValue(ir.OpReturn, diag.Span{}, inElse))
 	f.RecomputeUses()
 
@@ -307,7 +317,7 @@ func params(f *ir.Func) (*ir.Value, *ir.Value) {
 func TestLoopInvariantCodeMotionHoists(t *testing.T) {
 	f, pre, _, body, _ := loopFunc("licm")
 	a, c := params(f)
-	inv := body.Append(f.NewValue(ir.OpWrapAdd, diag.Span{}, a, c))
+	inv := intOpAt(f, body, ir.OpWrapAdd, a, c)
 	f.RecomputeUses()
 
 	if !LoopInvariantCodeMotion(f, prog()) {
@@ -324,7 +334,7 @@ func TestLoopInvariantCodeMotionHoists(t *testing.T) {
 func TestLoopInvariantCodeMotionNeverHoistsATrap(t *testing.T) {
 	f, _, _, body, _ := loopFunc("licm-trap")
 	a, c := params(f)
-	div := body.Append(f.NewValue(ir.OpDiv, diag.Span{}, a, c))
+	div := intOpAt(f, body, ir.OpDiv, a, c)
 	f.RecomputeUses()
 
 	LoopInvariantCodeMotion(f, prog())
@@ -341,7 +351,7 @@ func TestEscapeAnalysisReplacesFieldReads(t *testing.T) {
 	read := f.NewValue(ir.OpGetField, diag.Span{}, obj)
 	read.Const = 1
 	b.Append(read)
-	use := b.Append(f.NewValue(ir.OpWrapAdd, diag.Span{}, read, x))
+	use := intOpAt(f, b, ir.OpWrapAdd, read, x)
 	finish(f, b, use)
 
 	if !EscapeAnalysis(f, p) {

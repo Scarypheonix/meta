@@ -206,10 +206,21 @@ type Kind int32
 
 // The operand kinds. KindUnknown is what an older or hand-written instruction carries,
 // and the backend rejects it rather than guessing.
+//
+// An integer says its *width* as well as its signedness, because that is what "what do
+// these sixty-four bits mean" actually asks: `255u8 + 1` has to trap and `255u32 + 1` has
+// to be 256, and nothing in the register distinguishes them. One vocabulary rather than a
+// kind plus a separate width operand, so there is one place to be wrong.
 const (
 	KindUnknown Kind = iota
-	KindInt
-	KindUint
+	KindI8
+	KindI16
+	KindI32
+	KindI64
+	KindU8
+	KindU16
+	KindU32
+	KindU64
 	KindFloat
 	KindBool
 	KindChar
@@ -220,12 +231,45 @@ const (
 	KindRef
 )
 
+// IsInteger reports whether k is one of the eight integer kinds.
+func (k Kind) IsInteger() bool { return k >= KindI8 && k <= KindU64 }
+
+// IsSigned reports whether k is a signed integer. It is false for everything that is not
+// an integer at all, so a caller must ask IsInteger first when that matters.
+func (k Kind) IsSigned() bool { return k >= KindI8 && k <= KindI64 }
+
+// Bits is an integer kind's width. It is 64 for anything else, which is the width of the
+// machine word every other value occupies.
+func (k Kind) Bits() uint {
+	switch k {
+	case KindI8, KindU8:
+		return 8
+	case KindI16, KindU16:
+		return 16
+	case KindI32, KindU32:
+		return 32
+	}
+	return 64
+}
+
 func (k Kind) String() string {
 	switch k {
-	case KindInt:
-		return "int"
-	case KindUint:
-		return "uint"
+	case KindI8:
+		return "i8"
+	case KindI16:
+		return "i16"
+	case KindI32:
+		return "i32"
+	case KindI64:
+		return "i64"
+	case KindU8:
+		return "u8"
+	case KindU16:
+		return "u16"
+	case KindU32:
+		return "u32"
+	case KindU64:
+		return "u64"
 	case KindFloat:
 		return "float"
 	case KindBool:

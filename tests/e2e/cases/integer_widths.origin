@@ -1,0 +1,85 @@
+use std::io;
+
+// Arithmetic at the operand type's own width (spec/04-expressions.md). "Overflow" means
+// *not representable in that type*, never "not representable in 64 bits", so `255u8 + 1`
+// and `255u32 + 1` are different programs even though the values are the same bits.
+//
+// A machine register holds sixty-four bits and nothing in it says which of the eight
+// integer types they are, so the width travels with the operation. It travels through the
+// optimizer too: this whole file is constants, and folding it at `-O1` has to reach the
+// same answers -- including the same trap -- that running it at `-O0` does.
+
+fn showU8(o: Option[u8]) -> String {
+    match o {
+        Option::Some(n) => n.to_str(),
+        Option::None => "None",
+    }
+}
+
+fn showI8(o: Option[i8]) -> String {
+    match o {
+        Option::Some(n) => n.to_str(),
+        Option::None => "None",
+    }
+}
+
+fn main() {
+    // The same arithmetic at four widths.
+    io::println((255u32 + 1).to_str());
+    io::println((255u16 + 1).to_str());
+    io::println((255i64 + 1).to_str());
+    io::println((127i8 + 0).to_str());
+
+    // Signed bounds.
+    io::println((127i8 - 1).to_str());
+    io::println((i8::MIN + 1).to_str());
+    io::println((-(127i8)).to_str());
+    io::println((100i16 * 300).to_str());
+
+    // Unsigned bounds, and unsigned division and comparison.
+    io::println((255u8 / 2).to_str());
+    io::println((255u8 % 4).to_str());
+    io::println((0u8 - 0).to_str());
+    io::println((200u8 > 100u8).to_str());
+    io::println((200u8 >> 1).to_str());
+    io::println((1u8 << 7).to_str());
+    io::println((0xFFu8 & 0x0Fu8).to_str());
+    io::println((0xF0u8 | 0x0Fu8).to_str());
+    io::println((0xFFu8 ^ 0x0Fu8).to_str());
+
+    // The three non-trapping forms, each at the receiver's width.
+    io::println((255u8).wrapping_add(1).to_str());
+    io::println((0u8).wrapping_sub(1).to_str());
+    io::println((16u8).wrapping_mul(16).to_str());
+    io::println((127i8).wrapping_add(1).to_str());
+    io::println((255u8).saturating_add(1).to_str());
+    io::println((0u8).saturating_sub(1).to_str());
+    io::println((127i8).saturating_add(1).to_str());
+    io::println((i8::MIN).saturating_sub(1).to_str());
+    io::println((100i8).saturating_mul(100).to_str());
+    io::println((-100i8).saturating_mul(100).to_str());
+    io::println(showU8((255u8).checked_add(1)));
+    io::println(showU8((254u8).checked_add(1)));
+    io::println(showI8((127i8).checked_add(1)));
+    io::println(showU8((0u8).checked_sub(1)));
+    io::println(showU8((16u8).checked_mul(16)));
+
+    // `as` truncates and re-establishes the invariant, so what comes out is a real value
+    // of its type and arithmetic on it happens at that width.
+    let a = 300 as u8;
+    io::println(a.to_str());
+    io::println((a + 1).to_str());
+    io::println((200 as i8).to_str());
+    io::println((-1 as u8).to_str());
+    io::println((-1i8 as u8).to_str());
+    io::println((1i8 as i64).to_str());
+
+    // And a value that is not a constant, so no amount of folding can answer it early.
+    let mut n = 250u8;
+    let mut i = 0;
+    while i < 5 {
+        n = n.wrapping_add(1);
+        i = i + 1;
+    }
+    io::println(n.to_str());
+}

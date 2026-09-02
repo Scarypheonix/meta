@@ -257,6 +257,14 @@ type Value struct {
 	// kind is fixed by its operation alone; and anything derived, like a φ, from ones
 	// that are already known).
 	Kind bytecode.Kind
+	// OperandKind is what the *operands* are, for an operation whose behaviour depends
+	// on it rather than only its result's shape: `checked_add` on a `u8` answers
+	// differently from the same call on a `u32`, and `Kind` cannot say so because a
+	// checked operation's result is an `Option` and the register allocator needs to be
+	// told that it is a reference (ADR-0021).
+	//
+	// Two facts, two fields. Backend kind propagation writes `Kind` and never this.
+	OperandKind bytecode.Kind
 
 	// Span is where the value came from, so a trap names a source location.
 	Span diag.Span

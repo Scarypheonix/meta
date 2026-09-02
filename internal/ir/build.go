@@ -382,7 +382,12 @@ func (b *builder) translateInstr(blk *Block, in bytecode.Instr, pc int) (bool, e
 		// A builtin whose result kind is the program's own T carries it on the
 		// instruction (ADR-0021). Dropping it here would leave the value kindless after
 		// any optimizer round trip, which the register allocator refuses.
+		//
+		// It lands in both fields: for most builtins the instruction's kind is the
+		// result's, and for the width-sensitive ones (`checked_*`, `saturating_*`) it is
+		// the operands', which backend kind propagation must not overwrite.
 		v.Kind = in.Kind
+		v.OperandKind = in.Kind
 		b.push(blk.Append(v))
 
 	case bytecode.OpClosure:

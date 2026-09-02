@@ -260,9 +260,6 @@ var builtinMethodOps = map[string]bytecode.Op{
 }
 
 var builtinMethodCalls = map[string]int{
-	"checked_add":    BuiltinCheckedAdd,
-	"checked_sub":    BuiltinCheckedSub,
-	"checked_mul":    BuiltinCheckedMul,
 	"saturating_add": BuiltinSaturatingAdd,
 	"saturating_sub": BuiltinSaturatingSub,
 	"saturating_mul": BuiltinSaturatingMul,
@@ -273,17 +270,104 @@ var builtinMethodCalls = map[string]int{
 // integer width, both float widths, `char` and `String`; nothing else reaches here for
 // a well-typed program.
 func cmpBuiltinFor(k bytecode.Kind, span diag.Span) (int, error) {
-	switch k {
-	case bytecode.KindInt, bytecode.KindChar:
+	switch {
+	case k == bytecode.KindChar || (k.IsInteger() && k.IsSigned()):
 		return BuiltinCmpInt, nil
-	case bytecode.KindUint:
+	case k.IsInteger():
 		return BuiltinCmpUint, nil
-	case bytecode.KindFloat:
+	case k == bytecode.KindFloat:
 		return BuiltinCmpFloat, nil
-	case bytecode.KindString:
+	case k == bytecode.KindString:
 		return BuiltinCmpString, nil
 	}
 	return 0, unsupported(fmt.Sprintf("`cmp` on a %s", k), span)
+}
+
+// checkedMethods maps `checked_add` and its siblings to the predicate that decides them.
+var checkedMethods = map[string]int{
+	"checked_add": BuiltinFitsAdd,
+	"checked_sub": BuiltinFitsSub,
+	"checked_mul": BuiltinFitsMul,
+}
+
+// wrappingFor is the operation whose result a checked one returns when it fits. Wrapping
+// and exact arithmetic agree on exactly the values that fit, which is what makes this the
+// same answer.
+var wrappingFor = map[int]bytecode.Op{
+	BuiltinFitsAdd: bytecode.OpWrapAdd,
+	BuiltinFitsSub: bytecode.OpWrapSub,
+	BuiltinFitsMul: bytecode.OpWrapMul,
+}
+
+// checkedCall compiles `a.checked_add(b)` and its siblings into the `Option` they mean.
+//
+// The wrapping is here rather than in a runtime because the `Option` it builds is the
+// call's own instantiation: `Option[u8]` and `Option[i64]` are different types with
+// different layouts (ADR-0019), and a runtime has only one recorded variant index to build
+// from. It is the same arrangement `?` and the concurrency handles use, and for the same
+// reason -- the native backend has no way to know which prelude type a call meant.
+func (c *Compiler) checkedCall(v *ast.MethodCall, fits int) error {
+	kind := c.kindOf(v.Recv)
+	someIdx, noneIdx, err := c.optionVariants(c.typeOf(v), v.Span())
+	if err != nil {
+		return err
+	}
+
+	// Both operands land in temporaries: the predicate and the arithmetic each read them,
+	// and evaluating either twice would run its side effects twice.
+	if err := c.expr(v.Recv); err != nil {
+		return err
+	}
+	lhs := c.temp()
+	c.emitA(bytecode.OpStore, lhs, v.Span())
+	if err := c.expr(v.Args[0]); err != nil {
+		return err
+	}
+	rhs := c.temp()
+	c.emitA(bytecode.OpStore, rhs, v.Span())
+
+	c.emitA(bytecode.OpLoad, lhs, v.Span())
+	c.emitA(bytecode.OpLoad, rhs, v.Span())
+	c.emitABK(bytecode.OpCallBuiltin, fits, 2, kind, v.Span())
+	toNone := c.emitA(bytecode.OpJumpIfFalse, 0, v.Span())
+
+	c.emitA(bytecode.OpLoad, lhs, v.Span())
+	c.emitA(bytecode.OpLoad, rhs, v.Span())
+	c.emitA(wrappingFor[fits], int(kind), v.Span())
+	c.emitAB(bytecode.OpVariant, someIdx, 1, v.Span())
+	toEnd := c.emitA(bytecode.OpJump, 0, v.Span())
+
+	c.patch(toNone)
+	c.emitAB(bytecode.OpVariant, noneIdx, 0, v.Span())
+	c.patch(toEnd)
+	return nil
+}
+
+// optionVariants finds the `Some` and `None` indices for a concrete `Option[T]`.
+func (c *Compiler) optionVariants(t types.Type, span diag.Span) (some, none int, err error) {
+	n, ok := types.AsNamed(c.concreteType(t))
+	if !ok || n.Def == nil || n.Def.Enum == nil || n.Def.Name != "Option" {
+		return 0, 0, unsupported("a checked operation whose result is not an `Option`", span)
+	}
+	var someVar, noneVar *ast.Variant
+	for _, va := range n.Def.Enum.Variants {
+		switch va.Name.Name {
+		case "Some":
+			someVar = va
+		case "None":
+			noneVar = va
+		}
+	}
+	if someVar == nil || noneVar == nil {
+		return 0, 0, unsupported("an `Option` without `Some` and `None`", span)
+	}
+	if some, err = c.variantInst(someVar, n); err != nil {
+		return 0, 0, err
+	}
+	if none, err = c.variantInst(noneVar, n); err != nil {
+		return 0, 0, err
+	}
+	return some, none, nil
 }
 
 func (c *Compiler) methodCall(v *ast.MethodCall) error {
@@ -323,7 +407,9 @@ func (c *Compiler) methodCall(v *ast.MethodCall) error {
 		if err := c.expr(v.Args[0]); err != nil {
 			return err
 		}
-		c.emit(op, v.Span())
+		// `wrapping_add` wraps at the receiver's own width, which is the whole point of
+		// it: `255u8.wrapping_add(1)` is 0, not 256.
+		c.emitA(op, int(c.kindOf(v.Recv)), v.Span())
 		return nil
 	}
 	if v.Name.Name == "cmp" && len(v.Args) == 1 {
@@ -340,6 +426,9 @@ func (c *Compiler) methodCall(v *ast.MethodCall) error {
 		c.emitAB(bytecode.OpCallBuiltin, idx, 2, v.Span())
 		return nil
 	}
+	if op, ok := checkedMethods[v.Name.Name]; ok && len(v.Args) == 1 {
+		return c.checkedCall(v, op)
+	}
 	if idx, ok := builtinMethodCalls[v.Name.Name]; ok {
 		if err := c.expr(v.Recv); err != nil {
 			return err
@@ -349,7 +438,9 @@ func (c *Compiler) methodCall(v *ast.MethodCall) error {
 				return err
 			}
 		}
-		c.emitAB(bytecode.OpCallBuiltin, idx, len(v.Args)+1, v.Span())
+		// `checked_*` and `saturating_*` answer at the receiver's own width too, so the
+		// kind rides along on the instruction that has room for it.
+		c.emitABK(bytecode.OpCallBuiltin, idx, len(v.Args)+1, c.kindOf(v.Recv), v.Span())
 		return nil
 	}
 	return unsupported("method `"+v.Name.Name+"`", v.Span())

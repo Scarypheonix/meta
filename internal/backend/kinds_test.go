@@ -96,7 +96,7 @@ fn main() {
 `)
 	f := funcIR(t, prog, "main")
 	got := kindsOf(f, ir.OpConst)
-	want := []bytecode.Kind{bytecode.KindInt, bytecode.KindFloat, bytecode.KindChar, bytecode.KindString}
+	want := []bytecode.Kind{bytecode.KindI64, bytecode.KindFloat, bytecode.KindChar, bytecode.KindString}
 	if len(got) != len(want) {
 		t.Fatalf("const kinds = %v, want %v", got, want)
 	}
@@ -121,7 +121,7 @@ fn main() {
 		op   ir.Op
 		want bytecode.Kind
 	}{
-		{ir.OpAdd, bytecode.KindInt},
+		{ir.OpAdd, bytecode.KindI64},
 		{ir.OpAddF, bytecode.KindFloat},
 		{ir.OpLt, bytecode.KindBool},
 		{ir.OpNot, bytecode.KindBool},
@@ -179,7 +179,7 @@ fn main() {
 `)
 	f := funcIR(t, prog, "main")
 	got := kindsOf(f, ir.OpCast)
-	want := []bytecode.Kind{bytecode.KindUint, bytecode.KindFloat}
+	want := []bytecode.Kind{bytecode.KindU64, bytecode.KindFloat}
 	if len(got) != len(want) {
 		t.Fatalf("cast kinds = %v, want %v", got, want)
 	}
@@ -210,7 +210,7 @@ fn main() {
 	// apply's own call to f(x) is now indirect (its callee is a parameter, not a bare
 	// OpFunc), so it is an OpCallClosure whose kind came from the OpCall it used to be.
 	applyFn := funcIR(t, prog, "apply")
-	if got := kindsOf(applyFn, ir.OpCallClosure); len(got) != 1 || got[0] != bytecode.KindInt {
+	if got := kindsOf(applyFn, ir.OpCallClosure); len(got) != 1 || got[0] != bytecode.KindI64 {
 		t.Errorf("apply's call_closure kind = %v, want [KindInt]", got)
 	}
 }
@@ -226,7 +226,12 @@ fn main() {
 `)
 	f := funcIR(t, prog, "main")
 	got := kindsOf(f, ir.OpCallBuiltin)
-	want := []bytecode.Kind{bytecode.KindRef, bytecode.KindRef, bytecode.KindInt, bytecode.KindBool}
+	// `cmp` builds an `Ordering`, which is a reference. `checked_add` is the *predicate*
+	// behind one -- a bool -- because the `Option` it decides is built by internal/compile
+	// at the call's own instantiation rather than by a runtime with one recorded variant
+	// index to build from. `saturating_add` answers at the receiver's own width, and
+	// `ref_eq` is a bool.
+	want := []bytecode.Kind{bytecode.KindRef, bytecode.KindBool, bytecode.KindI64, bytecode.KindBool}
 	if len(got) != len(want) {
 		t.Fatalf("call_builtin kinds = %v, want %v", got, want)
 	}

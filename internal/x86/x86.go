@@ -84,9 +84,13 @@ type Cond uint8
 // The condition codes. Signed and unsigned comparisons are distinct instructions, so
 // the caller picks: Origin's `<` on `u64` is Below, on `i64` it is Less.
 const (
-	Overflow     Cond = 0x0
-	NoOverflow   Cond = 0x1
-	Below        Cond = 0x2
+	Overflow   Cond = 0x0
+	NoOverflow Cond = 0x1
+	Below      Cond = 0x2
+	// Carry is Below under its other name. The same flag answers "was there a borrow or
+	// a carry" and "is the unsigned comparison below", and naming both makes the calling
+	// code say which question it asked.
+	Carry        Cond = 0x2
 	AboveEqual   Cond = 0x3
 	Equal        Cond = 0x4
 	NotEqual     Cond = 0x5
@@ -501,6 +505,11 @@ func (a *Asm) Neg(r Reg) { a.unary(3, r) }
 // it — the magnitude of the most negative integer does not fit in a signed 64-bit value,
 // so the digits are produced by unsigned division of the negated bits.
 func (a *Asm) Div(r Reg) { a.unary(6, r) }
+
+// Mul is `mul r`: multiplies RAX by r as unsigned, putting the low half in RAX and the
+// high half in RDX. A non-zero high half is exactly an unsigned overflow, which `imul`'s
+// OF does not answer -- it answers the signed question instead.
+func (a *Asm) Mul(r Reg) { a.unary(4, r) }
 
 // Idiv is `idiv r`: divides RDX:RAX by r, quotient in RAX, remainder in RDX. The caller
 // must have executed Cqo, and must have already excluded a zero divisor and the

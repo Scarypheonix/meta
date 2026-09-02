@@ -46,9 +46,16 @@ const (
 	BuiltinCmpUint
 	BuiltinCmpFloat
 	BuiltinCmpString
-	BuiltinCheckedAdd
-	BuiltinCheckedSub
-	BuiltinCheckedMul
+	// BuiltinFitsAdd, BuiltinFitsSub and BuiltinFitsMul answer `does a op b fit in this
+	// type`, as a bool. `checked_add` and its siblings are built out of one of these plus
+	// the corresponding wrapping operation, in internal/compile, rather than returning an
+	// `Option` from the runtime: an `Option[u8]` and an `Option[i64]` are different types
+	// with different layouts (ADR-0019), and a runtime that built one from a single
+	// recorded variant index handed `checked_add` on a `u8` an `Option[i64]` -- whose
+	// variant tags the caller's own `match` matched none of.
+	BuiltinFitsAdd
+	BuiltinFitsSub
+	BuiltinFitsMul
 	BuiltinSaturatingAdd
 	BuiltinSaturatingSub
 	BuiltinSaturatingMul
@@ -319,10 +326,14 @@ func wordKindOf(k bytecode.Kind) (layout.WordKind, bool) {
 		return layout.WordChar, true
 	case bytecode.KindUnit:
 		return layout.WordUnit, true
-	case bytecode.KindInt, bytecode.KindUint:
-		return layout.WordInt, true
 	case bytecode.KindString, bytecode.KindRef:
 		return layout.WordRef, true
+	}
+	if k.IsInteger() {
+		// Every integer occupies a whole word whatever its declared width: the layout
+		// question is "is this a reference", and a narrow integer is stored in range and
+		// sign- or zero-extended to sixty-four bits (spec/04-expressions.md).
+		return layout.WordInt, true
 	}
 	return layout.WordRaw, false
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/scarypheonix/meta/internal/arith"
 	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/diag"
@@ -58,14 +59,15 @@ func (v *VM) run(floor int) {
 			bytecode.OpWrapAdd, bytecode.OpWrapSub, bytecode.OpWrapMul:
 			b := v.pop()
 			a := v.pop()
-			v.push(v.intOp(in.Op, a.Int(), b.Int(), in.Span))
+			v.push(v.intOp(in.Op, bytecode.Kind(in.A), a.N, b.N, in.Span))
 
 		case bytecode.OpNeg:
 			a := v.pop()
-			if a.Int() == math.MinInt64 {
-				v.trap(in.Span, "arithmetic overflow")
+			r, trap := arith.Neg(bytecode.Kind(in.A), a.N)
+			if trap != "" {
+				v.trap(in.Span, "%s", trap)
 			}
-			v.push(intVal(-a.Int()))
+			v.push(Value{Tag: layout.TagInt, N: r})
 
 		case bytecode.OpAddF, bytecode.OpSubF, bytecode.OpMulF, bytecode.OpDivF, bytecode.OpRemF:
 			b := v.pop()
@@ -121,7 +123,7 @@ func (v *VM) run(floor int) {
 			v.doCall(int(in.A), in.Span)
 
 		case bytecode.OpCallBuiltin:
-			v.callBuiltin(int(in.A), int(in.B), in.Span)
+			v.callBuiltin(int(in.A), int(in.B), in.Kind, in.Span)
 
 		case bytecode.OpClosure:
 			v.makeClosure(int(in.A), in.Span)
@@ -265,69 +267,51 @@ func (v *VM) doCall(argCount int, span diag.Span) {
 	}
 }
 
-func (v *VM) intOp(op bytecode.Op, a, b int64, span diag.Span) Value {
+// intOp performs one integer operation at the width the instruction carries.
+//
+// The rules are internal/arith's, not this file's: three engines have to agree on what
+// `255u8 + 1` does, and the two written in Go agree by sharing the code rather than by
+// being reviewed against each other (spec/04-expressions.md).
+func (v *VM) intOp(op bytecode.Op, k bytecode.Kind, a, b uint64, span diag.Span) Value {
+	if !k.IsInteger() {
+		panic("vm: an integer operation with no integer kind")
+	}
+	var r uint64
+	var trap string
 	switch op {
 	case bytecode.OpAdd:
-		s := a + b
-		if (a > 0 && b > 0 && s < 0) || (a < 0 && b < 0 && s >= 0) {
-			v.trap(span, "arithmetic overflow")
-		}
-		return intVal(s)
+		r, trap = arith.Add(k, a, b)
 	case bytecode.OpSub:
-		d := a - b
-		if (a >= 0 && b < 0 && d < 0) || (a < 0 && b > 0 && d >= 0) {
-			v.trap(span, "arithmetic overflow")
-		}
-		return intVal(d)
+		r, trap = arith.Sub(k, a, b)
 	case bytecode.OpMul:
-		if a == 0 || b == 0 {
-			return intVal(0)
-		}
-		p := a * b
-		if p/b != a || (a == math.MinInt64 && b == -1) || (b == math.MinInt64 && a == -1) {
-			v.trap(span, "arithmetic overflow")
-		}
-		return intVal(p)
+		r, trap = arith.Mul(k, a, b)
 	case bytecode.OpDiv:
-		if b == 0 {
-			v.trap(span, "divide by zero")
-		}
-		if a == math.MinInt64 && b == -1 {
-			v.trap(span, "arithmetic overflow")
-		}
-		return intVal(a / b)
+		r, trap = arith.Div(k, a, b)
 	case bytecode.OpRem:
-		if b == 0 {
-			v.trap(span, "remainder by zero")
-		}
-		if a == math.MinInt64 && b == -1 {
-			v.trap(span, "arithmetic overflow")
-		}
-		return intVal(a % b)
+		r, trap = arith.Rem(k, a, b)
 	case bytecode.OpAnd:
-		return intVal(a & b)
+		r = arith.And(k, a, b)
 	case bytecode.OpOr:
-		return intVal(a | b)
+		r = arith.Or(k, a, b)
 	case bytecode.OpXor:
-		return intVal(a ^ b)
+		r = arith.Xor(k, a, b)
 	case bytecode.OpShl:
-		if b < 0 || b >= 64 {
-			v.trap(span, "shift amount out of range")
-		}
-		return intVal(a << uint(b))
+		r, trap = arith.Shl(k, a, b)
 	case bytecode.OpShr:
-		if b < 0 || b >= 64 {
-			v.trap(span, "shift amount out of range")
-		}
-		return intVal(a >> uint(b))
+		r, trap = arith.Shr(k, a, b)
 	case bytecode.OpWrapAdd:
-		return intVal(a + b)
+		r = arith.Wrap(k, a+b)
 	case bytecode.OpWrapSub:
-		return intVal(a - b)
+		r = arith.Wrap(k, a-b)
 	case bytecode.OpWrapMul:
-		return intVal(a * b)
+		r = arith.Wrap(k, a*b)
+	default:
+		panic("vm: not an integer operation")
 	}
-	panic("vm: not an integer operation")
+	if trap != "" {
+		v.trap(span, "%s", trap)
+	}
+	return Value{Tag: layout.TagInt, N: r}
 }
 
 func floatOp(op bytecode.Op, a, b float64) float64 {

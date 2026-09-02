@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/scarypheonix/meta/internal/arith"
 	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/diag"
@@ -270,7 +271,7 @@ func intRange(bits uint, signed bool) (lo, hi float64) {
 }
 
 // callBuiltin implements the compiler-provided functions and methods.
-func (v *VM) callBuiltin(index, argCount int, span diag.Span) {
+func (v *VM) callBuiltin(index, argCount int, kind bytecode.Kind, span diag.Span) {
 	// The arguments leave the stack but stay reachable: temps is scanned as roots, so
 	// a builtin that allocates cannot leave its own arguments pointing at nothing.
 	base := len(v.temps)
@@ -326,73 +327,17 @@ func (v *VM) callBuiltin(index, argCount int, span diag.Span) {
 		// already carry their own kind and treat all four identically.
 		v.push(refVal(v.ordering(args[0], args[1], span)))
 
-	case compile.BuiltinCheckedAdd, compile.BuiltinCheckedSub, compile.BuiltinCheckedMul:
-		res, ok := checkedOp(index, args[0].Int(), args[1].Int())
-		if !ok {
-			v.push(refVal(v.optionNone(span)))
-		} else {
-			v.push(refVal(v.optionSome(intVal(res), span)))
-		}
+	case compile.BuiltinFitsAdd, compile.BuiltinFitsSub, compile.BuiltinFitsMul:
+		// Only the predicate: internal/compile builds the `Option` itself, at the call's
+		// own instantiation, out of this and the matching wrapping operation.
+		_, ok := arith.Checked(kind, arithOp(index), args[0].N, args[1].N)
+		v.push(boolVal(ok))
 
 	case compile.BuiltinSaturatingAdd, compile.BuiltinSaturatingSub, compile.BuiltinSaturatingMul:
-		v.push(intVal(saturate(index, args[0].Int(), args[1].Int())))
+		v.push(Value{Tag: layout.TagInt, N: arith.Saturating(kind, arithOp(index), args[0].N, args[1].N)})
 
 	default:
 		panic(fmt.Sprintf("vm: unimplemented builtin %d", index))
-	}
-}
-
-func checkedOp(index int, a, b int64) (int64, bool) {
-	switch index {
-	case compile.BuiltinCheckedAdd:
-		s := a + b
-		if (a > 0 && b > 0 && s < 0) || (a < 0 && b < 0 && s >= 0) {
-			return 0, false
-		}
-		return s, true
-	case compile.BuiltinCheckedSub:
-		d := a - b
-		if (a >= 0 && b < 0 && d < 0) || (a < 0 && b > 0 && d >= 0) {
-			return 0, false
-		}
-		return d, true
-	default:
-		if a == 0 || b == 0 {
-			return 0, true
-		}
-		p := a * b
-		if p/b != a || (a == math.MinInt64 && b == -1) || (b == math.MinInt64 && a == -1) {
-			return 0, false
-		}
-		return p, true
-	}
-}
-
-func saturate(index int, a, b int64) int64 {
-	checked := map[int]int{
-		compile.BuiltinSaturatingAdd: compile.BuiltinCheckedAdd,
-		compile.BuiltinSaturatingSub: compile.BuiltinCheckedSub,
-		compile.BuiltinSaturatingMul: compile.BuiltinCheckedMul,
-	}[index]
-	if r, ok := checkedOp(checked, a, b); ok {
-		return r
-	}
-	switch index {
-	case compile.BuiltinSaturatingAdd:
-		if b > 0 {
-			return math.MaxInt64
-		}
-		return math.MinInt64
-	case compile.BuiltinSaturatingSub:
-		if b > 0 {
-			return math.MinInt64
-		}
-		return math.MaxInt64
-	default:
-		if (a > 0) == (b > 0) {
-			return math.MaxInt64
-		}
-		return math.MinInt64
 	}
 }
 
@@ -431,4 +376,17 @@ func (v *VM) requirePrelude(span diag.Span) {
 	if !v.prog.Prelude.Found {
 		v.trap(span, "the prelude does not define `Option` and `Ordering`")
 	}
+}
+
+// arithOp maps a checked/saturating builtin index to the operation it performs. The
+// arithmetic itself is internal/arith's, at the width the instruction carries, so the
+// virtual machine and the interpreter cannot disagree about it (spec/04-expressions.md).
+func arithOp(index int) arith.Op {
+	switch index {
+	case compile.BuiltinFitsAdd, compile.BuiltinSaturatingAdd:
+		return arith.OpAdd
+	case compile.BuiltinFitsSub, compile.BuiltinSaturatingSub:
+		return arith.OpSub
+	}
+	return arith.OpMul
 }

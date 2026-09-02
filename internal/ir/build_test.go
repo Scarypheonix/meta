@@ -258,9 +258,9 @@ func TestRoundTripPreservesOperands(t *testing.T) {
 	a := newAsm()
 	a.op(bytecode.OpLoad, 0)
 	a.op(bytecode.OpConst, 0)
-	a.op(bytecode.OpLt, int32(bytecode.KindUint))
+	a.op(bytecode.OpLt, int32(bytecode.KindU64))
 	a.op(bytecode.OpLoad, 0)
-	a.op(bytecode.OpToStr, int32(bytecode.KindInt))
+	a.op(bytecode.OpToStr, int32(bytecode.KindI64))
 	a.op(bytecode.OpPop)
 	a.op(bytecode.OpReturn)
 	src := a.fn(t, "kinds", 1, 1)
@@ -272,8 +272,8 @@ func TestRoundTripPreservesOperands(t *testing.T) {
 	}
 
 	want := map[bytecode.Op]int32{
-		bytecode.OpLt:    int32(bytecode.KindUint),
-		bytecode.OpToStr: int32(bytecode.KindInt),
+		bytecode.OpLt:    int32(bytecode.KindU64),
+		bytecode.OpToStr: int32(bytecode.KindI64),
 	}
 	seen := map[bytecode.Op]bool{}
 	for _, in := range out.Code {

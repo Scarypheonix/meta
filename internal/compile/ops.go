@@ -19,7 +19,8 @@ func (c *Compiler) unary(v *ast.Unary) error {
 		if c.isFloat(v.X) {
 			c.emit(bytecode.OpNegF, v.Span())
 		} else {
-			c.emit(bytecode.OpNeg, v.Span())
+			// Negation traps at the operand's own width: `-(-128i8)` has no i8 value.
+			c.emitA(bytecode.OpNeg, int(c.kindOf(v.X)), v.Span())
 		}
 	}
 	return nil
@@ -92,7 +93,11 @@ func (c *Compiler) binary(v *ast.Binary) error {
 		}
 	}
 	if op, ok := intOps[v.Op]; ok {
-		c.emit(op, v.Span())
+		// The operand kind travels with the instruction, exactly as it does for a
+		// comparison, and for a stronger reason: `255u8 + 1` traps and `255u32 + 1` is
+		// 256, and nothing in a sixty-four-bit register tells the two apart. Division and
+		// the shifts need the signedness for the same reason.
+		c.emitA(op, int(c.kindOf(v.L)), v.Span())
 		return nil
 	}
 	return unsupported("this operator", v.Span())
@@ -267,16 +272,38 @@ func kindOfType(t types.Type) bytecode.Kind {
 			return bytecode.KindUnit
 		case p.Kind.IsFloat():
 			return bytecode.KindFloat
-		case p.Kind.IsSigned():
-			return bytecode.KindInt
 		case p.Kind.IsInteger():
-			return bytecode.KindUint
+			return intKindOf(p.Kind)
 		}
 		return bytecode.KindUnknown
 	}
 	switch types.Prune(t).(type) {
 	case *types.Named, *types.TupleT, *types.FnT:
 		return bytecode.KindRef
+	}
+	return bytecode.KindUnknown
+}
+
+// intKindOf maps a primitive integer type to the bytecode kind that names its width and
+// signedness together. Every instruction whose behaviour depends on either carries it.
+func intKindOf(k types.PrimKind) bytecode.Kind {
+	switch k {
+	case types.I8:
+		return bytecode.KindI8
+	case types.I16:
+		return bytecode.KindI16
+	case types.I32:
+		return bytecode.KindI32
+	case types.I64:
+		return bytecode.KindI64
+	case types.U8:
+		return bytecode.KindU8
+	case types.U16:
+		return bytecode.KindU16
+	case types.U32:
+		return bytecode.KindU32
+	case types.U64:
+		return bytecode.KindU64
 	}
 	return bytecode.KindUnknown
 }

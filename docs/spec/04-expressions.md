@@ -59,14 +59,31 @@ arithmetic is REJECTED.
 
 ### Integers
 
+Arithmetic happens at the operand type's own width. `i8` addition is 8-bit addition, `u32`
+multiplication is 32-bit multiplication, and "overflow" always means *not representable in
+that type* — never "not representable in 64 bits". So `255u8 + 1` TRAPS and `255u32 + 1`
+is `256`, and the two are different programs even though the values are the same bits.
+
+That is not a detail an implementation may round off. A machine register holds sixty-four
+bits and nothing in it says which of the eight integer types they are, so the width travels
+with the operation, and every engine performs the operation at it.
+
+A value of an integer type is always representable in that type: an operation that would
+leave one that is not, traps instead. So a narrow integer needs no separate "is this in
+range" state — being in range is an invariant, and `as`, which truncates rather than
+trapping, re-establishes it by discarding the bits above the target width.
+
 `+ - *` TRAP on overflow, at every optimization level, in debug and release alike
 (ADR-0005). Explicit alternatives live in the prelude and never trap:
 
 ```origin
-a.wrapping_add(b)      // two's-complement wraparound
-a.checked_add(b)       // Option[T]: None on overflow
-a.saturating_add(b)    // clamps to MIN/MAX
+a.wrapping_add(b)      // two's-complement wraparound, at a's own width
+a.checked_add(b)       // Option[T]: None when the result does not fit in T
+a.saturating_add(b)    // clamps to T::MIN / T::MAX
 ```
+
+All three are at the receiver's width too: `255u8.wrapping_add(1)` is `0`,
+`255u8.saturating_add(1)` is `255`, and `255u8.checked_add(1)` is `None`.
 
 `/` truncates toward zero. `%` takes the sign of the dividend, so
 `a == (a / b) * b + (a % b)` holds whenever neither side traps. Division and remainder
@@ -197,6 +214,21 @@ in `10-examples.md` §7 with its expected output.
 |---|---|
 | `2 + 3 * 4` | `14` |
 | `i64::MAX + 1` | TRAPS `arithmetic overflow` |
+| `255u8 + 1` | TRAPS `arithmetic overflow` — 8-bit addition |
+| `255u32 + 1` | `256` — the same bits, a different type, a different program |
+| `127i8 + 1`, `-128i8 - 1`, `-(-128i8)` | TRAPS `arithmetic overflow` |
+| `255u8.wrapping_add(1)` | `0` |
+| `255u8.saturating_add(1)` | `255` |
+| `255u8.checked_add(1)` | `None` |
+| `200u8 * 2` | TRAPS `arithmetic overflow` |
+| `-128i8 / -1` | TRAPS `arithmetic overflow` |
+| `1u8 << 7` | `128` |
+| `3u8 << 7` | TRAPS `arithmetic overflow` |
+| `1u8 << 8` | TRAPS `shift amount out of range` |
+| `u64::MAX` | `18446744073709551615` |
+| `u64::MAX + 1` | TRAPS `arithmetic overflow` |
+| `u64::MAX / 2` | `9223372036854775807` — unsigned division, not signed |
+| `u64::MAX > 1` | `true` — unsigned comparison |
 | `i64::MAX.wrapping_add(1)` | `i64::MIN` |
 | `(-7) / 2` | `-3` (truncates toward zero) |
 | `(-7) % 2` | `-1` (sign of dividend) |

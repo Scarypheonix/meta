@@ -3,6 +3,7 @@ package backend
 import (
 	"fmt"
 
+	"github.com/scarypheonix/meta/internal/arith"
 	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/ir"
@@ -85,9 +86,17 @@ func (e *emitter) instr(v *ir.Value) error {
 		return e.division(v)
 
 	case ir.OpNeg:
+		// Negation overflows on exactly one operand: the type's most negative value.
+		// `neg`'s own OF answers that at sixty-four bits and not below it, so a narrow
+		// kind checks the result instead -- `-(-128i8)` is 128, which is not an `i8`.
+		k := bytecode.Kind(v.Const)
 		e.load(scratchA, v.Args[0])
 		e.a.Neg(scratchA)
-		e.trapIf(x86.Overflow, "arithmetic overflow", v)
+		if k.IsInteger() && k.Bits() < 64 {
+			e.trapUnlessFits(k, scratchA, v)
+		} else {
+			e.trapIf(x86.Overflow, "arithmetic overflow", v)
+		}
 		e.def(v, scratchA)
 
 	case ir.OpNot:
@@ -236,27 +245,123 @@ func (e *emitter) constant(v *ir.Value) error {
 }
 
 // trappingArith lowers `+`, `-` and `*`, which stop the program on overflow at every
-// optimization level (ADR-0005). The hardware sets OF for exactly these cases, so the
-// check is one conditional jump per operation.
+// optimization level (ADR-0005), at the operand type's own width.
+//
+// At sixty-four bits the hardware answers directly: OF for signed, CF for unsigned. Below
+// that it does not -- `255u8 + 1` sets neither flag, because 256 fits a register perfectly
+// well -- so the check is on the *result*: every operand is in range by the invariant
+// spec/04-expressions.md states, so a narrow operation cannot overflow the register it is
+// computed in, and "did it fit" is the only question left.
 func (e *emitter) trappingArith(v *ir.Value) error {
+	k := bytecode.Kind(v.Const)
+	if !k.IsInteger() {
+		return fmt.Errorf("this is a compiler bug: %s reached the backend with no integer kind", v.Op)
+	}
+	bad := e.a.NewLabel("arith_overflow")
+	past := e.a.NewLabel("arith_ok")
 	e.load(scratchA, v.Args[0])
 	e.load(scratchB, v.Args[1])
-	switch v.Op {
-	case ir.OpAdd:
-		e.a.AddRR(scratchA, scratchB)
-	case ir.OpSub:
-		e.a.SubRR(scratchA, scratchB)
-	case ir.OpMul:
-		e.a.ImulRR(scratchA, scratchB)
-	}
-	e.trapIf(x86.Overflow, "arithmetic overflow", v)
+	e.arithInto(k, arithOpOf(v.Op), bad)
+	e.a.Jmp(past)
+	e.a.Bind(bad)
+	e.trapWith(e.trapMessage("arithmetic overflow", v.Span))
+	e.a.Bind(past)
 	e.def(v, scratchA)
 	return nil
+}
+
+// arithInto computes `scratchA op scratchB` at kind k, leaving the result in scratchA and
+// jumping to bad when it overflows. It is the one place the three forms of `+ - *` --
+// trapping, checked and saturating -- agree about what overflow means.
+//
+// At sixty-four bits the hardware answers: OF for signed, CF for an unsigned add or
+// subtract, and a non-zero high half for an unsigned multiply (`imul`'s OF answers the
+// signed question instead). Below that the flags say nothing useful -- `255u8 + 1` sets
+// neither, because 256 fits a register perfectly well -- so the check is on the result:
+// every operand is in range by spec/04-expressions.md's invariant, so a narrow operation
+// cannot overflow the register it is computed in, and "did it fit" is all that is left.
+func (e *emitter) arithInto(k bytecode.Kind, op arith.Op, bad x86.Label) {
+	if k.Bits() == 64 && op == arith.OpMul && !k.IsSigned() {
+		e.a.MovRR(x86.RAX, scratchA)
+		e.a.Mul(scratchB)
+		e.a.MovRR(scratchA, x86.RAX)
+		e.a.TestRR(x86.RDX, x86.RDX)
+		e.a.Jcc(x86.NotEqual, bad)
+		return
+	}
+	switch op {
+	case arith.OpAdd:
+		e.a.AddRR(scratchA, scratchB)
+	case arith.OpSub:
+		e.a.SubRR(scratchA, scratchB)
+	default:
+		e.a.ImulRR(scratchA, scratchB)
+	}
+	if k.Bits() < 64 {
+		e.jumpUnlessFits(k, scratchA, bad)
+		return
+	}
+	if k.IsSigned() {
+		e.a.Jcc(x86.Overflow, bad)
+		return
+	}
+	e.a.Jcc(x86.Carry, bad)
+}
+
+// arithOpOf names which of the three operations an IR opcode is.
+func arithOpOf(op ir.Op) arith.Op {
+	switch op {
+	case ir.OpAdd, ir.OpWrapAdd:
+		return arith.OpAdd
+	case ir.OpSub, ir.OpWrapSub:
+		return arith.OpSub
+	}
+	return arith.OpMul
+}
+
+// jumpUnlessFits jumps to bad unless the value in reg is representable in k.
+func (e *emitter) jumpUnlessFits(k bytecode.Kind, reg x86.Reg, bad x86.Label) {
+	e.a.MovRR(x86.RAX, reg)
+	e.wrapTo(k, x86.RAX)
+	e.a.CmpRR(x86.RAX, reg)
+	e.a.Jcc(x86.NotEqual, bad)
+}
+
+// trapUnlessFits traps unless the value in reg is representable in k, which is only asked
+// of a kind narrower than the machine word.
+//
+// It is `wrap and compare`: re-reading the low bits as a value of k and checking that
+// nothing changed is the definition of "it fits", and it is two instructions plus a
+// comparison whichever signedness k has. rax is the scratch, which the register allocator
+// never hands out and nothing here holds across a call.
+func (e *emitter) trapUnlessFits(k bytecode.Kind, reg x86.Reg, v *ir.Value) {
+	e.a.MovRR(x86.RAX, reg)
+	e.wrapTo(k, x86.RAX)
+	e.a.CmpRR(x86.RAX, reg)
+	e.trapIf(x86.NotEqual, "arithmetic overflow", v)
+}
+
+// wrapTo truncates reg to k's width and extends it back, which is two's-complement
+// wraparound (internal/arith's Wrap, in machine code).
+func (e *emitter) wrapTo(k bytecode.Kind, reg x86.Reg) {
+	w := k.Bits()
+	if w == 64 {
+		return
+	}
+	// Shift the unwanted bits off the top and back down: arithmetically for a signed
+	// kind, so the sign comes back, and logically for an unsigned one, so it does not.
+	e.a.ShlI(reg, uint8(64-w))
+	if k.IsSigned() {
+		e.a.SarI(reg, uint8(64-w))
+	} else {
+		e.a.ShrI(reg, uint8(64-w))
+	}
 }
 
 // wrappingArith lowers the explicit `wrapping_*` methods, which are the same
 // instructions with no check.
 func (e *emitter) wrappingArith(v *ir.Value) error {
+	k := bytecode.Kind(v.Const)
 	e.load(scratchA, v.Args[0])
 	e.load(scratchB, v.Args[1])
 	switch v.Op {
@@ -266,6 +371,11 @@ func (e *emitter) wrappingArith(v *ir.Value) error {
 		e.a.SubRR(scratchA, scratchB)
 	case ir.OpWrapMul:
 		e.a.ImulRR(scratchA, scratchB)
+	}
+	// Wrapping at the operand's own width: `255u8.wrapping_add(1)` is 0, not 256. At
+	// sixty-four bits the register has already done it, and wrapTo is a no-op.
+	if k.IsInteger() {
+		e.wrapTo(k, scratchA)
 	}
 	e.def(v, scratchA)
 	return nil
@@ -278,6 +388,10 @@ func (e *emitter) wrappingArith(v *ir.Value) error {
 // trap with a message and exit 101. Testing first is what turns them into the behaviour
 // spec/04-expressions.md requires.
 func (e *emitter) division(v *ir.Value) error {
+	k := bytecode.Kind(v.Const)
+	if !k.IsInteger() {
+		return fmt.Errorf("this is a compiler bug: %s reached the backend with no integer kind", v.Op)
+	}
 	msg := "divide by zero"
 	if v.Op == ir.OpRem {
 		msg = "remainder by zero"
@@ -286,14 +400,28 @@ func (e *emitter) division(v *ir.Value) error {
 	e.load(scratchB, v.Args[1]) // the divisor
 	e.a.TestRR(scratchB, scratchB)
 	e.trapIf(x86.Equal, msg, v)
-
-	// The one overflowing division: the most negative integer divided by -1 has no
-	// representation.
 	e.load(scratchA, v.Args[0])
+
+	if !k.IsSigned() {
+		// Unsigned division cannot overflow, and `div` is the instruction for it: `idiv`
+		// on a `u64` above i64::MAX would read both operands as negative.
+		e.a.MovRR(x86.RAX, scratchA)
+		e.a.XorRR(x86.RDX, x86.RDX)
+		e.a.Div(scratchB)
+		if v.Op == ir.OpRem {
+			e.def(v, x86.RDX)
+			return nil
+		}
+		e.def(v, x86.RAX)
+		return nil
+	}
+
+	// The one overflowing division: the type's most negative value divided by -1 has no
+	// representation in it.
 	notMin := e.a.NewLabel("div_not_min")
 	e.a.CmpRI(scratchB, -1)
 	e.a.Jcc(x86.NotEqual, notMin)
-	e.a.MovRI(x86.RAX, 1<<63)
+	e.a.MovRI(x86.RAX, arith.Min(k))
 	e.a.CmpRR(scratchA, x86.RAX)
 	e.trapIf(x86.Equal, "arithmetic overflow", v)
 	e.a.Bind(notMin)
@@ -328,24 +456,60 @@ func (e *emitter) bitwise(v *ir.Value) error {
 // (spec/04-expressions.md). x86 would silently mask the count to six bits instead, which
 // is a different program.
 func (e *emitter) shift(v *ir.Value) error {
+	k := bytecode.Kind(v.Const)
+	if !k.IsInteger() {
+		return fmt.Errorf("this is a compiler bug: %s reached the backend with no integer kind", v.Op)
+	}
 	e.load(scratchA, v.Args[0])
 	e.load(scratchB, v.Args[1])
 
-	e.a.CmpRI(scratchB, 64)
+	// The amount is compared against the *operand's* width, not the register's:
+	// `1u8 << 8` is out of range even though the register has plenty of room.
+	e.a.CmpRI(scratchB, int32(k.Bits()))
 	e.trapIf(x86.AboveEqual, "shift amount out of range", v)
 
 	// The count has to be in cl, and cl may be holding something the allocator put
 	// there, so it is saved around the shift.
 	e.a.Push(x86.RCX)
 	e.a.MovRR(x86.RCX, scratchB)
-	if v.Op == ir.OpShl {
+	switch {
+	case v.Op == ir.OpShl:
 		e.a.ShlCL(scratchA)
-	} else {
-		e.a.SarCL(scratchA)
+	case k.IsSigned():
+		e.a.SarCL(scratchA) // arithmetic: the sign comes back
+	default:
+		e.a.ShrCL(scratchA) // logical: it does not
 	}
 	e.a.Pop(x86.RCX)
+	if v.Op == ir.OpShl {
+		// A left shift overflows when the bits it pushed out mattered, which at any
+		// width is "the result does not fit".
+		e.trapUnlessFits64(k, scratchA, scratchB, v)
+	}
 	e.def(v, scratchA)
 	return nil
+}
+
+// trapUnlessFits64 is trapUnlessFits for a left shift, which at full width has no spare
+// bits to check against: there, shifting the result back must recover the operand, and the
+// amount is still in `amount` for that.
+func (e *emitter) trapUnlessFits64(k bytecode.Kind, reg, amount x86.Reg, v *ir.Value) {
+	if k.Bits() < 64 {
+		e.trapUnlessFits(k, reg, v)
+		return
+	}
+	e.a.MovRR(x86.RAX, reg)
+	e.a.Push(x86.RCX)
+	e.a.MovRR(x86.RCX, amount)
+	if k.IsSigned() {
+		e.a.SarCL(x86.RAX)
+	} else {
+		e.a.ShrCL(x86.RAX)
+	}
+	e.a.Pop(x86.RCX)
+	e.load(scratchB, v.Args[0])
+	e.a.CmpRR(x86.RAX, scratchB)
+	e.trapIf(x86.NotEqual, "arithmetic overflow", v)
 }
 
 // compare lowers `==`, `!=`, `<`, `<=`, `>` and `>=`.
@@ -357,11 +521,20 @@ func (e *emitter) shift(v *ir.Value) error {
 func (e *emitter) compare(v *ir.Value) error {
 	kind := bytecode.Kind(v.Const)
 	var cond x86.Cond
+	switch {
+	case kind.IsInteger():
+		// A narrow integer is stored in range and extended to sixty-four bits, so the
+		// width does not enter into the comparison -- only the signedness does.
+		if kind.IsSigned() {
+			cond = signedCond(v.Op)
+		} else {
+			cond = unsignedCond(v.Op)
+		}
+		return e.finishCompare(v, cond)
+	}
 	switch kind {
-	case bytecode.KindInt, bytecode.KindChar, bytecode.KindBool, bytecode.KindUnit:
+	case bytecode.KindChar, bytecode.KindBool, bytecode.KindUnit:
 		cond = signedCond(v.Op)
-	case bytecode.KindUint:
-		cond = unsignedCond(v.Op)
 	case bytecode.KindFloat:
 		return e.floatCompare(v)
 	case bytecode.KindRef:
@@ -382,7 +555,11 @@ func (e *emitter) compare(v *ir.Value) error {
 	default:
 		return fmt.Errorf("unimplemented: comparing %s values in native code", kind)
 	}
+	return e.finishCompare(v, cond)
+}
 
+// finishCompare emits the comparison itself, once the condition code is decided.
+func (e *emitter) finishCompare(v *ir.Value, cond x86.Cond) error {
 	e.load(scratchA, v.Args[0])
 	e.load(scratchB, v.Args[1])
 	e.a.CmpRR(scratchA, scratchB)
@@ -923,11 +1100,11 @@ func (e *emitter) builtin(v *ir.Value) error {
 		}
 		return e.buildOrdering(v)
 
-	case compile.BuiltinCheckedAdd, compile.BuiltinCheckedSub, compile.BuiltinCheckedMul:
+	case compile.BuiltinFitsAdd, compile.BuiltinFitsSub, compile.BuiltinFitsMul:
 		if len(v.Args) != 2 {
-			return fmt.Errorf("this is a compiler bug: a checked operation takes two arguments, got %d", len(v.Args))
+			return fmt.Errorf("this is a compiler bug: a fits-check takes two arguments, got %d", len(v.Args))
 		}
-		return e.checkedArith(v)
+		return e.fitsCheck(v)
 
 	case compile.BuiltinSaturatingAdd, compile.BuiltinSaturatingSub, compile.BuiltinSaturatingMul:
 		if len(v.Args) != 2 {
@@ -1216,48 +1393,25 @@ func (e *emitter) construct(v *ir.Value, t layout.TypeID) error {
 	return nil
 }
 
-// checkedArith lowers `checked_add`, `checked_sub` and `checked_mul` (§06's `Int`): the
-// same instruction the trapping operator uses, with the overflow flag turned into an
-// `Option` instead of a trap.
+// fitsCheck lowers the predicate behind `checked_add` and its siblings: does `a op b` fit
+// in the operand type? It answers a bool and builds nothing.
 //
-// It builds a prelude value, which the backend does for `cmp`'s `Ordering` too: the variant
-// indices came from the compiler, so nothing is looked up by name and `Option[i64]`'s exact
-// layout is the one this instantiation actually uses (ADR-0019).
-func (e *emitter) checkedArith(v *ir.Value) error {
-	if !e.prog.Prelude.Found {
-		return fmt.Errorf("this is a compiler bug: checked arithmetic without the prelude's `Option`")
-	}
+// The `Option` is internal/compile's to build, because it is the call's own instantiation:
+// `Option[u8]` and `Option[i64]` are different types with different layouts (ADR-0019),
+// and a runtime has one recorded variant index rather than one per instantiation.
+func (e *emitter) fitsCheck(v *ir.Value) error {
 	a := e.a
+	k := checkedKind(v)
 	e.load(scratchA, v.Args[0])
 	e.load(scratchB, v.Args[1])
-	switch v.Const {
-	case compile.BuiltinCheckedAdd:
-		a.AddRR(scratchA, scratchB)
-	case compile.BuiltinCheckedSub:
-		a.SubRR(scratchA, scratchB)
-	default:
-		a.ImulRR(scratchA, scratchB)
-	}
 
-	none := a.NewLabel("checked_none")
-	done := a.NewLabel("checked_done")
-	a.Jcc(x86.Overflow, none)
-
-	// Some(result). The payload has to survive the allocation, and there is nowhere in
-	// the register file to put it: every scratch register is clobbered by the call, and
-	// every other one may hold a value the allocator put there. So it goes on the stack,
-	// twice, which keeps rsp 16-byte aligned for the call -- the same shape `shift` uses
-	// to borrow cl. It is an integer, so no stack map has to describe it.
-	a.Push(scratchA)
-	a.Push(scratchA)
-	e.allocPreludeVariant(v, e.prog.Prelude.OptionSome)
-	a.Pop(scratchB)
-	a.Pop(scratchB)
-	a.MovMR(x86.At(x86.RAX, fieldOffset(0)), scratchB)
+	no := a.NewLabel("fits_no")
+	done := a.NewLabel("fits_done")
+	e.arithInto(k, checkedOpOf(v.Const), no)
+	a.MovRI(x86.RAX, 1)
 	a.Jmp(done)
-
-	a.Bind(none)
-	e.allocPreludeVariant(v, e.prog.Prelude.OptionNone)
+	a.Bind(no)
+	a.XorRR(x86.RAX, x86.RAX)
 	a.Bind(done)
 	e.def(v, x86.RAX)
 	return nil
@@ -1288,47 +1442,76 @@ func (e *emitter) allocPreludeVariant(v *ir.Value, idx int) {
 // about to consume, and read after the flag it must not disturb.
 func (e *emitter) saturatingArith(v *ir.Value) error {
 	a := e.a
+	k := checkedKind(v)
+	op := checkedOpOf(v.Const)
 	e.load(scratchA, v.Args[0])
 	e.load(scratchB, v.Args[1])
 
-	// rax rather than rcx: rcx is in the allocator's pool and would need saving, and rax
-	// is scratch the allocator never hands out. Nothing here calls anything, so it stays
-	// untouched until it is read.
-	a.MovRR(x86.RAX, scratchA)
-	if v.Const == compile.BuiltinSaturatingMul {
-		a.XorRR(x86.RAX, scratchB)
-	}
-	switch v.Const {
-	case compile.BuiltinSaturatingAdd:
-		a.AddRR(scratchA, scratchB)
-	case compile.BuiltinSaturatingSub:
-		a.SubRR(scratchA, scratchB)
-	default:
-		a.ImulRR(scratchA, scratchB)
+	// Which end an overflow ran off follows from the *operands*, which is exactly what
+	// the wrapped answer cannot say -- so it is computed before the operation consumes
+	// them. r9 rather than rcx: rcx is in the allocator's pool and would need saving,
+	// and nothing here calls anything, so a caller-saved scratch is enough.
+	//
+	// For an unsigned type there is only one end to run off downwards, and only `-` can:
+	// `negativeOverflow` in internal/arith says the same thing in Go.
+	end := x86.R9
+	if k.IsSigned() {
+		a.MovRR(end, scratchA)
+		if op == arith.OpMul {
+			a.XorRR(end, scratchB) // a product is negative when the signs differ
+		}
+	} else if op == arith.OpSub {
+		a.MovRI(end, ^uint64(0)) // any negative value: an unsigned subtraction clamps to 0
+	} else {
+		a.XorRR(end, end)
 	}
 
+	over := a.NewLabel("saturating_over")
 	done := a.NewLabel("saturating_done")
-	a.Jcc(x86.NoOverflow, done)
+	e.arithInto(k, op, over)
+	a.Jmp(done)
 
-	a.MovRI(scratchA, 0x7FFFFFFFFFFFFFFF)
-	a.MovRI(scratchB, 0x8000000000000000)
-	a.CmpRI(x86.RAX, 0)
+	a.Bind(over)
+	a.MovRI(scratchA, arith.Max(k))
+	a.MovRI(scratchB, arith.Min(k))
+	a.CmpRI(end, 0)
 	a.Cmov(x86.Less, scratchA, scratchB)
 	a.Bind(done)
 	e.def(v, scratchA)
 	return nil
 }
 
+// checkedKind is the width a checked or saturating operation answers at, which
+// internal/compile put on the instruction from the receiver's own type.
+func checkedKind(v *ir.Value) bytecode.Kind {
+	if v.OperandKind.IsInteger() {
+		return v.OperandKind
+	}
+	return bytecode.KindI64
+}
+
+// checkedOpOf names which operation a checked or saturating builtin index performs.
+func checkedOpOf(idx int) arith.Op {
+	switch idx {
+	case compile.BuiltinFitsAdd, compile.BuiltinSaturatingAdd:
+		return arith.OpAdd
+	case compile.BuiltinFitsSub, compile.BuiltinSaturatingSub:
+		return arith.OpSub
+	}
+	return arith.OpMul
+}
+
 // toStr renders a value as a String.
 func (e *emitter) toStr(v *ir.Value) error {
 	kind := bytecode.Kind(v.Const)
-	switch kind {
-	case bytecode.KindInt, bytecode.KindUint:
+	if kind.IsInteger() {
 		e.load(x86.RDI, v.Args[0])
 		e.a.Call(e.rt.intToStr)
 		e.recordCall(v)
 		e.def(v, x86.RAX)
 		return nil
+	}
+	switch kind {
 	case bytecode.KindString:
 		// A String renders as itself.
 		e.load(scratchA, v.Args[0])

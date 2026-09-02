@@ -3,6 +3,7 @@ package opt
 import (
 	"math"
 
+	"github.com/scarypheonix/meta/internal/arith"
 	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/ir"
 )
@@ -156,7 +157,7 @@ func foldBinary(f *ir.Func, b *ir.Block, v *ir.Value, x, y bytecode.Const, prog 
 	// Comparison and equality work on any constant kind.
 	switch v.Op {
 	case ir.OpEq, ir.OpNe, ir.OpLt, ir.OpLe, ir.OpGt, ir.OpGe:
-		res, ok := foldCompare(v.Op, x, y)
+		res, ok := foldCompare(v.Op, bytecode.Kind(v.Const), x, y)
 		if !ok {
 			return false
 		}
@@ -169,72 +170,60 @@ func foldBinary(f *ir.Func, b *ir.Block, v *ir.Value, x, y bytecode.Const, prog 
 	if x.Kind != bytecode.ConstInt || y.Kind != bytecode.ConstInt {
 		return false
 	}
-	return foldInt(f, b, v, int64(x.Bits), int64(y.Bits), prog)
+	return foldInt(f, b, v, x.Bits, y.Bits, prog)
 }
 
-func foldInt(f *ir.Func, b *ir.Block, v *ir.Value, x, y int64, prog *bytecode.Program) bool {
+// foldInt evaluates an integer operation on two constants, at the width the instruction
+// carries.
+//
+// The rules are internal/arith's, which is not a convenience: folding is only allowed
+// because it is unobservable (spec/11-codegen.md), and a folder with its own arithmetic is
+// a second definition of what `255u8 + 1` means. This one used to be 64-bit only, so `-O1`
+// folded that to 256 while `-O0` trapped -- a program whose answer depended on the
+// optimization level, which is the one thing the level is not allowed to change.
+func foldInt(f *ir.Func, b *ir.Block, v *ir.Value, x, y uint64, prog *bytecode.Program) bool {
+	k := bytecode.Kind(v.Const)
+	if !k.IsInteger() {
+		// An instruction with no kind is one no engine could run either; leave it for
+		// the backend to reject rather than inventing a width here.
+		return false
+	}
+	var r uint64
+	var trap string
 	switch v.Op {
 	case ir.OpAdd:
-		s := x + y
-		if (x > 0 && y > 0 && s < 0) || (x < 0 && y < 0 && s >= 0) {
-			return trapHere(f, b, v, prog, "arithmetic overflow")
-		}
-		return replaceWithConst(f, v, intConst(prog, s))
+		r, trap = arith.Add(k, x, y)
 	case ir.OpSub:
-		d := x - y
-		if (x >= 0 && y < 0 && d < 0) || (x < 0 && y > 0 && d >= 0) {
-			return trapHere(f, b, v, prog, "arithmetic overflow")
-		}
-		return replaceWithConst(f, v, intConst(prog, d))
+		r, trap = arith.Sub(k, x, y)
 	case ir.OpMul:
-		if x == 0 || y == 0 {
-			return replaceWithConst(f, v, intConst(prog, 0))
-		}
-		p := x * y
-		if p/y != x || (x == math.MinInt64 && y == -1) || (y == math.MinInt64 && x == -1) {
-			return trapHere(f, b, v, prog, "arithmetic overflow")
-		}
-		return replaceWithConst(f, v, intConst(prog, p))
+		r, trap = arith.Mul(k, x, y)
 	case ir.OpDiv:
-		if y == 0 {
-			return trapHere(f, b, v, prog, "divide by zero")
-		}
-		if x == math.MinInt64 && y == -1 {
-			return trapHere(f, b, v, prog, "arithmetic overflow")
-		}
-		return replaceWithConst(f, v, intConst(prog, x/y))
+		r, trap = arith.Div(k, x, y)
 	case ir.OpRem:
-		if y == 0 {
-			return trapHere(f, b, v, prog, "remainder by zero")
-		}
-		if x == math.MinInt64 && y == -1 {
-			return trapHere(f, b, v, prog, "arithmetic overflow")
-		}
-		return replaceWithConst(f, v, intConst(prog, x%y))
-	case ir.OpWrapAdd:
-		return replaceWithConst(f, v, intConst(prog, x+y))
-	case ir.OpWrapSub:
-		return replaceWithConst(f, v, intConst(prog, x-y))
-	case ir.OpWrapMul:
-		return replaceWithConst(f, v, intConst(prog, x*y))
+		r, trap = arith.Rem(k, x, y)
 	case ir.OpAnd:
-		return replaceWithConst(f, v, intConst(prog, x&y))
+		r = arith.And(k, x, y)
 	case ir.OpOr:
-		return replaceWithConst(f, v, intConst(prog, x|y))
+		r = arith.Or(k, x, y)
 	case ir.OpXor:
-		return replaceWithConst(f, v, intConst(prog, x^y))
+		r = arith.Xor(k, x, y)
 	case ir.OpShl:
-		if y < 0 || y >= 64 {
-			return trapHere(f, b, v, prog, "shift amount out of range")
-		}
-		return replaceWithConst(f, v, intConst(prog, x<<uint(y)))
+		r, trap = arith.Shl(k, x, y)
 	case ir.OpShr:
-		if y < 0 || y >= 64 {
-			return trapHere(f, b, v, prog, "shift amount out of range")
-		}
-		return replaceWithConst(f, v, intConst(prog, x>>uint(y)))
+		r, trap = arith.Shr(k, x, y)
+	case ir.OpWrapAdd:
+		r = arith.Wrap(k, x+y)
+	case ir.OpWrapSub:
+		r = arith.Wrap(k, x-y)
+	case ir.OpWrapMul:
+		r = arith.Wrap(k, x*y)
+	default:
+		return false
 	}
-	return false
+	if trap != "" {
+		return trapHere(f, b, v, prog, trap)
+	}
+	return replaceWithConst(f, v, intConst(prog, int64(r)))
 }
 
 func foldFloat(f *ir.Func, v *ir.Value, x, y float64, prog *bytecode.Program) bool {
@@ -257,17 +246,26 @@ func foldFloat(f *ir.Func, v *ir.Value, x, y float64, prog *bytecode.Program) bo
 
 // foldCompare evaluates a comparison of two constants, reporting false when the pair
 // cannot be compared at compile time.
-func foldCompare(op ir.Op, x, y bytecode.Const) (bool, bool) {
+func foldCompare(op ir.Op, k bytecode.Kind, x, y bytecode.Const) (bool, bool) {
 	if x.Kind != y.Kind {
 		return false, false
 	}
 	var cmp int
 	switch x.Kind {
 	case bytecode.ConstInt, bytecode.ConstChar:
-		a, b := int64(x.Bits), int64(y.Bits)
-		if x.Kind == bytecode.ConstChar {
-			a, b = int64(uint64(x.Bits)), int64(uint64(y.Bits))
+		// Signed or unsigned as the operand kind says, which is the same question the
+		// backend asks: the bits of `u64::MAX` and `-1i64` are identical and their order
+		// against 1 is not.
+		if x.Kind == bytecode.ConstInt && k.IsInteger() {
+			switch {
+			case arith.Less(k, x.Bits, y.Bits):
+				cmp = -1
+			case arith.Less(k, y.Bits, x.Bits):
+				cmp = 1
+			}
+			break
 		}
+		a, b := int64(x.Bits), int64(y.Bits)
 		switch {
 		case a < b:
 			cmp = -1
@@ -332,11 +330,15 @@ func foldUnary(f *ir.Func, b *ir.Block, v *ir.Value, x bytecode.Const, prog *byt
 		if x.Kind != bytecode.ConstInt {
 			return false
 		}
-		n := int64(x.Bits)
-		if n == math.MinInt64 {
-			return trapHere(f, b, v, prog, "arithmetic overflow")
+		k := bytecode.Kind(v.Const)
+		if !k.IsInteger() {
+			return false
 		}
-		return replaceWithConst(f, v, intConst(prog, -n))
+		r, trap := arith.Neg(k, x.Bits)
+		if trap != "" {
+			return trapHere(f, b, v, prog, trap)
+		}
+		return replaceWithConst(f, v, intConst(prog, int64(r)))
 	case ir.OpNegF:
 		if x.Kind != bytecode.ConstFloat {
 			return false

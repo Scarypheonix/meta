@@ -73,7 +73,7 @@ func staticKind(v *ir.Value, prog *bytecode.Program) (bytecode.Kind, bool) {
 		}
 		switch prog.Consts[v.Const].Kind {
 		case bytecode.ConstInt:
-			return bytecode.KindInt, true
+			return bytecode.KindI64, true
 		case bytecode.ConstFloat:
 			return bytecode.KindFloat, true
 		case bytecode.ConstChar:
@@ -91,10 +91,11 @@ func staticKind(v *ir.Value, prog *bytecode.Program) (bytecode.Kind, bool) {
 	case ir.OpAdd, ir.OpSub, ir.OpMul, ir.OpDiv, ir.OpRem, ir.OpNeg,
 		ir.OpWrapAdd, ir.OpWrapSub, ir.OpWrapMul,
 		ir.OpAnd, ir.OpOr, ir.OpXor, ir.OpShl, ir.OpShr:
-		// Every one of these is an integer op. KindInt and KindUint are both "raw" to a
-		// stack map -- the only distinction that matters here -- so the signedness the
-		// checker resolved does not need to travel this far.
-		return bytecode.KindInt, true
+		// Every one of these is an integer op. Every integer kind is "raw" to a stack
+		// map -- the only distinction that matters here -- so neither the width nor the
+		// signedness the checker resolved needs to travel this far, and KindI64 stands
+		// for "a machine word that is not a reference".
+		return bytecode.KindI64, true
 
 	case ir.OpAddF, ir.OpSubF, ir.OpMulF, ir.OpDivF, ir.OpRemF, ir.OpNegF:
 		return bytecode.KindFloat, true
@@ -106,7 +107,7 @@ func staticKind(v *ir.Value, prog *bytecode.Program) (bytecode.Kind, bool) {
 		// A bare code address: raw, never a reference. closures.go's resolveClosureCalls
 		// has already boxed any OpFunc value that escapes being an immediate call's own
 		// callee, so every OpFunc value reaching here really is just an address.
-		return bytecode.KindInt, true
+		return bytecode.KindI64, true
 
 	case ir.OpStruct, ir.OpTuple, ir.OpVariant, ir.OpClosure, ir.OpBoxFn:
 		return bytecode.KindRef, true
@@ -139,9 +140,9 @@ func castResultKind(k bytecode.CastKind, aux int) bytecode.Kind {
 		return bytecode.KindFloat
 	case bytecode.CastIntTrunc, bytecode.CastFloatToInt, bytecode.CastBoolToInt, bytecode.CastCharToInt:
 		if aux&(1<<8) != 0 {
-			return bytecode.KindInt
+			return bytecode.KindI64
 		}
-		return bytecode.KindUint
+		return bytecode.KindU64
 	}
 	return bytecode.KindUnknown
 }
@@ -156,16 +157,17 @@ func builtinResultKind(idx int) bytecode.Kind {
 		return bytecode.KindUnit
 	case compile.BuiltinRefEq:
 		return bytecode.KindBool
-	case compile.BuiltinCmpInt, compile.BuiltinCmpUint, compile.BuiltinCmpFloat, compile.BuiltinCmpString,
-		compile.BuiltinCheckedAdd, compile.BuiltinCheckedSub, compile.BuiltinCheckedMul:
+	case compile.BuiltinCmpInt, compile.BuiltinCmpUint, compile.BuiltinCmpFloat, compile.BuiltinCmpString:
 		return bytecode.KindRef
+	case compile.BuiltinFitsAdd, compile.BuiltinFitsSub, compile.BuiltinFitsMul:
+		return bytecode.KindBool
 	case compile.BuiltinSaturatingAdd, compile.BuiltinSaturatingSub, compile.BuiltinSaturatingMul:
-		return bytecode.KindInt
+		return bytecode.KindI64
 	case compile.BuiltinSpawn, compile.BuiltinChannel, compile.BuiltinMutex:
 		// A bare handle: an index into the runtime's own tables, which internal/compile
 		// then wraps in the prelude type the call's checked type names
 		// (spec/12-concurrency.md).
-		return bytecode.KindInt
+		return bytecode.KindI64
 	case compile.BuiltinAwait:
 		return bytecode.KindBool
 	case compile.BuiltinSend, compile.BuiltinCloseChan:

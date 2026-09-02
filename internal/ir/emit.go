@@ -206,7 +206,14 @@ func (e *emitter) emitValue(v *Value) error {
 		for _, a := range v.Args {
 			e.load(a, span)
 		}
-		e.emitABK(bytecode.OpCallBuiltin, v.Const, v.Aux, v.Kind, span)
+		// OperandKind is what Build read off the instruction; Kind may since have been
+		// rewritten by a backend pass that does not run on this path, so the round trip
+		// writes back what came in.
+		k := v.OperandKind
+		if k == bytecode.KindUnknown {
+			k = v.Kind
+		}
+		e.emitABK(bytecode.OpCallBuiltin, v.Const, v.Aux, k, span)
 
 	case OpClosure:
 		for _, a := range v.Args {

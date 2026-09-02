@@ -6,6 +6,8 @@ import (
 	"math"
 
 	"github.com/scarypheonix/meta/internal/ast"
+	"github.com/scarypheonix/meta/internal/bytecode"
+	"github.com/scarypheonix/meta/internal/check"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/prelude"
@@ -86,9 +88,14 @@ type Interp struct {
 	// whose callee monomorphization did not have to choose between.
 	mo       *mono.Result
 	rootInst map[*ast.FnDecl]*mono.Instance
-	stdout   io.Writer
-	stderr   io.Writer
-	frames   []*frame
+	// tys is the checker's own types, read for the one thing a runtime value cannot say:
+	// which of the eight integer types an arithmetic operand is, and therefore at what
+	// width the operation traps (spec/04-expressions.md). An Origin integer is a Go int64
+	// here, so `255u8` and `255u32` are the same value and different programs.
+	tys    *check.Result
+	stdout io.Writer
+	stderr io.Writer
+	frames []*frame
 	// depth guards against unbounded recursion, which the specification says traps as a
 	// stack overflow rather than corrupting memory.
 	depth    int
@@ -109,11 +116,12 @@ type Interp struct {
 }
 
 // New returns an interpreter writing program output to stdout and trap messages to
-// stderr. mo is the instantiation set for the same program: the interpreter runs only
-// programs that have been checked and monomorphized, and resolves every call through it,
-// exactly as the bytecode compiler and the backend do.
-func New(res *resolve.Result, mo *mono.Result, stdout, stderr io.Writer) *Interp {
-	in := &Interp{res: res, mo: mo, stdout: stdout, stderr: stderr, maxDepth: 8192, rt: newRuntime(), tid: 1}
+// stderr. tys and mo are the check result and the instantiation set for the same program:
+// the interpreter runs only programs that have been checked and monomorphized, and reads
+// both for the questions a runtime value cannot answer -- which impl a call reaches, and at
+// what width an arithmetic operation traps.
+func New(res *resolve.Result, tys *check.Result, mo *mono.Result, stdout, stderr io.Writer) *Interp {
+	in := &Interp{res: res, tys: tys, mo: mo, stdout: stdout, stderr: stderr, maxDepth: 8192, rt: newRuntime(), tid: 1}
 	in.rootInst = map[*ast.FnDecl]*mono.Instance{}
 	if mo != nil {
 		for _, inst := range mo.Instances {
@@ -727,10 +735,10 @@ func (in *Interp) evalFor(fo *ast.For) (Value, ctrl) {
 	cur := in.frame().inst
 	intoIter, _ := in.mo.LookupIter(cur, fo.NodeID())
 	nextFn, _ := in.mo.Lookup(cur, fo.NodeID())
-	it := in.callResolved(intoIter, iterable, "into_iter", nil, fo.Iter.Span())
+	it := in.callResolved(intoIter, iterable, "into_iter", bytecode.KindUnknown, nil, fo.Iter.Span())
 	f := in.frame()
 	for {
-		next := in.callResolved(nextFn, it, "next", nil, fo.Span())
+		next := in.callResolved(nextFn, it, "next", bytecode.KindUnknown, nil, fo.Span())
 		e, ok := next.(*Enum)
 		if !ok || e.Def.Name.Name != "Option" {
 			in.trap(fo.Span(), "`next` must return `Option`, found %s", TypeName(next))
