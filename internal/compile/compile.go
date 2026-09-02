@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/scarypheonix/meta/internal/arith"
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/check"
@@ -799,35 +800,23 @@ var _ = math.MaxInt64
 func mathFloat64bits(f float64) uint64 { return math.Float64bits(f) }
 
 // primConstValue evaluates `i64::MAX` and friends at compile time.
+//
+// The numbers are internal/arith's, so the three engines cannot disagree about them. A
+// constant slot holds sixty-four bits; `u64::MAX` is the pattern with every bit set, which
+// read as an i64 is -1 and read as the u64 the static type names is the number the spec
+// says.
 func primConstValue(prim, member string) (int64, error) {
-	info, ok := map[string]struct {
-		bits   uint
-		signed bool
-	}{
-		"i8": {8, true}, "i16": {16, true}, "i32": {32, true}, "i64": {64, true},
-		"u8": {8, false}, "u16": {16, false}, "u32": {32, false}, "u64": {64, false},
-	}[prim]
+	k, ok := bytecode.IntKindNamed(prim)
 	if !ok {
 		return 0, fmt.Errorf("`%s` has no associated constants", prim)
 	}
 	switch member {
 	case "BITS":
-		return int64(info.bits), nil
+		return int64(k.Bits()), nil
 	case "MIN":
-		if !info.signed {
-			return 0, nil
-		}
-		return -(int64(1) << (info.bits - 1)), nil
+		return int64(arith.Min(k)), nil
 	case "MAX":
-		if info.signed {
-			return int64(1)<<(info.bits-1) - 1, nil
-		}
-		if info.bits >= 64 {
-			// The VM's value model is one machine integer, so u64::MAX has no
-			// representation yet (docs/deferred.md, Phase 3).
-			return 0, fmt.Errorf("unimplemented: `u64::MAX` needs real integer widths")
-		}
-		return int64(1)<<info.bits - 1, nil
+		return int64(arith.Max(k)), nil
 	}
 	return 0, fmt.Errorf("`%s` has no associated constant `%s`", prim, member)
 }

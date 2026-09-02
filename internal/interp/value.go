@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/scarypheonix/meta/internal/ast"
+	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/resolve"
 )
@@ -161,6 +162,17 @@ func TypeName(v Value) string {
 		return "function"
 	}
 	return "value"
+}
+
+// DisplayAt renders a value the way `to_str` does at the static type the call site had.
+// Only an integer needs the type: sixty-four bits are two different numbers depending on
+// whether they are read signed or unsigned, and nothing in the value says which
+// (spec/04-expressions.md). `u64::MAX` renders as 18446744073709551615, not as -1.
+func DisplayAt(k bytecode.Kind, v Value) string {
+	if n, ok := v.(Int); ok && k.IsInteger() && !k.IsSigned() {
+		return strconv.FormatUint(uint64(n), 10)
+	}
+	return Display(v)
 }
 
 // Display renders a value the way `to_str` does. It is total: every value has a

@@ -1,0 +1,68 @@
+use std::io;
+
+// `u64` is where a value model that stores one machine integer per value stops being able
+// to hide: the largest `u64` has all sixty-four bits set, and those same bits read as an
+// `i64` are -1. Every engine holds the bit pattern; what the bits *mean* comes from the
+// static type, which is why division, comparison, right shift and rendering all have to be
+// told the width and the signedness rather than reading them off the value
+// (spec/04-expressions.md).
+
+fn describe(a: u64, b: u64) -> String {
+    match a.cmp(b) {
+        Ordering::Less => "less",
+        Ordering::Equal => "equal",
+        Ordering::Greater => "greater",
+    }
+}
+
+fn showU64(o: Option[u64]) -> String {
+    match o {
+        Option::Some(n) => n.to_str(),
+        Option::None => "None",
+    }
+}
+
+fn main() {
+    // The constants themselves.
+    io::println((u64::MAX).to_str());
+    io::println((u64::MIN).to_str());
+    io::println((u64::BITS).to_str());
+    io::println((i64::MAX).to_str());
+    io::println((i64::MIN).to_str());
+
+    // Arithmetic near the top of the range.
+    io::println((u64::MAX - 1).to_str());
+    io::println((u64::MAX / 2).to_str());
+    io::println((u64::MAX % 10).to_str());
+    io::println((u64::MAX >> 1).to_str());
+    io::println((u64::MAX >> 63).to_str());
+    io::println((1u64 << 63).to_str());
+
+    // Ordering is unsigned: the same bits ordered as an i64 would put u64::MAX last.
+    io::println((u64::MAX > 1u64).to_str());
+    io::println((1u64 < u64::MAX).to_str());
+    io::println(describe(u64::MAX, 1u64));
+    io::println(describe(1u64, u64::MAX));
+    io::println(describe(u64::MAX, u64::MAX));
+
+    // The three non-trapping forms at full width.
+    io::println((u64::MAX).wrapping_add(1).to_str());
+    io::println((0u64).wrapping_sub(1).to_str());
+    io::println((u64::MAX).saturating_add(1).to_str());
+    io::println(showU64((u64::MAX).checked_add(1)));
+    io::println(showU64((u64::MAX - 1).checked_add(1)));
+
+    // Rendering goes through the same path interpolation does.
+    io::println("max is \(u64::MAX)");
+
+    // And a value the optimizer cannot fold, so the run-time path is exercised too.
+    let mut n = u64::MAX - 3;
+    let mut i = 0;
+    while i < 3 {
+        n = n + 1;
+        i = i + 1;
+    }
+    io::println(n.to_str());
+    io::println((n as i64).to_str());
+    io::println((-1i64 as u64).to_str());
+}

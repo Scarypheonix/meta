@@ -541,8 +541,12 @@ func (e *emitter) emitTrap() {
 	a.Ud2()
 }
 
-// emitIntToStr renders a signed 64-bit integer as decimal into a fresh String: rdi = the
-// integer, result in rax.
+// emitIntToStr renders a 64-bit integer as decimal into a fresh String: rdi = the integer,
+// rsi = non-zero when those bits are to be read as signed, result in rax.
+//
+// The signedness is an argument rather than two routines because only the sign test
+// differs: `u64::MAX` and `-1i64` are the same sixty-four bits and the caller's static type
+// is the only thing that says which number they are (spec/04-expressions.md).
 func (e *emitter) emitIntToStr() {
 	a := e.a
 	a.Align(16)
@@ -568,6 +572,8 @@ func (e *emitter) emitIntToStr() {
 	a.XorRR(x86.R14, x86.R14)
 	a.MovRR(x86.RAX, x86.RDI)
 	notNeg := a.NewLabel("not_negative")
+	a.TestRR(x86.RSI, x86.RSI)
+	a.Jcc(x86.Equal, notNeg) // unsigned: never a sign, and the digits are already right
 	a.CmpRI(x86.RAX, 0)
 	a.Jcc(x86.GreaterEqual, notNeg)
 	a.Neg(x86.RAX)

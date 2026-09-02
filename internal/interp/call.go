@@ -173,7 +173,7 @@ func (in *Interp) builtinMethod(recv Value, name string, kind bytecode.Kind, arg
 		if len(args) != 0 {
 			in.trap(span, "`to_str` takes no arguments")
 		}
-		return &Str{S: Display(recv)}, true
+		return &Str{S: DisplayAt(kind, recv)}, true
 
 	case "wrapping_add", "wrapping_sub", "wrapping_mul":
 		a, b := in.twoInts(recv, args, name, span)
@@ -203,7 +203,7 @@ func (in *Interp) builtinMethod(recv Value, name string, kind bytecode.Kind, arg
 		if len(args) != 1 {
 			in.trap(span, "`cmp` takes exactly one argument")
 		}
-		return in.ordering(recv, args[0], span), true
+		return in.ordering(recv, args[0], intKindOr(kind), span), true
 	}
 	return nil, false
 }
@@ -255,8 +255,8 @@ func (in *Interp) optionNone(span diag.Span) Value {
 	return &Enum{Def: def, Variant: va}
 }
 
-func (in *Interp) ordering(a, b Value, span diag.Span) Value {
-	cmp, err := compareValues(a, b)
+func (in *Interp) ordering(a, b Value, k bytecode.Kind, span diag.Span) Value {
+	cmp, err := compareValues(a, b, k)
 	if err != nil {
 		in.trap(span, "%s", err.Error())
 	}
@@ -271,14 +271,15 @@ func (in *Interp) ordering(a, b Value, span diag.Span) Value {
 	return &Enum{Def: def, Variant: va}
 }
 
-func compareValues(a, b Value) (int, error) {
+func compareValues(a, b Value, k bytecode.Kind) (int, error) {
 	switch x := a.(type) {
 	case Int:
 		y, ok := b.(Int)
 		if !ok {
 			return 0, fmt.Errorf("cannot compare an integer with %s", TypeName(b))
 		}
-		return compareInt(int64(x), int64(y)), nil
+		// Signed or unsigned as the static type says: `u64::MAX.cmp(1)` is Greater.
+		return compareAt(intKindOr(k), uint64(x), uint64(y)), nil
 	case Float:
 		y, ok := b.(Float)
 		if !ok {

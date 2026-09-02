@@ -89,7 +89,7 @@ func (v *VM) run(floor int) {
 		case bytecode.OpLt, bytecode.OpLe, bytecode.OpGt, bytecode.OpGe:
 			b := v.pop()
 			a := v.pop()
-			v.push(boolVal(v.compareOp(in.Op, a, b, in.Span)))
+			v.push(boolVal(v.compareOp(in.Op, bytecode.Kind(in.A), a, b, in.Span)))
 
 		case bytecode.OpJump:
 			// §08 puts a safepoint on every loop back edge, so a compute loop cannot
@@ -164,7 +164,7 @@ func (v *VM) run(floor int) {
 			v.push(v.cast(bytecode.CastKind(in.A), int(in.B), v.pop(), in.Span))
 
 		case bytecode.OpToStr:
-			s := v.display(v.pop())
+			s := v.displayAt(bytecode.Kind(in.A), v.pop())
 			v.push(refVal(v.newString(s, in.Span)))
 
 		case bytecode.OpTrap:

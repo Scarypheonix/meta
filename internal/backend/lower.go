@@ -1506,6 +1506,13 @@ func (e *emitter) toStr(v *ir.Value) error {
 	kind := bytecode.Kind(v.Const)
 	if kind.IsInteger() {
 		e.load(x86.RDI, v.Args[0])
+		// The routine cannot ask the register whether its bits are signed, so the
+		// static type tells it.
+		if kind.IsSigned() {
+			e.a.MovRI(x86.RSI, 1)
+		} else {
+			e.a.XorRR(x86.RSI, x86.RSI)
+		}
 		e.a.Call(e.rt.intToStr)
 		e.recordCall(v)
 		e.def(v, x86.RAX)

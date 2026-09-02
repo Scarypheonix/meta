@@ -252,6 +252,31 @@ func (k Kind) Bits() uint {
 	return 64
 }
 
+// IntKindNamed is the integer kind a primitive type's source name denotes. It is here
+// rather than in a compiler package because `u64::MAX` has to mean the same number in the
+// interpreter and in the bytecode compiler, and the number is arith.Max of this kind.
+func IntKindNamed(name string) (Kind, bool) {
+	switch name {
+	case "i8":
+		return KindI8, true
+	case "i16":
+		return KindI16, true
+	case "i32":
+		return KindI32, true
+	case "i64":
+		return KindI64, true
+	case "u8":
+		return KindU8, true
+	case "u16":
+		return KindU16, true
+	case "u32":
+		return KindU32, true
+	case "u64":
+		return KindU64, true
+	}
+	return KindUnknown, false
+}
+
 func (k Kind) String() string {
 	switch k {
 	case KindI8:

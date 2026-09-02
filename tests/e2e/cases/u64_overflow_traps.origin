@@ -1,0 +1,11 @@
+use std::io;
+
+// One past the top of the `u64` range. The check is against the *type's* maximum, not
+// against sixty-four bits: the bits of `u64::MAX + 1` are 0, which is a perfectly good
+// number, and the operation still has to trap (spec/04-expressions.md).
+
+fn main() {
+    io::println("before");
+    io::println((u64::MAX + 1u64).to_str());
+    io::println("unreachable");
+}

@@ -82,11 +82,19 @@ func (v *VM) equalObjects(a, b layout.Ref, span diag.Span) bool {
 
 // compareOp implements `<` and friends, which are built in for integers, floats, char
 // and String only (spec/04-expressions.md).
-func (v *VM) compareOp(op bytecode.Op, a, b Value, span diag.Span) bool {
+//
+// k is the operands' static kind, which the instruction carries because a slot holds
+// sixty-four bits and their order depends on how they are read: the same bits are -1 as an
+// i64 and u64::MAX as a u64. A non-integer kind names a tag the value already carries.
+func (v *VM) compareOp(op bytecode.Op, k bytecode.Kind, a, b Value, span diag.Span) bool {
 	var cmp int
 	switch a.Tag {
 	case layout.TagInt, layout.TagChar:
-		cmp = compareInt(a.Int(), b.Int())
+		if k.IsInteger() {
+			cmp = compareAt(k, a.N, b.N)
+		} else {
+			cmp = compareInt(a.Int(), b.Int())
+		}
 	case layout.TagFloat:
 		// IEEE comparison: any comparison with NaN is false, which the ordering below
 		// reproduces because NaN is neither less than, equal to, nor greater than.
@@ -118,6 +126,18 @@ func (v *VM) compareOp(op bytecode.Op, a, b Value, span diag.Span) bool {
 	}
 }
 
+// compareAt orders two integers of kind k, signed or unsigned as k says. It mirrors
+// internal/interp's own; both defer to internal/arith for which order that is.
+func compareAt(k bytecode.Kind, a, b uint64) int {
+	switch {
+	case arith.Less(k, a, b):
+		return -1
+	case arith.Less(k, b, a):
+		return 1
+	}
+	return 0
+}
+
 func compareInt(a, b int64) int {
 	switch {
 	case a < b:
@@ -126,6 +146,16 @@ func compareInt(a, b int64) int {
 		return 1
 	}
 	return 0
+}
+
+// displayAt renders a value the way `to_str` does at the static type the call site had.
+// Only an integer needs the type: the same bits are -1 as an i64 and 18446744073709551615
+// as a u64, and the value's tag says only that they are an integer.
+func (v *VM) displayAt(k bytecode.Kind, val Value) string {
+	if val.Tag == layout.TagInt && k.IsInteger() && !k.IsSigned() {
+		return strconv.FormatUint(val.N, 10)
+	}
+	return v.display(val)
 }
 
 // display renders a value the way `to_str` does. It must match the interpreter's
@@ -322,10 +352,15 @@ func (v *VM) callBuiltin(index, argCount int, kind bytecode.Kind, span diag.Span
 		v.push(boolVal(a.R == b.R))
 
 	case compile.BuiltinCmpInt, compile.BuiltinCmpUint, compile.BuiltinCmpFloat, compile.BuiltinCmpString:
-		// One builtin per receiver kind exists so that native code (which cannot ask a
-		// register what it holds) knows which comparison to run; the VM's values
-		// already carry their own kind and treat all four identically.
-		v.push(refVal(v.ordering(args[0], args[1], span)))
+		// One builtin per receiver kind exists so that native code, which cannot ask a
+		// register what it holds, knows which comparison to run. The VM's values carry
+		// a tag, but a tag does not distinguish signed from unsigned bits, so the
+		// unsigned builtin still has to say so.
+		ck := bytecode.KindI64
+		if index == compile.BuiltinCmpUint {
+			ck = bytecode.KindU64
+		}
+		v.push(refVal(v.ordering(args[0], args[1], ck, span)))
 
 	case compile.BuiltinFitsAdd, compile.BuiltinFitsSub, compile.BuiltinFitsMul:
 		// Only the predicate: internal/compile builds the `Option` itself, at the call's
@@ -358,13 +393,13 @@ func (v *VM) optionNone(span diag.Span) layout.Ref {
 	return v.alloc(v.prog.Variants[v.prog.Prelude.OptionNone].Type, 0, span)
 }
 
-func (v *VM) ordering(a, b Value, span diag.Span) layout.Ref {
+func (v *VM) ordering(a, b Value, k bytecode.Kind, span diag.Span) layout.Ref {
 	v.requirePrelude(span)
 	var idx int
 	switch {
-	case v.compareOp(bytecode.OpLt, a, b, span):
+	case v.compareOp(bytecode.OpLt, k, a, b, span):
 		idx = v.prog.Prelude.Less
-	case v.compareOp(bytecode.OpGt, a, b, span):
+	case v.compareOp(bytecode.OpGt, k, a, b, span):
 		idx = v.prog.Prelude.Greater
 	default:
 		idx = v.prog.Prelude.Equal

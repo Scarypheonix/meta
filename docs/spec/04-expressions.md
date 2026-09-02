@@ -97,6 +97,17 @@ unsigned type it is logical.
 `& | ^` are bitwise on integers only. Unary `-` on an integer TRAPS when the operand is
 that type's minimum value; it is REJECTED on unsigned types.
 
+Signedness is a property of the *type*, not of the value. The bits `0xFFFF_FFFF_FFFF_FFFF`
+are `-1` at type `i64` and `18446744073709551615` at type `u64`, and no engine may decide
+which by looking at the value. Everything whose answer differs between the two — `/`, `%`,
+`>>`, `< <= > >=`, `cmp`, and the decimal rendering `to_str` produces — takes it from the
+static type of its operands. In particular `u64::MAX` is a value like any other: it
+renders as `18446744073709551615`, `u64::MAX > 1` is `true`, `u64::MAX / 2` is
+`9223372036854775807`, and `u64::MAX + 1` TRAPS.
+
+`T::MIN`, `T::MAX` and `T::BITS` are declared for every integer type. `MIN` and `MAX` have
+type `T`; `BITS` has type `u32`.
+
 ### Floats
 
 IEEE-754 binary32/binary64 with round-to-nearest-ties-to-even. Overflow produces an
@@ -229,6 +240,10 @@ in `10-examples.md` §7 with its expected output.
 | `u64::MAX + 1` | TRAPS `arithmetic overflow` |
 | `u64::MAX / 2` | `9223372036854775807` — unsigned division, not signed |
 | `u64::MAX > 1` | `true` — unsigned comparison |
+| `u64::MAX >> 1` | `9223372036854775807` — logical shift, no sign to extend |
+| `u64::MAX.to_str()` | `"18446744073709551615"`, not `"-1"` |
+| `u64::MAX.cmp(1)` | `Ordering::Greater` |
+| `-1i64 as u64` | `18446744073709551615` — the same bits, read as the new type |
 | `i64::MAX.wrapping_add(1)` | `i64::MIN` |
 | `(-7) / 2` | `-3` (truncates toward zero) |
 | `(-7) % 2` | `-1` (sign of dividend) |
