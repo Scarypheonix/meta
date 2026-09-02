@@ -30,6 +30,7 @@ must be corrected in the same commit that changes behaviour.
 | `13-collections.md` | `Array`, `List`, `Map`, and the specified hash |
 | `14-strings.md` | `String`'s operations, character boundaries, interpolation |
 | `15-files.md` | Reading and writing whole files |
+| `16-floats.md` | What `to_str` on a float produces, exactly |
 
 ## Design pillars
 

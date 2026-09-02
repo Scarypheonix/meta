@@ -3,7 +3,6 @@ package interp
 import (
 	"fmt"
 	"io"
-	"math"
 
 	"github.com/scarypheonix/meta/internal/arith"
 	"github.com/scarypheonix/meta/internal/ast"
@@ -337,8 +336,13 @@ func (in *Interp) evalExpr(e ast.Expr) (Value, ctrl) {
 		return Unit{}, normal
 
 	case *ast.IntLit:
-		if v.Overflow || v.Value > math.MaxInt64 {
-			in.trap(v.Span(), "integer literal is out of range for `i64`")
+		// The checker has already rejected a literal that does not fit the type
+		// inference gave it, per width and signedness. What is left is a literal that
+		// does not fit in sixty-four bits at all, which the lexer could not even read.
+		// `18446744073709551615u64` is a `u64` and reaches here as the bit pattern of
+		// -1; that is the same number, read the way its type says (spec/04-expressions.md).
+		if v.Overflow {
+			in.trap(v.Span(), "integer literal is out of range")
 		}
 		return Int(int64(v.Value)), normal
 	case *ast.FloatLit:

@@ -17,7 +17,7 @@ There are no exceptions and no stack unwinding in the language semantics (ADR-00
 pub enum Result[T, E] { Ok(T), Err(E) }
 
 fn read_config(path: String) -> Result[Config, IoError] {
-    let text = fs::read_to_string(path)?;   // returns early on Err
+    let text = read_to_string(path)?;       // returns early on Err
     let cfg = parse(text)?;
     Result::Ok(cfg)
 }

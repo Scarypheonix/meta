@@ -90,9 +90,10 @@ All three are at the receiver's width too: `255u8.wrapping_add(1)` is `0`,
 by zero TRAP. `i64::MIN / -1` TRAPS (the mathematical result is not representable).
 
 `<<` and `>>` require the shift amount to be strictly less than the bit width of the
-left operand; otherwise they TRAP. The shift amount has type `u32` regardless of the
-left operand's type. `>>` on a signed type is arithmetic (sign-extending); on an
-unsigned type it is logical.
+left operand; otherwise they TRAP. The shift amount has the **same type as the left
+operand**, like every other binary operator's right side — there is no promotion here
+either, so `n >> 1` infers `1` at `n`'s own type and `n >> 1u32` on an `i64` is rejected.
+`>>` on a signed type is arithmetic (sign-extending); on an unsigned type it is logical.
 
 `& | ^` are bitwise on integers only. Unary `-` on an integer TRAPS when the operand is
 that type's minimum value; it is REJECTED on unsigned types.

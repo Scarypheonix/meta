@@ -8,7 +8,7 @@ enough for that, and no more.
 use std::io;
 
 fn main() {
-    match fs::read_to_string("input.txt") {
+    match read_to_string("input.txt") {
         Result::Ok(text) => io::println("\(text.len()) bytes"),
         Result::Err(e) => io::println("cannot read it: \(e.to_str())"),
     }

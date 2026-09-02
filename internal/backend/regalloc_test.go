@@ -103,6 +103,87 @@ func TestAllocateGivesLoopCarriedPhisDistinctLocations(t *testing.T) {
 	}
 }
 
+// TestAllocateGivesEveryPhiOfABlockADistinctLocation is the same requirement one step
+// further, and the bug it caught was silent for three phases.
+//
+// A merge block's phis are all written by one parallel copy on the edge into it, so no two
+// may share a location however short one's own life is. Numbering them one after another
+// did not say that: a phi nothing reads -- the unit-typed one a `let mut` assigned in both
+// arms of a *nested* `if` leaves behind -- was a one-point interval, expired before the
+// next phi's began, and handed its register to a later phi of the same block. Both were
+// then written through that register and the first one won, so the later phi's value was
+// whatever the dead one carried: `unit`, which is zero, which is a null reference.
+//
+// The shape below is the smallest one that produced it: four values merged at a block one
+// of whose phis is dead.
+func TestAllocateGivesEveryPhiOfABlockADistinctLocation(t *testing.T) {
+	f := ir.NewFunc("merge", 1, 0)
+	entry := f.Entry
+	left := f.NewBlock()
+	right := f.NewBlock()
+	join := f.NewBlock()
+
+	cond := entry.Append(f.NewValue(ir.OpParam, diag.Span{}))
+	entry.SetTerminator(f.NewValue(ir.OpBranch, diag.Span{}, cond), left, right)
+
+	const arms = 4
+	var lefts, rights []*ir.Value
+	for i := 0; i < arms; i++ {
+		lefts = append(lefts, left.Append(f.NewValue(ir.OpConst, diag.Span{})))
+		rights = append(rights, right.Append(f.NewValue(ir.OpConst, diag.Span{})))
+	}
+	left.SetTerminator(f.NewValue(ir.OpJump, diag.Span{}), join)
+	right.SetTerminator(f.NewValue(ir.OpJump, diag.Span{}), join)
+
+	var phis []*ir.Value
+	for i := 0; i < arms; i++ {
+		p := f.NewValue(ir.OpPhi, diag.Span{})
+		p.Args = []*ir.Value{lefts[i], rights[i]}
+		join.Append(p)
+		phis = append(phis, p)
+	}
+	// Only the last phi is read. The first three are dead, which is exactly the case that
+	// used to collapse their intervals to a point.
+	join.SetTerminator(f.NewValue(ir.OpReturn, diag.Span{}, phis[arms-1]))
+
+	// The invariant is on the intervals, not on which registers a particular free list
+	// happened to hand out: two phis of one block must overlap, so that no linear scan,
+	// under no amount of register pressure, can ever give them the same location.
+	n := number(f, false)
+	byVal := map[*ir.Value]*interval{}
+	for _, iv := range intervals(f, n) {
+		byVal[iv.val] = iv
+	}
+	for i, p := range phis {
+		for j := i + 1; j < len(phis); j++ {
+			a, b := byVal[p], byVal[phis[j]]
+			if a == nil || b == nil {
+				t.Fatalf("phi %d or %d has no interval at all", i, j)
+			}
+			if a.end < b.start || b.end < a.start {
+				t.Errorf("phi %d [%d,%d] and phi %d [%d,%d] do not overlap: "+
+					"the allocator may give them one location, and the parallel copy "+
+					"into the block writes both through it",
+					i, a.start, a.end, j, b.start, b.end)
+			}
+		}
+	}
+
+	al := allocate(f, false)
+	seen := map[loc]int{}
+	for i, p := range phis {
+		l, ok := al.where[p]
+		if !ok {
+			continue // no location at all is fine: nothing is written to it
+		}
+		if prev, dup := seen[l]; dup {
+			t.Errorf("phi %d and phi %d share location %+v: one parallel copy writes "+
+				"both, so whichever lands first is lost", prev, i, l)
+		}
+		seen[l] = i
+	}
+}
+
 // TestReferenceSpillSlotsAreContiguousAndBelowRawOnes is ADR-0021's own regression
 // test: spec/11-codegen.md's "Stack frames" requires every reference-kind spill slot to
 // sit below every raw one, so a stack map can describe the reference area as one offset

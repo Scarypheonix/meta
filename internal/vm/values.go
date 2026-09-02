@@ -332,6 +332,17 @@ func (v *VM) callBuiltin(index, argCount int, kind bytecode.Kind, span diag.Span
 	}
 
 	switch index {
+	case compile.BuiltinFloatBits:
+		// The bits are already in the slot; only the tag that says how to read them
+		// changes (spec/16-floats.md).
+		v.push(Value{Tag: layout.TagInt, N: args[0].N})
+		return
+	case compile.BuiltinFloatFromBits:
+		v.push(Value{Tag: layout.TagFloat, N: args[0].N})
+		return
+	}
+
+	switch index {
 	case compile.BuiltinPrint, compile.BuiltinPrintln:
 		s := v.heap.Bytes(args[0].R)
 		if index == compile.BuiltinPrintln {

@@ -314,6 +314,10 @@ var stdModules = map[string][]string{
 	// allocate raw bytes; everything else about a string is Origin source in the prelude,
 	// as the `Str` trait's default method bodies.
 	"std::str": {"len", "byte_at", "slice", "concat", "char_at", "char_width"},
+	// Phase 8 (spec/16-floats.md). The two operations that read a float's bits and put
+	// them back. Rendering a float in decimal is Origin source in the prelude, written
+	// over exactly these; nothing else in the language can see a float's representation.
+	"std::float": {"bits", "from_bits"},
 	// Phase 7 (spec/15-files.md). Four operations whose bodies are system calls. The
 	// prelude's `read_to_string`, `write_string` and `file_exists` are what a program
 	// calls; these are what those are written in terms of.

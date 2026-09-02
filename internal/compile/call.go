@@ -47,6 +47,9 @@ var builtinIndex = map[string]int{
 	"str::char_at":    BuiltinStrCharAt,
 	"str::char_width": BuiltinStrCharWidth,
 
+	"float::bits":      BuiltinFloatBits,
+	"float::from_bits": BuiltinFloatFromBits,
+
 	"fs::read_file":   BuiltinReadFile,
 	"fs::taken_text":  BuiltinTakenText,
 	"fs::write_file":  BuiltinWriteFile,

@@ -17,6 +17,7 @@ use std::list;
 use std::hash;
 use std::str;
 use std::fs;
+use std::float;
 
 pub enum Option[T] {
     None,
@@ -905,4 +906,447 @@ pub fn write_string(path: String, contents: String) -> Result[(), IoError] {
 /// is exactly what `false` means here.
 pub fn file_exists(path: String) -> bool {
     fs::file_exists(path)
+}
+
+// --- Rendering a float (spec/16-floats.md) -----------------------------------------
+//
+// `to_str` on a float produces the shortest decimal that reads back as the same value.
+// That is not a formatting detail: it is a fact about the number, and finding it needs
+// exact arithmetic on integers far wider than sixty-four bits.
+//
+// So it is written here, in Origin, over the two operations the compiler provides for it
+// (`float::bits` and `float::from_bits`, which reinterpret the same sixty-four bits). One
+// implementation the interpreter, the virtual machine and native code all run, rather than
+// three that would have to be argued into agreeing -- and, for the native backend, rather
+// than a shortest-round-trip algorithm hand-written in machine code (ADR-0031).
+//
+// The algorithm is Steele & White's free-format conversion in Burger & Dybvig's form: keep
+// the value and the two half-gaps to its neighbours as exact rationals, scale them so the
+// first digit is the first one that matters, and emit digits until the remainder is close
+// enough to one neighbour that no further digit could change which float the string reads
+// back as.
+
+/// The number of digits a `Big` limb holds, and the base it counts in.
+///
+/// Base 10^9 rather than a power of two because every intermediate has to fit in an `i64`:
+/// a limb times the base is 10^18, and 10^18 plus a carry is still under `i64::MAX`. A
+/// wider base would overflow, and overflow traps.
+fn big_base() -> i64 {
+    1000000000
+}
+
+/// A non-negative integer of unbounded size: limbs in base 10^9, least significant first,
+/// with no zero limb on the end. The empty list is zero.
+///
+/// Every function below builds a fresh list and never writes through its arguments, so two
+/// names for one `Big` are always safe.
+fn big_trim(a: List[i64]) -> List[i64] {
+    while a.len() > 0 && a.at(a.len() - 1) == 0 {
+        a.pop();
+    }
+    a
+}
+
+/// `n` as a `Big`. `n` must not be negative.
+fn big_of(n: i64) -> List[i64] {
+    let out = list::new[i64]();
+    let mut v = n;
+    while v > 0 {
+        out.push(v % big_base());
+        v = v / big_base();
+    }
+    out
+}
+
+/// `a * m`, for `0 <= m <= 10^9`.
+fn big_mul_small(a: List[i64], m: i64) -> List[i64] {
+    let out = list::new[i64]();
+    let mut carry = 0;
+    let mut i = 0;
+    while i < a.len() {
+        let p = a.at(i) * m + carry;
+        out.push(p % big_base());
+        carry = p / big_base();
+        i = i + 1;
+    }
+    while carry > 0 {
+        out.push(carry % big_base());
+        carry = carry / big_base();
+    }
+    big_trim(out)
+}
+
+/// `a * 2^n`, for `n >= 0`.
+///
+/// In chunks of twenty-nine bits, which is the widest multiplier that keeps a limb times it
+/// inside an `i64`.
+fn big_mul_pow2(a: List[i64], n: i64) -> List[i64] {
+    let mut out = a;
+    let mut left = n;
+    while left >= 29 {
+        out = big_mul_small(out, 536870912);
+        left = left - 29;
+    }
+    if left > 0 {
+        out = big_mul_small(out, 1 << left);
+    }
+    out
+}
+
+/// `a * 10^n`, for `n >= 0`. Nine digits at a time, which is exactly one limb.
+fn big_mul_pow10(a: List[i64], n: i64) -> List[i64] {
+    let mut out = a;
+    let mut left = n;
+    while left >= 9 {
+        out = big_mul_small(out, 1000000000);
+        left = left - 9;
+    }
+    while left > 0 {
+        out = big_mul_small(out, 10);
+        left = left - 1;
+    }
+    out
+}
+
+/// How many bits `n` occupies. `n` must be positive.
+fn bit_length(n: i64) -> i64 {
+    let mut v = n;
+    let mut bits = 0;
+    while v > 0 {
+        bits = bits + 1;
+        v = v / 2;
+    }
+    bits
+}
+
+/// `a + b`.
+fn big_add(a: List[i64], b: List[i64]) -> List[i64] {
+    let out = list::new[i64]();
+    let mut carry = 0;
+    let mut i = 0;
+    let mut n = a.len();
+    if b.len() > n {
+        n = b.len();
+    }
+    while i < n {
+        let mut sum = carry;
+        if i < a.len() {
+            sum = sum + a.at(i);
+        }
+        if i < b.len() {
+            sum = sum + b.at(i);
+        }
+        if sum >= big_base() {
+            out.push(sum - big_base());
+            carry = 1;
+        } else {
+            out.push(sum);
+            carry = 0;
+        }
+        i = i + 1;
+    }
+    if carry > 0 {
+        out.push(carry);
+    }
+    big_trim(out)
+}
+
+/// `a - b`, which the caller must know is not negative.
+fn big_sub(a: List[i64], b: List[i64]) -> List[i64] {
+    let out = list::new[i64]();
+    let mut borrow = 0;
+    let mut i = 0;
+    while i < a.len() {
+        let mut d = a.at(i) - borrow;
+        if i < b.len() {
+            d = d - b.at(i);
+        }
+        if d < 0 {
+            d = d + big_base();
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out.push(d);
+        i = i + 1;
+    }
+    big_trim(out)
+}
+
+/// `-1`, `0` or `1` as `a` is less than, equal to or greater than `b`.
+fn big_cmp(a: List[i64], b: List[i64]) -> i64 {
+    if a.len() != b.len() {
+        if a.len() < b.len() {
+            return -1;
+        }
+        return 1;
+    }
+    let mut i = a.len();
+    while i > 0 {
+        i = i - 1;
+        if a.at(i) != b.at(i) {
+            if a.at(i) < b.at(i) {
+                return -1;
+            }
+            return 1;
+        }
+    }
+    0
+}
+
+/// Whether the value's upper neighbour boundary has been reached: `r + mp` against `s`.
+///
+/// `inclusive` is what decides a tie, and it is the parser's rule read backwards: a decimal
+/// exactly halfway between two floats reads back as the one with the even significand, so a
+/// boundary counts as reachable exactly when this float's significand is even.
+fn big_reaches(r: List[i64], mp: List[i64], s: List[i64], inclusive: bool) -> bool {
+    let c = big_cmp(big_add(r, mp), s);
+    if inclusive {
+        return c >= 0;
+    }
+    c > 0
+}
+
+/// Whether the remainder has fallen to the lower neighbour boundary: `r` against `mm`.
+fn big_below(r: List[i64], mm: List[i64], inclusive: bool) -> bool {
+    let c = big_cmp(r, mm);
+    if inclusive {
+        return c <= 0;
+    }
+    c < 0
+}
+
+/// One decimal digit as a one-byte `String`.
+fn digit_str(d: i64) -> String {
+    "0123456789".slice(d, d + 1)
+}
+
+/// The shortest digits of a positive finite float, and where its decimal point goes.
+///
+/// `f` and `e` are the significand and exponent of `v = f * 2^e`, `asymmetric` says the
+/// gap below `v` is half the gap above it (which happens at a power of two that is not the
+/// smallest normal), and `inclusive` says the boundaries themselves count.
+///
+/// Returns the digits; `point` is written into the one-element list `point_out`, because
+/// Origin has no tuple field access yet (docs/deferred.md).
+fn shortest_digits(f: i64, e: i64, asymmetric: bool, inclusive: bool, point_out: List[i64]) -> String {
+    // The value and its two half-gaps as exact rationals over a common denominator:
+    // v = r/s, the gap up is mp/s, the gap down is mm/s.
+    let mut r = list::new[i64]();
+    let mut s = list::new[i64]();
+    let mut mp = list::new[i64]();
+    let mut mm = list::new[i64]();
+    if e >= 0 {
+        if asymmetric {
+            r = big_mul_pow2(big_of(f), e + 2);
+            s = big_of(4);
+            mp = big_mul_pow2(big_of(1), e + 1);
+            mm = big_mul_pow2(big_of(1), e);
+        } else {
+            r = big_mul_pow2(big_of(f), e + 1);
+            s = big_of(2);
+            mp = big_mul_pow2(big_of(1), e);
+            mm = big_mul_pow2(big_of(1), e);
+        }
+    } else {
+        if asymmetric {
+            r = big_mul_small(big_of(f), 4);
+            s = big_mul_pow2(big_of(1), 2 - e);
+            mp = big_of(2);
+            mm = big_of(1);
+        } else {
+            r = big_mul_small(big_of(f), 2);
+            s = big_mul_pow2(big_of(1), 1 - e);
+            mp = big_of(1);
+            mm = big_of(1);
+        }
+    }
+
+    // Scale until 0.d1d2... names the value: the upper boundary must be at most one, and
+    // more than a tenth, so the first digit generated is the first significant one.
+    //
+    // The power of ten to scale by is estimated first, because getting there one factor of
+    // ten at a time is three hundred passes over a bignum for a value near either end of
+    // the range. 30103/100000 is log10(2) to five places, which puts the estimate within a
+    // step or two; the two loops below are what make it exact, and they are written to
+    // correct in either direction so that the estimate never has to be trusted.
+    let mut point = ((e + bit_length(f) - 1) * 30103) / 100000;
+    if point > 0 && ((e + bit_length(f) - 1) * 30103) % 100000 != 0 {
+        point = point + 1;
+    }
+    if point >= 0 {
+        s = big_mul_pow10(s, point);
+    } else {
+        r = big_mul_pow10(r, 0 - point);
+        mp = big_mul_pow10(mp, 0 - point);
+        mm = big_mul_pow10(mm, 0 - point);
+    }
+
+    while big_reaches(r, mp, s, inclusive) {
+        s = big_mul_small(s, 10);
+        point = point + 1;
+    }
+    let mut scaled = false;
+    while !scaled {
+        let r10 = big_mul_small(r, 10);
+        let mp10 = big_mul_small(mp, 10);
+        if big_reaches(r10, mp10, s, inclusive) {
+            scaled = true;
+        } else {
+            r = r10;
+            mp = mp10;
+            mm = big_mul_small(mm, 10);
+            point = point - 1;
+        }
+    }
+
+    // Emit digits until one more could not change which float the string reads back as.
+    //
+    // Rounding the last digit up never carries: the scaling invariant makes the digit at
+    // most eight whenever the upper boundary has been reached, so `d + 1` is at most nine.
+    let mut out = "";
+    let mut done = false;
+    while !done {
+        r = big_mul_small(r, 10);
+        mp = big_mul_small(mp, 10);
+        mm = big_mul_small(mm, 10);
+        let mut d = 0;
+        while big_cmp(r, s) >= 0 {
+            r = big_sub(r, s);
+            d = d + 1;
+        }
+        let low = big_below(r, mm, inclusive);
+        let high = big_reaches(r, mp, s, inclusive);
+        if !low && !high {
+            out = out.concat(digit_str(d));
+        } else {
+            if low && !high {
+                out = out.concat(digit_str(d));
+            } else {
+                if high && !low {
+                    out = out.concat(digit_str(d + 1));
+                } else {
+                    // Both boundaries are in reach, so either digit reads back as this
+                    // float and the nearer one wins. An exact tie goes to the even digit,
+                    // which is the rule parsing uses read backwards (spec/16-floats.md).
+                    let half = big_cmp(big_mul_small(r, 2), s);
+                    if half < 0 || (half == 0 && d % 2 == 0) {
+                        out = out.concat(digit_str(d));
+                    } else {
+                        out = out.concat(digit_str(d + 1));
+                    }
+                }
+            }
+            done = true;
+        }
+    }
+    point_out.push(point);
+    out
+}
+
+/// Lays digits out as spec/16-floats.md's table says, given the decimal point position.
+fn layout_decimal(digits: String, point: i64) -> String {
+    let n = digits.len();
+    let e = point - 1;
+
+    if e < -4 || e >= 6 {
+        let mut out = digits.slice(0, 1);
+        if n > 1 {
+            out = out.concat(".").concat(digits.slice(1, n));
+        }
+        out = out.concat("e");
+        let mut mag = e;
+        if e < 0 {
+            out = out.concat("-");
+            mag = 0 - e;
+        } else {
+            out = out.concat("+");
+        }
+        let tail = mag.to_str();
+        if tail.len() < 2 {
+            out = out.concat("0");
+        }
+        return out.concat(tail);
+    }
+
+    if point <= 0 {
+        let mut out = "0.";
+        let mut i = point;
+        while i < 0 {
+            out = out.concat("0");
+            i = i + 1;
+        }
+        return out.concat(digits);
+    }
+
+    if point >= n {
+        // Nothing after the point, so this is the one layout that needs the `.0` that
+        // keeps a float from being read as an integer.
+        let mut out = digits;
+        let mut i = n;
+        while i < point {
+            out = out.concat("0");
+            i = i + 1;
+        }
+        return out.concat(".0");
+    }
+
+    digits.slice(0, point).concat(".").concat(digits.slice(point, n))
+}
+
+/// The decimal rendering of a float (spec/16-floats.md).
+pub fn float_to_str(v: f64) -> String {
+    let bits = float::bits(v);
+    let negative = (bits >> 63u64) == 1u64;
+    let biased = ((bits >> 52u64) & 2047u64) as i64;
+    let frac = (bits & 4503599627370495u64) as i64;
+
+    if biased == 2047 {
+        if frac != 0 {
+            return "NaN";
+        }
+        if negative {
+            return "-Inf";
+        }
+        return "+Inf";
+    }
+
+    // The significand as an integer, and the power of two it is scaled by. A subnormal has
+    // no implicit leading one and shares the smallest normal's exponent.
+    let mut f = frac;
+    let mut e = -1074;
+    if biased != 0 {
+        f = frac + 4503599627370496;
+        e = biased - 1075;
+    }
+
+    if f == 0 {
+        if negative {
+            return "-0.0";
+        }
+        return "0.0";
+    }
+
+    // The gap below a power of two is half the gap above it, except at the smallest normal,
+    // whose neighbour below is the largest subnormal one gap away.
+    let asymmetric = frac == 0 && biased >= 2;
+    let point_out = list::new[i64]();
+    let digits = shortest_digits(f, e, asymmetric, f % 2 == 0, point_out);
+    let body = layout_decimal(digits, point_out.at(0));
+    if negative {
+        return "-".concat(body);
+    }
+    body
+}
+
+impl Show for f64 {
+    fn to_str(self) -> String {
+        float_to_str(self)
+    }
+}
+
+impl Show for f32 {
+    fn to_str(self) -> String {
+        float_to_str(self as f64)
+    }
 }

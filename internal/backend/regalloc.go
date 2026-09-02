@@ -317,8 +317,22 @@ func intervals(f *ir.Func, n *numbering) []*interval {
 		for v := range liveOut[b] {
 			extend(v, n.end[b])
 		}
+		// Every φ of a block is written by the *same* parallel copy, on the edge into
+		// the block, so no two of them may share a location however short one's own life
+		// is. Numbering them one after another does not say that: a φ nothing reads --
+		// the unit-typed φ a `let mut` in both arms of a nested `if` leaves behind --
+		// would be a one-point interval, expire before the next φ's began, and hand its
+		// register to a later φ of the same block. phiCopies would then write both
+		// through that one register, and whichever landed first would be lost. Giving
+		// every φ of a block the whole run of φs as its interval makes them pairwise
+		// overlapping, which is what they actually are.
+		last := n.start[b]
+		if len(b.Phis) > 0 {
+			last = n.index[b.Phis[len(b.Phis)-1]]
+		}
 		for _, p := range b.Phis {
-			extend(p, n.index[p])
+			extend(p, n.start[b])
+			extend(p, last)
 		}
 		for _, v := range b.Instr {
 			extend(v, n.index[v])

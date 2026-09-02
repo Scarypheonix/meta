@@ -1,6 +1,7 @@
 package interp
 
 import (
+	"math"
 	"unicode/utf8"
 
 	"github.com/scarypheonix/meta/internal/diag"
@@ -17,6 +18,30 @@ import (
 // is not the same answer as "the same answer".
 
 // strBuiltin dispatches the std::str operations, reporting whether it handled the name.
+// floatBuiltin dispatches the std::float operations, reporting whether it handled the name.
+//
+// Neither one computes anything: a `f64` and a `u64` are the same sixty-four bits, and what
+// these say is only which of the two ways to read them applies from here on. They are what
+// makes the decimal rendering of a float Origin source in the prelude (spec/16-floats.md)
+// rather than a shortest-round-trip algorithm written once per engine.
+func (in *Interp) floatBuiltin(name string, args []Value, span diag.Span) (Value, bool) {
+	switch name {
+	case "float::bits":
+		f, ok := args[0].(Float)
+		if !ok {
+			in.trap(span, "`float::bits` takes a float, found %s", TypeName(args[0]))
+		}
+		return Int(int64(math.Float64bits(float64(f)))), true
+	case "float::from_bits":
+		n, ok := args[0].(Int)
+		if !ok {
+			in.trap(span, "`float::from_bits` takes an integer, found %s", TypeName(args[0]))
+		}
+		return Float(math.Float64frombits(uint64(n))), true
+	}
+	return nil, false
+}
+
 func (in *Interp) strBuiltin(name string, args []Value, span diag.Span) (Value, bool) {
 	switch name {
 	case "str::len":

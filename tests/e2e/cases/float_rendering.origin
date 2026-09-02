@@ -1,0 +1,57 @@
+use std::io;
+use std::float;
+
+// The shortest decimal that reads back as the same float (spec/16-floats.md).
+//
+// It is Origin source in the prelude (ADR-0031), so this case is three things at once: the
+// specification's own worked-examples table, a test that the language can carry bignum
+// arithmetic over its own `List`, and -- because it runs on the interpreter, the virtual
+// machine and native code at every optimization level -- the differential holding all three
+// to the same digits. `tests/floats` is what holds those digits to Go's `strconv` over
+// fourteen thousand values; this is what holds the engines to each other.
+
+fn main() {
+    // The table in spec/16-floats.md, in its own order.
+    io::println(0.0.to_str());
+    io::println((-0.0).to_str());
+    io::println(1.0.to_str());
+    io::println(0.5.to_str());
+    io::println(100000.0.to_str());
+    io::println(1000000.0.to_str());
+    io::println(999999.0.to_str());
+    io::println(0.0001.to_str());
+    io::println(0.00001.to_str());
+    io::println((1.0 / 3.0).to_str());
+    io::println((0.1 + 0.2).to_str());
+    io::println(1e20.to_str());
+    io::println(1e100.to_str());
+
+    // The values that have no digits at all.
+    io::println((2.0 / 0.0).to_str());
+    io::println((-2.0 / 0.0).to_str());
+    io::println((0.0 / 0.0).to_str());
+
+    // Both ends of the range, reached through their bit patterns so that a subnormal is
+    // reachable without asking the lexer for one.
+    io::println(float::from_bits(9218868437227405311u64).to_str());
+    io::println(float::from_bits(1u64).to_str());
+    io::println(float::from_bits(4503599627370496u64).to_str());
+
+    // An exact tie in the seventeenth digit: 2^-25 is ...3125 exactly, and the rule is the
+    // even digit, not the larger one.
+    io::println(float::from_bits(4494592428115755008u64).to_str());
+
+    // Interpolation reaches the same rendering, and so does a generic bound.
+    let x = 1.5;
+    io::println("x is \(x), and twice that is \(x + x)");
+    io::println(show(2.25));
+    io::println(show(0.1));
+
+    // `f32` renders through the same path, since Origin computes in binary64.
+    let small: f32 = 0.5;
+    io::println(small.to_str());
+}
+
+fn show[T: Show](v: T) -> String {
+    v.to_str()
+}

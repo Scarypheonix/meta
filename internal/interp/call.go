@@ -124,6 +124,10 @@ func (in *Interp) callBuiltin(name string, args []Value, c *ast.Call) Value {
 	if v, ok := in.fsBuiltin(name, args, span); ok {
 		return v
 	}
+	// A float's bits, which is what the prelude renders a float over (spec/16-floats.md).
+	if v, ok := in.floatBuiltin(name, args, span); ok {
+		return v
+	}
 	switch name {
 	case "io::print", "io::println":
 		if len(args) != 1 {

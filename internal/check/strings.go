@@ -45,6 +45,15 @@ func (c *Checker) strBuiltinType(name string) types.Type {
 		return &types.FnT{Params: []types.Type{str, str}, Ret: i64}
 	case "fs::file_exists":
 		return &types.FnT{Params: []types.Type{str}, Ret: types.P(types.Bool)}
+
+	// The float's bits (spec/16-floats.md). A `f64` and a `u64` are the same sixty-four
+	// bits; these two say so, and nothing else in the language does. They exist so that
+	// the decimal rendering of a float can be Origin source in the prelude rather than a
+	// shortest-round-trip algorithm written three times, once per engine.
+	case "float::bits":
+		return &types.FnT{Params: []types.Type{types.P(types.F64)}, Ret: types.P(types.U64)}
+	case "float::from_bits":
+		return &types.FnT{Params: []types.Type{types.P(types.U64)}, Ret: types.P(types.F64)}
 	}
 	return nil
 }

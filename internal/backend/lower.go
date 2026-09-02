@@ -943,6 +943,18 @@ func (e *emitter) builtin(v *ir.Value) error {
 		}
 		return e.strConcat(v)
 
+	case compile.BuiltinFloatBits, compile.BuiltinFloatFromBits:
+		if len(v.Args) != 1 {
+			return fmt.Errorf("this is a compiler bug: a float reinterpretation takes one argument, got %d", len(v.Args))
+		}
+		// Nothing to emit but the move. A float lives in a general-purpose register as
+		// its own bits and is moved into an XMM only to be computed on, so `float::bits`
+		// and `float::from_bits` are the same sixty-four bits under a different static
+		// type (spec/16-floats.md).
+		e.load(scratchA, v.Args[0])
+		e.def(v, scratchA)
+		return nil
+
 	case compile.BuiltinReadFile, compile.BuiltinFileExists:
 		if len(v.Args) != 1 {
 			return fmt.Errorf("this is a compiler bug: a path operation takes one argument, got %d", len(v.Args))

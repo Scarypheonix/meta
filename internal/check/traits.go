@@ -16,10 +16,14 @@ import (
 // than special-casing bound checking keeps one code path: `i64: Show` is satisfied by
 // finding an impl, exactly like `MyType: Show`.
 var builtinImpls = map[string][]types.PrimKind{
+	// The floats are absent on purpose: `Show for f64` and `Show for f32` are Origin
+	// source in the prelude, because the shortest decimal that reads back as the same
+	// float needs exact arithmetic wider than sixty-four bits and is not something to
+	// write three times (spec/16-floats.md, ADR-0031).
 	"Show": {
 		types.I8, types.I16, types.I32, types.I64,
 		types.U8, types.U16, types.U32, types.U64,
-		types.F32, types.F64, types.Bool, types.Char, types.String,
+		types.Bool, types.Char, types.String,
 	},
 	"Ord": {
 		types.I8, types.I16, types.I32, types.I64,

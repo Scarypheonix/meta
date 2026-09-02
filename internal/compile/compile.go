@@ -104,6 +104,13 @@ const (
 	BuiltinStrCharWidth
 	// The file operations (spec/15-files.md). The prelude's `read_to_string`,
 	// `write_string` and `file_exists` are written in terms of these four.
+	// BuiltinFloatBits and BuiltinFloatFromBits reinterpret sixty-four bits
+	// (spec/16-floats.md). Neither computes anything: on every engine the bits are
+	// already where they need to be, and what changes is only the static type that says
+	// how to read them.
+	BuiltinFloatBits
+	BuiltinFloatFromBits
+
 	BuiltinReadFile
 	BuiltinTakenText
 	BuiltinWriteFile
