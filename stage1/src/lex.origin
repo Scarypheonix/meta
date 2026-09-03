@@ -1,0 +1,1018 @@
+// The Origin lexer, written in Origin (spec/01-lexical.md).
+//
+// This is the first piece of stage1: the compiler for Origin that is itself written in
+// Origin, which Phase 9 exists to build and which `bootstrap/` is reserved for. It is a
+// translation of `internal/lex` and is held to it -- `tests/selfhost` runs both over every
+// `.origin` file in this repository and requires the token streams to be identical, so the
+// Go lexer is the oracle exactly as `strconv` is for the float rendering.
+//
+// Two deliberate differences from the Go lexer, both recorded in docs/deferred.md:
+//
+//   - A float literal carries its text and not its value. Turning a decimal into the
+//     nearest binary64 is the inverse of spec/16-floats.md's rendering and belongs with the
+//     stage that needs the number, not with the one that reads the characters.
+//   - An identifier is ASCII plus "any scalar value at or above U+0080". The Go lexer asks
+//     Unicode whether a scalar is a letter; doing that here needs XID tables that do not
+//     exist yet. Every identifier in this repository is ASCII, so the two agree on the
+//     corpus, and where they would not is written down rather than papered over.
+
+use std::list;
+use std::str;
+
+// --- Token kinds -------------------------------------------------------------------
+//
+// Numbers rather than an enum, because a token stores its kind in a field and the parser
+// compares and prints it constantly. The values match `internal/lex`'s own ordering so a
+// mismatch in the differential names the same number on both sides.
+
+pub const K_EOF: i64 = 0;
+pub const K_IDENT: i64 = 1;
+pub const K_INT: i64 = 2;
+pub const K_FLOAT: i64 = 3;
+pub const K_STR: i64 = 4;
+pub const K_CHAR: i64 = 5;
+
+pub const K_AS: i64 = 10;
+pub const K_BREAK: i64 = 11;
+pub const K_CONST: i64 = 12;
+pub const K_CONTINUE: i64 = 13;
+pub const K_ELSE: i64 = 14;
+pub const K_ENUM: i64 = 15;
+pub const K_FALSE: i64 = 16;
+pub const K_FN: i64 = 17;
+pub const K_FOR: i64 = 18;
+pub const K_IF: i64 = 19;
+pub const K_IMPL: i64 = 20;
+pub const K_IN: i64 = 21;
+pub const K_LET: i64 = 22;
+pub const K_LOOP: i64 = 23;
+pub const K_MATCH: i64 = 24;
+pub const K_MUT: i64 = 25;
+pub const K_PUB: i64 = 26;
+pub const K_RETURN: i64 = 27;
+pub const K_SELF_VALUE: i64 = 28;
+pub const K_SELF_TYPE: i64 = 29;
+pub const K_STRUCT: i64 = 30;
+pub const K_TRAIT: i64 = 31;
+pub const K_TRUE: i64 = 32;
+pub const K_TYPE: i64 = 33;
+pub const K_USE: i64 = 34;
+pub const K_WHERE: i64 = 35;
+pub const K_WHILE: i64 = 36;
+
+pub const K_LPAREN: i64 = 40;
+pub const K_RPAREN: i64 = 41;
+pub const K_LBRACE: i64 = 42;
+pub const K_RBRACE: i64 = 43;
+pub const K_LBRACKET: i64 = 44;
+pub const K_RBRACKET: i64 = 45;
+pub const K_COMMA: i64 = 46;
+pub const K_SEMI: i64 = 47;
+pub const K_COLON: i64 = 48;
+pub const K_COLONCOLON: i64 = 49;
+pub const K_DOT: i64 = 50;
+pub const K_DOTDOT: i64 = 51;
+pub const K_ARROW: i64 = 52;
+pub const K_FATARROW: i64 = 53;
+pub const K_UNDERSCORE: i64 = 54;
+pub const K_AT: i64 = 55;
+
+pub const K_PLUS: i64 = 60;
+pub const K_MINUS: i64 = 61;
+pub const K_STAR: i64 = 62;
+pub const K_SLASH: i64 = 63;
+pub const K_PERCENT: i64 = 64;
+pub const K_AMP: i64 = 65;
+pub const K_PIPE: i64 = 66;
+pub const K_CARET: i64 = 67;
+pub const K_BANG: i64 = 68;
+pub const K_SHL: i64 = 69;
+pub const K_SHR: i64 = 70;
+
+pub const K_ASSIGN: i64 = 75;
+pub const K_PLUSEQ: i64 = 76;
+pub const K_MINUSEQ: i64 = 77;
+pub const K_STAREQ: i64 = 78;
+pub const K_SLASHEQ: i64 = 79;
+pub const K_PERCENTEQ: i64 = 80;
+
+pub const K_EQEQ: i64 = 85;
+pub const K_BANGEQ: i64 = 86;
+pub const K_LT: i64 = 87;
+pub const K_LE: i64 = 88;
+pub const K_GT: i64 = 89;
+pub const K_GE: i64 = 90;
+pub const K_ANDAND: i64 = 91;
+pub const K_OROR: i64 = 92;
+pub const K_QUESTION: i64 = 93;
+
+/// How a kind is written in source, or a description for the ones with no fixed spelling.
+pub fn kind_name(k: i64) -> String {
+    if k == K_EOF { return "end of file"; }
+    if k == K_IDENT { return "identifier"; }
+    if k == K_INT { return "integer literal"; }
+    if k == K_FLOAT { return "float literal"; }
+    if k == K_STR { return "string literal"; }
+    if k == K_CHAR { return "character literal"; }
+    if k == K_AS { return "as"; }
+    if k == K_BREAK { return "break"; }
+    if k == K_CONST { return "const"; }
+    if k == K_CONTINUE { return "continue"; }
+    if k == K_ELSE { return "else"; }
+    if k == K_ENUM { return "enum"; }
+    if k == K_FALSE { return "false"; }
+    if k == K_FN { return "fn"; }
+    if k == K_FOR { return "for"; }
+    if k == K_IF { return "if"; }
+    if k == K_IMPL { return "impl"; }
+    if k == K_IN { return "in"; }
+    if k == K_LET { return "let"; }
+    if k == K_LOOP { return "loop"; }
+    if k == K_MATCH { return "match"; }
+    if k == K_MUT { return "mut"; }
+    if k == K_PUB { return "pub"; }
+    if k == K_RETURN { return "return"; }
+    if k == K_SELF_VALUE { return "self"; }
+    if k == K_SELF_TYPE { return "Self"; }
+    if k == K_STRUCT { return "struct"; }
+    if k == K_TRAIT { return "trait"; }
+    if k == K_TRUE { return "true"; }
+    if k == K_TYPE { return "type"; }
+    if k == K_USE { return "use"; }
+    if k == K_WHERE { return "where"; }
+    if k == K_WHILE { return "while"; }
+    if k == K_LPAREN { return "("; }
+    if k == K_RPAREN { return ")"; }
+    if k == K_LBRACE { return "{"; }
+    if k == K_RBRACE { return "}"; }
+    if k == K_LBRACKET { return "["; }
+    if k == K_RBRACKET { return "]"; }
+    if k == K_COMMA { return ","; }
+    if k == K_SEMI { return ";"; }
+    if k == K_COLON { return ":"; }
+    if k == K_COLONCOLON { return "::"; }
+    if k == K_DOT { return "."; }
+    if k == K_DOTDOT { return ".."; }
+    if k == K_ARROW { return "->"; }
+    if k == K_FATARROW { return "=>"; }
+    if k == K_UNDERSCORE { return "_"; }
+    if k == K_AT { return "@"; }
+    if k == K_PLUS { return "+"; }
+    if k == K_MINUS { return "-"; }
+    if k == K_STAR { return "*"; }
+    if k == K_SLASH { return "/"; }
+    if k == K_PERCENT { return "%"; }
+    if k == K_AMP { return "&"; }
+    if k == K_PIPE { return "|"; }
+    if k == K_CARET { return "^"; }
+    if k == K_BANG { return "!"; }
+    if k == K_SHL { return "<<"; }
+    if k == K_SHR { return ">>"; }
+    if k == K_ASSIGN { return "="; }
+    if k == K_PLUSEQ { return "+="; }
+    if k == K_MINUSEQ { return "-="; }
+    if k == K_STAREQ { return "*="; }
+    if k == K_SLASHEQ { return "/="; }
+    if k == K_PERCENTEQ { return "%="; }
+    if k == K_EQEQ { return "=="; }
+    if k == K_BANGEQ { return "!="; }
+    if k == K_LT { return "<"; }
+    if k == K_LE { return "<="; }
+    if k == K_GT { return ">"; }
+    if k == K_GE { return ">="; }
+    if k == K_ANDAND { return "&&"; }
+    if k == K_OROR { return "||"; }
+    if k == K_QUESTION { return "?"; }
+    "token"
+}
+
+// --- Tokens ------------------------------------------------------------------------
+
+/// One piece of an interpolated string literal: either literal text, or the tokens of an
+/// expression written between `\(` and its matching `)`.
+pub enum Part {
+    Text(String),
+    Expr(List[Token]),
+}
+
+/// One lexed token. The payload fields are meaningful only for the matching kind; reading
+/// `float_text` on an integer is a bug, not a conversion.
+pub struct Token {
+    pub kind: i64,
+    /// Byte offsets into the source: `[start, end)`.
+    pub start: i64,
+    pub end: i64,
+    /// The identifier's name, or the raw source slice for the other kinds.
+    pub text: String,
+    /// An integer literal's magnitude. Unsigned because negation is a unary operator and
+    /// not part of the literal (spec/01-lexical.md).
+    pub int: u64,
+    /// Whether the integer does not fit in sixty-four bits at all.
+    pub overflow: bool,
+    /// A string literal with its escapes decoded, or a character literal's own text.
+    pub str: String,
+    /// A character literal's scalar value.
+    pub ch: i64,
+    /// A numeric literal's type suffix, or "" when it has none.
+    pub suffix: String,
+    /// An interpolated string literal's pieces. Empty for every other token, and for a
+    /// string literal with no `\(` in it -- which is what tells the parser it is ordinary.
+    pub parts: List[Part],
+    /// Whether this literal is interpolated, which `parts` alone cannot say: `"\(x)"` has
+    /// an interpolation and no literal chunk at all.
+    pub interpolated: bool,
+}
+
+/// One lexical error: the message and the span it names.
+pub struct LexError {
+    pub message: String,
+    pub start: i64,
+    pub end: i64,
+}
+
+/// The result of lexing a whole file.
+pub struct Lexed {
+    pub tokens: List[Token],
+    pub errors: List[LexError],
+}
+
+fn empty_parts() -> List[Part] {
+    list::new[Part]()
+}
+
+// A token is built once and never written to, so the five shapes a token comes in each get
+// their own constructor rather than the fields being `mut`. That keeps a token something a
+// parser can pass around freely, and keeps it `Send`.
+
+fn plain(kind: i64, start: i64, end: i64, text: String) -> Token {
+    Token {
+        kind: kind, start: start, end: end, text: text,
+        int: 0u64, overflow: false, str: "", ch: 0, suffix: "",
+        parts: empty_parts(), interpolated: false,
+    }
+}
+
+fn int_token(start: i64, end: i64, text: String, suffix: String, value: u64, overflow: bool) -> Token {
+    Token {
+        kind: K_INT, start: start, end: end, text: text,
+        int: value, overflow: overflow, str: "", ch: 0, suffix: suffix,
+        parts: empty_parts(), interpolated: false,
+    }
+}
+
+fn float_token(start: i64, end: i64, text: String, suffix: String) -> Token {
+    Token {
+        kind: K_FLOAT, start: start, end: end, text: text,
+        int: 0u64, overflow: false, str: "", ch: 0, suffix: suffix,
+        parts: empty_parts(), interpolated: false,
+    }
+}
+
+fn str_token(start: i64, end: i64, text: String, decoded: String, parts: List[Part], interpolated: bool) -> Token {
+    Token {
+        kind: K_STR, start: start, end: end, text: text,
+        int: 0u64, overflow: false, str: decoded, ch: 0, suffix: "",
+        parts: parts, interpolated: interpolated,
+    }
+}
+
+fn char_token(start: i64, end: i64, text: String, value: i64) -> Token {
+    Token {
+        kind: K_CHAR, start: start, end: end, text: text,
+        int: 0u64, overflow: false, str: "", ch: value, suffix: "",
+        parts: empty_parts(), interpolated: false,
+    }
+}
+
+// --- The lexer ---------------------------------------------------------------------
+
+pub struct Lexer {
+    src: String,
+    mut pos: i64,
+    errors: List[LexError],
+}
+
+/// Lexes a whole file, returning every token including the final end-of-file one.
+pub fn lex(src: String) -> Lexed {
+    let l = Lexer { src: src, pos: 0, errors: list::new[LexError]() };
+    l.check_utf8();
+    l.skip_bom();
+    let out = list::new[Token]();
+    let mut going = true;
+    while going {
+        let t = l.next();
+        out.push(t);
+        if t.kind == K_EOF {
+            going = false;
+        }
+    }
+    Lexed { tokens: out, errors: l.errors }
+}
+
+impl Lexer {
+    fn error(self, start: i64, end: i64, message: String) {
+        self.errors.push(LexError { message: message, start: start, end: end })
+    }
+
+    fn at_end(self) -> bool {
+        self.pos >= self.src.len()
+    }
+
+    /// The byte `n` ahead of the cursor, or 0 past the end. Zero is safe to return because
+    /// a NUL byte in source is itself invalid, so no caller can confuse the two.
+    fn peek(self, n: i64) -> i64 {
+        if self.pos + n >= self.src.len() {
+            return 0;
+        }
+        self.src.byte_at(self.pos + n)
+    }
+
+    /// The scalar value at the cursor, advanced past.
+    fn next_char(self) -> i64 {
+        let c = self.src.char_at(self.pos);
+        self.pos = self.pos + self.src.char_width(self.pos);
+        c as i64
+    }
+
+    /// Rejects a byte-order mark anywhere but the first character, which is all this can
+    /// check: a `String` in Origin is already valid UTF-8, so the Go lexer's scan for
+    /// malformed sequences has nothing to find here.
+    fn check_utf8(self) {
+        let mut i = 3;
+        while i + 3 <= self.src.len() {
+            if self.src.byte_at(i) == 239 && self.src.byte_at(i + 1) == 187 && self.src.byte_at(i + 2) == 191 {
+                self.error(i, i + 3, "byte-order mark inside the file");
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    fn skip_bom(self) {
+        if self.src.len() >= 3 && self.src.byte_at(0) == 239 && self.src.byte_at(1) == 187 && self.src.byte_at(2) == 191 {
+            self.pos = 3;
+        }
+    }
+
+    /// The next token, with whitespace and comments already skipped.
+    fn next(self) -> Token {
+        self.skip_trivia();
+        let start = self.pos;
+        if self.at_end() {
+            return plain(K_EOF, start, start, "");
+        }
+        let c = self.src.byte_at(self.pos);
+        if c == 34 {
+            return self.lex_string();
+        }
+        if c == 39 {
+            return self.lex_char();
+        }
+        if is_dec_digit(c) {
+            return self.lex_number();
+        }
+        if is_ident_start_byte(c) {
+            return self.lex_ident();
+        }
+        if c >= 128 {
+            // Every multi-byte scalar value is treated as an identifier character. The Go
+            // lexer asks Unicode whether it is a letter; see this file's header.
+            return self.lex_ident();
+        }
+        match self.lex_punct() {
+            Option::Some(t) => t,
+            Option::None => {
+                let ch = self.next_char();
+                self.error(start, self.pos, "invalid character in source");
+                self.next()
+            }
+        }
+    }
+
+    fn skip_trivia(self) {
+        while !self.at_end() {
+            let c = self.src.byte_at(self.pos);
+            if c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 {
+                self.pos = self.pos + 1;
+            } else {
+                if c == 47 && self.peek(1) == 47 {
+                    while !self.at_end() && self.src.byte_at(self.pos) != 10 {
+                        self.pos = self.pos + 1;
+                    }
+                } else {
+                    if c == 47 && self.peek(1) == 42 {
+                        self.skip_block_comment();
+                    } else {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Block comments nest, so an inner `/*` needs its own `*/`.
+    fn skip_block_comment(self) {
+        let outermost = self.pos;
+        let mut depth = 0;
+        while !self.at_end() {
+            if self.src.byte_at(self.pos) == 47 && self.peek(1) == 42 {
+                depth = depth + 1;
+                self.pos = self.pos + 2;
+            } else {
+                if self.src.byte_at(self.pos) == 42 && self.peek(1) == 47 {
+                    depth = depth - 1;
+                    self.pos = self.pos + 2;
+                    if depth == 0 {
+                        return;
+                    }
+                } else {
+                    self.pos = self.pos + 1;
+                }
+            }
+        }
+        self.error(outermost, outermost + 2, "unterminated block comment")
+    }
+
+    fn lex_ident(self) -> Token {
+        let start = self.pos;
+        while !self.at_end() && is_ident_continue(self.src.char_at(self.pos) as i64) {
+            self.pos = self.pos + self.src.char_width(self.pos);
+        }
+        let text = self.src.slice(start, self.pos);
+        if text == "_" {
+            return plain(K_UNDERSCORE, start, self.pos, text);
+        }
+        let kw = keyword_kind(text);
+        if kw != 0 {
+            return plain(kw, start, self.pos, text);
+        }
+        if is_reserved(text) {
+            self.error(start, self.pos, "reserved word");
+        }
+        plain(K_IDENT, start, self.pos, text)
+    }
+
+    fn lex_number(self) -> Token {
+        let start = self.pos;
+        if self.src.byte_at(self.pos) == 48 && self.pos + 1 < self.src.len() {
+            let b = self.src.byte_at(self.pos + 1);
+            if b == 120 || b == 88 {
+                return self.lex_radix(start, 16, "hexadecimal");
+            }
+            if b == 111 || b == 79 {
+                return self.lex_radix(start, 8, "octal");
+            }
+            if b == 98 || b == 66 {
+                return self.lex_radix(start, 2, "binary");
+            }
+        }
+
+        self.skip_digits();
+        let mut is_float = false;
+
+        // A `.` begins a fraction only when a digit follows it, so `1.to_str()` is a method
+        // call on an integer and a bare `1.` is left for the parser to reject.
+        if self.peek(0) == 46 && is_dec_digit(self.peek(1)) {
+            is_float = true;
+            self.pos = self.pos + 1;
+            self.skip_digits();
+        }
+        let e = self.peek(0);
+        if e == 101 || e == 69 {
+            let mut n = 1;
+            if self.peek(1) == 43 || self.peek(1) == 45 {
+                n = 2;
+            }
+            if is_dec_digit(self.peek(n)) {
+                is_float = true;
+                self.pos = self.pos + n;
+                self.skip_digits();
+            }
+        }
+
+        let digits = self.src.slice(start, self.pos);
+        let suffix = self.lex_suffix(is_float);
+        let end = self.pos;
+
+        let bad = underscore_error(digits);
+        if !bad.is_empty() {
+            self.error(start, end, bad);
+            if is_float {
+                return float_token(start, end, digits, suffix);
+            }
+            return int_token(start, end, digits, suffix, 0u64, false);
+        }
+        if is_float {
+            // A float literal keeps its text; converting it is a later stage's business.
+            return float_token(start, end, digits, suffix);
+        }
+        match parse_digits(strip_underscores(digits), 10) {
+            Option::Some(v) => int_token(start, end, digits, suffix, v, false),
+            Option::None => int_token(start, end, digits, suffix, 0u64, true),
+        }
+    }
+
+    fn skip_digits(self) {
+        while !self.at_end() && (is_dec_digit(self.src.byte_at(self.pos)) || self.src.byte_at(self.pos) == 95) {
+            self.pos = self.pos + 1;
+        }
+    }
+
+    fn lex_radix(self, start: i64, base: i64, name: String) -> Token {
+        self.pos = self.pos + 2;
+        let digit_start = self.pos;
+        let mut scanning = true;
+        while scanning {
+            if self.at_end() {
+                scanning = false;
+            } else {
+                let b = self.src.byte_at(self.pos);
+                let d = digit_value(b);
+                if b == 95 || (d >= 0 && d < base) {
+                    self.pos = self.pos + 1;
+                } else {
+                    scanning = false;
+                }
+            }
+        }
+        self.finish_radix(start, digit_start, base, name)
+    }
+
+    fn finish_radix(self, start: i64, digit_start: i64, base: i64, name: String) -> Token {
+        let digits = self.src.slice(digit_start, self.pos);
+        let suffix = self.lex_suffix(false);
+        let end = self.pos;
+        let text = self.src.slice(start, end);
+
+        if digits.is_empty() {
+            self.error(start, end, "\(name) literal has no digits");
+            return int_token(start, end, text, suffix, 0u64, false);
+        }
+        let bad = underscore_error(digits);
+        if !bad.is_empty() {
+            self.error(start, end, bad);
+            return int_token(start, end, text, suffix, 0u64, false);
+        }
+        match parse_digits(strip_underscores(digits), base) {
+            Option::Some(v) => int_token(start, end, text, suffix, v, false),
+            Option::None => int_token(start, end, text, suffix, 0u64, true),
+        }
+    }
+
+    /// Reads a trailing type suffix and checks it against the literal's kind.
+    fn lex_suffix(self, is_float: bool) -> String {
+        if self.at_end() || !is_ident_start_byte(self.src.byte_at(self.pos)) {
+            return "";
+        }
+        let suf_start = self.pos;
+        while !self.at_end() && is_ident_continue(self.src.char_at(self.pos) as i64) {
+            self.pos = self.pos + self.src.char_width(self.pos);
+        }
+        let suf = self.src.slice(suf_start, self.pos);
+        if is_float {
+            if is_float_suffix(suf) {
+                return suf;
+            }
+            if is_int_suffix(suf) {
+                self.error(suf_start, self.pos, "`\(suf)` is not a float suffix");
+                return "";
+            }
+        } else {
+            if is_int_suffix(suf) {
+                return suf;
+            }
+            // `1f64` is a float literal written without a point.
+            if is_float_suffix(suf) {
+                return suf;
+            }
+        }
+        self.error(suf_start, self.pos, "unknown numeric suffix `\(suf)`");
+        ""
+    }
+
+    fn lex_string(self) -> Token {
+        let start = self.pos;
+        self.pos = self.pos + 1;
+        let parts = list::new[Part]();
+        let mut chunk = "";
+        let mut interpolated = false;
+        let mut done = false;
+        let mut unterminated = false;
+
+        while !done {
+            if self.at_end() || self.src.byte_at(self.pos) == 10 {
+                self.error(start, self.pos, "unterminated string literal");
+                unterminated = true;
+                done = true;
+            } else {
+                if self.src.byte_at(self.pos) == 34 {
+                    self.pos = self.pos + 1;
+                    done = true;
+                } else {
+                    if self.src.byte_at(self.pos) == 92 && self.peek(1) == 40 {
+                        // `\(` opens an interpolation (spec/14-strings.md). Every other
+                        // escape is lex_escape's.
+                        interpolated = true;
+                        if !chunk.is_empty() {
+                            parts.push(Part::Text(chunk));
+                            chunk = "";
+                        }
+                        match self.lex_interpolation() {
+                            Option::Some(toks) => { parts.push(Part::Expr(toks)); }
+                            Option::None => {}
+                        }
+                    } else {
+                        if self.src.byte_at(self.pos) == 92 {
+                            match self.lex_escape() {
+                                Option::Some(c) => { chunk = chunk.concat(c.to_str()); }
+                                Option::None => {}
+                            }
+                        } else {
+                            let c = self.src.char_at(self.pos);
+                            self.pos = self.pos + self.src.char_width(self.pos);
+                            chunk = chunk.concat(c.to_str());
+                        }
+                    }
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            parts.push(Part::Text(chunk));
+        }
+
+        // `str` is the literal text with the interpolations removed, which is what a
+        // diagnostic naming the literal wants to show.
+        let mut whole = "";
+        let mut i = 0;
+        while i < parts.len() {
+            match parts.at(i) {
+                Part::Text(s) => { whole = whole.concat(s); }
+                Part::Expr(_) => {}
+            }
+            i = i + 1;
+        }
+        let held = if interpolated { parts } else { empty_parts() };
+        let _ = unterminated;
+        // `text` stays empty for a string and a character literal, matching internal/lex:
+        // the span already names the source, and the decoded value is what a later stage
+        // wants. Nothing reads the raw slice back.
+        str_token(start, self.pos, "", whole, held, interpolated)
+    }
+
+    /// Consumes `\(` through its matching `)` and returns the tokens between them, ending
+    /// with an end-of-file token so a sub-parser can run over them unchanged.
+    ///
+    /// The nesting is counted in *tokens*, not bytes, so a `)` inside a nested string or
+    /// character literal closes nothing: `next` handles those, and this only ever sees the
+    /// parentheses they are not.
+    fn lex_interpolation(self) -> Option[List[Token]] {
+        let open = self.pos;
+        self.pos = self.pos + 2;
+        let toks = list::new[Token]();
+        let mut depth = 1;
+        let mut done = false;
+        let mut ok = true;
+        while !done {
+            let t = self.next();
+            if t.kind == K_EOF {
+                self.error(open, self.pos, "unterminated interpolation");
+                ok = false;
+                done = true;
+            } else {
+                if t.kind == K_LPAREN {
+                    depth = depth + 1;
+                }
+                if t.kind == K_RPAREN {
+                    depth = depth - 1;
+                }
+                if depth == 0 {
+                    toks.push(plain(K_EOF, t.start, t.end, ""));
+                    done = true;
+                } else {
+                    toks.push(t);
+                }
+            }
+        }
+        if !ok {
+            return Option::None;
+        }
+        if toks.len() == 1 {
+            self.error(open, self.pos, "empty interpolation");
+            return Option::None;
+        }
+        Option::Some(toks)
+    }
+
+    fn lex_char(self) -> Token {
+        let start = self.pos;
+        self.pos = self.pos + 1;
+        let mut value = 0;
+        if self.at_end() || self.src.byte_at(self.pos) == 10 {
+            self.error(start, self.pos, "unterminated character literal");
+            return char_token(start, self.pos, "", 0);
+        }
+        if self.src.byte_at(self.pos) == 39 {
+            self.pos = self.pos + 1;
+            self.error(start, self.pos, "empty character literal");
+            return char_token(start, self.pos, "", 0);
+        }
+        if self.src.byte_at(self.pos) == 92 {
+            match self.lex_escape() {
+                Option::Some(c) => { value = c as i64; }
+                Option::None => { value = 0; }
+            }
+        } else {
+            value = self.next_char();
+        }
+        if !self.at_end() && self.src.byte_at(self.pos) == 39 {
+            self.pos = self.pos + 1;
+            return char_token(start, self.pos, "", value);
+        }
+        // More than one character, or no closing quote: consume to the quote or the end of
+        // the line, so the rest of the file still lexes.
+        while !self.at_end() && self.src.byte_at(self.pos) != 39 && self.src.byte_at(self.pos) != 10 {
+            self.pos = self.pos + self.src.char_width(self.pos);
+        }
+        if !self.at_end() && self.src.byte_at(self.pos) == 39 {
+            self.pos = self.pos + 1;
+            self.error(start, self.pos, "character literal contains more than one character");
+        } else {
+            self.error(start, self.pos, "unterminated character literal");
+        }
+        char_token(start, self.pos, "", value)
+    }
+
+    /// Consumes a backslash escape and returns the scalar value it denotes.
+    fn lex_escape(self) -> Option[char] {
+        let start = self.pos;
+        self.pos = self.pos + 1;
+        if self.at_end() {
+            self.error(start, self.pos, "unterminated escape sequence");
+            return Option::None;
+        }
+        let c = self.src.byte_at(self.pos);
+        self.pos = self.pos + 1;
+        if c == 110 { return char::from_u32(10u32); }
+        if c == 114 { return char::from_u32(13u32); }
+        if c == 116 { return char::from_u32(9u32); }
+        if c == 48 { return char::from_u32(0u32); }
+        if c == 92 { return char::from_u32(92u32); }
+        if c == 39 { return char::from_u32(39u32); }
+        if c == 34 { return char::from_u32(34u32); }
+        if c == 120 { return self.lex_hex_escape(start); }
+        if c == 117 { return self.lex_unicode_escape(start); }
+        self.error(start, self.pos, "unknown escape sequence");
+        Option::None
+    }
+
+    fn lex_hex_escape(self, start: i64) -> Option[char] {
+        if self.pos + 1 >= self.src.len() {
+            self.error(start, self.src.len(), "\\x needs exactly two hexadecimal digits");
+            return Option::None;
+        }
+        let hi = digit_value(self.src.byte_at(self.pos));
+        let lo = digit_value(self.src.byte_at(self.pos + 1));
+        if hi < 0 || hi >= 16 || lo < 0 || lo >= 16 {
+            self.error(start, self.pos + 2, "\\x needs exactly two hexadecimal digits");
+            return Option::None;
+        }
+        self.pos = self.pos + 2;
+        let v = hi * 16 + lo;
+        if v > 127 {
+            self.error(start, self.pos, "\\x escapes are limited to \\x00 through \\x7F");
+            return Option::None;
+        }
+        char::from_u32(v as u32)
+    }
+
+    fn lex_unicode_escape(self, start: i64) -> Option[char] {
+        if self.at_end() || self.src.byte_at(self.pos) != 123 {
+            self.error(start, self.pos, "\\u must be followed by `{`");
+            return Option::None;
+        }
+        self.pos = self.pos + 1;
+        let digit_start = self.pos;
+        let mut scanning = true;
+        while scanning {
+            if self.at_end() {
+                scanning = false;
+            } else {
+                let d = digit_value(self.src.byte_at(self.pos));
+                if d < 0 || d >= 16 {
+                    scanning = false;
+                } else {
+                    self.pos = self.pos + 1;
+                }
+            }
+        }
+        let digits = self.src.slice(digit_start, self.pos);
+        if self.at_end() || self.src.byte_at(self.pos) != 125 {
+            self.error(start, self.pos, "unterminated unicode escape; expected `}`");
+            return Option::None;
+        }
+        self.pos = self.pos + 1;
+        if digits.is_empty() || digits.len() > 6 {
+            self.error(start, self.pos, "\\u{...} takes 1 to 6 hexadecimal digits");
+            return Option::None;
+        }
+        match parse_digits(digits, 16) {
+            Option::None => {
+                self.error(start, self.pos, "unicode escape is out of range");
+                Option::None
+            }
+            Option::Some(v) => {
+                match char::from_u32(v as u32) {
+                    Option::Some(c) => Option::Some(c),
+                    Option::None => {
+                        self.error(start, self.pos, "not a Unicode scalar value");
+                        Option::None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Maximal munch over the operator table: the two-byte spellings first.
+    fn lex_punct(self) -> Option[Token] {
+        let start = self.pos;
+        if self.pos + 1 < self.src.len() {
+            let two = self.src.slice(self.pos, self.pos + 2);
+            let k = two_char_kind(two);
+            if k != 0 {
+                self.pos = self.pos + 2;
+                return Option::Some(plain(k, start, self.pos, two));
+            }
+        }
+        let one = self.src.slice(self.pos, self.pos + 1);
+        let k = one_char_kind(one);
+        if k == 0 {
+            return Option::None;
+        }
+        self.pos = self.pos + 1;
+        Option::Some(plain(k, start, self.pos, one))
+    }
+}
+
+// --- Character classes and tables ---------------------------------------------------
+
+fn is_dec_digit(b: i64) -> bool { b >= 48 && b <= 57 }
+
+/// The value of a digit byte in base 16, or -1 when it is not one.
+fn digit_value(b: i64) -> i64 {
+    if b >= 48 && b <= 57 { return b - 48; }
+    if b >= 97 && b <= 102 { return b - 87; }
+    if b >= 65 && b <= 70 { return b - 55; }
+    -1
+}
+
+fn is_ident_start_byte(b: i64) -> bool {
+    b == 95 || (b >= 97 && b <= 122) || (b >= 65 && b <= 90)
+}
+
+fn is_ident_continue(c: i64) -> bool {
+    is_ident_start_byte(c) || is_dec_digit(c) || c >= 128
+}
+
+fn kind_of_number(is_float: bool) -> i64 {
+    if is_float { K_FLOAT } else { K_INT }
+}
+
+fn keyword_kind(text: String) -> i64 {
+    if text == "as" { return K_AS; }
+    if text == "break" { return K_BREAK; }
+    if text == "const" { return K_CONST; }
+    if text == "continue" { return K_CONTINUE; }
+    if text == "else" { return K_ELSE; }
+    if text == "enum" { return K_ENUM; }
+    if text == "false" { return K_FALSE; }
+    if text == "fn" { return K_FN; }
+    if text == "for" { return K_FOR; }
+    if text == "if" { return K_IF; }
+    if text == "impl" { return K_IMPL; }
+    if text == "in" { return K_IN; }
+    if text == "let" { return K_LET; }
+    if text == "loop" { return K_LOOP; }
+    if text == "match" { return K_MATCH; }
+    if text == "mut" { return K_MUT; }
+    if text == "pub" { return K_PUB; }
+    if text == "return" { return K_RETURN; }
+    if text == "self" { return K_SELF_VALUE; }
+    if text == "Self" { return K_SELF_TYPE; }
+    if text == "struct" { return K_STRUCT; }
+    if text == "trait" { return K_TRAIT; }
+    if text == "true" { return K_TRUE; }
+    if text == "type" { return K_TYPE; }
+    if text == "use" { return K_USE; }
+    if text == "where" { return K_WHERE; }
+    if text == "while" { return K_WHILE; }
+    0
+}
+
+/// Words held for a future version of Origin. Using one as an identifier is reported.
+fn is_reserved(text: String) -> bool {
+    text == "async" || text == "await" || text == "box" || text == "dyn"
+        || text == "extern" || text == "macro" || text == "move" || text == "ref"
+        || text == "static" || text == "super" || text == "unsafe" || text == "yield"
+}
+
+fn is_int_suffix(s: String) -> bool {
+    s == "i8" || s == "i16" || s == "i32" || s == "i64"
+        || s == "u8" || s == "u16" || s == "u32" || s == "u64"
+}
+
+fn is_float_suffix(s: String) -> bool {
+    s == "f32" || s == "f64"
+}
+
+fn two_char_kind(s: String) -> i64 {
+    if s == "::" { return K_COLONCOLON; }
+    if s == ".." { return K_DOTDOT; }
+    if s == "->" { return K_ARROW; }
+    if s == "=>" { return K_FATARROW; }
+    if s == "<<" { return K_SHL; }
+    if s == ">>" { return K_SHR; }
+    if s == "+=" { return K_PLUSEQ; }
+    if s == "-=" { return K_MINUSEQ; }
+    if s == "*=" { return K_STAREQ; }
+    if s == "/=" { return K_SLASHEQ; }
+    if s == "%=" { return K_PERCENTEQ; }
+    if s == "==" { return K_EQEQ; }
+    if s == "!=" { return K_BANGEQ; }
+    if s == "<=" { return K_LE; }
+    if s == ">=" { return K_GE; }
+    if s == "&&" { return K_ANDAND; }
+    if s == "||" { return K_OROR; }
+    0
+}
+
+fn one_char_kind(s: String) -> i64 {
+    if s == "(" { return K_LPAREN; }
+    if s == ")" { return K_RPAREN; }
+    if s == "{" { return K_LBRACE; }
+    if s == "}" { return K_RBRACE; }
+    if s == "[" { return K_LBRACKET; }
+    if s == "]" { return K_RBRACKET; }
+    if s == "," { return K_COMMA; }
+    if s == ";" { return K_SEMI; }
+    if s == ":" { return K_COLON; }
+    if s == "." { return K_DOT; }
+    if s == "@" { return K_AT; }
+    if s == "+" { return K_PLUS; }
+    if s == "-" { return K_MINUS; }
+    if s == "*" { return K_STAR; }
+    if s == "/" { return K_SLASH; }
+    if s == "%" { return K_PERCENT; }
+    if s == "&" { return K_AMP; }
+    if s == "|" { return K_PIPE; }
+    if s == "^" { return K_CARET; }
+    if s == "!" { return K_BANG; }
+    if s == "=" { return K_ASSIGN; }
+    if s == "<" { return K_LT; }
+    if s == ">" { return K_GT; }
+    if s == "?" { return K_QUESTION; }
+    0
+}
+
+/// A digit separator may be neither the first nor the last character of a digit run
+/// (spec/01-lexical.md). Returns "" when the run is well formed.
+fn underscore_error(digits: String) -> String {
+    if digits.is_empty() {
+        return "";
+    }
+    if digits.byte_at(0) == 95 {
+        return "a digit separator cannot come first in a literal";
+    }
+    if digits.byte_at(digits.len() - 1) == 95 {
+        return "a digit separator cannot come last in a literal";
+    }
+    ""
+}
+
+fn strip_underscores(s: String) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < s.len() {
+        if s.byte_at(i) != 95 {
+            out = out.concat(s.slice(i, i + 1));
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// The number `digits` denotes in `base`, or `None` when it does not fit in a `u64`.
+fn parse_digits(digits: String, base: i64) -> Option[u64] {
+    let b = base as u64;
+    let mut acc = 0u64;
+    let mut i = 0;
+    while i < digits.len() {
+        let d = digit_value(digits.byte_at(i));
+        if d < 0 || d >= base {
+            return Option::None;
+        }
+        acc = acc.checked_mul(b)?;
+        acc = acc.checked_add(d as u64)?;
+        i = i + 1;
+    }
+    Option::Some(acc)
+}

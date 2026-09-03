@@ -1,0 +1,42 @@
+// EXPECT: accept
+
+// spec: 02-grammar.md — `ExprStmt = ExprWithBlock [ ";" ] | ExprWithoutBlock ";"`. A braced
+// expression used as a statement is a complete statement, so what follows it starts afresh
+// even when it could have continued the expression.
+//
+// The parser used to carry on: `if b > 0 { return 1; }` followed by `-1` parsed as one
+// binary expression, and the diagnostic was "both operands of `-` must have the same type"
+// against a value of type `()`, which describes nothing a reader can act on.
+
+use std::list;
+
+fn sign(b: i64) -> i64 {
+    if b > 0 { return 1; }
+    -1
+}
+
+fn negated(b: i64) -> i64 {
+    let mut n = 0;
+    while n < b { n = n + 1; }
+    -n
+}
+
+fn after_match(b: i64) -> i64 {
+    match b {
+        0 => { return 0; }
+        _ => {}
+    }
+    -b
+}
+
+fn after_for(xs: List[i64]) -> i64 {
+    let mut n = 0;
+    for x in xs { n = n + x; }
+    -n
+}
+
+fn main() {
+    let a = sign(1);
+    let c = negated(3);
+    let d = after_match(2);
+}

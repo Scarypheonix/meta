@@ -55,7 +55,31 @@ func (p *Parser) parseStmt() (ast.Stmt, ast.Expr) {
 		return s, nil
 	}
 
-	e := p.parseExpr()
+	// spec/02-grammar.md: `ExprStmt = ExprWithBlock [ ";" ] | ExprWithoutBlock ";"`. An
+	// expression whose body is braced, in statement position, is a *complete statement*, so
+	// the parser must not carry on into a binary operator. Reading the whole of
+	//
+	//	if b > 0 { return 1; }
+	//	-1
+	//
+	// as one expression made the `-` a subtraction from a value of type `()`, and the
+	// diagnostic was about the types rather than about the shape.
+	var e ast.Expr
+	if startsBlockExpr(p.cur().Kind) {
+		e = p.parsePrimary()
+		if p.eat(lex.Semi) {
+			s := &ast.ExprStmt{X: e, Semi: true}
+			s.Base = p.base(start)
+			return s, nil
+		}
+		if p.at(lex.RBrace) || p.atEOF() {
+			return nil, e // the block's value
+		}
+		s := &ast.ExprStmt{X: e, Semi: false}
+		s.Base = p.base(start)
+		return s, nil
+	}
+	e = p.parseExpr()
 
 	switch {
 	case p.eat(lex.Semi):
@@ -76,6 +100,16 @@ func (p *Parser) parseStmt() (ast.Stmt, ast.Expr) {
 		s.Base = p.base(start)
 		return s, nil
 	}
+}
+
+// startsBlockExpr reports whether a token begins an `ExprWithBlock`. It is isBlockExpr's
+// question asked one token earlier, before there is a tree to look at.
+func startsBlockExpr(k lex.Kind) bool {
+	switch k {
+	case lex.LBrace, lex.KwIf, lex.KwMatch, lex.KwWhile, lex.KwFor, lex.KwLoop:
+		return true
+	}
+	return false
 }
 
 // isBlockExpr reports whether e is one of the expressions whose body is braced, and

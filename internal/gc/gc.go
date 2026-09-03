@@ -187,9 +187,73 @@ func (h *Heap) collectForNursery() {
 		h.MinorCollect()
 		return
 	}
-	h.MajorCollect()
+	h.majorCollectWithRoom(worstCase)
 	if h.oldFromEnd-h.oldNext < worstCase {
 		h.outOfMemory = true
+	}
+}
+
+// majorCollectWithRoom runs a major collection whose destination is large enough to take
+// everything live, plus `extra` words of room to allocate into afterwards.
+//
+// Sizing the destination *before* the copy is the whole point. A Cheney scan discovers a
+// shortfall halfway through, with some objects moved and some not and forwarding pointers
+// written into a space it is about to abandon; there is no recovery from that, and the old
+// code's answer was to set the out-of-memory flag and hand the mutator a reference that had
+// not been updated. A copying collector's live set is bounded before it starts -- it cannot
+// exceed what is in the nursery plus what is in the from-space -- so the destination can
+// simply be made big enough first.
+func (h *Heap) majorCollectWithRoom(extra uint64) {
+	live := (h.nurseryNext - h.nurseryStart) + (h.oldNext - h.oldFromStart)
+	// Half again as much as could possibly survive, and never below the configured size:
+	// a semispace exactly as large as the live set collects on every allocation and never
+	// makes progress.
+	want := h.cfg.OldWords
+	for want < live+live/2+extra && want < maxOldWords {
+		want *= 2
+	}
+	h.ensureToSpace(want)
+	h.MajorCollect()
+}
+
+// maxOldWords caps a semispace at 4 GiB. Past there, a program that keeps growing is a
+// program with a leak rather than one that needs more room.
+//
+// It is a variable so that the test for what happens at the ceiling can lower it. Nothing
+// else writes it.
+var maxOldWords uint64 = 1 << 29
+
+// ensureToSpace makes the destination of the next major collection at least `want` words.
+//
+// The to-space holds nothing -- that is what makes this safe. It can be moved and resized
+// freely, while the nursery and the from-space never move, so every reference the mutator
+// holds stays valid. Growing the heap therefore needs no relocation pass and no second
+// collection: the next major collection does the moving, as it was going to anyway.
+func (h *Heap) ensureToSpace(want uint64) {
+	if want > maxOldWords {
+		want = maxOldWords
+	}
+	if h.oldToEnd-h.oldToStart >= want {
+		return
+	}
+	// Extend it in place when it already sits at the top of the heap; otherwise put the
+	// new one there, abandoning the old one to the next collection's reuse.
+	start := h.oldToStart
+	if h.oldToEnd != uint64(len(h.mem)) {
+		start = uint64(len(h.mem))
+	}
+	end := start + want
+	if end > uint64(len(h.mem)) {
+		mem := make([]uint64, end)
+		copy(mem, h.mem)
+		h.mem = mem
+	}
+	h.oldToStart, h.oldToEnd = start, end
+	if want > h.cfg.OldWords {
+		h.cfg.OldWords = want
+	}
+	if n := want/h.cfg.CardWords + 1; n > uint64(len(h.cards)) {
+		h.cards = make([]bool, n)
 	}
 }
 
@@ -198,7 +262,7 @@ func (h *Heap) collectForNursery() {
 func (h *Heap) allocOld(t layout.TypeID, payloadWords uint64) layout.Ref {
 	need := payloadWords + 1
 	if h.oldNext+need > h.oldFromEnd {
-		h.MajorCollect()
+		h.majorCollectWithRoom(need)
 		if h.oldNext+need > h.oldFromEnd {
 			h.outOfMemory = true
 			return layout.Nil

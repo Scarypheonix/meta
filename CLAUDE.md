@@ -65,6 +65,8 @@ internal/driver/      pass ordering and error suppression
 tests/conformance/    type-system accept/reject corpus, one file per case
 tests/e2e/            programs + exact expected stdout/stderr/exit
 tests/docs/           documentation invariants (ADR numbering, code registry, lints)
+tests/selfhost/       stage1 against the Go compiler it replaces, over this repo's own
+                      Origin source
 tests/floats/         the float rendering against Go's strconv, over 14,000 bit patterns
 tests/debuginfo/      lldb/llvm-dwarfdump on both formats; skips if they are absent
 tests/fuzz/           fuzz targets for the lexer and parser
@@ -73,6 +75,7 @@ docs/spec/            THE language specification — normative; §13 collections
 docs/adr/             architecture decision records — every irreversible choice
 docs/phases/          N-complete.md, written at each phase gate
 docs/deferred.md      everything deliberately left out, each tagged with a phase
+stage1/src/           from Phase 9: the compiler for Origin, written in Origin
 bootstrap/            from Phase 9: the last known-good stage1 binary
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```

@@ -101,7 +101,15 @@ ExprStmt     = ExprWithBlock [ ";" ] | ExprWithoutBlock ";" ;
 
 A block's value is its trailing `Expr` if present, otherwise `()`. `ExprWithBlock` is
 any of `Block`, `IfExpr`, `MatchExpr`, `WhileExpr`, `ForExpr`, `LoopExpr`; used as a
-statement it needs no `;`.
+statement it needs no `;`, and it **ends there**: the parser does not carry on into a
+binary operator. So
+
+```origin
+if b > 0 { return 1; }
+-1
+```
+
+is a statement and then the block's value, not a subtraction from `()`.
 
 ## Expressions
 

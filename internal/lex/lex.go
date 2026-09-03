@@ -17,13 +17,17 @@ type Token struct {
 	Kind Kind
 	Span diag.Span
 
-	// Text is the identifier's name (Ident) or the raw source slice for other kinds.
+	// Text is the identifier's name (Ident), the keyword or operator's own spelling, or
+	// the digits of a numeric literal. It is empty for a string and a character literal:
+	// the span already names the source, and Str and Char hold the decoded value, which is
+	// what every reader of those two wants.
 	Text string
 	// Int holds an integer literal's magnitude. It is unsigned because negation is a
 	// unary operator, not part of the literal (spec/01-lexical.md).
 	Int uint64
-	// IntOverflow reports that the literal does not fit in 64 bits at all. The value of
-	// Int is then meaningless and the parser reports the range error.
+	// IntOverflow reports that the literal does not fit in 64 bits at all. Int is then
+	// zero rather than a saturated value that would look real, and the parser reports the
+	// range error.
 	IntOverflow bool
 	// Float holds a float literal's value.
 	Float float64
@@ -373,6 +377,12 @@ func (l *Lexer) lexNumber() Token {
 		return Token{Kind: Float, Span: span, Text: digits, Float: v, Suffix: suffix}
 	}
 	v, err := strconv.ParseUint(clean, 10, 64)
+	if err != nil {
+		// ParseUint saturates at MaxUint64 on a range error, which looks like a real
+		// value and is not one. Zero says "meaningless" plainly, and lets stage1's lexer
+		// agree with this one on a literal neither can represent.
+		v = 0
+	}
 	return Token{Kind: Int, Span: span, Text: digits, Int: v, IntOverflow: err != nil, Suffix: suffix}
 }
 
@@ -396,6 +406,9 @@ func (l *Lexer) lexRadix(start, base int, isDigit func(byte) bool, name string) 
 		return Token{Kind: Int, Span: span, Text: l.src[start:l.pos], Suffix: suffix}
 	}
 	v, err := strconv.ParseUint(strings.ReplaceAll(digits, "_", ""), base, 64)
+	if err != nil {
+		v = 0
+	}
 	return Token{Kind: Int, Span: span, Text: l.src[start:l.pos], Int: v, IntOverflow: err != nil, Suffix: suffix}
 }
 

@@ -339,9 +339,49 @@ func TestRandomObjectGraphs(t *testing.T) {
 	}
 }
 
+// The heap grows rather than failing on a program larger than its initial configuration.
+//
+// It used not to, and the shape of the failure is worth remembering: a major collection
+// discovered the shortfall *during* its Cheney scan, with some objects moved and some not,
+// set the out-of-memory flag and handed the mutator back a reference it had not updated.
+// The flag is sticky, so everything after that failed too. The fix is to size the
+// destination before the copy, which a copying collector can always do -- the live set
+// cannot exceed the nursery plus the from-space.
+func TestTheHeapGrowsForAProgramLargerThanItsConfiguration(t *testing.T) {
+	h, _, leaf, _ := testHeap(t, Config{NurseryWords: 16, OldWords: 32, CardWords: 8})
+	roots := &rootSet{}
+	h.SetRoots(roots.visitor())
+
+	const n = 20000
+	for i := 0; i < n; i++ {
+		r := h.Alloc(leaf, 1)
+		if r == layout.Nil {
+			t.Fatalf("allocation %d of %d failed in a heap that may grow", i, n)
+		}
+		roots.refs = append(roots.refs, r) // keep everything alive
+	}
+	// Every object is still readable and still itself: growth must not lose or alias one.
+	for i, r := range roots.refs {
+		h.Set(r, 0, uint64(i))
+	}
+	for i, r := range roots.refs {
+		if got := h.Get(r, 0); got != uint64(i) {
+			t.Fatalf("object %d holds %d after growth", i, got)
+		}
+	}
+	if h.cfg.OldWords <= 32 {
+		t.Errorf("the old generation never grew past its initial %d words", h.cfg.OldWords)
+	}
+}
+
 func TestOutOfMemoryIsReportedNotPanicked(t *testing.T) {
 	// spec/08: allocation may fail; it never returns an invalid reference, and the
-	// mutator turns the failure into the `out of memory` trap.
+	// mutator turns the failure into the `out of memory` trap. Reaching that now means
+	// reaching the ceiling on growth, so the test lowers the ceiling.
+	restore := maxOldWords
+	maxOldWords = 64
+	defer func() { maxOldWords = restore }()
+
 	h, _, leaf, _ := testHeap(t, Config{NurseryWords: 16, OldWords: 32, CardWords: 8})
 	roots := &rootSet{}
 	h.SetRoots(roots.visitor())
@@ -356,7 +396,7 @@ func TestOutOfMemoryIsReportedNotPanicked(t *testing.T) {
 		roots.refs = append(roots.refs, r) // keep everything alive
 	}
 	if !failed {
-		t.Fatal("a tiny heap holding every object should have run out")
+		t.Fatal("a heap that may not grow past 64 words should have run out")
 	}
 	if !h.OutOfMemory() {
 		t.Error("the heap did not report exhaustion")
