@@ -50,6 +50,14 @@ func (c *Checker) strBuiltinType(name string) types.Type {
 	// bits; these two say so, and nothing else in the language does. They exist so that
 	// the decimal rendering of a float can be Origin source in the prelude rather than a
 	// shortest-round-trip algorithm written three times, once per engine.
+	// `char::from_u32` is the one compiler-provided operation whose result is a prelude
+	// type. It is spelled that way because spec/04-expressions.md and the diagnostic for a
+	// rejected `as char` both name it, and because the alternative -- a predicate plus an
+	// unchecked conversion -- would put a way to make an invalid `char` in reach. Like
+	// `checked_add`, internal/compile builds the `Option` itself, so no runtime has to.
+	case "char::from_u32":
+		return &types.FnT{Params: []types.Type{types.P(types.U32)}, Ret: c.named("Option", types.P(types.Char))}
+
 	case "float::bits":
 		return &types.FnT{Params: []types.Type{types.P(types.F64)}, Ret: types.P(types.U64)}
 	case "float::from_bits":

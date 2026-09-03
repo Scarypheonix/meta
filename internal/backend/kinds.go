@@ -161,6 +161,8 @@ func builtinResultKind(idx int) bytecode.Kind {
 		return bytecode.KindRef
 	case compile.BuiltinFitsAdd, compile.BuiltinFitsSub, compile.BuiltinFitsMul:
 		return bytecode.KindBool
+	case compile.BuiltinCharValid:
+		return bytecode.KindBool
 	case compile.BuiltinFloatBits:
 		return bytecode.KindU64
 	case compile.BuiltinFloatFromBits:

@@ -943,6 +943,27 @@ func (e *emitter) builtin(v *ir.Value) error {
 		}
 		return e.strConcat(v)
 
+	case compile.BuiltinCharValid:
+		if len(v.Args) != 1 {
+			return fmt.Errorf("this is a compiler bug: char::from_u32 takes one argument, got %d", len(v.Args))
+		}
+		// `n <= 0x10FFFF && (n < 0xD800 || n > 0xDFFF)`, as two compares and a mask: the
+		// surrogate range is exactly the values whose top eleven bits are 0b1101_1011_0,
+		// so `(n & ~0x7FF) == 0xD800` tests it in one instruction.
+		e.load(scratchA, v.Args[0])
+		e.a.MovRI(x86.RAX, 0)
+		e.a.CmpRI(scratchA, 0x10FFFF)
+		tooBig := e.a.NewLabel("char_from_u32_out")
+		e.a.Jcc(x86.Above, tooBig)
+		e.a.MovRR(scratchB, scratchA)
+		e.a.AndRI(scratchB, -0x800) // ^0x7FF, sign-extended
+		e.a.CmpRI(scratchB, 0xD800)
+		e.a.Jcc(x86.Equal, tooBig)
+		e.a.MovRI(x86.RAX, 1)
+		e.a.Bind(tooBig)
+		e.def(v, x86.RAX)
+		return nil
+
 	case compile.BuiltinFloatBits, compile.BuiltinFloatFromBits:
 		if len(v.Args) != 1 {
 			return fmt.Errorf("this is a compiler bug: a float reinterpretation takes one argument, got %d", len(v.Args))

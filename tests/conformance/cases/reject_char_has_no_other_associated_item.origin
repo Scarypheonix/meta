@@ -1,0 +1,7 @@
+// EXPECT: reject E0433
+// spec: 04-expressions.md — `char::from_u32` is the only associated item on `char`, and a
+// mistyped one says so rather than falling through to the generic path error.
+
+fn main() {
+    let c = char::from_u16(65u32);
+}

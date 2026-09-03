@@ -878,7 +878,7 @@ func (r *resolver) resolvePathIn(path *ast.Path, nodeID ast.NodeID, inPattern bo
 			return
 		}
 		if base.Kind == Prim {
-			r.resolvePrimConst(base.Name, segs[1], nodeID)
+			r.resolvePrimMember(base.Name, segs[1], nodeID)
 			return
 		}
 	}
@@ -955,7 +955,24 @@ func (r *resolver) resolvePathIn(path *ast.Path, nodeID ast.NodeID, inPattern bo
 // (spec/01-lexical.md).
 var PrimConsts = map[string]bool{"MIN": true, "MAX": true, "BITS": true}
 
-func (r *resolver) resolvePrimConst(prim string, member ast.Ident, nodeID ast.NodeID) {
+// resolvePrimMember resolves `T::member` where T is a primitive type: an associated
+// constant on an integer, or `char::from_u32`.
+//
+// These are members of the *type*, so they need no `use` -- and must not, since a module
+// named `char` would shadow the primitive `char` in type position, which is how a first
+// attempt at `char::from_u32` made `Option[char]` stop resolving.
+func (r *resolver) resolvePrimMember(prim string, member ast.Ident, nodeID ast.NodeID) {
+	if prim == "char" {
+		if member.Name != "from_u32" {
+			r.bag.Errorf("E0433", member.Loc, "`char` has no associated item `%s`", member.Name).
+				Label("no such item").
+				Note("`char::from_u32(n: u32) -> Option[char]` is the only one")
+			r.out.Refs[nodeID] = Ref{Kind: Unresolved}
+			return
+		}
+		r.out.Refs[nodeID] = Ref{Kind: Builtin, Builtin: "char::from_u32", Name: "from_u32"}
+		return
+	}
 	if !PrimConsts[member.Name] {
 		r.bag.Errorf("E0433", member.Loc, "`%s` has no associated constant `%s`", prim, member.Name).
 			Label("no such constant").

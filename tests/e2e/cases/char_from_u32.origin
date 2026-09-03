@@ -1,0 +1,41 @@
+use std::io;
+
+// `u32` -> `char` is rejected as a cast because not every integer is a Unicode scalar
+// value (spec/04-expressions.md). `char::from_u32` is the checked form, and until now it
+// existed only in that rejection's own help text and in the specification's table.
+//
+// It is an associated item on the primitive, like `i64::MAX`, so it needs no `use`. A
+// module named `char` would have been the obvious place and is the wrong one: it shadows
+// the primitive in type position, and `Option[char]` stops resolving.
+
+fn show(o: Option[char]) -> String {
+    match o {
+        Option::Some(c) => "\(c as i64)",
+        Option::None => "none",
+    }
+}
+
+fn main() {
+    io::println(show(char::from_u32(65u32)));
+    io::println(show(char::from_u32(0u32)));
+    io::println(show(char::from_u32(955u32)));
+    io::println(show(char::from_u32(128512u32)));
+
+    // The last scalar value, and one past it.
+    io::println(show(char::from_u32(1114111u32)));
+    io::println(show(char::from_u32(1114112u32)));
+
+    // The surrogate range, and the values either side of it.
+    io::println(show(char::from_u32(55295u32)));
+    io::println(show(char::from_u32(55296u32)));
+    io::println(show(char::from_u32(57343u32)));
+    io::println(show(char::from_u32(57344u32)));
+
+    io::println(show(char::from_u32(4294967295u32)));
+
+    // A scalar value that came back is an ordinary `char`.
+    match char::from_u32(128512u32) {
+        Option::Some(c) => io::println("\(c) is \(c.to_str().len()) bytes"),
+        Option::None => io::println("none"),
+    }
+}

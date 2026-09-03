@@ -332,6 +332,11 @@ func (v *VM) callBuiltin(index, argCount int, kind bytecode.Kind, span diag.Span
 	}
 
 	switch index {
+	case compile.BuiltinCharValid:
+		// Only the predicate: internal/compile builds the `Option` out of this and the
+		// value itself, which needs no conversion (spec/04-expressions.md).
+		v.push(boolVal(args[0].N <= 0x10FFFF && !(args[0].N >= 0xD800 && args[0].N <= 0xDFFF)))
+		return
 	case compile.BuiltinFloatBits:
 		// The bits are already in the slot; only the tag that says how to read them
 		// changes (spec/16-floats.md).

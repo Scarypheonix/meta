@@ -26,6 +26,19 @@ import (
 // rather than a shortest-round-trip algorithm written once per engine.
 func (in *Interp) floatBuiltin(name string, args []Value, span diag.Span) (Value, bool) {
 	switch name {
+	case "char::from_u32":
+		n, ok := args[0].(Int)
+		if !ok {
+			in.trap(span, "`char::from_u32` takes an integer, found %s", TypeName(args[0]))
+		}
+		// The interpreter builds the `Option` itself. The bytecode compiler emits the
+		// construction instead, out of a predicate the runtimes provide -- ADR-0025's
+		// split, which exists because the native backend cannot make a prelude type.
+		if !isScalarValue(uint64(n)) {
+			return in.optionNone(span), true
+		}
+		return in.optionSome(Char(rune(n)), span), true
+
 	case "float::bits":
 		f, ok := args[0].(Float)
 		if !ok {
@@ -40,6 +53,13 @@ func (in *Interp) floatBuiltin(name string, args []Value, span diag.Span) (Value
 		return Float(math.Float64frombits(uint64(n))), true
 	}
 	return nil, false
+}
+
+// isScalarValue reports whether a number is a Unicode scalar value: below 0x110000 and
+// not a surrogate. It is the whole content of `char::from_u32`; the conversion itself is
+// nothing, since a `char` and its scalar value are the same bits.
+func isScalarValue(v uint64) bool {
+	return v <= 0x10FFFF && !(v >= 0xD800 && v <= 0xDFFF)
 }
 
 func (in *Interp) strBuiltin(name string, args []Value, span diag.Span) (Value, bool) {

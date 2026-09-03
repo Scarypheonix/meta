@@ -47,6 +47,8 @@ var builtinIndex = map[string]int{
 	"str::char_at":    BuiltinStrCharAt,
 	"str::char_width": BuiltinStrCharWidth,
 
+	"char::from_u32": BuiltinCharValid,
+
 	"float::bits":      BuiltinFloatBits,
 	"float::from_bits": BuiltinFloatFromBits,
 
@@ -84,6 +86,9 @@ func (c *Compiler) call(v *ast.Call) error {
 			}
 			if idx == BuiltinMapNew {
 				return c.mapNew(v)
+			}
+			if idx == BuiltinCharValid {
+				return c.charFromU32(v)
 			}
 			for _, a := range v.Args {
 				if err := c.expr(a); err != nil {
@@ -337,6 +342,40 @@ func (c *Compiler) checkedCall(v *ast.MethodCall, fits int) error {
 	c.emitA(bytecode.OpLoad, lhs, v.Span())
 	c.emitA(bytecode.OpLoad, rhs, v.Span())
 	c.emitA(wrappingFor[fits], int(kind), v.Span())
+	c.emitAB(bytecode.OpVariant, someIdx, 1, v.Span())
+	toEnd := c.emitA(bytecode.OpJump, 0, v.Span())
+
+	c.patch(toNone)
+	c.emitAB(bytecode.OpVariant, noneIdx, 0, v.Span())
+	c.patch(toEnd)
+	return nil
+}
+
+// charFromU32 lowers `char::from_u32`, the checked `u32` -> `char` conversion.
+//
+// The same shape as checkedCall: the compiler provides only the predicate, and the
+// `Option` is built here, at this call's own instantiation. Nothing converts -- a `char`
+// and its scalar value are the same sixty-four bits, and what the predicate decides is
+// whether reading them as a `char` is allowed at all (spec/04-expressions.md).
+func (c *Compiler) charFromU32(v *ast.Call) error {
+	if len(v.Args) != 1 {
+		return unsupported("`char::from_u32` takes one argument", v.Span())
+	}
+	someIdx, noneIdx, err := c.optionVariants(c.typeOf(v), v.Span())
+	if err != nil {
+		return err
+	}
+	if err := c.expr(v.Args[0]); err != nil {
+		return err
+	}
+	slot := c.temp()
+	c.emitA(bytecode.OpStore, slot, v.Span())
+
+	c.emitA(bytecode.OpLoad, slot, v.Span())
+	c.emitABK(bytecode.OpCallBuiltin, BuiltinCharValid, 1, bytecode.KindU32, v.Span())
+	toNone := c.emitA(bytecode.OpJumpIfFalse, 0, v.Span())
+
+	c.emitA(bytecode.OpLoad, slot, v.Span())
 	c.emitAB(bytecode.OpVariant, someIdx, 1, v.Span())
 	toEnd := c.emitA(bytecode.OpJump, 0, v.Span())
 

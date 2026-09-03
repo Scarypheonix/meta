@@ -158,6 +158,7 @@ identity, and a moving collector MUST preserve it.
 | `f32` → `f64` | exact |
 | `char` → `u32` | the scalar value |
 | `u32` → `char` | **REJECTED** — use `char::from_u32(x) -> Option[char]` |
+| `char::from_u32(n)` | `Some(c)` when `n` is a scalar value, `None` above `0x10FFFF` or in `0xD800..=0xDFFF` |
 | `bool` → integer | `0` or `1` |
 | anything else | REJECTED |
 
