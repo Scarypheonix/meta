@@ -4,7 +4,7 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Phases 0 through 7 are complete** (see `docs/phases/`). Phase 8 has not started, and
+**Phases 0 through 8 are complete** (see `docs/phases/`). Phase 9 has not started, and
 its scope is the user's to set.
 
 ---
@@ -43,6 +43,7 @@ internal/resolve/     name resolution, modules, visibility; owns the name side t
 internal/types/       the shared type language: terms, unification, generalization
 internal/check/       the type checker: inference, exhaustiveness, traits, coherence
 internal/interp/      tree-walking interpreter (Phase 1)
+internal/arith/       one definition of integer arithmetic per declared width (ADR-0021)
 internal/layout/      object layout and headers: the GC/backend shared contract
 internal/gc/          precise generational moving collector
 internal/bytecode/    the stack instruction set and its disassembler
@@ -51,8 +52,9 @@ internal/opt/         the optimizer: folding, CSE, LICM, escape analysis, inlini
 internal/mono/        monomorphization of call dispatch (ADR-0010)
 internal/compile/     AST -> bytecode, per monomorphized instance
 internal/vm/          the bytecode virtual machine
-internal/prelude/     the standard library, written in Origin: Option, Result, Ordering,
-                      the concurrency handles, List, Map, the Str trait, IoError and files
+internal/prelude/     the standard library, written in Origin: Option and Result and their
+                      methods, Ordering, Cell, the concurrency handles, List, Map, the Str
+                      trait, IoError and files, and the shortest-decimal float rendering
 internal/x86/         a hand-written encoder for the instructions the backend emits
 internal/dwarf/       the DWARF4 line table and its compile-unit DIE (ADR-0023)
 internal/codesign/    the ad-hoc Mach-O code signature, without which macOS will not
@@ -63,10 +65,11 @@ internal/driver/      pass ordering and error suppression
 tests/conformance/    type-system accept/reject corpus, one file per case
 tests/e2e/            programs + exact expected stdout/stderr/exit
 tests/docs/           documentation invariants (ADR numbering, code registry, lints)
+tests/floats/         the float rendering against Go's strconv, over 14,000 bit patterns
 tests/debuginfo/      lldb/llvm-dwarfdump on both formats; skips if they are absent
 tests/fuzz/           fuzz targets for the lexer and parser
 docs/spec/            THE language specification — normative; §13 collections, §14
-                      strings, §15 files were added in Phase 7
+                      strings, §15 files were added in Phase 7, §16 floats in Phase 8
 docs/adr/             architecture decision records — every irreversible choice
 docs/phases/          N-complete.md, written at each phase gate
 docs/deferred.md      everything deliberately left out, each tagged with a phase
@@ -175,6 +178,28 @@ This project outlasts any single context window.
 
 ## Status
 
+**Phase 8 is complete** (`docs/phases/8-complete.md`). Two halves. The first closed the
+three places `docs/spec/` and the implementation had drifted apart since Phase 5:
+arithmetic happens at the width the operand type declares (`internal/arith`, one definition
+the three engines share), `u64` has a run-time representation, and a float renders as the
+shortest decimal that reads back as the same value — the last `unimplemented:` in the
+project, written in **Origin, in the prelude** (**ADR-0031**, `docs/spec/16-floats.md`)
+because a shortest-round-trip conversion needs exact arithmetic wider than sixty-four bits
+and the alternative was hand-encoding Dragon4 in machine code.
+
+The second half was a method rather than a list, and it is the thing to carry forward:
+**seven real programs, ~1,400 lines of Origin, run on all three engines at every
+optimization level.** They found nine more holes, none of which any existing test caught.
+Seven of the nine were *accepted syntax that nothing verified* — an inline bound on an
+impl, a bound on an associated type, a lambda assigning what it captured, a qualified
+variant path, a struct literal in condition position. That failure mode has a tell: a field
+on an AST node that no other package reads. The other two were a register-allocator bug
+live since Phase 5 (two φs of one block could share a register, visible only at `-O0`) and
+`panic` from the prelude naming the prelude in native code.
+
+Read `docs/phases/8-complete.md` before starting Phase 9, and before touching the register
+allocator or anything that decides how a value is printed.
+
 **Phase 7 is complete** (`docs/phases/7-complete.md`). Origin has the standard library a
 program cannot be written without: `List` and `Map` over one compiler-provided `Array[T]`
 (ADR-0028), a hash the three engines agree on to the bit, a `String` with a real surface,
@@ -219,25 +244,28 @@ own output — there is no linker to do it), and the lesson recorded there about
 structurally", which had concealed the fact that every Mach-O the project produced was
 unrunnable.
 
-**Known-broken / deferred**, all recorded in `docs/deferred.md` with a phase: integer
-arithmetic is 64-bit only in every engine and `u64::MAX` has no run-time representation;
-`match` compiles to a linear chain of arm tests; `to_str` on a `Float` is unimplemented in
-native code (no spec fixes a rendering, and a real one is a shortest-round-trip decimal
-algorithm — Phase 8); a struct or enum declared inside a function body fails loudly in
-`internal/compile` rather than being checked (Phase 8); a function used both as a direct
-callee and as an escaping value loses its direct-call fast path for every use (ADR-0020);
-native collection is single-space, non-generational, with no write barrier (ADR-0022);
-DWARF is a line table and a symbol table only, so `frame variable` does not work
-(ADR-0023); no engine runs threads in parallel; the native runtime never reclaims what it
-maps for a channel, a mutex or a finished thread's stack; `std::fs` has no directory
-listing, metadata, rename, delete or streaming, and there is no `Path` type (ADR-0030);
-and error conversion in `?` via `Into` needs a blanket-impl story (Phase 8).
+**Known-broken / deferred**, all recorded in `docs/deferred.md` with a phase: `match`
+compiles to a linear chain of arm tests; `%` on floats works on the interpreter and the VM
+and fails to build natively (SSE has no remainder instruction — Phase 9); a struct or enum
+declared inside a function body fails loudly in `internal/compile` rather than being
+checked; there are no associated functions, so a constructor is a free function in a `std::`
+module (`list::new`, `sync::mutex`); a function used both as a direct callee and as an
+escaping value loses its direct-call fast path for every use (ADR-0020); native collection
+is single-space, non-generational, with no write barrier (ADR-0022); DWARF is a line table
+and a symbol table only, so `frame variable` does not work (ADR-0023); no engine runs
+threads in parallel; the native runtime never reclaims what it maps for a channel, a mutex
+or a finished thread's stack; `std::fs` has no directory listing, metadata, rename, delete
+or streaming, and there is no `Path` type (ADR-0030); and error conversion in `?` via `Into`
+needs a blanket-impl story (`map_err` now exists, so the explicit form is real).
 
-**Next action:** Phase 8's scope is not decided, and rule 7 puts that choice with the user.
-`docs/deferred.md` holds the candidates, and two stand out for what Phase 9 needs rather
-than for their own sake: the **package manager and multi-file compilation** (Phase 9's
-compiler will not be one file), and **float formatting**, which is the last `unimplemented:`
-in native code. Nothing is in flight.
+**Next action:** Phase 9's scope is not decided, and rule 7 puts that choice with the user.
+The project's own arc points at **self-hosting**: a compiler for Origin, written in Origin,
+which is what every phase so far has been building toward and what `bootstrap/` is reserved
+for. Multi-file packages, recursive enums, maps, strings, files, `?` and now `Option`/
+`Result` methods all work and are covered by end-to-end cases; what a self-hosting compiler
+would still miss is recorded above. The cheapest next thing that is not that: keep writing
+Origin. Nine of nine bugs this phase came from running programs, none from reading Go.
+Nothing is in flight.
 
 **A note on the history:** the VM's concurrency runtime landed inside commit `6b073de`,
 whose message describes only ADR-0027 — the bug the VM work uncovered. The commit is
