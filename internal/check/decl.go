@@ -531,7 +531,12 @@ func (c *Checker) collectImpls(f *ast.File) {
 			Assoc:   map[string]types.Type{},
 		}
 		c.env = envFor(params, self, nil)
-		info.Bounds = c.collectBounds(nil, v.Where, params)
+		// Both spellings, and they mean the same thing: `impl[T: Show] Box[T]` and
+		// `impl[T] Box[T] where T: Show`. Collecting only the second was a silent hole --
+		// the parser accepted the first and the checker dropped it, so a method body
+		// could not use the bound it had just been given and an impl that should not have
+		// applied did.
+		info.Bounds = c.collectBounds(v.Generics, v.Where, params)
 
 		if v.Trait != nil {
 			if b, ok := c.toBound(self, v.Trait); ok {

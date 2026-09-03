@@ -1,0 +1,22 @@
+// EXPECT: reject E0277
+// spec: 06-traits-generics.md — an impl's own bounds are obligations of every call that
+// selects it. `impl[T: Show] Show for Box[T]` gives `Box[Opaque]` a `to_str` only if
+// `Opaque` has one, and it does not.
+//
+// Requiring only the *method's* bounds let this through, and what happened next depended
+// on the engine: the interpreter and the VM fell back on a debug rendering of a value with
+// no `Show` impl at all, and native code failed to build.
+
+struct Opaque { n: i64 }
+struct Box[T] { item: T }
+
+impl[T: Show] Show for Box[T] {
+    fn to_str(self) -> String {
+        self.item.to_str()
+    }
+}
+
+fn main() {
+    let bad = Box { item: Opaque { n: 1 } };
+    let shown = bad.to_str();
+}

@@ -1,0 +1,11 @@
+1 + 2 * 3  =>  7
+(1 + 2) * 3  =>  9
+x = 10  =>  x = 10
+y = x * x + 1  =>  y = 101
+y - x  =>  91
+-4 + 10  =>  6
+100 / 7  =>  14
+100 / (7 - 7)  =>  error: divide by zero
+z + 1  =>  error: `z` is not bound
+2 +  =>  error: unexpected token <end>
+3 $ 4  =>  error: unexpected character `$`

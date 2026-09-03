@@ -1,0 +1,176 @@
+use std::io;
+use std::list;
+use std::map;
+use std::thread;
+use std::chan;
+
+// Generic containers of containers, closures held in parameters, a `for` loop over a
+// collection, a user comparator, a `Cell` shared with a lambda, and a thread draining a
+// channel of a generic payload.
+//
+// The companion to `expression_language`: that one is depth, this one is width. Between
+// them they were what found the three checker holes Phase 8 closed -- an impl's inline
+// bounds being dropped, an impl's bounds never being required at a call, and a lambda
+// being allowed to assign what it captured on one engine out of three.
+
+pub struct Pair[A, B] { first: A, second: B }
+
+impl[A, B] Pair[A, B] {
+    pub fn swap(self) -> Pair[B, A] {
+        Pair { first: self.second, second: self.first }
+    }
+}
+
+impl[A: Show, B: Show] Show for Pair[A, B] {
+    fn to_str(self) -> String {
+        "(\(self.first.to_str()), \(self.second.to_str()))"
+    }
+}
+
+/// Insertion sort over a caller-supplied ordering: exercises a closure held in a
+/// parameter and called in a loop.
+fn sort_by[T](items: List[T], less: fn(T, T) -> bool) -> List[T] {
+    let out = list::new[T]();
+    let mut i = 0;
+    while i < items.len() {
+        let v = items.at(i);
+        let mut at = out.len();
+        let mut j = 0;
+        let mut placed = false;
+        while j < out.len() && !placed {
+            if less(v, out.at(j)) {
+                at = j;
+                placed = true;
+            }
+            j = j + 1;
+        }
+        // Shift right from the end, then drop v in.
+        out.push(v);
+        let mut k = out.len() - 1;
+        while k > at {
+            out.set(k, out.at(k - 1));
+            k = k - 1;
+        }
+        out.set(at, v);
+        i = i + 1;
+    }
+    out
+}
+
+fn largest[T: Ord](items: List[T]) -> Option[T] {
+    if items.is_empty() {
+        return Option::None;
+    }
+    let mut best = items.at(0);
+    let mut i = 1;
+    while i < items.len() {
+        match items.at(i).cmp(best) {
+            Ordering::Greater => { best = items.at(i); }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    Option::Some(best)
+}
+
+/// A group-by: `Map[String, List[i64]]`, a generic nested inside a generic.
+fn group(words: List[String]) -> Map[String, List[i64]] {
+    let out = map::new[String, List[i64]]();
+    let mut i = 0;
+    while i < words.len() {
+        let w = words.at(i);
+        let key = w.slice(0, 1);
+        match out.get(key) {
+            Option::Some(seen) => { seen.push(i); }
+            Option::None => {
+                let fresh = list::new[i64]();
+                fresh.push(i);
+                out.insert(key, fresh);
+            }
+        }
+        i = i + 1;
+    }
+    out
+}
+
+fn counter(start: i64) -> fn() -> i64 {
+    // A lambda cannot reassign what it captured (spec/04-expressions.md); a `Cell` is the
+    // shared slot that makes the counter work anyway.
+    let n = Cell { value: start };
+    || { n.set(n.get() + 1); n.get() }
+}
+
+fn main() {
+    // Generic struct, its method, and a Show impl with two bounds.
+    let p = Pair { first: 3, second: "three" };
+    io::println(p.to_str());
+    io::println(p.swap().to_str());
+    let nested = Pair { first: Pair { first: 1, second: 2 }, second: "inner" };
+    io::println(nested.to_str());
+
+    // A closure passed as a value, called from a generic function.
+    let nums = list::new[i64]();
+    nums.push(5); nums.push(2); nums.push(9); nums.push(2); nums.push(7);
+    let up = sort_by(nums, |a, b| { a < b });
+    let down = sort_by(nums, |a, b| { a > b });
+    io::println(join(up));
+    io::println(join(down));
+
+    // A trait bound reaching a compiler-provided impl through monomorphization.
+    match largest(nums) {
+        Option::Some(n) => io::println("largest \(n)"),
+        Option::None => io::println("empty"),
+    }
+    let names = list::new[String]();
+    names.push("pear"); names.push("apple"); names.push("plum");
+    match largest(names) {
+        Option::Some(s) => io::println("last word \(s)"),
+        Option::None => io::println("empty"),
+    }
+
+    // A map of lists, walked with a `for` loop over its keys.
+    let g = group(names);
+    let keys = sort_by(g.keys(), |a, b| { a < b });
+    for k in keys {
+        match g.get(k) {
+            Option::Some(idx) => io::println("\(k): \(join(idx))"),
+            Option::None => io::println("\(k): ?"),
+        }
+    }
+
+    // A closure that owns mutable state and outlives the call that made it.
+    let next = counter(10);
+    io::println("\(next()) \(next()) \(next())");
+
+    // Threads, a channel, and a join, all carrying a generic payload.
+    let (tx, rx) = chan::channel[Pair[i64, i64]](2);
+    let h = thread::spawn(|| -> i64 {
+        let mut total = 0;
+        let mut going = true;
+        while going {
+            match rx.recv() {
+                Option::Some(got) => { total = total + got.first * got.second; }
+                Option::None => { going = false; }
+            }
+        }
+        total
+    });
+    let mut i = 1;
+    while i <= 5 {
+        tx.send(Pair { first: i, second: i });
+        i = i + 1;
+    }
+    tx.close();
+    io::println("sum of squares \(h.join())");
+}
+
+fn join[T: Show](items: List[T]) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < items.len() {
+        if i > 0 { out = out.concat(" "); }
+        out = out.concat(items.at(i).to_str());
+        i = i + 1;
+    }
+    out
+}

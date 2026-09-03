@@ -1,0 +1,37 @@
+use std::io;
+
+// spec/10-examples.md §3, and the type spec/04-expressions.md points at when it says a
+// lambda cannot reassign what it captured: share an aggregate with a `mut` field instead.
+//
+// The capture is a copy of a *reference* (ADR-0008), so the lambda and the scope that made
+// it see the same object -- and two counters made the same way share nothing.
+
+fn make_counter() -> fn() -> i64 {
+    let cell = Cell { value: 0 };
+    || { cell.set(cell.get() + 1); cell.get() }
+}
+
+fn main() {
+    let c = make_counter();
+    let d = make_counter();
+    io::println(c().to_str());
+    io::println(c().to_str());
+    io::println(d().to_str());
+
+    let swap = Cell { value: "before" };
+    io::println(swap.replace("after"));
+    io::println(swap.get());
+
+    // A cell of an aggregate, and a cell read through a plain function.
+    let held = Cell { value: Option::Some(7) };
+    io::println(show(held.get()));
+    held.set(Option::None);
+    io::println(show(held.get()));
+}
+
+fn show(o: Option[i64]) -> String {
+    match o {
+        Option::Some(n) => n.to_str(),
+        Option::None => "None",
+    }
+}

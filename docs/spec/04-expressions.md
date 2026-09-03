@@ -214,11 +214,19 @@ For a primitive that means a copy of the value; for an aggregate that means a co
 the reference, so the lambda and the enclosing scope observe the same object and see
 each other's mutations to `mut` fields. A captured `mut` *binding* is captured by value:
 reassigning the outer binding after the lambda is created does not affect the lambda,
-and the lambda cannot reassign the outer binding. To share a mutable slot, share an
-aggregate with a `mut` field — that is what `Cell[T]` in the prelude is for.
+and assigning it **inside** the lambda is REJECTED (`E0595`) — there is no outer binding
+there to assign to, only the copy. To share a mutable slot, share an aggregate with a
+`mut` field; that is what `Cell[T]` in the prelude is for:
+
+```origin
+fn make_counter() -> fn() -> i64 {
+    let cell = Cell { value: 0 };
+    || { cell.set(cell.get() + 1); cell.get() }
+}
+```
 
 This rule is what makes the Phase 1 closure-counter test meaningful; it is spelled out
-in `10-examples.md` §7 with its expected output.
+in `10-examples.md` §3 with its expected output.
 
 ## Worked examples
 

@@ -1116,6 +1116,17 @@ func (c *Checker) inferMethodCall(v *ast.MethodCall) types.Type {
 		subst[cand.Trait.SelfParam] = recv
 	}
 	c.recordMethodInst(c.out.Insts, v.NodeID(), v.Name.Name, cand, recv, subst)
+	// The impl's own bounds are obligations of the call as much as the method's are:
+	// `impl[T: Show] Show for Box[T]` gives `Box[Opaque]` a `to_str` only if `Opaque` has
+	// one. Requiring only the method's bounds let the call through, and what happened next
+	// depended on the engine -- the interpreter and the VM fell back on a debug rendering,
+	// native code failed to build -- which is the shape of divergence the whole project is
+	// arranged to prevent.
+	if cand.Impl != nil {
+		for _, b := range cand.Impl.Bounds {
+			c.requireBound(types.Substitute(b.Type, subst), b.Trait, v.Span())
+		}
+	}
 	for _, b := range cand.Sig.Bounds {
 		c.requireBound(types.Substitute(b.Type, subst), b.Trait, v.Span())
 	}

@@ -1,0 +1,29 @@
+// EXPECT: accept
+// spec: 06-traits-generics.md — a bound written inline on an impl's own generic parameter
+// is in scope in the method bodies, exactly as the `where` spelling of it is. The parser
+// accepted both from the start; the checker collected only the second, so a method could
+// not use the bound it had just been given.
+
+struct Box[T] { item: T }
+
+impl[T: Show] Box[T] {
+    fn describe(self) -> String {
+        self.item.to_str()
+    }
+}
+
+impl[T] Box[T] where T: Ord {
+    fn beats(self, other: Box[T]) -> bool {
+        match self.item.cmp(other.item) {
+            Ordering::Greater => true,
+            _ => false,
+        }
+    }
+}
+
+fn main() {
+    let a = Box { item: 2 };
+    let b = Box { item: 1 };
+    let shown = a.describe();
+    let won = a.beats(b);
+}

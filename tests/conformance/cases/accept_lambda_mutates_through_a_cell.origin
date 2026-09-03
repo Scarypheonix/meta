@@ -1,0 +1,15 @@
+// EXPECT: accept
+// spec: 04-expressions.md — the sanctioned way to share a mutable slot with a lambda: an
+// aggregate with a `mut` field, whose reference the lambda copies (ADR-0008). `Cell[T]` is
+// that type, in the prelude, which §04 names.
+
+fn make_counter() -> fn() -> i64 {
+    let cell = Cell { value: 0 };
+    || { cell.set(cell.get() + 1); cell.get() }
+}
+
+fn main() {
+    let c = make_counter();
+    let first = c();
+    let second = c();
+}

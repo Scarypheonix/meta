@@ -1,0 +1,260 @@
+use std::io;
+use std::list;
+use std::map;
+
+// A small language, written in Origin: a lexer, a Pratt parser over a recursive enum, an
+// evaluator with variables in a `Map`, and errors as values all the way through.
+//
+// This case exists because of what Phase 7 recorded: five of that phase's six bugs were
+// found by *writing a library in Origin* rather than by testing the compiler, and four
+// were invisible to a differential suite that had no case exercising them. So this is a
+// program rather than a feature test -- recursive enums holding other enums, `?`
+// threading one error type through four call levels, `impl Show` on a generic-free enum,
+// interpolation everywhere, and a `Map[String, i64]` mutated through a parameter.
+
+pub enum Tok {
+    Num(i64),
+    Name(String),
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    LParen,
+    RParen,
+    Assign,
+    End,
+}
+
+impl Show for Tok {
+    fn to_str(self) -> String {
+        match self {
+            Tok::Num(n) => "Num(\(n))",
+            Tok::Name(s) => "Name(\(s))",
+            Tok::Plus => "+",
+            Tok::Minus => "-",
+            Tok::Star => "*",
+            Tok::Slash => "/",
+            Tok::LParen => "(",
+            Tok::RParen => ")",
+            Tok::Assign => "=",
+            Tok::End => "<end>",
+        }
+    }
+}
+
+pub enum Expr {
+    Lit(i64),
+    Var(String),
+    Bin(String, Expr, Expr),
+}
+
+pub enum Fault {
+    BadChar(String),
+    BadToken(String),
+    Unbound(String),
+    DivZero,
+}
+
+impl Show for Fault {
+    fn to_str(self) -> String {
+        match self {
+            Fault::BadChar(c) => "unexpected character `\(c)`",
+            Fault::BadToken(t) => "unexpected token \(t)",
+            Fault::Unbound(n) => "`\(n)` is not bound",
+            Fault::DivZero => "divide by zero",
+        }
+    }
+}
+
+fn is_digit(b: i64) -> bool { b >= 48 && b <= 57 }
+fn is_alpha(b: i64) -> bool { (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || b == 95 }
+
+pub fn lex(src: String) -> Result[List[Tok], Fault] {
+    let out = list::new[Tok]();
+    let mut i = 0;
+    while i < src.len() {
+        let b = src.byte_at(i);
+        if b == 32 || b == 9 {
+            i = i + 1;
+        } else {
+            if is_digit(b) {
+                let start = i;
+                while i < src.len() && is_digit(src.byte_at(i)) {
+                    i = i + 1;
+                }
+                match src.slice(start, i).parse_int() {
+                    Option::Some(n) => { out.push(Tok::Num(n)); }
+                    Option::None => { return Result::Err(Fault::BadChar(src.slice(start, i))); }
+                }
+            } else {
+                if is_alpha(b) {
+                    let start = i;
+                    while i < src.len() && (is_alpha(src.byte_at(i)) || is_digit(src.byte_at(i))) {
+                        i = i + 1;
+                    }
+                    out.push(Tok::Name(src.slice(start, i)));
+                } else {
+                    let one = src.slice(i, i + 1);
+                    if b == 43 { out.push(Tok::Plus); }
+                    else { if b == 45 { out.push(Tok::Minus); }
+                    else { if b == 42 { out.push(Tok::Star); }
+                    else { if b == 47 { out.push(Tok::Slash); }
+                    else { if b == 40 { out.push(Tok::LParen); }
+                    else { if b == 41 { out.push(Tok::RParen); }
+                    else { if b == 61 { out.push(Tok::Assign); }
+                    else { return Result::Err(Fault::BadChar(one)); } } } } } } }
+                    i = i + 1;
+                }
+            }
+        }
+    }
+    out.push(Tok::End);
+    Result::Ok(out)
+}
+
+pub struct Parser {
+    toks: List[Tok],
+    mut at: i64,
+}
+
+impl Parser {
+    fn peek(self) -> Tok {
+        self.toks.at(self.at)
+    }
+
+    fn advance(self) -> Tok {
+        let t = self.toks.at(self.at);
+        self.at = self.at + 1;
+        t
+    }
+
+    /// Binding power of an infix operator, or 0 when it is not one.
+    fn power(self, t: Tok) -> i64 {
+        match t {
+            Tok::Plus => 1,
+            Tok::Minus => 1,
+            Tok::Star => 2,
+            Tok::Slash => 2,
+            _ => 0,
+        }
+    }
+
+    fn primary(self) -> Result[Expr, Fault] {
+        let t = self.advance();
+        match t {
+            Tok::Num(n) => Result::Ok(Expr::Lit(n)),
+            Tok::Name(s) => Result::Ok(Expr::Var(s)),
+            Tok::Minus => {
+                let inner = self.expr(3)?;
+                Result::Ok(Expr::Bin("-", Expr::Lit(0), inner))
+            }
+            Tok::LParen => {
+                let inner = self.expr(0)?;
+                match self.advance() {
+                    Tok::RParen => Result::Ok(inner),
+                    other => Result::Err(Fault::BadToken(other.to_str())),
+                }
+            }
+            other => Result::Err(Fault::BadToken(other.to_str())),
+        }
+    }
+
+    fn expr(self, min: i64) -> Result[Expr, Fault] {
+        let mut left = self.primary()?;
+        let mut going = true;
+        while going {
+            let t = self.peek();
+            let p = self.power(t);
+            if p == 0 || p <= min {
+                going = false;
+            } else {
+                self.advance();
+                let right = self.expr(p)?;
+                left = Expr::Bin(t.to_str(), left, right);
+            }
+        }
+        Result::Ok(left)
+    }
+}
+
+pub fn eval(e: Expr, env: Map[String, i64]) -> Result[i64, Fault] {
+    match e {
+        Expr::Lit(n) => Result::Ok(n),
+        Expr::Var(name) => {
+            match env.get(name) {
+                Option::Some(v) => Result::Ok(v),
+                Option::None => Result::Err(Fault::Unbound(name)),
+            }
+        }
+        Expr::Bin(op, l, r) => {
+            let a = eval(l, env)?;
+            let b = eval(r, env)?;
+            if op == "+" { return Result::Ok(a + b); }
+            if op == "-" { return Result::Ok(a - b); }
+            if op == "*" { return Result::Ok(a * b); }
+            if b == 0 { return Result::Err(Fault::DivZero); }
+            Result::Ok(a / b)
+        }
+    }
+}
+
+fn run_line(line: String, env: Map[String, i64]) -> Result[String, Fault] {
+    let toks = lex(line)?;
+    // `name = expr` when the first two tokens say so.
+    let mut target = Option::None;
+    let mut body = toks;
+    match toks.at(0) {
+        Tok::Name(n) => {
+            match toks.at(1) {
+                Tok::Assign => {
+                    target = Option::Some(n);
+                    let rest = list::new[Tok]();
+                    let mut i = 2;
+                    while i < toks.len() {
+                        rest.push(toks.at(i));
+                        i = i + 1;
+                    }
+                    body = rest;
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    let p = Parser { toks: body, at: 0 };
+    let tree = p.expr(0)?;
+    let value = eval(tree, env)?;
+    match target {
+        Option::Some(name) => {
+            env.insert(name, value);
+            Result::Ok("\(name) = \(value)")
+        }
+        Option::None => Result::Ok(value.to_str()),
+    }
+}
+
+fn main() {
+    let env = map::new[String, i64]();
+    let lines = list::new[String]();
+    lines.push("1 + 2 * 3");
+    lines.push("(1 + 2) * 3");
+    lines.push("x = 10");
+    lines.push("y = x * x + 1");
+    lines.push("y - x");
+    lines.push("-4 + 10");
+    lines.push("100 / 7");
+    lines.push("100 / (7 - 7)");
+    lines.push("z + 1");
+    lines.push("2 +");
+    lines.push("3 $ 4");
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines.at(i);
+        match run_line(line, env) {
+            Result::Ok(s) => io::println("\(line)  =>  \(s)"),
+            Result::Err(e) => io::println("\(line)  =>  error: \(e.to_str())"),
+        }
+        i = i + 1;
+    }
+}

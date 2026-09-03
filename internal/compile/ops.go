@@ -1,6 +1,8 @@
 package compile
 
 import (
+	"fmt"
+
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/diag"
@@ -122,7 +124,9 @@ func (c *Compiler) assign(v *ast.Assign) error {
 			return err
 		}
 		if _, isCapture := c.captures[ref.Local]; isCapture {
-			return unsupported("assigning to a captured binding", v.Span())
+			// The resolver rejects this now (E0595), so reaching it means the check was
+			// removed or bypassed rather than that the feature is missing.
+			return fmt.Errorf("this is a compiler bug: an assignment to a captured binding reached the compiler")
 		}
 		c.emitA(bytecode.OpStore, c.slotOf(ref.Local), v.Span())
 		c.emit(bytecode.OpUnit, v.Span())

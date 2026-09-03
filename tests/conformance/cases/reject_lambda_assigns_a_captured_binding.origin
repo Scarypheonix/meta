@@ -1,0 +1,15 @@
+// EXPECT: reject E0595
+// spec: 04-expressions.md — "A captured `mut` *binding* is captured by value: reassigning
+// the outer binding after the lambda is created does not affect the lambda, and the lambda
+// cannot reassign the outer binding."
+//
+// Nothing enforced the second half. The interpreter assigned the lambda's own copy and lost
+// it at the next call, so a counter written this way returned the same number every time;
+// the bytecode compiler stopped with an `unimplemented:`. One program, two meanings and a
+// build failure, which is exactly what a specified language is for.
+
+fn main() {
+    let mut n = 0;
+    let bump = || { n = n + 1; n };
+    let a = bump();
+}

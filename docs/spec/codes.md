@@ -22,6 +22,7 @@ compiler appears here exactly once, and that no code appears twice.
 | E0433 | error | unresolved path | 0.1 |
 | E0603 | error | item is private | 0.1 |
 | E0594 | error | cannot assign: binding or field is not `mut` | 0.1 |
+| E0595 | error | cannot assign to a binding a lambda captured | 0.1 |
 | E0599 | error | no method found | 0.1 |
 | E0034 | error | ambiguous method call | 0.1 |
 | E0055 | error | monomorphization depth exceeded (polymorphic recursion) | 0.1 |

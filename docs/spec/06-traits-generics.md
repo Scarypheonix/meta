@@ -51,6 +51,24 @@ An impl MUST define every required method and every associated type, with signat
 that match after substituting `Self`. A mismatch is REJECTED showing both signatures.
 An impl MUST NOT define a method the trait does not declare.
 
+### An impl's own bounds
+
+An impl's generic parameters take bounds, inline or in a `where` clause, and the two
+spellings mean the same thing:
+
+```origin
+impl[T: Show] Show for Box[T] { ... }
+impl[T] Show for Box[T] where T: Show { ... }
+```
+
+Those bounds work in both directions, and both are REQUIRED:
+
+- **Inside**, they are in scope in every method body, so `self.item.to_str()` is a
+  method call the checker can find.
+- **Outside**, they are obligations of every call that selects the impl. `Box[Opaque]`
+  gets a `to_str` only if `Opaque` has one; a call where it does not is REJECTED
+  (`E0277`), naming the type that fails the bound rather than the impl.
+
 ## Coherence
 
 Two rules, both checked globally at link time over the whole program:

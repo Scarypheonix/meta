@@ -1202,6 +1202,19 @@ func (r *resolver) checkAssignable(a *ast.Assign) {
 				Label("cannot assign twice to an immutable binding").
 				Secondary(ref.Local.Decl, "`%s` is bound here", ref.Local.Name).
 				Help("declare it as `let mut %s`", ref.Local.Name)
+			return
+		}
+		// A capture is a copy, so there is no outer binding here to assign to
+		// (spec/04-expressions.md). Saying so is the whole point: the alternative is a
+		// program that means different things on different engines, which is what this
+		// one did -- the interpreter assigned the copy and lost it at the next call, and
+		// the bytecode compiler stopped with an `unimplemented:`.
+		if ref.Local.fnDepth < r.fnDepth {
+			r.bag.Errorf("E0595", place.Span(), "cannot assign to `%s`, which this lambda captured", ref.Local.Name).
+				Label("a capture is a copy, not the binding it was copied from").
+				Secondary(ref.Local.Decl, "`%s` is bound outside the lambda", ref.Local.Name).
+				Note("a lambda captures by value and cannot reassign the outer binding").
+				Help("share an aggregate with a `mut` field instead")
 		}
 	case *ast.FieldAccess:
 		// Checked at run time in Phase 1; statically in Phase 2 once field types exist.
