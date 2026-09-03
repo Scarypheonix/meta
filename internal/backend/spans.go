@@ -113,32 +113,12 @@ func (e *emitter) emitTrapSpan() {
 	a.MovRR(x86.R12, x86.RDI) // the prefix, across every call below
 	a.MovRR(x86.R13, x86.RSI)
 
-	// r14 and rbx end up holding the location's text; the fallback is `<runtime>`.
-	a.MovRI(x86.R14, e.runtimeLocMsg.addr)
-	a.MovRI(x86.RBX, uint64(e.runtimeLocMsg.length))
+	// r14 and rbx end up holding the location's text.
+	a.MovRR(x86.RDI, x86.RBP)
+	a.Call(e.rt.spanHere)
+	a.MovRR(x86.R14, x86.RAX)
+	a.MovRR(x86.RBX, x86.RDX)
 
-	walk := a.NewLabel("trap_span_walk")
-	report := a.NewLabel("trap_span_report")
-	next := a.NewLabel("trap_span_next")
-
-	a.MovRR(x86.RCX, x86.RBP) // this frame; [rcx+8] is the call that reached it
-	a.Bind(walk)
-	a.MovRM(x86.RDI, x86.At(x86.RCX, 8))
-	a.Push(x86.RCX)
-	a.Call(e.rt.spanLookup)
-	a.Pop(x86.RCX)
-	a.TestRR(x86.RAX, x86.RAX)
-	a.Jcc(x86.Equal, next)
-	a.MovRM(x86.R14, x86.At(x86.RAX, 8))
-	a.MovRM(x86.RBX, x86.At(x86.RAX, 16))
-	a.Jmp(report)
-
-	a.Bind(next)
-	a.MovRM(x86.RCX, x86.At(x86.RCX, 0))
-	a.TestRR(x86.RCX, x86.RCX)
-	a.Jcc(x86.NotEqual, walk)
-
-	a.Bind(report)
 	a.MovRI(x86.RDI, 2)
 	a.MovRR(x86.RSI, x86.R12)
 	a.MovRR(x86.RDX, x86.R13)
@@ -147,6 +127,115 @@ func (e *emitter) emitTrapSpan() {
 	a.MovRI(x86.RDI, 2)
 	a.MovRR(x86.RSI, x86.R14)
 	a.MovRR(x86.RDX, x86.RBX)
+	a.Call(e.rt.write)
+
+	a.MovRI(x86.RDI, 2)
+	a.MovRI(x86.RSI, e.newlineAddr)
+	a.MovRI(x86.RDX, 1)
+	a.Call(e.rt.write)
+
+	a.MovRI(x86.RAX, e.target.SysExit)
+	a.MovRI(x86.RDI, 101)
+	a.Syscall()
+	a.Ud2()
+}
+
+// emitSpanHere writes `rt_span_here(rbp rdi) -> rax, rdx`: the text of the innermost
+// user-code call site at or below the frame it is given, and its length.
+//
+// It walks out from that frame until a return address turns up in the span table, which
+// holds user-code call sites only -- so the first hit is the innermost frame the programmer
+// wrote, which is what `userSpan` means. A frame with no entry is skipped rather than
+// stopping the walk: the routines between here and user code are the prelude's and the
+// runtime's own. When nothing matches, the answer is `<runtime>`, which is honest.
+//
+// It is a routine of its own because two callers need the same walk: a trap whose message
+// is a compile-time constant (rt_trap_span) and `panic`, whose message is a String the
+// program computed (rt_panic_span). One walk, one place to be wrong about frame layout.
+func (e *emitter) emitSpanHere() {
+	a := e.a
+	a.Align(16)
+	a.Bind(e.rt.spanHere)
+
+	a.Push(x86.RBP)
+	a.MovRR(x86.RBP, x86.RSP)
+	a.Push(x86.RBX)
+	a.Push(x86.R12)
+
+	a.MovRR(x86.RBX, x86.RDI) // the frame to start from
+
+	// The fallback, if no frame on the way out was written in user code.
+	a.MovRI(x86.R12, e.runtimeLocMsg.addr)
+	a.MovRI(x86.RAX, e.runtimeLocMsg.addr)
+	a.MovRI(x86.RDX, uint64(e.runtimeLocMsg.length))
+
+	walk := a.NewLabel("span_here_walk")
+	next := a.NewLabel("span_here_next")
+	done := a.NewLabel("span_here_done")
+
+	a.Bind(walk)
+	a.TestRR(x86.RBX, x86.RBX)
+	a.Jcc(x86.Equal, done)
+	a.MovRM(x86.RDI, x86.At(x86.RBX, 8)) // the call that reached this frame
+	a.Call(e.rt.spanLookup)
+	a.TestRR(x86.RAX, x86.RAX)
+	a.Jcc(x86.Equal, next)
+	a.MovRM(x86.RDX, x86.At(x86.RAX, 16))
+	a.MovRM(x86.RAX, x86.At(x86.RAX, 8))
+	a.Jmp(done)
+
+	a.Bind(next)
+	a.MovRM(x86.RBX, x86.At(x86.RBX, 0))
+	a.MovRI(x86.RAX, e.runtimeLocMsg.addr)
+	a.MovRI(x86.RDX, uint64(e.runtimeLocMsg.length))
+	a.Jmp(walk)
+
+	a.Bind(done)
+	a.Pop(x86.R12)
+	a.Pop(x86.RBX)
+	a.Pop(x86.RBP)
+	a.Ret()
+}
+
+// emitPanicSpan writes `rt_panic_span(msg String rdi)`: `panic` from inside the prelude.
+//
+// `panic`'s message is a String the program computed, so unlike every other trap its text
+// is not known while compiling; and when the `panic` itself was written in the prelude --
+// `Option::expect` is the one that matters -- its span names a file the programmer never
+// opened. This is the two answers together: the runtime writes the message, and the line
+// comes from the same walk rt_trap_span uses.
+func (e *emitter) emitPanicSpan() {
+	a := e.a
+	a.Align(16)
+	a.Bind(e.rt.panicSpan)
+
+	e.runtimePrologue()
+	a.MovRR(x86.RBX, x86.RDI) // the message
+
+	a.MovRR(x86.RDI, x86.RBP)
+	a.Call(e.rt.spanHere)
+	a.MovRR(x86.R12, x86.RAX)
+	a.MovRR(x86.R13, x86.RDX)
+
+	a.MovRI(x86.RDI, 2)
+	a.MovRI(x86.RSI, e.panicPrefix.addr)
+	a.MovRI(x86.RDX, uint64(e.panicPrefix.length))
+	a.Call(e.rt.write)
+
+	a.MovRI(x86.RDI, 2)
+	a.MovRR(x86.RSI, x86.RBX)
+	a.AddRI(x86.RSI, strBytesOff)
+	a.MovRM(x86.RDX, x86.At(x86.RBX, objHeaderSize))
+	a.Call(e.rt.write)
+
+	a.MovRI(x86.RDI, 2)
+	a.MovRI(x86.RSI, e.atMsg.addr)
+	a.MovRI(x86.RDX, uint64(e.atMsg.length))
+	a.Call(e.rt.write)
+
+	a.MovRI(x86.RDI, 2)
+	a.MovRR(x86.RSI, x86.R12)
+	a.MovRR(x86.RDX, x86.R13)
 	a.Call(e.rt.write)
 
 	a.MovRI(x86.RDI, 2)

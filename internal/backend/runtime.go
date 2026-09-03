@@ -117,6 +117,8 @@ type runtimeLabels struct {
 	// trapSpan and spanLookup report a trap whose message is known while compiling but
 	// whose line is only knowable at run time (spans.go).
 	trapSpan   x86.Label
+	spanHere   x86.Label
+	panicSpan  x86.Label
 	spanLookup x86.Label
 	// The channel operations (chan.go, spec/12-concurrency.md).
 	chanNew   x86.Label
@@ -192,6 +194,8 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.schedPark = e.a.NewLabel("rt_park")
 	e.rt.schedDrain = e.a.NewLabel("rt_drain")
 	e.rt.trapSpan = e.a.NewLabel("rt_trap_span")
+	e.rt.spanHere = e.a.NewLabel("rt_span_here")
+	e.rt.panicSpan = e.a.NewLabel("rt_panic_span")
 	e.rt.spanLookup = e.a.NewLabel("rt_span_lookup")
 	e.rt.chanNew = e.a.NewLabel("rt_chan_new")
 	e.rt.chanSend = e.a.NewLabel("rt_chan_send")
@@ -250,7 +254,9 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitSchedPark()
 	e.emitSchedDrain()
 	e.emitSpanLookup()
+	e.emitSpanHere()
 	e.emitTrapSpan()
+	e.emitPanicSpan()
 	e.emitChanNew()
 	e.emitChanSend()
 	e.emitChanRecv()

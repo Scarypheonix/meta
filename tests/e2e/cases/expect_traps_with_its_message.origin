@@ -1,0 +1,11 @@
+use std::io;
+
+// `expect` is the one place a program says "I know there is a value here". Being wrong is
+// a trap carrying the message the writer chose, not a wrong answer (ADR-0007, §09).
+
+fn main() {
+    io::println("before");
+    let missing: Option[i64] = Option::None;
+    io::println(missing.expect("the config should have been read by now").to_str());
+    io::println("unreachable");
+}

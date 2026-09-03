@@ -1,0 +1,57 @@
+// `Option` and `Result` had no methods at all: two enum declarations and nothing else.
+// A program could only take them apart with `match` or `?`, and the diagnostic for a `?`
+// whose error type does not match told the writer to call `.map_err(|e| ...)`, which did
+// not exist.
+//
+// They are ordinary Origin in the prelude, like `List` and `Str` before them (ADR-0028),
+// and this case is the whole surface at once -- including the idiom the diagnostic names,
+// `read_to_string(p).map_err(Fault::Io)?`, spelled with a lambda since `?` still cannot
+// convert an error type by itself (spec/09-errors.md).
+
+use std::io;
+use std::list;
+
+enum Fault { Io(IoError), Parse(String) }
+
+impl Show for Fault {
+    fn to_str(self) -> String {
+        match self {
+            Fault::Io(e) => "io: \(e.to_str())",
+            Fault::Parse(s) => "parse: \(s)",
+        }
+    }
+}
+
+fn read_number(path: String) -> Result[i64, Fault] {
+    let text = read_to_string(path).map_err(|e| { Fault::Io(e) })?;
+    text.trim().parse_int().ok_or(Fault::Parse(text))
+}
+
+fn main() {
+    let l = list::new[i64]();
+    l.push(5);
+    io::println(l.get(0).unwrap_or(0).to_str());
+    io::println(l.get(9).unwrap_or(-1).to_str());
+    io::println(l.get(0).is_some().to_str());
+    io::println(l.get(9).is_none().to_str());
+    io::println(l.get(0).map(|n| { n * 2 }).unwrap_or(0).to_str());
+    io::println(l.get(0).filter(|n| { n > 10 }).is_none().to_str());
+    io::println(l.get(0).and_then(|n| { if n > 1 { Option::Some(n + 1) } else { Option::None } }).unwrap_or(0).to_str());
+    io::println(l.get(9).unwrap_or_else(|| { 42 }).to_str());
+
+    let ok: Result[i64, String] = Result::Ok(3);
+    let bad: Result[i64, String] = Result::Err("nope");
+    io::println(ok.is_ok().to_str());
+    io::println(bad.is_err().to_str());
+    io::println(ok.map(|n| { n + 1 }).unwrap_or(0).to_str());
+    io::println(bad.map_err(|e| { e.len() }).err().unwrap_or(0).to_str());
+    io::println(ok.and_then(|n| { Result::Ok(n * 10) }).unwrap_or(0).to_str());
+    io::println(ok.ok().unwrap_or(0).to_str());
+    io::println(bad.unwrap_or(-5).to_str());
+    io::println(ok.expect("must be ok").to_str());
+
+    match read_number("/nonexistent") {
+        Result::Ok(n) => io::println("read \(n)"),
+        Result::Err(e) => io::println("failed: \(e.to_str())"),
+    }
+}

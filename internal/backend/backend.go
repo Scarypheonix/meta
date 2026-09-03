@@ -168,6 +168,9 @@ type emitter struct {
 	// panicPrefix is the "origin: " a panic's message is wrapped in, so that the three
 	// engines print the same line.
 	panicPrefix staticStr
+	// atMsg is the " at " between a panic's message and the location the stack walk
+	// found, when the panic itself was written in the prelude (spans.go).
+	atMsg staticStr
 	// constStr maps a constant-pool index to the String object built for it, so a
 	// literal costs no allocation at run time.
 	constStr map[int]staticStr
@@ -260,6 +263,7 @@ func emitProgram(prog *bytecode.Program, funcs []*ir.Func, target obj.Target, pl
 	e.deadlockMsg = e.rawString("origin: all threads are blocked at <runtime>\n")
 	e.runtimeLocMsg = e.rawString("<runtime>")
 	e.panicPrefix = e.rawString("origin: ")
+	e.atMsg = e.rawString(" at ")
 	e.emitTypeTable()
 	e.emitGCRuntimeFrameEntry()
 

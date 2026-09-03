@@ -39,8 +39,12 @@ match e {
 ```
 
 `?` inside a lambda applies to the lambda's return type, not the enclosing function's.
-Automatic error conversion via an `Into` bound on `E` is DEFERRED (Phase 8); until then,
-convert explicitly: `fs::read(p).map_err(|e| MyError::Io(e))?`.
+Automatic error conversion via an `Into` bound on `E` is DEFERRED; until then, convert
+explicitly with `map_err`, which the prelude provides:
+
+```origin
+let text = read_to_string(path).map_err(|e| Fault::Io(e))?;
+```
 
 Using `?` in a function that does not return `Result` is REJECTED with a note showing
 the signature change that would fix it.
@@ -92,6 +96,44 @@ Handing `outer`'s caller an object of `inner`'s type would give it a value whose
 tag belongs to a different instantiation, and its own `match` would match no arm at all.
 So `?` unwraps the payload and rebuilds — except when the two instantiations coincide, in
 which case there is nothing to rebuild.
+
+## The methods on `Option` and `Result`
+
+Both are ordinary Origin in the prelude, with ordinary methods — the same arrangement §13
+made for collections and §14 for strings, for the same reason (ADR-0028): nothing here
+needs the compiler.
+
+```origin
+impl[T] Option[T] {
+    pub fn is_some(self) -> bool
+    pub fn is_none(self) -> bool
+    pub fn unwrap_or(self, fallback: T) -> T
+    pub fn unwrap_or_else(self, fallback: fn() -> T) -> T
+    pub fn expect(self, msg: String) -> T          // TRAPS with msg on None
+    pub fn map[U](self, f: fn(T) -> U) -> Option[U]
+    pub fn and_then[U](self, f: fn(T) -> Option[U]) -> Option[U]
+    pub fn filter(self, keep: fn(T) -> bool) -> Option[T]
+    pub fn ok_or[E](self, err: E) -> Result[T, E]
+}
+
+impl[T, E] Result[T, E] {
+    pub fn is_ok(self) -> bool
+    pub fn is_err(self) -> bool
+    pub fn ok(self) -> Option[T]
+    pub fn err(self) -> Option[E]
+    pub fn unwrap_or(self, fallback: T) -> T
+    pub fn expect(self, msg: String) -> T          // TRAPS with msg on Err
+    pub fn map[U](self, f: fn(T) -> U) -> Result[U, E]
+    pub fn map_err[F](self, f: fn(E) -> F) -> Result[T, F]
+    pub fn and_then[U](self, f: fn(T) -> Result[U, E]) -> Result[U, E]
+}
+```
+
+There is no `unwrap()`. `expect(msg)` takes the message that says why the writer believed
+there was a value, because "the program stopped, and here is what was assumed" is worth
+strictly more than "the program stopped".
+
+`ok_or` is the bridge between the two: "there is nothing" becomes "here is why".
 
 ## Panics and traps
 
@@ -169,6 +211,9 @@ from a broken parse into the type checker.
 | `let x: i32 = 1;` used as `i64` later | one error at the use site, not two |
 | `g();` where `g -> Result[..]` | warning: unused `Result` |
 | `panic("boom")` | stderr `origin: boom at src/main.origin:3:5`, exit 101 |
+| `Option::None.expect("no config")` | stderr `origin: no config at ...`, exit 101 |
+| `read_to_string(p).map_err(\|e\| Fault::Io(e))?` | converts the error type explicitly |
+| `text.parse_int().ok_or(Fault::Parse(text))` | `Option` becomes `Result` |
 | `v.at(99)` on a 3-element `Vec` | stderr `origin: index out of bounds at ...`, exit 101 |
 | a program with 5 syntax errors | all 5 reported in one run, source-ordered |
 | a program with a syntax error and a type error | only the syntax error (typecheck did not run) |

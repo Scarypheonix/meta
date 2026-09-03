@@ -1083,8 +1083,17 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 1 {
 			return fmt.Errorf("this is a compiler bug: panic takes one argument, got %d", len(v.Args))
 		}
-		suffix := e.rawString(fmt.Sprintf(" at %s\n", v.Span))
 		e.load(x86.RDI, v.Args[0])
+		if isPreludeSpan(v) {
+			// A `panic` written in the prelude -- `Option::expect` is the one that
+			// matters -- has a span naming a file the programmer never opened. The line
+			// comes from the same run-time walk every other prelude trap uses, so that
+			// the three engines say the same thing (spans.go).
+			e.a.Call(e.rt.panicSpan)
+			e.a.Ud2()
+			return nil
+		}
+		suffix := e.rawString(fmt.Sprintf(" at %s\n", v.Span))
 		e.a.MovRI(x86.RSI, suffix.addr)
 		e.a.MovRI(x86.RDX, uint64(suffix.length))
 		e.a.Call(e.rt.panic)

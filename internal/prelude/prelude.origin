@@ -29,6 +29,169 @@ pub enum Result[T, E] {
     Err(E),
 }
 
+impl[T] Option[T] {
+    /// Whether there is a value.
+    pub fn is_some(self) -> bool {
+        match self {
+            Option::Some(_) => true,
+            Option::None => false,
+        }
+    }
+
+    /// Whether there is not.
+    pub fn is_none(self) -> bool {
+        match self {
+            Option::Some(_) => false,
+            Option::None => true,
+        }
+    }
+
+    /// The value, or `fallback` when there is none.
+    pub fn unwrap_or(self, fallback: T) -> T {
+        match self {
+            Option::Some(v) => v,
+            Option::None => fallback,
+        }
+    }
+
+    /// The value, or what `fallback` computes when there is none. Use this rather than
+    /// `unwrap_or` when producing the fallback costs something.
+    pub fn unwrap_or_else(self, fallback: fn() -> T) -> T {
+        match self {
+            Option::Some(v) => v,
+            Option::None => fallback(),
+        }
+    }
+
+    /// The value. TRAPS with `msg` when there is none.
+    ///
+    /// This is the one place a program says "I know there is a value here"; the trap is
+    /// what makes being wrong about that loud rather than silent (ADR-0007).
+    pub fn expect(self, msg: String) -> T {
+        match self {
+            Option::Some(v) => v,
+            Option::None => panic(msg),
+        }
+    }
+
+    /// `f` applied to the value, if there is one.
+    pub fn map[U](self, f: fn(T) -> U) -> Option[U] {
+        match self {
+            Option::Some(v) => Option::Some(f(v)),
+            Option::None => Option::None,
+        }
+    }
+
+    /// `f` applied to the value, when `f` itself may find nothing.
+    pub fn and_then[U](self, f: fn(T) -> Option[U]) -> Option[U] {
+        match self {
+            Option::Some(v) => f(v),
+            Option::None => Option::None,
+        }
+    }
+
+    /// The value, if there is one and `keep` accepts it.
+    pub fn filter(self, keep: fn(T) -> bool) -> Option[T] {
+        match self {
+            Option::Some(v) => {
+                if keep(v) {
+                    Option::Some(v)
+                } else {
+                    Option::None
+                }
+            }
+            Option::None => Option::None,
+        }
+    }
+
+    /// This `Option` as a `Result`, with `err` standing in for the absent value. The
+    /// bridge between "there is nothing" and "here is why" (spec/09-errors.md).
+    pub fn ok_or[E](self, err: E) -> Result[T, E] {
+        match self {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(err),
+        }
+    }
+}
+
+impl[T, E] Result[T, E] {
+    /// Whether this is an `Ok`.
+    pub fn is_ok(self) -> bool {
+        match self {
+            Result::Ok(_) => true,
+            Result::Err(_) => false,
+        }
+    }
+
+    /// Whether this is an `Err`.
+    pub fn is_err(self) -> bool {
+        match self {
+            Result::Ok(_) => false,
+            Result::Err(_) => true,
+        }
+    }
+
+    /// The value, dropping the error.
+    pub fn ok(self) -> Option[T] {
+        match self {
+            Result::Ok(v) => Option::Some(v),
+            Result::Err(_) => Option::None,
+        }
+    }
+
+    /// The error, dropping the value.
+    pub fn err(self) -> Option[E] {
+        match self {
+            Result::Ok(_) => Option::None,
+            Result::Err(e) => Option::Some(e),
+        }
+    }
+
+    /// The value, or `fallback` when this is an `Err`.
+    pub fn unwrap_or(self, fallback: T) -> T {
+        match self {
+            Result::Ok(v) => v,
+            Result::Err(_) => fallback,
+        }
+    }
+
+    /// The value. TRAPS with `msg` when this is an `Err`.
+    pub fn expect(self, msg: String) -> T {
+        match self {
+            Result::Ok(v) => v,
+            Result::Err(_) => panic(msg),
+        }
+    }
+
+    /// `f` applied to the value, leaving an error alone.
+    pub fn map[U](self, f: fn(T) -> U) -> Result[U, E] {
+        match self {
+            Result::Ok(v) => Result::Ok(f(v)),
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+
+    /// `f` applied to the error, leaving a value alone.
+    ///
+    /// This is how a function converts one error type into its own, which is what `?`
+    /// cannot do for itself in Origin 0.1: `read_to_string(p).map_err(Fault::Io)?` is the
+    /// idiom the diagnostic for a mismatched error type points at (spec/09-errors.md).
+    pub fn map_err[F](self, f: fn(E) -> F) -> Result[T, F] {
+        match self {
+            Result::Ok(v) => Result::Ok(v),
+            Result::Err(e) => Result::Err(f(e)),
+        }
+    }
+
+    /// `f` applied to the value, when `f` itself may fail the same way.
+    pub fn and_then[U](self, f: fn(T) -> Result[U, E]) -> Result[U, E] {
+        match self {
+            Result::Ok(v) => f(v),
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+}
+
 pub enum Ordering {
     Less,
     Equal,
