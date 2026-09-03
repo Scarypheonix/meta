@@ -118,5 +118,30 @@ That is the same trade §13 made for collections and §14 made for strings, and 
 the most: a shortest-round-trip conversion needs exact arithmetic on numbers far wider than
 sixty-four bits, and the alternative was writing that by hand in x86-64 machine code.
 
+## Reading one back
+
+`parse_float` on a `Str` is the inverse (spec/14-strings.md's trait, beside `parse_int`):
+
+```origin
+"1.5".parse_float()          // Some(1.5)
+"3e-9".parse_float()         // Some(0.000000003)
+"1e400".parse_float()        // Some(+Inf)  -- the value it rounds to, not an error
+"1.2.3".parse_float()        // None
+```
+
+It takes an optional sign, digits with an optional point, and an optional decimal
+exponent — a float literal's shape (§01), with a sign in front because a literal's sign is
+a separate operator and a string's is not. Digit separators are not accepted; they are a
+feature of source text. Anything else is `None`.
+
+The result is the binary64 **nearest** the exact decimal value, ties to even. Not "close
+enough": the exact value is kept as a ratio of two arbitrary-precision integers and rounded
+once, at the end. That is what makes the two halves inverses — every finite float printed
+by `to_str` and read by `parse_float` is the same float, and every decimal that names a
+float names the one a literal would.
+
+A value too large is the infinity it rounds to and a value too small is the zero it rounds
+to, both `Some`. Overflow is a property of the number, not a malformed string.
+
 `f32` renders through the same path. Origin computes in binary64 (§04), so an `f32` value
 is a `f64` value and renders as one.

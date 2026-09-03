@@ -1,0 +1,66 @@
+use std::io;
+use std::list;
+use std::float;
+
+// `parse_float` and `to_str` are inverses (spec/16-floats.md): the nearest binary64 to a
+// decimal, and the shortest decimal that names a binary64. Printing a float and reading it
+// back must give the same float, for every float.
+
+fn show(s: String) -> String {
+    match s.parse_float() {
+        Option::Some(f) => f.to_str(),
+        Option::None => "none",
+    }
+}
+
+fn main() {
+    io::println(show("1.5"));
+    io::println(show("0.1"));
+    io::println(show("-2.5e3"));
+    io::println(show("0"));
+    io::println(show("-0"));
+    io::println(show("1e20"));
+    io::println(show("0.30000000000000004"));
+
+    // Both ends of the range, and past them.
+    io::println(show("1.7976931348623157e308"));
+    io::println(show("5e-324"));
+    io::println(show("2.2250738585072014e-308"));
+    io::println(show("1e309"));
+    io::println(show("1e-400"));
+
+    // A decimal that decides on a digit far to the right: reading it in a float rather
+    // than exactly gets the last bit wrong.
+    io::println(show("-1.9999999999999998"));
+    io::println(show("9007199254740993"));
+    io::println(show("0.49999999999999994"));
+
+    // Shapes that are not numbers.
+    io::println(show(""));
+    io::println(show("1.2.3"));
+    io::println(show("1e"));
+    io::println(show("12_3"));
+
+    // The round trip itself, over values reached without a literal.
+    let bits = list::new[u64]();
+    bits.push(4607182418800017408u64);
+    bits.push(1u64);
+    bits.push(9218868437227405311u64);
+    bits.push(4494592428115755008u64);
+    bits.push(13830554455654793216u64);
+    let mut i = 0;
+    let mut same = true;
+    while i < bits.len() {
+        let f = float::from_bits(bits.at(i));
+        match f.to_str().parse_float() {
+            Option::Some(back) => {
+                if float::bits(back) != bits.at(i) {
+                    same = false;
+                }
+            }
+            Option::None => { same = false; }
+        }
+        i = i + 1;
+    }
+    io::println("round trip \(same)");
+}

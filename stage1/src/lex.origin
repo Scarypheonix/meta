@@ -6,11 +6,8 @@
 // `.origin` file in this repository and requires the token streams to be identical, so the
 // Go lexer is the oracle exactly as `strconv` is for the float rendering.
 //
-// Two deliberate differences from the Go lexer, both recorded in docs/deferred.md:
+// One deliberate difference from the Go lexer, recorded in docs/deferred.md:
 //
-//   - A float literal carries its text and not its value. Turning a decimal into the
-//     nearest binary64 is the inverse of spec/16-floats.md's rendering and belongs with the
-//     stage that needs the number, not with the one that reads the characters.
 //   - An identifier is ASCII plus "any scalar value at or above U+0080". The Go lexer asks
 //     Unicode whether a scalar is a letter; doing that here needs XID tables that do not
 //     exist yet. Every identifier in this repository is ASCII, so the two agree on the
@@ -213,6 +210,9 @@ pub struct Token {
     pub str: String,
     /// A character literal's scalar value.
     pub ch: i64,
+    /// A float literal's value, the nearest binary64 to the decimal written
+    /// (spec/16-floats.md). Zero for every other kind.
+    pub float: f64,
     /// A numeric literal's type suffix, or "" when it has none.
     pub suffix: String,
     /// An interpolated string literal's pieces. Empty for every other token, and for a
@@ -247,7 +247,7 @@ fn empty_parts() -> List[Part] {
 fn plain(kind: i64, start: i64, end: i64, text: String) -> Token {
     Token {
         kind: kind, start: start, end: end, text: text,
-        int: 0u64, overflow: false, str: "", ch: 0, suffix: "",
+        int: 0u64, overflow: false, str: "", ch: 0, float: 0.0, suffix: "",
         parts: empty_parts(), interpolated: false,
     }
 }
@@ -255,15 +255,15 @@ fn plain(kind: i64, start: i64, end: i64, text: String) -> Token {
 fn int_token(start: i64, end: i64, text: String, suffix: String, value: u64, overflow: bool) -> Token {
     Token {
         kind: K_INT, start: start, end: end, text: text,
-        int: value, overflow: overflow, str: "", ch: 0, suffix: suffix,
+        int: value, overflow: overflow, str: "", ch: 0, float: 0.0, suffix: suffix,
         parts: empty_parts(), interpolated: false,
     }
 }
 
-fn float_token(start: i64, end: i64, text: String, suffix: String) -> Token {
+fn float_token(start: i64, end: i64, text: String, suffix: String, value: f64) -> Token {
     Token {
         kind: K_FLOAT, start: start, end: end, text: text,
-        int: 0u64, overflow: false, str: "", ch: 0, suffix: suffix,
+        int: 0u64, overflow: false, str: "", ch: 0, float: value, suffix: suffix,
         parts: empty_parts(), interpolated: false,
     }
 }
@@ -271,7 +271,7 @@ fn float_token(start: i64, end: i64, text: String, suffix: String) -> Token {
 fn str_token(start: i64, end: i64, text: String, decoded: String, parts: List[Part], interpolated: bool) -> Token {
     Token {
         kind: K_STR, start: start, end: end, text: text,
-        int: 0u64, overflow: false, str: decoded, ch: 0, suffix: "",
+        int: 0u64, overflow: false, str: decoded, ch: 0, float: 0.0, suffix: "",
         parts: parts, interpolated: interpolated,
     }
 }
@@ -279,7 +279,7 @@ fn str_token(start: i64, end: i64, text: String, decoded: String, parts: List[Pa
 fn char_token(start: i64, end: i64, text: String, value: i64) -> Token {
     Token {
         kind: K_CHAR, start: start, end: end, text: text,
-        int: 0u64, overflow: false, str: "", ch: value, suffix: "",
+        int: 0u64, overflow: false, str: "", ch: value, float: 0.0, suffix: "",
         parts: empty_parts(), interpolated: false,
     }
 }
@@ -498,13 +498,15 @@ impl Lexer {
         if !bad.is_empty() {
             self.error(start, end, bad);
             if is_float {
-                return float_token(start, end, digits, suffix);
+                return float_token(start, end, digits, suffix, 0.0);
             }
             return int_token(start, end, digits, suffix, 0u64, false);
         }
         if is_float {
-            // A float literal keeps its text; converting it is a later stage's business.
-            return float_token(start, end, digits, suffix);
+            // The value is the nearest binary64 to the decimal written, which is what
+            // makes the lexer and `to_str` inverses (spec/16-floats.md).
+            let value = strip_underscores(digits).parse_float().unwrap_or(0.0);
+            return float_token(start, end, digits, suffix, value);
         }
         match parse_digits(strip_underscores(digits), 10) {
             Option::Some(v) => int_token(start, end, digits, suffix, v, false),

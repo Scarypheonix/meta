@@ -11,6 +11,7 @@ package selfhost
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -96,9 +97,9 @@ func dumpGo(f *source.File) []string {
 			if t.IntOverflow {
 				overflow = 1
 			}
-			out = append(out, fmt.Sprintf("%d %d %d %d %d %d %d %d %d |%s|%s|%s",
+			out = append(out, fmt.Sprintf("%d %d %d %d %d %d %d %d %d %d |%s|%s|%s",
 				depth, n, t.Span.Start, t.Span.End, t.Int, overflow, int(t.Char),
-				interp, len(t.Parts),
+				math.Float64bits(t.Float), interp, len(t.Parts),
 				escape(t.Text), escape(t.Str), t.Suffix))
 			for _, p := range t.Parts {
 				if p.Expr == nil {
@@ -149,6 +150,7 @@ func corpus(t *testing.T) []string {
 // tokens. One program for the whole corpus, so the lexer is compiled once.
 const driverSource = `use std::io;
 use std::list;
+use std::float;
 use lex;
 
 fn escape(s: String) -> String {
@@ -199,7 +201,7 @@ fn dump(depth: i64, toks: List[lex::Token]) {
     let mut i = 0;
     while i < toks.len() {
         let t = toks.at(i);
-        io::println("\(depth) \(t.kind) \(t.start) \(t.end) \(t.int) \(flag(t.overflow)) \(t.ch) \(flag(t.interpolated)) \(t.parts.len()) |\(escape(t.text))|\(escape(t.str))|\(t.suffix)");
+        io::println("\(depth) \(t.kind) \(t.start) \(t.end) \(t.int) \(flag(t.overflow)) \(t.ch) \(float::bits(t.float)) \(flag(t.interpolated)) \(t.parts.len()) |\(escape(t.text))|\(escape(t.str))|\(t.suffix)");
         let mut j = 0;
         while j < t.parts.len() {
             match t.parts.at(j) {

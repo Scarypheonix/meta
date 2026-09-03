@@ -77,6 +77,7 @@ pub trait Str {
     fn trim_start(self) -> String { ... }
     fn trim_end(self) -> String { ... }
     fn parse_int(self) -> Option[i64] { ... }
+    fn parse_float(self) -> Option[f64] { ... }
 }
 ```
 
@@ -124,6 +125,7 @@ kind of quiet special case ADR-0005's trapping arithmetic exists to avoid.
 | `s.trim()` | `s` without leading or trailing ASCII whitespace |
 | `s.trim_start()`, `s.trim_end()` | one end only |
 | `s.parse_int()` | the decimal integer `s` denotes, or `None` |
+| `s.parse_float()` | the binary64 nearest the decimal `s` denotes, or `None` (§16) |
 
 `find` and `split` search by bytes, not by characters. That is the same answer either way:
 UTF-8 is self-synchronizing, so a valid encoding never occurs at a non-boundary inside
