@@ -681,3 +681,73 @@ fn main() {
 }
 `, "held\n320000\ntrue")
 }
+
+// TestACollectionForwardsARecursiveGenericTree is the one shape none of the cases above
+// has: a type that holds *itself*, at a concrete instantiation.
+//
+// `Tree[T]` is `Node(Tree[T], T, Tree[T])`, so a variant's own fields are references to
+// the same TypeID it has -- and, since ADR-0019 gives every instantiation an exact layout,
+// `Tree[i64]` and `Tree[String]` are different TypeIDs whose descriptors have to say the
+// right thing about a field that names their own type. Building the tree by insertion
+// rebuilds the whole path on every insert, so the garbage is interior nodes whose children
+// are still live, which is exactly what a copying collector gets wrong when a descriptor
+// is off by one.
+func TestACollectionForwardsARecursiveGenericTree(t *testing.T) {
+	checkRun(t, `
+use std::io;
+use std::list;
+
+enum Tree[T] { Leaf, Node(Tree[T], T, Tree[T]) }
+
+fn insert[T: Ord](t: Tree[T], v: T) -> Tree[T] {
+    match t {
+        Tree::Leaf => Tree::Node(Tree::Leaf, v, Tree::Leaf),
+        Tree::Node(l, here, r) => {
+            match v.cmp(here) {
+                Ordering::Less => Tree::Node(insert(l, v), here, r),
+                Ordering::Greater => Tree::Node(l, here, insert(r, v)),
+                Ordering::Equal => Tree::Node(l, here, r),
+            }
+        }
+    }
+}
+
+fn walk[T](t: Tree[T], into: List[T]) {
+    match t {
+        Tree::Leaf => {}
+        Tree::Node(l, here, r) => { walk(l, into); into.push(here); walk(r, into); }
+    }
+}
+
+fn main() {
+    // Two instantiations at once, so neither one's descriptor can stand in for the other.
+    let mut nums = Tree::Leaf;
+    let mut words = Tree::Leaf;
+    let mut i = 0;
+    let mut x = 1;
+    while i < 300 {
+        x = (x * 48271) % 65537;
+        nums = insert(nums, x % 500);
+        words = insert(words, (x % 7).to_str());
+        i = i + 1;
+    }
+
+    let got = list::new[i64]();
+    walk(nums, got);
+    let seen = list::new[String]();
+    walk(words, seen);
+
+    let mut sum = 0;
+    let mut ordered = true;
+    let mut j = 0;
+    while j < got.len() {
+        sum = sum + got.at(j);
+        if j > 0 && got.at(j - 1) >= got.at(j) { ordered = false; }
+        j = j + 1;
+    }
+    io::println(sum.to_str());
+    io::println(ordered.to_str());
+    io::println(seen.len().to_str());
+}
+`, "52770\ntrue\n7")
+}

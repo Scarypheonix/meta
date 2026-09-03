@@ -1,0 +1,20 @@
+// EXPECT: reject E0277
+// spec: 06-traits-generics.md — an impl must keep the promise its trait's associated type
+// declaration makes. The prelude declares `type Iter: Iterator;` on `IntoIterator`, so an
+// impl defining `Iter` as something with no `Iterator` impl is rejected here rather than
+// at the `for` loop that would have used it.
+
+struct Bag { n: i64 }
+struct NotAnIterator { x: i64 }
+
+impl IntoIterator for Bag {
+    type Item = i64;
+    type Iter = NotAnIterator;
+    fn into_iter(self) -> NotAnIterator {
+        NotAnIterator { x: self.n }
+    }
+}
+
+fn main() {
+    let b = Bag { n: 1 };
+}

@@ -51,6 +51,25 @@ An impl MUST define every required method and every associated type, with signat
 that match after substituting `Self`. A mismatch is REJECTED showing both signatures.
 An impl MUST NOT define a method the trait does not declare.
 
+### Bounds on an associated type
+
+An associated type declaration takes bounds, and they work in both directions like every
+other bound:
+
+```origin
+pub trait IntoIterator {
+    type Item;
+    type Iter: Iterator;
+    fn into_iter(self) -> Self::Iter;
+}
+```
+
+- **Inside the trait**, `Self::Iter: Iterator` is in scope in every default body, so a
+  default method may call `next` on one.
+- **At each impl**, whatever the impl defines the associated type to be MUST satisfy the
+  bound, or the impl is REJECTED (`E0277`) naming the type it chose and the bound it
+  missed. Checking it there is what lets the default bodies rely on it.
+
 ### An impl's own bounds
 
 An impl's generic parameters take bounds, inline or in a `where` clause, and the two

@@ -196,11 +196,12 @@ func (c *Checker) satisfies(subject types.Type, ti *TraitInfo) bool {
 		}
 	}
 
-	// A rigid parameter is satisfied only by a declared bound, directly or through a
-	// supertrait.
-	if p, ok := subject.(*types.Param); ok {
+	// A rigid type -- a generic parameter, or a projection through one -- is satisfied
+	// only by a declared bound, directly or through a supertrait. Nothing is known about
+	// what it will be instantiated with, so there is no impl to find.
+	if isRigid(subject) {
 		for _, b := range c.env.bounds {
-			if bp, ok := types.Prune(b.Type).(*types.Param); ok && bp == p {
+			if sameRigid(b.Type, subject) {
 				if b.Trait == ti || c.supertraitReaches(b.Trait, ti) {
 					return true
 				}
@@ -228,6 +229,33 @@ func (c *Checker) satisfies(subject types.Type, ti *TraitInfo) bool {
 		if ok {
 			return true
 		}
+	}
+	return false
+}
+
+// isRigid reports whether a type is one the checker cannot look inside: a generic
+// parameter, or an associated type projected through one. Both get their methods and
+// their trait memberships from declared bounds rather than from an impl.
+func isRigid(t types.Type) bool {
+	switch v := types.Prune(t).(type) {
+	case *types.Param:
+		return true
+	case *types.AssocT:
+		return isRigid(v.Self)
+	}
+	return false
+}
+
+// sameRigid reports whether two rigid types are the same one. A parameter is compared by
+// identity, a projection by its trait, its member and the type it projects through.
+func sameRigid(a, b types.Type) bool {
+	switch x := types.Prune(a).(type) {
+	case *types.Param:
+		y, ok := types.Prune(b).(*types.Param)
+		return ok && x == y
+	case *types.AssocT:
+		y, ok := types.Prune(b).(*types.AssocT)
+		return ok && x.Trait == y.Trait && x.Member == y.Member && sameRigid(x.Self, y.Self)
 	}
 	return false
 }
@@ -337,18 +365,19 @@ type methodCandidate struct {
 func (c *Checker) lookupMethod(recv types.Type, name string) (*methodCandidate, []string) {
 	recv = types.Prune(recv)
 
-	// A rigid parameter's methods come from its declared bounds.
-	if p, ok := recv.(*types.Param); ok {
+	// A rigid parameter's methods come from its declared bounds. So do an unresolved
+	// projection's: inside a trait's own default body `Self::Tag` is no more known than
+	// `Self` is, and `type Tag: Show;` is the only thing that says it has a `to_str`.
+	if isRigid(recv) {
 		for _, b := range c.env.bounds {
-			bp, ok := types.Prune(b.Type).(*types.Param)
-			if !ok || bp != p {
+			if !sameRigid(b.Type, recv) {
 				continue
 			}
-			if cand := c.traitMethod(b.Trait, p, name); cand != nil {
+			if cand := c.traitMethod(b.Trait, recv, name); cand != nil {
 				return cand, nil
 			}
 			for _, st := range b.Trait.Supertraits {
-				if cand := c.traitMethod(st.Trait, p, name); cand != nil {
+				if cand := c.traitMethod(st.Trait, recv, name); cand != nil {
 					return cand, nil
 				}
 			}
@@ -423,6 +452,43 @@ func (c *Checker) traitMethod(ti *TraitInfo, self types.Type, name string) *meth
 	return &methodCandidate{
 		Decl: decl, Sig: sig, Trait: ti,
 		Subst: map[*types.Param]types.Type{ti.SelfParam: self},
+	}
+}
+
+// normalizeDeep reduces every associated-type projection in a type, not only one at the
+// top. `Option[Self::Item]` is the ordinary shape -- `Iterator::next` returns one -- and a
+// caller that needs a concrete type needs the whole of it concrete.
+func (c *Checker) normalizeDeep(t types.Type) types.Type {
+	switch p := types.Prune(t).(type) {
+	case *types.AssocT:
+		reduced := c.normalize(&types.AssocT{Trait: p.Trait, Member: p.Member, Self: c.normalizeDeep(p.Self)})
+		if again, still := types.Prune(reduced).(*types.AssocT); still {
+			return again // irreducible: the self type is still rigid
+		}
+		return c.normalizeDeep(reduced)
+	case *types.Named:
+		if len(p.Args) == 0 {
+			return p
+		}
+		args := make([]types.Type, len(p.Args))
+		for i, a := range p.Args {
+			args[i] = c.normalizeDeep(a)
+		}
+		return &types.Named{Def: p.Def, Args: args}
+	case *types.TupleT:
+		elems := make([]types.Type, len(p.Elems))
+		for i, e := range p.Elems {
+			elems[i] = c.normalizeDeep(e)
+		}
+		return &types.TupleT{Elems: elems}
+	case *types.FnT:
+		params := make([]types.Type, len(p.Params))
+		for i, a := range p.Params {
+			params[i] = c.normalizeDeep(a)
+		}
+		return &types.FnT{Params: params, Ret: c.normalizeDeep(p.Ret)}
+	default:
+		return p
 	}
 }
 

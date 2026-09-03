@@ -1,0 +1,16 @@
+// EXPECT: reject E0002
+// spec: 02-grammar.md — the first parser restriction: `{` after an expression in the
+// condition of `if`, `while`, `for` or `match` always opens the block, so a struct literal
+// there is rejected "with a diagnostic that names the fix".
+//
+// It did not name it. The `{` was taken as the body and the field initializer inside it
+// produced "expected `;` after this expression, found `:`" several tokens later, which
+// describes nothing a reader can act on.
+
+struct Point { x: i64, y: i64 }
+
+fn main() {
+    if Point { x: 1, y: 2 }.x == 1 {
+        let a = 1;
+    }
+}

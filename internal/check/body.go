@@ -40,6 +40,9 @@ func (c *Checker) checkBodies(f *ast.File) {
 				// per impl (spec/06-traits-generics.md).
 				selfBounds := []Bound{{Type: ti.SelfParam, Trait: ti}}
 				selfBounds = append(selfBounds, ti.Supertraits...)
+				for _, bs := range ti.AssocBounds {
+					selfBounds = append(selfBounds, bs...)
+				}
 				c.checkFn(m, append(ti.Params, ti.SelfParam), ti.SelfParam, ti, selfBounds)
 				_ = name
 			}

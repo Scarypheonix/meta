@@ -559,6 +559,21 @@ func (p *Parser) parsePathExprOrStructLit(start int) ast.Expr {
 	if p.at(lex.LBrace) && !p.noStruct {
 		return p.parseStructLit(start, path, args)
 	}
+	// A struct literal here is what the writer meant, and it is exactly what
+	// spec/02-grammar.md's first parser restriction forbids: `if x { }` has to be an `if`
+	// with condition `x`, so `{` after a path in condition position always opens the body.
+	// `Ident :` inside it is a field initializer and nothing else -- Origin has no labels --
+	// so this is the one shape where the restriction can be named rather than reported as
+	// a missing semicolon several tokens later, which is what the writer used to see.
+	if p.at(lex.LBrace) && p.noStruct && p.peekIs(1, lex.Ident) && p.peekIs(2, lex.Colon) {
+		p.errorAt(p.cur().Span, "a struct literal cannot appear here").
+			Label("this `{` opens the body, not a struct literal").
+			Note("in the condition of `if`, `while`, `for` or `match`, `{` always begins the block").
+			Help("parenthesize it: `(%s { ... })`", path)
+		// Recover by parsing what was meant. The alternative is to treat the `{` as the
+		// body and report a second, unrelated error inside it for the same mistake.
+		return p.parseStructLit(start, path, args)
+	}
 	e := &ast.PathExpr{Path: path, Args: args}
 	e.Base = p.base(start)
 	return e

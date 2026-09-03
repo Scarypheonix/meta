@@ -51,6 +51,11 @@ type TraitInfo struct {
 	Supertraits []Bound
 	// AssocTypes are the associated type names, in declaration order.
 	AssocTypes []string
+	// AssocBounds are the bounds an associated type declaration carries, keyed by name:
+	// `type Iter: Iterator;` is one. They work the way every other bound does, in both
+	// directions -- in scope in the trait's default bodies as `Self::Iter: Iterator`, and
+	// required of whatever an impl defines the associated type to be.
+	AssocBounds map[string][]Bound
 	// Methods maps a method name to its declaration.
 	Methods map[string]*ast.FnDecl
 	// Sigs maps a method name to its signature, with Self left as the trait's own self
@@ -144,6 +149,14 @@ type Inst struct {
 // the concrete type a parameter turned out to be.
 type Resolver struct {
 	c *Checker
+}
+
+// Normalize reduces every associated-type projection a type contains, as far as the impls
+// allow. It is what a later pass needs to turn `Self::Tag` into the type this
+// instantiation actually gives it: the substitution alone leaves the projection standing,
+// and a projection has no layout, no width and no kind (ADR-0021).
+func (r *Resolver) Normalize(t types.Type) types.Type {
+	return r.c.normalizeDeep(t)
 }
 
 // Method resolves a method call on a concrete receiver type, reporting the declaration
@@ -277,6 +290,7 @@ func Program(bag *diag.Bag, res *resolve.Result, files ...*ast.File) *Result {
 		c.collectImpls(f)
 	}
 	c.checkCoherence()
+	c.checkAssocBounds()
 	for _, f := range files {
 		c.checkBodies(f)
 	}
@@ -413,6 +427,21 @@ func (c *Checker) collectSignatures(f *ast.File) {
 				c.env = envFor(ti.Params, selfTy, ti)
 				if b, ok := c.toBound(selfTy, st); ok {
 					ti.Supertraits = append(ti.Supertraits, b)
+				}
+			}
+			for _, at := range v.AssocTypes {
+				if len(at.Bounds) == 0 {
+					continue
+				}
+				c.env = envFor(ti.Params, selfTy, ti)
+				proj := &types.AssocT{Trait: v, Member: at.Name.Name, Self: selfTy}
+				for _, tr := range at.Bounds {
+					if b, ok := c.toBound(proj, tr); ok {
+						if ti.AssocBounds == nil {
+							ti.AssocBounds = map[string][]Bound{}
+						}
+						ti.AssocBounds[at.Name.Name] = append(ti.AssocBounds[at.Name.Name], b)
+					}
 				}
 			}
 		}
@@ -584,6 +613,47 @@ func selfKey(t types.Type) string {
 	return "(other)"
 }
 
+// checkAssocBounds verifies each impl keeps the promises its trait's associated type
+// declarations make: `type Iter: Iterator;` means whatever an impl defines `Iter` to be
+// must implement `Iterator`.
+//
+// It is a pass of its own rather than part of checkImplCompleteness because the answer
+// depends on *other* impls -- `impl IntoIterator for Counter { type Iter = Counter; }` is
+// satisfied by the `impl Iterator for Counter` written below it -- and completeness is
+// checked as each impl is collected, when the later ones do not exist yet.
+func (c *Checker) checkAssocBounds() {
+	for _, info := range c.impls {
+		ti := info.Trait
+		if ti == nil || len(ti.AssocBounds) == 0 {
+			continue
+		}
+		// The impl's own parameters and bounds are in scope: an associated type may be
+		// defined in terms of them.
+		c.env = envFor(info.Params, info.Self, nil)
+		c.env.bounds = info.Bounds
+		for _, name := range ti.AssocTypes {
+			def, ok := info.Assoc[name]
+			if !ok {
+				continue // already reported as missing
+			}
+			for _, b := range ti.AssocBounds[name] {
+				if c.satisfies(def, b.Trait) {
+					continue
+				}
+				d := c.bag.Errorf("E0277", info.Decl.Span(),
+					"`%s` does not implement `%s`", def, b.Trait.Decl.Name.Name).
+					Label("this impl defines `%s` as `%s`", name, def).
+					Note("trait `%s` requires `type %s: %s`",
+						ti.Decl.Name.Name, name, b.Trait.Decl.Name.Name)
+				if at := assocDeclOf(ti.Decl, name); at != nil {
+					d.Secondary(at.Name.Loc, "the bound is declared here")
+				}
+			}
+		}
+	}
+	c.env = typeEnv{}
+}
+
 // checkImplCompleteness verifies a trait impl defines everything the trait requires and
 // nothing it does not (spec/06-traits-generics.md).
 func (c *Checker) checkImplCompleteness(info *ImplInfo) {
@@ -633,4 +703,15 @@ func containsString(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// assocDeclOf finds a trait's associated type declaration by name, for a diagnostic that
+// can point at the bound rather than only naming it.
+func assocDeclOf(decl *ast.TraitDecl, name string) *ast.AssocTypeDecl {
+	for _, at := range decl.AssocTypes {
+		if at.Name.Name == name {
+			return at
+		}
+	}
+	return nil
 }

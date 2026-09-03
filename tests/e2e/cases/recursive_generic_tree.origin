@@ -1,0 +1,144 @@
+use std::io;
+use std::list;
+
+// A recursive generic type, the pattern forms §05 specifies, and enough allocation to
+// make the collector work.
+
+pub enum Tree[T] {
+    Leaf,
+    Node(Tree[T], T, Tree[T]),
+}
+
+pub fn insert[T: Ord](t: Tree[T], v: T) -> Tree[T] {
+    match t {
+        Tree::Leaf => Tree::Node(Tree::Leaf, v, Tree::Leaf),
+        Tree::Node(l, here, r) => {
+            match v.cmp(here) {
+                Ordering::Less => Tree::Node(insert(l, v), here, r),
+                Ordering::Greater => Tree::Node(l, here, insert(r, v)),
+                Ordering::Equal => Tree::Node(l, here, r),
+            }
+        }
+    }
+}
+
+pub fn walk[T](t: Tree[T], into: List[T]) {
+    match t {
+        Tree::Leaf => {}
+        Tree::Node(l, here, r) => {
+            walk(l, into);
+            into.push(here);
+            walk(r, into);
+        }
+    }
+}
+
+pub fn depth[T](t: Tree[T]) -> i64 {
+    match t {
+        Tree::Leaf => 0,
+        Tree::Node(l, _, r) => {
+            let a = depth(l);
+            let b = depth(r);
+            if a > b { a + 1 } else { b + 1 }
+        }
+    }
+}
+
+pub struct Point { x: i64, y: i64, label: String }
+
+/// The pattern forms §05 specifies: literals, or-patterns, guards, nested struct and
+/// tuple patterns, `..`, and a binding that shadows.
+fn classify(p: Point) -> String {
+    match p {
+        Point { x: 0, y: 0, .. } => "origin",
+        Point { x: 0, y, .. } => "on the y axis at \(y)",
+        Point { x, y: 0, .. } => "on the x axis at \(x)",
+        Point { x, y, label } => {
+            if x == y {
+                "diagonal \(label)"
+            } else {
+                "\(label) at \(x),\(y)"
+            }
+        }
+    }
+}
+
+fn small(n: i64) -> String {
+    match n {
+        0 => "zero",
+        1 => "one",
+        2 => "two",
+        _ => "many",
+    }
+}
+
+fn pair_kind(p: (i64, String)) -> String {
+    match p {
+        (0, s) => "zero and \(s)",
+        (n, s) => "\(n) and \(s)",
+    }
+}
+
+fn main() {
+    // Build a tree out of a deterministic scramble, then read it back in order.
+    let mut t = Tree::Leaf;
+    let mut i = 0;
+    let mut x = 1;
+    while i < 200 {
+        x = (x * 48271) % 65537;
+        t = insert(t, x % 1000);
+        i = i + 1;
+    }
+    let got = list::new[i64]();
+    walk(t, got);
+    io::println("count \(got.len()) depth \(depth(t))");
+    let mut ordered = true;
+    let mut j = 1;
+    while j < got.len() {
+        if got.at(j - 1) >= got.at(j) {
+            ordered = false;
+        }
+        j = j + 1;
+    }
+    io::println("sorted \(ordered) first \(got.at(0)) last \(got.at(got.len() - 1))");
+
+    // The same tree over strings, which is a different instantiation of everything above.
+    let mut ts = Tree::Leaf;
+    let words = list::new[String]();
+    words.push("pear"); words.push("apple"); words.push("fig"); words.push("plum");
+    for w in words {
+        ts = insert(ts, w);
+    }
+    let sorted = list::new[String]();
+    walk(ts, sorted);
+    let mut out = "";
+    for w in sorted {
+        out = out.concat(w).concat(" ");
+    }
+    io::println(out.trim());
+
+    // Patterns.
+    io::println(classify(Point { x: 0, y: 0, label: "o" }));
+    io::println(classify(Point { x: 0, y: 5, label: "a" }));
+    io::println(classify(Point { x: 7, y: 0, label: "b" }));
+    io::println(classify(Point { x: 3, y: 3, label: "c" }));
+    io::println(classify(Point { x: 1, y: 2, label: "d" }));
+    io::println("\(small(0)) \(small(2)) \(small(9))");
+    io::println(pair_kind((0, "a")));
+    io::println(pair_kind((4, "b")));
+
+    // Allocation churn: a lot of short-lived trees, so a collection actually happens.
+    let mut n = 0;
+    let mut total = 0;
+    while n < 300 {
+        let mut scratch = Tree::Leaf;
+        let mut k = 0;
+        while k < 20 {
+            scratch = insert(scratch, (n * 31 + k * 7) % 101);
+            k = k + 1;
+        }
+        total = total + depth(scratch);
+        n = n + 1;
+    }
+    io::println("churn \(total)");
+}

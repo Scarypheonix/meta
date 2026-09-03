@@ -1,0 +1,32 @@
+// EXPECT: accept
+// spec: 06-traits-generics.md — `type Tag: Show;` is a bound like any other, and it works
+// in both directions: in scope in the trait's own default bodies as `Self::Tag: Show`, and
+// required of whatever an impl defines `Tag` to be.
+//
+// The grammar (§02) has always had `AssocTypeDecl = "type" Ident [ ":" TraitBounds ] ";"`.
+// The checker kept only the name, so the bound was accepted and dropped.
+
+trait Named {
+    type Tag: Show;
+    fn tag(self) -> Self::Tag;
+    fn shout(self) -> String {
+        "<\(self.tag().to_str())>"
+    }
+}
+
+struct Widget { id: i64 }
+impl Named for Widget {
+    type Tag = i64;
+    fn tag(self) -> i64 { self.id }
+}
+
+struct Label { text: String }
+impl Named for Label {
+    type Tag = String;
+    fn tag(self) -> String { self.text }
+}
+
+fn main() {
+    let a = Widget { id: 1 }.shout();
+    let b = Label { text: "x" }.shout();
+}

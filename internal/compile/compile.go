@@ -405,6 +405,13 @@ func (c *Compiler) concreteType(t types.Type) types.Type {
 	if c.inst != nil && len(c.inst.Subst) > 0 {
 		t = types.Substitute(t, c.inst.Subst)
 	}
+	// Substituting `Self` inside a trait's default body leaves `Self::Tag` as a projection
+	// through a now-concrete type, which is not itself concrete: it has no layout, no width
+	// and no kind. Reducing it is the checker's job and the checker's tables, so it is the
+	// checker that is asked (ADR-0029: one answer for three engines).
+	if c.tys.Lookup != nil {
+		t = c.tys.Lookup.Normalize(t)
+	}
 	types.ApplyDefaults(t)
 	return types.Prune(t)
 }

@@ -1,0 +1,110 @@
+use std::io;
+use std::list;
+
+// A user trait with an associated type carrying a bound, driving a `for` loop; `loop` used
+// as an expression and with a value; recursion deep enough to matter; and a long string
+// built by doubling rather than by appending.
+//
+// The `Named` trait is why this case exists. `type Tag: Show;` is grammar the parser has
+// always accepted and the checker used to throw away, so a default body could not call
+// `to_str` on `Self::Tag`; and once it could, `shout[Widget]` reached the backend with an
+// operand whose type was still the projection `Self::Tag` rather than the `i64` this
+// instantiation makes it -- a projection has no width and no kind, so native code stopped.
+
+pub struct Countdown {
+    mut n: i64,
+}
+
+impl Iterator for Countdown {
+    type Item = i64;
+    fn next(mut self) -> Option[i64] {
+        if self.n <= 0 {
+            return Option::None;
+        }
+        self.n = self.n - 1;
+        Option::Some(self.n + 1)
+    }
+}
+
+impl IntoIterator for Countdown {
+    type Item = i64;
+    type Iter = Countdown;
+    fn into_iter(self) -> Countdown {
+        self
+    }
+}
+
+pub trait Named {
+    type Tag: Show;
+    fn tag(self) -> Self::Tag;
+    fn shout(self) -> String {
+        "<\(self.tag().to_str())>"
+    }
+}
+
+pub struct Widget { id: i64 }
+impl Named for Widget {
+    type Tag = i64;
+    fn tag(self) -> i64 { self.id }
+}
+
+pub struct Label { text: String }
+impl Named for Label {
+    type Tag = String;
+    fn tag(self) -> String { self.text }
+}
+
+fn ackermann(m: i64, n: i64) -> i64 {
+    if m == 0 { return n + 1; }
+    if n == 0 { return ackermann(m - 1, 1); }
+    ackermann(m - 1, ackermann(m, n - 1))
+}
+
+fn first_over(limit: i64) -> i64 {
+    let mut n = 0;
+    let mut acc = 0;
+    loop {
+        n = n + 1;
+        acc = acc + n * n;
+        if acc > limit {
+            break acc;
+        }
+    }
+}
+
+fn main() {
+    let mut sum = 0;
+    for n in (Countdown { n: 5 }) {
+        sum = sum * 10 + n;
+    }
+    io::println("countdown \(sum)");
+
+    io::println(Widget { id: 7 }.shout());
+    io::println(Label { text: "hi" }.shout());
+
+    io::println("ackermann \(ackermann(2, 3))");
+    io::println("first over 1000: \(first_over(1000))");
+
+    // A long string, built by halving rather than by appending, so it stays linear.
+    let piece = "abcdefgh";
+    let mut big = piece;
+    let mut i = 0;
+    while i < 12 {
+        big = big.concat(big);
+        i = i + 1;
+    }
+    io::println("length \(big.len()) starts \(big.slice(0, 8)) ends \(big.slice(big.len() - 8, big.len()))");
+
+    // The same over a list, and a `loop` used as an expression inside another expression.
+    let sizes = list::new[i64]();
+    let mut k = 1;
+    while k <= 4 {
+        sizes.push(loop { break k * k; });
+        k = k + 1;
+    }
+    let mut shown = "";
+    for s in sizes {
+        shown = shown.concat("\(s) ");
+    }
+    io::println(shown.trim());
+}
