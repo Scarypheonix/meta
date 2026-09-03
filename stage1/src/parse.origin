@@ -1,0 +1,1610 @@
+// The Origin parser, in Origin (spec/02-grammar.md).
+//
+// A translation of `internal/parse`, held to it: tests/selfhost runs both over every
+// `.origin` file in this repository and requires the dumped syntax trees to be identical.
+// That includes the files with deliberate syntax errors in `tests/conformance`, so the
+// recovery strategy §02 calls normative is translated too, not only the grammar.
+//
+// String interpolation is desugared here, as it is there: `"a \(x) b"` becomes
+// `"a ".concat(x.to_str()).concat(" b")`, so nothing downstream learns a new form
+// (spec/14-strings.md).
+
+use std::list;
+use ast;
+use lex;
+
+pub struct ParseError {
+    pub message: String,
+    pub start: i64,
+    pub end: i64,
+}
+
+pub struct Parsed {
+    pub file: ast::File,
+    pub errors: List[ParseError],
+}
+
+pub struct Parser {
+    toks: List[lex::Token],
+    mut pos: i64,
+    /// True in condition position, where a top-level struct literal would be ambiguous
+    /// with the block that follows (spec/02-grammar.md's first parser restriction).
+    mut no_struct: bool,
+    /// Set on an error and cleared by the next token consumed, so one mistake produces one
+    /// diagnostic rather than a cascade.
+    mut recovering: bool,
+    errors: List[ParseError],
+}
+
+/// Parses a whole file's tokens.
+pub fn parse(toks: List[lex::Token]) -> Parsed {
+    let p = Parser {
+        toks: toks, pos: 0, no_struct: false, recovering: false,
+        errors: list::new[ParseError](),
+    };
+    let f = p.file();
+    Parsed { file: f, errors: p.errors }
+}
+
+// --- Token helpers -------------------------------------------------------------------
+
+impl Parser {
+    fn cur(self) -> lex::Token {
+        self.toks.at(self.pos)
+    }
+
+    fn at(self, k: i64) -> bool {
+        self.toks.at(self.pos).kind == k
+    }
+
+    fn at_eof(self) -> bool {
+        self.toks.at(self.pos).kind == lex::K_EOF
+    }
+
+    fn peek_is(self, n: i64, k: i64) -> bool {
+        if self.pos + n >= self.toks.len() {
+            return false;
+        }
+        self.toks.at(self.pos + n).kind == k
+    }
+
+    fn advance(self) -> lex::Token {
+        let t = self.toks.at(self.pos);
+        if !self.at_eof() {
+            self.pos = self.pos + 1;
+            self.recovering = false;
+        }
+        t
+    }
+
+    fn eat(self, k: i64) -> bool {
+        if self.at(k) {
+            self.advance();
+            return true;
+        }
+        false
+    }
+
+    fn expect(self, k: i64) -> bool {
+        if self.at(k) {
+            self.advance();
+            return true;
+        }
+        self.error_expected(lex::kind_name(k));
+        false
+    }
+
+    fn error_expected(self, what: String) {
+        if self.recovering {
+            return;
+        }
+        self.recovering = true;
+        let t = self.cur();
+        self.errors.push(ParseError { message: "expected \(what)", start: t.start, end: t.end })
+    }
+
+    fn error_at(self, start: i64, end: i64, message: String) {
+        self.recovering = true;
+        self.errors.push(ParseError { message: message, start: start, end: end })
+    }
+}
+
+// --- Recovery ------------------------------------------------------------------------
+
+fn is_item_start(k: i64) -> bool {
+    k == lex::K_PUB || k == lex::K_FN || k == lex::K_STRUCT || k == lex::K_ENUM
+        || k == lex::K_TRAIT || k == lex::K_IMPL || k == lex::K_TYPE || k == lex::K_CONST
+        || k == lex::K_USE
+}
+
+impl Parser {
+    /// Skips to the next item boundary at brace depth zero.
+    fn sync_item(self) {
+        let mut depth = 0;
+        while !self.at_eof() {
+            let k = self.cur().kind;
+            if k == lex::K_LBRACE {
+                depth = depth + 1;
+            } else {
+                if k == lex::K_RBRACE {
+                    if depth == 0 {
+                        return;
+                    }
+                    depth = depth - 1;
+                } else {
+                    if depth == 0 && is_item_start(k) {
+                        return;
+                    }
+                }
+            }
+            self.advance();
+        }
+    }
+
+    /// Skips to the end of the current statement: a `;`, consumed, or a `}`, left in
+    /// place for the block to close on.
+    fn sync_stmt(self) {
+        let mut depth = 0;
+        while !self.at_eof() {
+            let k = self.cur().kind;
+            if k == lex::K_LBRACE || k == lex::K_LPAREN || k == lex::K_LBRACKET {
+                depth = depth + 1;
+            } else {
+                if k == lex::K_RPAREN || k == lex::K_RBRACKET {
+                    if depth > 0 {
+                        depth = depth - 1;
+                    }
+                } else {
+                    if k == lex::K_RBRACE {
+                        if depth == 0 {
+                            return;
+                        }
+                        depth = depth - 1;
+                    } else {
+                        if k == lex::K_SEMI && depth == 0 {
+                            self.advance();
+                            return;
+                        }
+                        if depth == 0 && is_item_start(k) {
+                            return;
+                        }
+                    }
+                }
+            }
+            self.advance();
+        }
+    }
+
+    /// Skips to the next `,`, left in place, or the closing delimiter, never past it.
+    fn sync_list(self, closer: i64) {
+        let mut depth = 0;
+        while !self.at_eof() {
+            let k = self.cur().kind;
+            if depth == 0 && (k == lex::K_COMMA || k == closer) {
+                return;
+            }
+            if k == lex::K_LPAREN || k == lex::K_LBRACKET || k == lex::K_LBRACE {
+                depth = depth + 1;
+            } else {
+                if k == lex::K_RPAREN || k == lex::K_RBRACKET || k == lex::K_RBRACE {
+                    if depth == 0 {
+                        return;
+                    }
+                    depth = depth - 1;
+                }
+            }
+            self.advance();
+        }
+    }
+}
+
+// --- File and items ------------------------------------------------------------------
+
+impl Parser {
+    fn file(self) -> ast::File {
+        let uses = list::new[ast::Use]();
+        let items = list::new[ast::Item]();
+        while self.at(lex::K_USE) {
+            uses.push(self.use_decl());
+        }
+        while !self.at_eof() {
+            if self.at(lex::K_USE) {
+                let t = self.cur();
+                let u = self.use_decl();
+                self.error_at(t.start, t.end, "`use` declarations must come before all items");
+                uses.push(u);
+            } else {
+                let before = self.pos;
+                items.push(self.item());
+                if self.pos == before {
+                    self.advance();
+                }
+            }
+        }
+        ast::File { uses: uses, items: items }
+    }
+
+    fn use_decl(self) -> ast::Use {
+        self.advance();
+        let path = self.path();
+        let names = list::new[String]();
+        if self.at(lex::K_COLONCOLON) && self.peek_is(1, lex::K_LBRACE) {
+            self.advance();
+            self.advance();
+            while !self.at(lex::K_RBRACE) && !self.at_eof() {
+                match self.ident() {
+                    Option::Some(n) => { names.push(n); }
+                    Option::None => { self.sync_list(lex::K_RBRACE); }
+                }
+                if !self.eat(lex::K_COMMA) {
+                    break;
+                }
+            }
+            self.expect(lex::K_RBRACE);
+        }
+        self.expect(lex::K_SEMI);
+        ast::Use { path: path, names: names }
+    }
+
+    fn ident(self) -> Option[String] {
+        if self.at(lex::K_IDENT) {
+            return Option::Some(self.advance().text);
+        }
+        self.error_expected("an identifier");
+        Option::None
+    }
+
+    /// A `::`-separated path, rendered as the text the dumper prints.
+    fn path(self) -> String {
+        let mut out = "";
+        let mut n = 0;
+        let mut going = true;
+        while going {
+            if self.at(lex::K_IDENT) {
+                if n > 0 {
+                    out = out.concat("::");
+                }
+                out = out.concat(self.advance().text);
+                n = n + 1;
+            } else {
+                if self.at(lex::K_SELF_TYPE) {
+                    self.advance();
+                    if n > 0 {
+                        out = out.concat("::");
+                    }
+                    out = out.concat("Self");
+                    n = n + 1;
+                } else {
+                    if n == 0 {
+                        self.error_expected("a path");
+                        return out;
+                    }
+                }
+            }
+            // A `::` before `{` belongs to a braced `use` list, not to the path.
+            if self.at(lex::K_COLONCOLON) && !self.peek_is(1, lex::K_LBRACE) {
+                self.advance();
+            } else {
+                going = false;
+            }
+        }
+        out
+    }
+
+    fn item(self) -> ast::Item {
+        let start = self.pos;
+        let public = self.eat(lex::K_PUB);
+        let k = self.cur().kind;
+        if k == lex::K_FN { return ast::Item::Fn(self.fn_decl(public)); }
+        if k == lex::K_STRUCT { return ast::Item::Struct(self.struct_decl(public)); }
+        if k == lex::K_ENUM { return ast::Item::Enum(self.enum_decl(public)); }
+        if k == lex::K_TRAIT { return ast::Item::Trait(self.trait_decl(public)); }
+        if k == lex::K_IMPL {
+            if public {
+                let t = self.toks.at(start);
+                self.error_at(t.start, t.end, "`impl` blocks cannot be `pub`");
+            }
+            return ast::Item::Impl(self.impl_decl());
+        }
+        if k == lex::K_TYPE { return ast::Item::Alias(self.alias_decl(public)); }
+        if k == lex::K_CONST { return ast::Item::Const(self.const_decl(public)); }
+        self.error_expected("an item (`fn`, `struct`, `enum`, `trait`, `impl`, `type` or `const`)");
+        self.sync_item();
+        ast::Item::ErrorItem
+    }
+
+    fn generics(self) -> List[String] {
+        let out = list::new[String]();
+        if !self.at(lex::K_LBRACKET) {
+            return out;
+        }
+        self.advance();
+        while !self.at(lex::K_RBRACKET) && !self.at_eof() {
+            match self.ident() {
+                Option::None => {
+                    self.sync_list(lex::K_RBRACKET);
+                    if !self.eat(lex::K_COMMA) {
+                        return self.finish_generics(out);
+                    }
+                }
+                Option::Some(name) => {
+                    out.push(name);
+                    if self.eat(lex::K_COLON) {
+                        self.trait_bounds();
+                    }
+                    if !self.eat(lex::K_COMMA) {
+                        return self.finish_generics(out);
+                    }
+                }
+            }
+        }
+        self.finish_generics(out)
+    }
+
+    fn finish_generics(self, out: List[String]) -> List[String] {
+        self.expect(lex::K_RBRACKET);
+        out
+    }
+
+    /// Bounds are parsed and dropped: the dumper never shows them, and nothing after the
+    /// parser exists yet to read them.
+    fn trait_bounds(self) {
+        let mut going = true;
+        while going {
+            self.path();
+            self.type_args();
+            going = self.eat(lex::K_PLUS);
+        }
+    }
+
+    fn type_args(self) -> List[ast::Type] {
+        let out = list::new[ast::Type]();
+        if !self.at(lex::K_LBRACKET) {
+            return out;
+        }
+        self.advance();
+        while !self.at(lex::K_RBRACKET) && !self.at_eof() {
+            out.push(self.type_expr());
+            if !self.eat(lex::K_COMMA) {
+                break;
+            }
+        }
+        self.expect(lex::K_RBRACKET);
+        out
+    }
+
+    fn where_clause(self) {
+        if !self.eat(lex::K_WHERE) {
+            return;
+        }
+        let mut going = true;
+        while going {
+            self.type_expr();
+            if self.expect(lex::K_COLON) {
+                self.trait_bounds();
+            }
+            if !self.eat(lex::K_COMMA) {
+                going = false;
+            } else {
+                if self.at(lex::K_LBRACE) || self.at(lex::K_SEMI) {
+                    going = false;
+                }
+            }
+        }
+    }
+
+    fn fn_decl(self, public: bool) -> ast::FnDecl {
+        self.advance();
+        let name = self.ident().unwrap_or("");
+        let generics = self.generics();
+        let params = list::new[ast::Param]();
+        let mut self_param = Option::None;
+        if self.expect(lex::K_LPAREN) {
+            self_param = self.param_list(params);
+        }
+        let mut ret = Option::None;
+        if self.eat(lex::K_ARROW) {
+            ret = Option::Some(self.type_expr());
+        }
+        self.where_clause();
+
+        if self.eat(lex::K_SEMI) {
+            return ast::FnDecl {
+                public: public, name: name, generics: generics, self_param: self_param,
+                params: params, ret: ret, body: Option::None,
+            };
+        }
+        let mut body = Option::None;
+        if self.at(lex::K_LBRACE) {
+            body = Option::Some(self.block());
+        } else {
+            self.error_expected("a function body `{ ... }` or `;`");
+            self.sync_item();
+        }
+        ast::FnDecl {
+            public: public, name: name, generics: generics, self_param: self_param,
+            params: params, ret: ret, body: body,
+        }
+    }
+
+    fn param_list(self, params: List[ast::Param]) -> Option[bool] {
+        let mut self_param = Option::None;
+        let mut first = true;
+        while !self.at(lex::K_RPAREN) && !self.at_eof() {
+            let takes_self = self.at(lex::K_SELF_VALUE)
+                || (self.at(lex::K_MUT) && self.peek_is(1, lex::K_SELF_VALUE));
+            if first && takes_self {
+                let mutable = self.eat(lex::K_MUT);
+                self.advance();
+                self_param = Option::Some(mutable);
+            } else {
+                let mutable = self.eat(lex::K_MUT);
+                let pat = self.pattern();
+                let mut ty = ast::Type::ErrorType;
+                if self.expect(lex::K_COLON) {
+                    ty = self.type_expr();
+                } else {
+                    self.sync_list(lex::K_RPAREN);
+                }
+                params.push(ast::Param { mutable: mutable, pat: pat, ty: ty });
+            }
+            first = false;
+            if !self.eat(lex::K_COMMA) {
+                break;
+            }
+        }
+        self.expect(lex::K_RPAREN);
+        self_param
+    }
+
+    fn struct_decl(self, public: bool) -> ast::StructDecl {
+        self.advance();
+        let name = self.ident().unwrap_or("");
+        let generics = self.generics();
+        self.where_clause();
+        let mut fields = list::new[ast::Field]();
+        if self.expect(lex::K_LBRACE) {
+            fields = self.field_list();
+            self.expect(lex::K_RBRACE);
+        } else {
+            self.sync_item();
+        }
+        ast::StructDecl { public: public, name: name, generics: generics, fields: fields }
+    }
+
+    fn field_list(self) -> List[ast::Field] {
+        let out = list::new[ast::Field]();
+        while !self.at(lex::K_RBRACE) && !self.at_eof() {
+            let public = self.eat(lex::K_PUB);
+            let mutable = self.eat(lex::K_MUT);
+            match self.ident() {
+                Option::None => {
+                    self.sync_list(lex::K_RBRACE);
+                    if !self.eat(lex::K_COMMA) {
+                        return out;
+                    }
+                }
+                Option::Some(name) => {
+                    let mut ty = ast::Type::ErrorType;
+                    if self.expect(lex::K_COLON) {
+                        ty = self.type_expr();
+                    } else {
+                        self.sync_list(lex::K_RBRACE);
+                    }
+                    out.push(ast::Field { public: public, mutable: mutable, name: name, ty: ty });
+                    if !self.eat(lex::K_COMMA) {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn enum_decl(self, public: bool) -> ast::EnumDecl {
+        self.advance();
+        let name = self.ident().unwrap_or("");
+        let generics = self.generics();
+        self.where_clause();
+        let variants = list::new[ast::Variant]();
+        if !self.expect(lex::K_LBRACE) {
+            self.sync_item();
+            return ast::EnumDecl { public: public, name: name, generics: generics, variants: variants };
+        }
+        while !self.at(lex::K_RBRACE) && !self.at_eof() {
+            match self.ident() {
+                Option::None => {
+                    self.sync_list(lex::K_RBRACE);
+                    if !self.eat(lex::K_COMMA) {
+                        return self.finish_enum(public, name, generics, variants);
+                    }
+                }
+                Option::Some(vname) => {
+                    let types = list::new[ast::Type]();
+                    let fields = list::new[ast::Field]();
+                    let mut kind = ast::VARIANT_UNIT;
+                    if self.eat(lex::K_LPAREN) {
+                        kind = ast::VARIANT_TUPLE;
+                        while !self.at(lex::K_RPAREN) && !self.at_eof() {
+                            types.push(self.type_expr());
+                            if !self.eat(lex::K_COMMA) {
+                                break;
+                            }
+                        }
+                        self.expect(lex::K_RPAREN);
+                    } else {
+                        if self.eat(lex::K_LBRACE) {
+                            kind = ast::VARIANT_STRUCT;
+                            let got = self.field_list();
+                            let mut i = 0;
+                            while i < got.len() {
+                                fields.push(got.at(i));
+                                i = i + 1;
+                            }
+                            self.expect(lex::K_RBRACE);
+                        }
+                    }
+                    variants.push(ast::Variant { name: vname, kind: kind, types: types, fields: fields });
+                    if !self.eat(lex::K_COMMA) {
+                        return self.finish_enum(public, name, generics, variants);
+                    }
+                }
+            }
+        }
+        self.finish_enum(public, name, generics, variants)
+    }
+
+    fn finish_enum(self, public: bool, name: String, generics: List[String], variants: List[ast::Variant]) -> ast::EnumDecl {
+        self.expect(lex::K_RBRACE);
+        ast::EnumDecl { public: public, name: name, generics: generics, variants: variants }
+    }
+
+    fn trait_decl(self, public: bool) -> ast::TraitDecl {
+        self.advance();
+        let name = self.ident().unwrap_or("");
+        let generics = self.generics();
+        if self.eat(lex::K_COLON) {
+            self.trait_bounds();
+        }
+        self.where_clause();
+        let assoc = list::new[ast::AssocType]();
+        let methods = list::new[ast::FnDecl]();
+        if !self.expect(lex::K_LBRACE) {
+            self.sync_item();
+            return ast::TraitDecl { public: public, name: name, generics: generics, assoc: assoc, methods: methods };
+        }
+        while !self.at(lex::K_RBRACE) && !self.at_eof() {
+            let before = self.pos;
+            if self.at(lex::K_TYPE) {
+                self.advance();
+                let aname = self.ident().unwrap_or("");
+                if self.eat(lex::K_COLON) {
+                    self.trait_bounds();
+                }
+                self.expect(lex::K_SEMI);
+                assoc.push(ast::AssocType { name: aname, ty: Option::None });
+            } else {
+                if self.at(lex::K_FN) {
+                    methods.push(self.fn_decl(false));
+                } else {
+                    self.error_expected("`fn` or `type` in a trait body");
+                    self.sync_stmt();
+                }
+            }
+            if self.pos == before {
+                self.advance();
+            }
+        }
+        self.expect(lex::K_RBRACE);
+        ast::TraitDecl { public: public, name: name, generics: generics, assoc: assoc, methods: methods }
+    }
+
+    fn impl_decl(self) -> ast::ImplDecl {
+        self.advance();
+        self.generics();
+
+        // `impl Trait for Type` and `impl Type` are told apart by the `for` that follows
+        // the first type, so a type is parsed and reinterpreted when one appears.
+        let first = self.type_expr();
+        let mut trait_path = "";
+        let mut has_trait = false;
+        let mut ty = first;
+        if self.eat(lex::K_FOR) {
+            has_trait = true;
+            trait_path = type_as_trait_path(first);
+            ty = self.type_expr();
+        }
+        self.where_clause();
+
+        let assoc = list::new[ast::AssocType]();
+        let methods = list::new[ast::FnDecl]();
+        if !self.expect(lex::K_LBRACE) {
+            self.sync_item();
+            return ast::ImplDecl { trait_path: trait_path, has_trait: has_trait, ty: ty, assoc: assoc, methods: methods };
+        }
+        while !self.at(lex::K_RBRACE) && !self.at_eof() {
+            let before = self.pos;
+            let public = self.eat(lex::K_PUB);
+            if self.at(lex::K_TYPE) {
+                self.advance();
+                let aname = self.ident().unwrap_or("");
+                let mut aty = ast::Type::ErrorType;
+                if self.expect(lex::K_ASSIGN) {
+                    aty = self.type_expr();
+                }
+                self.expect(lex::K_SEMI);
+                assoc.push(ast::AssocType { name: aname, ty: Option::Some(aty) });
+            } else {
+                if self.at(lex::K_FN) {
+                    methods.push(self.fn_decl(public));
+                } else {
+                    self.error_expected("`fn` or `type` in an impl body");
+                    self.sync_stmt();
+                }
+            }
+            if self.pos == before {
+                self.advance();
+            }
+        }
+        self.expect(lex::K_RBRACE);
+        ast::ImplDecl { trait_path: trait_path, has_trait: has_trait, ty: ty, assoc: assoc, methods: methods }
+    }
+
+    fn alias_decl(self, public: bool) -> ast::AliasDecl {
+        self.advance();
+        let name = self.ident().unwrap_or("");
+        let generics = self.generics();
+        let mut ty = ast::Type::ErrorType;
+        if self.expect(lex::K_ASSIGN) {
+            ty = self.type_expr();
+        } else {
+            self.sync_item();
+        }
+        self.expect(lex::K_SEMI);
+        ast::AliasDecl { public: public, name: name, generics: generics, ty: ty }
+    }
+
+    fn const_decl(self, public: bool) -> ast::ConstDecl {
+        self.advance();
+        let name = self.ident().unwrap_or("");
+        let mut ty = ast::Type::ErrorType;
+        if self.expect(lex::K_COLON) {
+            ty = self.type_expr();
+        }
+        let mut value = ast::Expr::ErrorExpr;
+        if self.expect(lex::K_ASSIGN) {
+            value = self.expr();
+        } else {
+            self.sync_stmt();
+        }
+        self.expect(lex::K_SEMI);
+        ast::ConstDecl { public: public, name: name, ty: ty, value: value }
+    }
+}
+
+/// A parsed type reinterpreted as a trait's path, which only a path type can be.
+fn type_as_trait_path(t: ast::Type) -> String {
+    match t {
+        ast::Type::Path(path, _) => path,
+        _ => "",
+    }
+}
+
+// --- Types ---------------------------------------------------------------------------
+
+impl Parser {
+    fn type_expr(self) -> ast::Type {
+        if self.at(lex::K_SELF_TYPE) {
+            // Bare `Self` is the self type; `Self::Item` is a projection, so a path.
+            if !self.peek_is(1, lex::K_COLONCOLON) {
+                self.advance();
+                return ast::Type::SelfType;
+            }
+            let path = self.path();
+            return ast::Type::Path(path, self.type_args());
+        }
+        if self.at(lex::K_FN) {
+            self.advance();
+            let params = list::new[ast::Type]();
+            if self.expect(lex::K_LPAREN) {
+                while !self.at(lex::K_RPAREN) && !self.at_eof() {
+                    params.push(self.type_expr());
+                    if !self.eat(lex::K_COMMA) {
+                        break;
+                    }
+                }
+                self.expect(lex::K_RPAREN);
+            }
+            let mut ret = ast::Type::ErrorType;
+            if self.expect(lex::K_ARROW) {
+                ret = self.type_expr();
+            }
+            return ast::Type::Func(params, ret);
+        }
+        if self.at(lex::K_LPAREN) {
+            self.advance();
+            if self.eat(lex::K_RPAREN) {
+                return ast::Type::Unit;
+            }
+            let first = self.type_expr();
+            if !self.at(lex::K_COMMA) {
+                self.expect(lex::K_RPAREN);
+                return first; // parenthesized, not a one-tuple
+            }
+            let elems = list::new[ast::Type]();
+            elems.push(first);
+            while self.eat(lex::K_COMMA) {
+                if self.at(lex::K_RPAREN) {
+                    break;
+                }
+                elems.push(self.type_expr());
+            }
+            self.expect(lex::K_RPAREN);
+            return ast::Type::Tuple(elems);
+        }
+        if self.at(lex::K_IDENT) {
+            let path = self.path();
+            return ast::Type::Path(path, self.type_args());
+        }
+        self.error_expected("a type");
+        self.advance();
+        ast::Type::ErrorType
+    }
+}
+
+// --- Statements ----------------------------------------------------------------------
+
+fn starts_block_expr(k: i64) -> bool {
+    k == lex::K_LBRACE || k == lex::K_IF || k == lex::K_MATCH || k == lex::K_WHILE
+        || k == lex::K_FOR || k == lex::K_LOOP
+}
+
+fn is_block_expr(e: ast::Expr) -> bool {
+    match e {
+        ast::Expr::Block(_) => true,
+        ast::Expr::If(_, _, _) => true,
+        ast::Expr::Match(_, _) => true,
+        ast::Expr::While(_, _) => true,
+        ast::Expr::For(_, _, _) => true,
+        ast::Expr::Loop(_) => true,
+        _ => false,
+    }
+}
+
+/// Either a statement or the block's trailing expression: exactly one is present.
+struct StmtOrTail {
+    stmt: Option[ast::Stmt],
+    tail: Option[ast::Expr],
+}
+
+impl Parser {
+    fn block(self) -> ast::Expr {
+        let saved = self.no_struct;
+        self.no_struct = false;
+        let stmts = list::new[ast::Stmt]();
+        let mut tail = Option::None;
+        if !self.expect(lex::K_LBRACE) {
+            self.no_struct = saved;
+            return ast::Expr::Block(ast::BlockBody { stmts: stmts, tail: tail });
+        }
+        let mut going = true;
+        while going {
+            if self.at(lex::K_RBRACE) || self.at_eof() {
+                going = false;
+            } else {
+                let before = self.pos;
+                let got = self.stmt();
+                match got.tail {
+                    Option::Some(t) => {
+                        tail = Option::Some(t);
+                        going = false;
+                    }
+                    Option::None => {
+                        match got.stmt {
+                            Option::Some(s) => { stmts.push(s); }
+                            Option::None => {}
+                        }
+                        if self.pos == before {
+                            self.advance();
+                        }
+                    }
+                }
+            }
+        }
+        self.expect(lex::K_RBRACE);
+        self.no_struct = saved;
+        ast::Expr::Block(ast::BlockBody { stmts: stmts, tail: tail })
+    }
+
+    fn stmt(self) -> StmtOrTail {
+        if self.at(lex::K_LET) {
+            return StmtOrTail { stmt: Option::Some(self.let_stmt()), tail: Option::None };
+        }
+        if is_item_start(self.cur().kind) {
+            let item = self.item();
+            return StmtOrTail { stmt: Option::Some(ast::Stmt::ItemStmt(item)), tail: Option::None };
+        }
+
+        // spec/02-grammar.md: an expression whose body is braced, in statement position, is
+        // a complete statement -- the parser does not carry on into a binary operator.
+        if starts_block_expr(self.cur().kind) {
+            let e = self.primary();
+            if self.eat(lex::K_SEMI) {
+                return StmtOrTail { stmt: Option::Some(ast::Stmt::ExprStmt(e, true)), tail: Option::None };
+            }
+            if self.at(lex::K_RBRACE) || self.at_eof() {
+                return StmtOrTail { stmt: Option::None, tail: Option::Some(e) };
+            }
+            return StmtOrTail { stmt: Option::Some(ast::Stmt::ExprStmt(e, false)), tail: Option::None };
+        }
+
+        let e = self.expr();
+        if self.eat(lex::K_SEMI) {
+            return StmtOrTail { stmt: Option::Some(ast::Stmt::ExprStmt(e, true)), tail: Option::None };
+        }
+        if self.at(lex::K_RBRACE) || self.at_eof() {
+            return StmtOrTail { stmt: Option::None, tail: Option::Some(e) };
+        }
+        if is_block_expr(e) {
+            return StmtOrTail { stmt: Option::Some(ast::Stmt::ExprStmt(e, false)), tail: Option::None };
+        }
+        self.error_expected("`;` after this expression");
+        self.sync_stmt();
+        StmtOrTail { stmt: Option::Some(ast::Stmt::ExprStmt(e, false)), tail: Option::None }
+    }
+
+    fn let_stmt(self) -> ast::Stmt {
+        self.advance();
+        let mutable = self.eat(lex::K_MUT);
+        let pat = self.pattern();
+        let mut ty = Option::None;
+        if self.eat(lex::K_COLON) {
+            ty = Option::Some(self.type_expr());
+        }
+        if !self.expect(lex::K_ASSIGN) {
+            self.sync_stmt();
+            return ast::Stmt::Let(mutable, pat, ty, ast::Expr::ErrorExpr);
+        }
+        let value = self.expr();
+        self.expect(lex::K_SEMI);
+        ast::Stmt::Let(mutable, pat, ty, value)
+    }
+}
+
+// --- Expressions, by descending precedence (spec/02-grammar.md) ----------------------
+
+fn assign_op(k: i64) -> String {
+    if k == lex::K_ASSIGN { return "="; }
+    if k == lex::K_PLUSEQ { return "+="; }
+    if k == lex::K_MINUSEQ { return "-="; }
+    if k == lex::K_STAREQ { return "*="; }
+    if k == lex::K_SLASHEQ { return "/="; }
+    if k == lex::K_PERCENTEQ { return "%="; }
+    ""
+}
+
+fn cmp_op(k: i64) -> String {
+    if k == lex::K_EQEQ { return "=="; }
+    if k == lex::K_BANGEQ { return "!="; }
+    if k == lex::K_LT { return "<"; }
+    if k == lex::K_LE { return "<="; }
+    if k == lex::K_GT { return ">"; }
+    if k == lex::K_GE { return ">="; }
+    ""
+}
+
+impl Parser {
+    fn expr(self) -> ast::Expr {
+        self.assign_expr()
+    }
+
+    /// An expression in condition position, where a top-level struct literal would be
+    /// ambiguous with the block that follows it.
+    fn expr_no_struct(self) -> ast::Expr {
+        let saved = self.no_struct;
+        self.no_struct = true;
+        let e = self.expr();
+        self.no_struct = saved;
+        e
+    }
+
+    fn assign_expr(self) -> ast::Expr {
+        let lhs = self.or_expr();
+        let op = assign_op(self.cur().kind);
+        if op.is_empty() {
+            return lhs;
+        }
+        self.advance();
+        let rhs = self.assign_expr(); // right-associative
+        ast::Expr::Assign(op, lhs, rhs)
+    }
+
+    fn or_expr(self) -> ast::Expr {
+        let mut left = self.and_expr();
+        while self.at(lex::K_OROR) {
+            self.advance();
+            left = ast::Expr::Binary("||", left, self.and_expr());
+        }
+        left
+    }
+
+    fn and_expr(self) -> ast::Expr {
+        let mut left = self.cmp_expr();
+        while self.at(lex::K_ANDAND) {
+            self.advance();
+            left = ast::Expr::Binary("&&", left, self.cmp_expr());
+        }
+        left
+    }
+
+    /// Comparison is non-associative: `a < b < c` is rejected rather than silently read as
+    /// `(a < b) < c`.
+    fn cmp_expr(self) -> ast::Expr {
+        let left = self.bit_or_expr();
+        let op = cmp_op(self.cur().kind);
+        if op.is_empty() {
+            return left;
+        }
+        let op_tok = self.advance();
+        let right = self.bit_or_expr();
+        let chained = cmp_op(self.cur().kind);
+        if !chained.is_empty() {
+            self.error_at(op_tok.start, self.cur().end, "comparison operators are non-associative");
+            // Consume the rest so one mistake yields one diagnostic, not a cascade.
+            self.advance();
+            self.bit_or_expr();
+        }
+        ast::Expr::Binary(op, left, right)
+    }
+
+    fn bit_or_expr(self) -> ast::Expr {
+        let mut left = self.bit_xor_expr();
+        while self.at(lex::K_PIPE) {
+            self.advance();
+            left = ast::Expr::Binary("|", left, self.bit_xor_expr());
+        }
+        left
+    }
+
+    fn bit_xor_expr(self) -> ast::Expr {
+        let mut left = self.bit_and_expr();
+        while self.at(lex::K_CARET) {
+            self.advance();
+            left = ast::Expr::Binary("^", left, self.bit_and_expr());
+        }
+        left
+    }
+
+    fn bit_and_expr(self) -> ast::Expr {
+        let mut left = self.shift_expr();
+        while self.at(lex::K_AMP) {
+            self.advance();
+            left = ast::Expr::Binary("&", left, self.shift_expr());
+        }
+        left
+    }
+
+    fn shift_expr(self) -> ast::Expr {
+        let mut left = self.add_expr();
+        let mut going = true;
+        while going {
+            if self.at(lex::K_SHL) {
+                self.advance();
+                left = ast::Expr::Binary("<<", left, self.add_expr());
+            } else {
+                if self.at(lex::K_SHR) {
+                    self.advance();
+                    left = ast::Expr::Binary(">>", left, self.add_expr());
+                } else {
+                    going = false;
+                }
+            }
+        }
+        left
+    }
+
+    fn add_expr(self) -> ast::Expr {
+        let mut left = self.mul_expr();
+        let mut going = true;
+        while going {
+            if self.at(lex::K_PLUS) {
+                self.advance();
+                left = ast::Expr::Binary("+", left, self.mul_expr());
+            } else {
+                if self.at(lex::K_MINUS) {
+                    self.advance();
+                    left = ast::Expr::Binary("-", left, self.mul_expr());
+                } else {
+                    going = false;
+                }
+            }
+        }
+        left
+    }
+
+    fn mul_expr(self) -> ast::Expr {
+        let mut left = self.cast_expr();
+        let mut going = true;
+        while going {
+            if self.at(lex::K_STAR) {
+                self.advance();
+                left = ast::Expr::Binary("*", left, self.cast_expr());
+            } else {
+                if self.at(lex::K_SLASH) {
+                    self.advance();
+                    left = ast::Expr::Binary("/", left, self.cast_expr());
+                } else {
+                    if self.at(lex::K_PERCENT) {
+                        self.advance();
+                        left = ast::Expr::Binary("%", left, self.cast_expr());
+                    } else {
+                        going = false;
+                    }
+                }
+            }
+        }
+        left
+    }
+
+    fn cast_expr(self) -> ast::Expr {
+        let mut e = self.unary_expr();
+        while self.at(lex::K_AS) {
+            self.advance();
+            e = ast::Expr::Cast(e, self.type_expr());
+        }
+        e
+    }
+
+    fn unary_expr(self) -> ast::Expr {
+        if self.at(lex::K_MINUS) {
+            self.advance();
+            return ast::Expr::Unary("-", self.unary_expr());
+        }
+        if self.at(lex::K_BANG) {
+            self.advance();
+            return ast::Expr::Unary("!", self.unary_expr());
+        }
+        self.postfix_expr()
+    }
+
+    fn postfix_expr(self) -> ast::Expr {
+        let mut e = self.primary();
+        let mut going = true;
+        while going {
+            if self.at(lex::K_DOT) {
+                self.advance();
+                match self.ident() {
+                    Option::None => {
+                        return ast::Expr::ErrorExpr;
+                    }
+                    Option::Some(name) => {
+                        if self.at(lex::K_LPAREN) {
+                            e = ast::Expr::Method(name, e, self.call_args());
+                        } else {
+                            e = ast::Expr::Field(name, e);
+                        }
+                    }
+                }
+            } else {
+                if self.at(lex::K_LPAREN) {
+                    e = ast::Expr::Call(e, self.call_args());
+                } else {
+                    if self.at(lex::K_QUESTION) {
+                        self.advance();
+                        e = ast::Expr::Try(e);
+                    } else {
+                        going = false;
+                    }
+                }
+            }
+        }
+        e
+    }
+
+    fn call_args(self) -> List[ast::Expr] {
+        let saved = self.no_struct;
+        self.no_struct = false;
+        let out = list::new[ast::Expr]();
+        self.expect(lex::K_LPAREN);
+        while !self.at(lex::K_RPAREN) && !self.at_eof() {
+            let before = self.pos;
+            out.push(self.expr());
+            if self.pos == before {
+                self.sync_list(lex::K_RPAREN);
+            }
+            if !self.eat(lex::K_COMMA) {
+                break;
+            }
+        }
+        self.expect(lex::K_RPAREN);
+        self.no_struct = saved;
+        out
+    }
+
+    /// Whether the current token could begin an expression, which is how `break` and
+    /// `return` tell a value from the end of the statement.
+    fn can_start_expr(self) -> bool {
+        let k = self.cur().kind;
+        !(k == lex::K_SEMI || k == lex::K_RBRACE || k == lex::K_RPAREN
+            || k == lex::K_RBRACKET || k == lex::K_COMMA || k == lex::K_EOF)
+    }
+
+    fn primary(self) -> ast::Expr {
+        let t = self.cur();
+        let k = t.kind;
+
+        if k == lex::K_INT {
+            self.advance();
+            return ast::Expr::Int(t.int, t.overflow, t.suffix);
+        }
+        if k == lex::K_FLOAT {
+            self.advance();
+            return ast::Expr::Float(t.float, t.suffix);
+        }
+        if k == lex::K_STR {
+            self.advance();
+            if t.interpolated {
+                return interpolated(t);
+            }
+            return ast::Expr::Str(t.str);
+        }
+        if k == lex::K_CHAR {
+            self.advance();
+            return ast::Expr::Char(t.ch);
+        }
+        if k == lex::K_TRUE || k == lex::K_FALSE {
+            self.advance();
+            return ast::Expr::Bool(k == lex::K_TRUE);
+        }
+        if k == lex::K_SELF_VALUE {
+            self.advance();
+            return ast::Expr::SelfExpr;
+        }
+        if k == lex::K_LPAREN {
+            return self.paren_or_tuple();
+        }
+        if k == lex::K_LBRACE {
+            return self.block();
+        }
+        if k == lex::K_IF {
+            return self.if_expr();
+        }
+        if k == lex::K_MATCH {
+            return self.match_expr();
+        }
+        if k == lex::K_WHILE {
+            self.advance();
+            let cond = self.expr_no_struct();
+            return ast::Expr::While(cond, self.block());
+        }
+        if k == lex::K_FOR {
+            self.advance();
+            let pat = self.pattern();
+            self.expect(lex::K_IN);
+            let iter = self.expr_no_struct();
+            return ast::Expr::For(pat, iter, self.block());
+        }
+        if k == lex::K_LOOP {
+            self.advance();
+            return ast::Expr::Loop(self.block());
+        }
+        if k == lex::K_BREAK {
+            self.advance();
+            if self.can_start_expr() {
+                return ast::Expr::Break(Option::Some(self.expr()));
+            }
+            return ast::Expr::Break(Option::None);
+        }
+        if k == lex::K_CONTINUE {
+            self.advance();
+            return ast::Expr::Continue;
+        }
+        if k == lex::K_RETURN {
+            self.advance();
+            if self.can_start_expr() {
+                return ast::Expr::Return(Option::Some(self.expr()));
+            }
+            return ast::Expr::Return(Option::None);
+        }
+        if k == lex::K_PIPE || k == lex::K_OROR {
+            return self.lambda();
+        }
+        if k == lex::K_IDENT || k == lex::K_SELF_TYPE {
+            return self.path_expr_or_struct_lit();
+        }
+
+        self.error_expected("an expression");
+        self.advance();
+        ast::Expr::ErrorExpr
+    }
+
+    fn paren_or_tuple(self) -> ast::Expr {
+        let saved = self.no_struct;
+        self.no_struct = false;
+        self.advance();
+        if self.at(lex::K_RPAREN) {
+            self.advance();
+            self.no_struct = saved;
+            return ast::Expr::Tuple(list::new[ast::Expr]());
+        }
+        let first = self.expr();
+        if !self.at(lex::K_COMMA) {
+            self.expect(lex::K_RPAREN);
+            self.no_struct = saved;
+            return first; // parenthesized, not a one-tuple
+        }
+        let elems = list::new[ast::Expr]();
+        elems.push(first);
+        while self.eat(lex::K_COMMA) {
+            if self.at(lex::K_RPAREN) {
+                break;
+            }
+            elems.push(self.expr());
+        }
+        self.expect(lex::K_RPAREN);
+        self.no_struct = saved;
+        ast::Expr::Tuple(elems)
+    }
+
+    fn if_expr(self) -> ast::Expr {
+        self.advance();
+        let cond = self.expr_no_struct();
+        let then = self.block();
+        let mut els = Option::None;
+        if self.eat(lex::K_ELSE) {
+            if self.at(lex::K_IF) {
+                els = Option::Some(self.if_expr());
+            } else {
+                els = Option::Some(self.block());
+            }
+        }
+        ast::Expr::If(cond, then, els)
+    }
+
+    fn match_expr(self) -> ast::Expr {
+        self.advance();
+        let scrutinee = self.expr_no_struct();
+        let arms = list::new[ast::Arm]();
+        if !self.expect(lex::K_LBRACE) {
+            return ast::Expr::Match(scrutinee, arms);
+        }
+        let saved = self.no_struct;
+        self.no_struct = false;
+        while !self.at(lex::K_RBRACE) && !self.at_eof() {
+            let before = self.pos;
+            let pat = self.pattern();
+            let mut guard = Option::None;
+            if self.eat(lex::K_IF) {
+                guard = Option::Some(self.expr());
+            }
+            if !self.expect(lex::K_FATARROW) {
+                self.sync_stmt();
+                if self.pos == before {
+                    self.advance();
+                }
+            } else {
+                let body = self.expr();
+                arms.push(ast::Arm { pat: pat, guard: guard, body: body });
+                // A brace-bodied arm may omit its comma; any other needs one unless last.
+                if !self.eat(lex::K_COMMA) && !is_block_expr(body) && !self.at(lex::K_RBRACE) {
+                    self.error_expected("`,` after this match arm");
+                    self.sync_stmt();
+                }
+                if self.pos == before {
+                    self.advance();
+                }
+            }
+        }
+        self.no_struct = saved;
+        self.expect(lex::K_RBRACE);
+        ast::Expr::Match(scrutinee, arms)
+    }
+
+    fn lambda(self) -> ast::Expr {
+        let saved = self.no_struct;
+        self.no_struct = false;
+        let params = list::new[ast::LambdaParam]();
+        if self.at(lex::K_OROR) {
+            self.advance(); // `||` is an empty parameter list here, not an operator
+        } else {
+            self.advance();
+            while !self.at(lex::K_PIPE) && !self.at_eof() {
+                // Not `pattern`: an or-pattern would swallow the closing `|`.
+                let pat = self.pattern_no_or();
+                let mut ty = Option::None;
+                if self.eat(lex::K_COLON) {
+                    ty = Option::Some(self.type_expr());
+                }
+                params.push(ast::LambdaParam { pat: pat, ty: ty });
+                if !self.eat(lex::K_COMMA) {
+                    break;
+                }
+            }
+            self.expect(lex::K_PIPE);
+        }
+        let mut body = ast::Expr::ErrorExpr;
+        if self.eat(lex::K_ARROW) {
+            self.type_expr();
+            body = self.block();
+        } else {
+            body = self.expr();
+        }
+        self.no_struct = saved;
+        ast::Expr::Lambda(params, body)
+    }
+
+    fn path_expr_or_struct_lit(self) -> ast::Expr {
+        let path = self.path();
+        let args = self.type_args();
+
+        if self.at(lex::K_LBRACE) && !self.no_struct {
+            return self.struct_lit(path);
+        }
+        // A struct literal here is what the writer meant, and exactly what §02's first
+        // parser restriction forbids. `Ident :` inside the brace is a field initializer and
+        // nothing else -- Origin has no labels -- so the restriction can be named rather
+        // than reported as a missing semicolon several tokens later.
+        if self.at(lex::K_LBRACE) && self.no_struct
+            && self.peek_is(1, lex::K_IDENT) && self.peek_is(2, lex::K_COLON) {
+            let t = self.cur();
+            self.error_at(t.start, t.end, "a struct literal cannot appear here");
+            return self.struct_lit(path);
+        }
+        ast::Expr::Path(path, args)
+    }
+
+    fn struct_lit(self, path: String) -> ast::Expr {
+        let saved = self.no_struct;
+        self.no_struct = false;
+        self.advance();
+        let fields = list::new[ast::FieldInit]();
+        while !self.at(lex::K_RBRACE) && !self.at_eof() {
+            match self.ident() {
+                Option::None => {
+                    self.sync_list(lex::K_RBRACE);
+                    if !self.eat(lex::K_COMMA) {
+                        break;
+                    }
+                }
+                Option::Some(name) => {
+                    let mut value = ast::Expr::Path(name, list::new[ast::Type]());
+                    if self.eat(lex::K_COLON) {
+                        value = self.expr();
+                    }
+                    // Shorthand `Point { x, y }` means `x: x, y: y`.
+                    fields.push(ast::FieldInit { name: name, value: value });
+                    if !self.eat(lex::K_COMMA) {
+                        break;
+                    }
+                }
+            }
+        }
+        self.expect(lex::K_RBRACE);
+        self.no_struct = saved;
+        ast::Expr::StructLit(path, fields)
+    }
+}
+
+// --- String interpolation (spec/14-strings.md) ---------------------------------------
+//
+// `"total: \(n + 1)"` becomes `"total: ".concat((n + 1).to_str())`, here in the parser, so
+// nothing downstream learns a new form: the checker sees `concat` and `to_str` and applies
+// `Str` and `Show` to them like any other call.
+
+fn interpolated(t: lex::Token) -> ast::Expr {
+    let mut out = ast::Expr::ErrorExpr;
+    let mut started = false;
+    let mut i = 0;
+    while i < t.parts.len() {
+        let mut piece = ast::Expr::ErrorExpr;
+        let mut have = false;
+        match t.parts.at(i) {
+            lex::Part::Text(text) => {
+                // An empty chunk between two interpolations contributes nothing.
+                if !text.is_empty() {
+                    piece = ast::Expr::Str(text);
+                    have = true;
+                }
+            }
+            lex::Part::Expr(toks) => {
+                piece = ast::Expr::Method("to_str", sub_expr(toks), list::new[ast::Expr]());
+                have = true;
+            }
+        }
+        if have {
+            if started {
+                let args = list::new[ast::Expr]();
+                args.push(piece);
+                out = ast::Expr::Method("concat", out, args);
+            } else {
+                out = piece;
+                started = true;
+            }
+        }
+        i = i + 1;
+    }
+    if !started {
+        // Every part was an empty chunk, which the lexer produces only for `""` itself.
+        return ast::Expr::Str("");
+    }
+    out
+}
+
+/// One interpolation's tokens, parsed with a parser of its own.
+fn sub_expr(toks: List[lex::Token]) -> ast::Expr {
+    let p = Parser {
+        toks: toks, pos: 0, no_struct: false, recovering: false,
+        errors: list::new[ParseError](),
+    };
+    p.expr()
+}
+
+// --- Patterns ------------------------------------------------------------------------
+
+impl Parser {
+    fn pattern(self) -> ast::Pat {
+        let first = self.pattern_no_or();
+        if !self.at(lex::K_PIPE) {
+            return first;
+        }
+        let alts = list::new[ast::Pat]();
+        alts.push(first);
+        while self.eat(lex::K_PIPE) {
+            alts.push(self.pattern_no_or());
+        }
+        ast::Pat::Or(alts)
+    }
+
+    fn pattern_no_or(self) -> ast::Pat {
+        let k = self.cur().kind;
+
+        if k == lex::K_UNDERSCORE {
+            self.advance();
+            return ast::Pat::Wild;
+        }
+        if k == lex::K_INT || k == lex::K_FLOAT || k == lex::K_STR || k == lex::K_CHAR
+            || k == lex::K_TRUE || k == lex::K_FALSE {
+            return ast::Pat::Lit(false, self.literal_for_pattern());
+        }
+        if k == lex::K_MINUS {
+            self.advance();
+            if !self.at(lex::K_INT) && !self.at(lex::K_FLOAT) {
+                self.error_expected("a numeric literal after `-` in a pattern");
+                self.advance();
+                return ast::Pat::ErrorPat;
+            }
+            return ast::Pat::Lit(true, self.literal_for_pattern());
+        }
+        if k == lex::K_LPAREN {
+            return self.tuple_pattern();
+        }
+        if k == lex::K_MUT {
+            self.advance();
+            match self.ident() {
+                Option::None => { return ast::Pat::ErrorPat; }
+                Option::Some(name) => {
+                    let mut sub = Option::None;
+                    if self.eat(lex::K_AT) {
+                        sub = Option::Some(self.pattern_no_or());
+                    }
+                    return ast::Pat::Bind(true, name, sub);
+                }
+            }
+        }
+        if k == lex::K_IDENT || k == lex::K_SELF_TYPE {
+            let start = self.pos;
+            let path = self.path();
+            if self.at(lex::K_LPAREN) {
+                return self.tuple_variant_pattern(path);
+            }
+            if self.at(lex::K_LBRACE) {
+                return self.struct_pattern(path);
+            }
+            // A bare name is a binding unless it resolves to a unit variant or a constant,
+            // and that decision belongs to name resolution rather than to the parser.
+            if self.pos == start + 1 {
+                let mut sub = Option::None;
+                if self.eat(lex::K_AT) {
+                    sub = Option::Some(self.pattern_no_or());
+                }
+                return ast::Pat::Bind(false, path, sub);
+            }
+            return ast::Pat::PathUnit(path);
+        }
+
+        self.error_expected("a pattern");
+        self.advance();
+        ast::Pat::ErrorPat
+    }
+
+    /// Patterns admit literals and never arbitrary expressions.
+    fn literal_for_pattern(self) -> ast::Expr {
+        let t = self.advance();
+        if t.kind == lex::K_INT {
+            return ast::Expr::Int(t.int, t.overflow, t.suffix);
+        }
+        if t.kind == lex::K_FLOAT {
+            return ast::Expr::Float(t.float, t.suffix);
+        }
+        if t.kind == lex::K_STR {
+            return ast::Expr::Str(t.str);
+        }
+        if t.kind == lex::K_CHAR {
+            return ast::Expr::Char(t.ch);
+        }
+        ast::Expr::Bool(t.kind == lex::K_TRUE)
+    }
+
+    fn tuple_pattern(self) -> ast::Pat {
+        self.advance();
+        if self.at(lex::K_RPAREN) {
+            self.advance();
+            return ast::Pat::Tup(list::new[ast::Pat]());
+        }
+        let first = self.pattern();
+        if !self.at(lex::K_COMMA) {
+            self.expect(lex::K_RPAREN);
+            return first; // parenthesized, not a one-tuple
+        }
+        let elems = list::new[ast::Pat]();
+        elems.push(first);
+        while self.eat(lex::K_COMMA) {
+            if self.at(lex::K_RPAREN) {
+                break;
+            }
+            elems.push(self.pattern());
+        }
+        self.expect(lex::K_RPAREN);
+        ast::Pat::Tup(elems)
+    }
+
+    fn tuple_variant_pattern(self, path: String) -> ast::Pat {
+        self.advance();
+        let elems = list::new[ast::Pat]();
+        while !self.at(lex::K_RPAREN) && !self.at_eof() {
+            let before = self.pos;
+            elems.push(self.pattern());
+            if self.pos == before {
+                self.sync_list(lex::K_RPAREN);
+            }
+            if !self.eat(lex::K_COMMA) {
+                break;
+            }
+        }
+        self.expect(lex::K_RPAREN);
+        ast::Pat::PathTuple(path, elems)
+    }
+
+    fn struct_pattern(self, path: String) -> ast::Pat {
+        self.advance();
+        let fields = list::new[ast::FieldPat]();
+        let mut rest = false;
+        while !self.at(lex::K_RBRACE) && !self.at_eof() {
+            if self.at(lex::K_DOTDOT) {
+                self.advance();
+                rest = true;
+                break;
+            }
+            match self.ident() {
+                Option::None => {
+                    self.sync_list(lex::K_RBRACE);
+                    if !self.eat(lex::K_COMMA) {
+                        break;
+                    }
+                }
+                Option::Some(name) => {
+                    let mut pat = ast::Pat::Bind(false, name, Option::None);
+                    if self.eat(lex::K_COLON) {
+                        pat = self.pattern();
+                    }
+                    fields.push(ast::FieldPat { name: name, pat: pat });
+                    if !self.eat(lex::K_COMMA) {
+                        break;
+                    }
+                }
+            }
+        }
+        self.expect(lex::K_RBRACE);
+        ast::Pat::PathStruct(path, rest, fields)
+    }
+}

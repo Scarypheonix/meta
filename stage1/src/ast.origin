@@ -1,0 +1,784 @@
+// The Origin syntax tree, in Origin, and the dumper that renders it.
+//
+// A translation of `internal/ast`, with two differences that follow from the language
+// rather than from taste. There is no sealed interface with one struct per node kind
+// (ADR-0015): Origin has enums with payloads, so a category is one enum and a node kind is
+// one variant, and exhaustiveness is the checker's job rather than a convention. And there
+// are no node ids or spans yet -- nothing downstream of the parser exists to key a side
+// table by, and a field nothing reads is exactly the failure mode Phase 8 kept finding.
+//
+// `dump` is held to `internal/ast`'s own `Dump` over every `.origin` file in this
+// repository (tests/selfhost), so its shape is not this file's to choose.
+
+use std::list;
+use std::str;
+
+// --- Types ---------------------------------------------------------------------------
+
+pub enum Type {
+    /// A path with its type arguments: `Map[String, i64]`.
+    Path(String, List[Type]),
+    Tuple(List[Type]),
+    Unit,
+    /// `fn(A, B) -> C`.
+    Func(List[Type], Type),
+    SelfType,
+    ErrorType,
+}
+
+// --- Patterns ------------------------------------------------------------------------
+
+pub struct FieldPat {
+    pub name: String,
+    pub pat: Pat,
+}
+
+pub enum Pat {
+    Wild,
+    /// A literal, with the `-` a numeric one may carry.
+    Lit(bool, Expr),
+    /// `mut x`, `x @ sub`.
+    Bind(bool, String, Option[Pat]),
+    PathUnit(String),
+    PathTuple(String, List[Pat]),
+    /// The `bool` is a trailing `..`.
+    PathStruct(String, bool, List[FieldPat]),
+    Tup(List[Pat]),
+    Or(List[Pat]),
+    ErrorPat,
+}
+
+// --- Expressions ---------------------------------------------------------------------
+
+pub struct FieldInit {
+    pub name: String,
+    pub value: Expr,
+}
+
+pub struct LambdaParam {
+    pub pat: Pat,
+    pub ty: Option[Type],
+}
+
+pub struct Arm {
+    pub pat: Pat,
+    pub guard: Option[Expr],
+    pub body: Expr,
+}
+
+pub struct BlockBody {
+    pub stmts: List[Stmt],
+    pub tail: Option[Expr],
+}
+
+pub enum Expr {
+    Int(u64, bool, String),
+    Float(f64, String),
+    Str(String),
+    Char(i64),
+    Bool(bool),
+    Path(String, List[Type]),
+    SelfExpr,
+    StructLit(String, List[FieldInit]),
+    Tuple(List[Expr]),
+    Lambda(List[LambdaParam], Expr),
+    Block(BlockBody),
+    If(Expr, Expr, Option[Expr]),
+    Match(Expr, List[Arm]),
+    While(Expr, Expr),
+    For(Pat, Expr, Expr),
+    Loop(Expr),
+    Break(Option[Expr]),
+    Continue,
+    Return(Option[Expr]),
+    Unary(String, Expr),
+    Binary(String, Expr, Expr),
+    Assign(String, Expr, Expr),
+    Cast(Expr, Type),
+    Call(Expr, List[Expr]),
+    Method(String, Expr, List[Expr]),
+    Field(String, Expr),
+    Try(Expr),
+    ErrorExpr,
+}
+
+// --- Statements ----------------------------------------------------------------------
+
+pub enum Stmt {
+    /// `let mut p: T = v;`
+    Let(bool, Pat, Option[Type], Expr),
+    /// An expression statement, and whether it ended with `;`.
+    ExprStmt(Expr, bool),
+    ItemStmt(Item),
+}
+
+// --- Items ---------------------------------------------------------------------------
+
+pub struct Param {
+    pub mutable: bool,
+    pub pat: Pat,
+    pub ty: Type,
+}
+
+pub struct FnDecl {
+    pub public: bool,
+    pub name: String,
+    pub generics: List[String],
+    /// One element when the function takes `self`, holding whether it is `mut`.
+    pub self_param: Option[bool],
+    pub params: List[Param],
+    pub ret: Option[Type],
+    pub body: Option[Expr],
+}
+
+pub struct Field {
+    pub public: bool,
+    pub mutable: bool,
+    pub name: String,
+    pub ty: Type,
+}
+
+pub struct StructDecl {
+    pub public: bool,
+    pub name: String,
+    pub generics: List[String],
+    pub fields: List[Field],
+}
+
+pub const VARIANT_UNIT: i64 = 0;
+pub const VARIANT_TUPLE: i64 = 1;
+pub const VARIANT_STRUCT: i64 = 2;
+
+pub struct Variant {
+    pub name: String,
+    pub kind: i64,
+    pub types: List[Type],
+    pub fields: List[Field],
+}
+
+pub struct EnumDecl {
+    pub public: bool,
+    pub name: String,
+    pub generics: List[String],
+    pub variants: List[Variant],
+}
+
+pub struct AssocType {
+    pub name: String,
+    pub ty: Option[Type],
+}
+
+pub struct TraitDecl {
+    pub public: bool,
+    pub name: String,
+    pub generics: List[String],
+    pub assoc: List[AssocType],
+    pub methods: List[FnDecl],
+}
+
+pub struct ImplDecl {
+    /// The trait's path, empty for an inherent impl.
+    pub trait_path: String,
+    pub has_trait: bool,
+    pub ty: Type,
+    pub assoc: List[AssocType],
+    pub methods: List[FnDecl],
+}
+
+pub struct AliasDecl {
+    pub public: bool,
+    pub name: String,
+    pub generics: List[String],
+    pub ty: Type,
+}
+
+pub struct ConstDecl {
+    pub public: bool,
+    pub name: String,
+    pub ty: Type,
+    pub value: Expr,
+}
+
+pub enum Item {
+    Fn(FnDecl),
+    Struct(StructDecl),
+    Enum(EnumDecl),
+    Trait(TraitDecl),
+    Impl(ImplDecl),
+    Alias(AliasDecl),
+    Const(ConstDecl),
+    ErrorItem,
+}
+
+pub struct Use {
+    pub path: String,
+    pub names: List[String],
+}
+
+pub struct File {
+    pub uses: List[Use],
+    pub items: List[Item],
+}
+
+// --- The dumper ----------------------------------------------------------------------
+//
+// One line per node, two spaces of indent per level. Every string it produces is fixed by
+// `internal/ast`'s own dumper, which tests/selfhost compares against.
+
+/// Two spaces per level.
+fn pad(depth: i64) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < depth {
+        out = out.concat("  ");
+        i = i + 1;
+    }
+    out
+}
+
+fn emit(out: List[String], depth: i64, text: String) {
+    out.push(pad(depth).concat(text))
+}
+
+fn pub_mark(p: bool) -> String {
+    if p { "pub " } else { "" }
+}
+
+fn mut_mark(m: bool) -> String {
+    if m { " mut" } else { "" }
+}
+
+fn mut_prefix(m: bool) -> String {
+    if m { "mut " } else { "" }
+}
+
+fn suffix_mark(s: String) -> String {
+    if s.is_empty() { "" } else { " ".concat(s) }
+}
+
+fn generics_mark(gs: List[String]) -> String {
+    if gs.is_empty() {
+        return "";
+    }
+    let mut out = "[";
+    let mut i = 0;
+    while i < gs.len() {
+        if i > 0 {
+            out = out.concat(", ");
+        }
+        out = out.concat(gs.at(i));
+        i = i + 1;
+    }
+    out.concat("]")
+}
+
+/// A float as Go's `%g` with the shortest round-tripping digits renders it.
+///
+/// `to_str` is that, plus the `.0` spec/16-floats.md appends so an integral value cannot be
+/// mistaken for an integer. The dumper's format predates that rule and does not want it, and
+/// the two differ in exactly that suffix: the positional layout never ends in `.0` any other
+/// way, since the shortest digits have no trailing zero.
+fn float_text(f: f64) -> String {
+    let s = f.to_str();
+    if s.len() > 2 && s.slice(s.len() - 2, s.len()) == ".0" {
+        return s.slice(0, s.len() - 2);
+    }
+    s
+}
+
+/// A string as Go's `%q` writes it.
+fn quote_str(s: String) -> String {
+    let mut out = "\"";
+    let mut i = 0;
+    while i < s.len() {
+        let w = s.char_width(i);
+        if w > 1 {
+            out = out.concat(s.slice(i, i + w));
+        } else {
+            out = out.concat(escape_byte(s.byte_at(i), 34));
+        }
+        i = i + w;
+    }
+    out.concat("\"")
+}
+
+/// A character as Go's `%q` writes it.
+fn quote_char(c: i64) -> String {
+    if c >= 128 {
+        match char::from_u32(c as u32) {
+            Option::Some(ch) => { return "'".concat(ch.to_str()).concat("'"); }
+            Option::None => {}
+        }
+    }
+    "'".concat(escape_byte(c, 39)).concat("'")
+}
+
+/// One byte of a quoted literal, with `quote` the delimiter that also needs escaping.
+fn escape_byte(b: i64, quote: i64) -> String {
+    if b == 92 { return "\\\\"; }
+    if b == quote {
+        if quote == 34 { return "\\\""; }
+        return "\\'";
+    }
+    if b == 7 { return "\\a"; }
+    if b == 8 { return "\\b"; }
+    if b == 12 { return "\\f"; }
+    if b == 10 { return "\\n"; }
+    if b == 13 { return "\\r"; }
+    if b == 9 { return "\\t"; }
+    if b == 11 { return "\\v"; }
+    if b < 32 || b == 127 {
+        return "\\x".concat(hex_byte(b));
+    }
+    match char::from_u32(b as u32) {
+        Option::Some(ch) => ch.to_str(),
+        Option::None => "?",
+    }
+}
+
+fn hex_byte(b: i64) -> String {
+    let digits = "0123456789abcdef";
+    digits.slice(b / 16, b / 16 + 1).concat(digits.slice(b % 16, b % 16 + 1))
+}
+
+/// The whole file, as a list of lines.
+pub fn dump(f: File) -> List[String] {
+    let out = list::new[String]();
+    emit(out, 0, "file");
+    let mut i = 0;
+    while i < f.uses.len() {
+        let u = f.uses.at(i);
+        let mut names = "";
+        if !u.names.is_empty() {
+            names = "::{";
+            let mut j = 0;
+            while j < u.names.len() {
+                if j > 0 {
+                    names = names.concat(", ");
+                }
+                names = names.concat(u.names.at(j));
+                j = j + 1;
+            }
+            names = names.concat("}");
+        }
+        emit(out, 1, "use \(u.path)\(names)");
+        i = i + 1;
+    }
+    let mut k = 0;
+    while k < f.items.len() {
+        dump_item(out, f.items.at(k), 1);
+        k = k + 1;
+    }
+    out
+}
+
+fn dump_item(out: List[String], item: Item, depth: i64) {
+    match item {
+        Item::Fn(d) => dump_fn(out, d, depth),
+        Item::Struct(d) => {
+            emit(out, depth, "struct \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics))");
+            dump_fields(out, d.fields, depth + 1, true);
+        }
+        Item::Enum(d) => {
+            emit(out, depth, "enum \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics))");
+            let mut i = 0;
+            while i < d.variants.len() {
+                let v = d.variants.at(i);
+                if v.kind == VARIANT_UNIT {
+                    emit(out, depth + 1, "variant \(v.name)");
+                } else {
+                    if v.kind == VARIANT_TUPLE {
+                        emit(out, depth + 1, "variant \(v.name)(..)");
+                        let mut j = 0;
+                        while j < v.types.len() {
+                            dump_type(out, v.types.at(j), depth + 2);
+                            j = j + 1;
+                        }
+                    } else {
+                        emit(out, depth + 1, "variant \(v.name){..}");
+                        dump_fields(out, v.fields, depth + 2, false);
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        Item::Trait(d) => {
+            emit(out, depth, "trait \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics))");
+            let mut i = 0;
+            while i < d.assoc.len() {
+                emit(out, depth + 1, "assoc-type \(d.assoc.at(i).name)");
+                i = i + 1;
+            }
+            let mut j = 0;
+            while j < d.methods.len() {
+                dump_fn(out, d.methods.at(j), depth + 1);
+                j = j + 1;
+            }
+        }
+        Item::Impl(d) => {
+            if d.has_trait {
+                emit(out, depth, "impl \(d.trait_path) for");
+            } else {
+                emit(out, depth, "impl");
+            }
+            dump_type(out, d.ty, depth + 1);
+            let mut i = 0;
+            while i < d.assoc.len() {
+                let a = d.assoc.at(i);
+                emit(out, depth + 1, "assoc-type \(a.name) =");
+                match a.ty {
+                    Option::Some(t) => dump_type(out, t, depth + 2),
+                    Option::None => {}
+                }
+                i = i + 1;
+            }
+            let mut j = 0;
+            while j < d.methods.len() {
+                dump_fn(out, d.methods.at(j), depth + 1);
+                j = j + 1;
+            }
+        }
+        Item::Alias(d) => {
+            emit(out, depth, "type \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics)) =");
+            dump_type(out, d.ty, depth + 1);
+        }
+        Item::Const(d) => {
+            emit(out, depth, "const \(pub_mark(d.public))\(d.name)");
+            dump_type(out, d.ty, depth + 1);
+            dump_expr(out, d.value, depth + 1);
+        }
+        Item::ErrorItem => emit(out, depth, "<error item>"),
+    }
+}
+
+fn dump_fields(out: List[String], fields: List[Field], depth: i64, with_pub: bool) {
+    let mut i = 0;
+    while i < fields.len() {
+        let f = fields.at(i);
+        if with_pub {
+            emit(out, depth, "field \(pub_mark(f.public))\(mut_prefix(f.mutable))\(f.name)");
+        } else {
+            emit(out, depth, "field \(mut_prefix(f.mutable))\(f.name)");
+        }
+        dump_type(out, f.ty, depth + 1);
+        i = i + 1;
+    }
+}
+
+fn dump_fn(out: List[String], d: FnDecl, depth: i64) {
+    emit(out, depth, "fn \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics))");
+    match d.self_param {
+        Option::Some(m) => emit(out, depth + 1, "self\(mut_mark(m))"),
+        Option::None => {}
+    }
+    let mut i = 0;
+    while i < d.params.len() {
+        let p = d.params.at(i);
+        emit(out, depth + 1, "param\(mut_mark(p.mutable))");
+        dump_pat(out, p.pat, depth + 2);
+        dump_type(out, p.ty, depth + 2);
+        i = i + 1;
+    }
+    match d.ret {
+        Option::Some(t) => {
+            emit(out, depth + 1, "returns");
+            dump_type(out, t, depth + 2);
+        }
+        Option::None => {}
+    }
+    match d.body {
+        Option::Some(b) => dump_expr(out, b, depth + 1),
+        Option::None => {}
+    }
+}
+
+fn dump_type(out: List[String], t: Type, depth: i64) {
+    match t {
+        Type::Path(path, args) => {
+            if args.is_empty() {
+                emit(out, depth, "type \(path)");
+            } else {
+                emit(out, depth, "type \(path)[..]");
+                let mut i = 0;
+                while i < args.len() {
+                    dump_type(out, args.at(i), depth + 1);
+                    i = i + 1;
+                }
+            }
+        }
+        Type::Tuple(elems) => {
+            emit(out, depth, "tuple-type");
+            let mut i = 0;
+            while i < elems.len() {
+                dump_type(out, elems.at(i), depth + 1);
+                i = i + 1;
+            }
+        }
+        Type::Unit => emit(out, depth, "unit-type"),
+        Type::Func(params, ret) => {
+            emit(out, depth, "fn-type");
+            let mut i = 0;
+            while i < params.len() {
+                dump_type(out, params.at(i), depth + 1);
+                i = i + 1;
+            }
+            emit(out, depth + 1, "->");
+            dump_type(out, ret, depth + 2);
+        }
+        Type::SelfType => emit(out, depth, "Self"),
+        Type::ErrorType => emit(out, depth, "<error type>"),
+    }
+}
+
+fn dump_stmt(out: List[String], s: Stmt, depth: i64) {
+    match s {
+        Stmt::Let(mutable, pat, ty, value) => {
+            emit(out, depth, "let\(mut_mark(mutable))");
+            dump_pat(out, pat, depth + 1);
+            match ty {
+                Option::Some(t) => dump_type(out, t, depth + 1),
+                Option::None => {}
+            }
+            dump_expr(out, value, depth + 1);
+        }
+        Stmt::ExprStmt(e, semi) => {
+            let mark = if semi { " ;" } else { "" };
+            emit(out, depth, "expr-stmt\(mark)");
+            dump_expr(out, e, depth + 1);
+        }
+        Stmt::ItemStmt(item) => {
+            emit(out, depth, "item-stmt");
+            dump_item(out, item, depth + 1);
+        }
+    }
+}
+
+fn dump_exprs(out: List[String], es: List[Expr], depth: i64) {
+    let mut i = 0;
+    while i < es.len() {
+        dump_expr(out, es.at(i), depth);
+        i = i + 1;
+    }
+}
+
+fn dump_expr(out: List[String], e: Expr, depth: i64) {
+    match e {
+        Expr::Int(v, overflow, suffix) => emit(out, depth, "int \(v)\(suffix_mark(suffix))"),
+        Expr::Float(v, suffix) => emit(out, depth, "float \(float_text(v))\(suffix_mark(suffix))"),
+        Expr::Str(v) => emit(out, depth, "str \(quote_str(v))"),
+        Expr::Char(v) => emit(out, depth, "char \(quote_char(v))"),
+        Expr::Bool(v) => emit(out, depth, "bool \(v)"),
+        Expr::Path(path, args) => {
+            if args.is_empty() {
+                emit(out, depth, "path \(path)");
+            } else {
+                emit(out, depth, "path \(path)[..]");
+                let mut i = 0;
+                while i < args.len() {
+                    dump_type(out, args.at(i), depth + 1);
+                    i = i + 1;
+                }
+            }
+        }
+        Expr::SelfExpr => emit(out, depth, "self"),
+        Expr::StructLit(path, fields) => {
+            emit(out, depth, "struct-lit \(path)");
+            let mut i = 0;
+            while i < fields.len() {
+                emit(out, depth + 1, "field \(fields.at(i).name)");
+                dump_expr(out, fields.at(i).value, depth + 2);
+                i = i + 1;
+            }
+        }
+        Expr::Tuple(elems) => {
+            if elems.is_empty() {
+                emit(out, depth, "unit");
+            } else {
+                emit(out, depth, "tuple");
+                dump_exprs(out, elems, depth + 1);
+            }
+        }
+        Expr::Lambda(params, body) => {
+            emit(out, depth, "lambda");
+            let mut i = 0;
+            while i < params.len() {
+                emit(out, depth + 1, "param");
+                dump_pat(out, params.at(i).pat, depth + 2);
+                match params.at(i).ty {
+                    Option::Some(t) => dump_type(out, t, depth + 2),
+                    Option::None => {}
+                }
+                i = i + 1;
+            }
+            dump_expr(out, body, depth + 1);
+        }
+        Expr::Block(b) => {
+            emit(out, depth, "block");
+            let mut i = 0;
+            while i < b.stmts.len() {
+                dump_stmt(out, b.stmts.at(i), depth + 1);
+                i = i + 1;
+            }
+            match b.tail {
+                Option::Some(t) => {
+                    emit(out, depth + 1, "tail");
+                    dump_expr(out, t, depth + 2);
+                }
+                Option::None => {}
+            }
+        }
+        Expr::If(cond, then, els) => {
+            emit(out, depth, "if");
+            dump_expr(out, cond, depth + 1);
+            dump_expr(out, then, depth + 1);
+            match els {
+                Option::Some(x) => {
+                    emit(out, depth + 1, "else");
+                    dump_expr(out, x, depth + 2);
+                }
+                Option::None => {}
+            }
+        }
+        Expr::Match(scrutinee, arms) => {
+            emit(out, depth, "match");
+            dump_expr(out, scrutinee, depth + 1);
+            let mut i = 0;
+            while i < arms.len() {
+                let a = arms.at(i);
+                emit(out, depth + 1, "arm");
+                dump_pat(out, a.pat, depth + 2);
+                match a.guard {
+                    Option::Some(g) => {
+                        emit(out, depth + 2, "guard");
+                        dump_expr(out, g, depth + 3);
+                    }
+                    Option::None => {}
+                }
+                dump_expr(out, a.body, depth + 2);
+                i = i + 1;
+            }
+        }
+        Expr::While(cond, body) => {
+            emit(out, depth, "while");
+            dump_expr(out, cond, depth + 1);
+            dump_expr(out, body, depth + 1);
+        }
+        Expr::For(pat, iter, body) => {
+            emit(out, depth, "for");
+            dump_pat(out, pat, depth + 1);
+            dump_expr(out, iter, depth + 1);
+            dump_expr(out, body, depth + 1);
+        }
+        Expr::Loop(body) => {
+            emit(out, depth, "loop");
+            dump_expr(out, body, depth + 1);
+        }
+        Expr::Break(v) => {
+            emit(out, depth, "break");
+            match v {
+                Option::Some(x) => dump_expr(out, x, depth + 1),
+                Option::None => {}
+            }
+        }
+        Expr::Continue => emit(out, depth, "continue"),
+        Expr::Return(v) => {
+            emit(out, depth, "return");
+            match v {
+                Option::Some(x) => dump_expr(out, x, depth + 1),
+                Option::None => {}
+            }
+        }
+        Expr::Unary(op, x) => {
+            emit(out, depth, "unary \(op)");
+            dump_expr(out, x, depth + 1);
+        }
+        Expr::Binary(op, l, r) => {
+            emit(out, depth, "binary \(op)");
+            dump_expr(out, l, depth + 1);
+            dump_expr(out, r, depth + 1);
+        }
+        Expr::Assign(op, place, value) => {
+            emit(out, depth, "assign \(op)");
+            dump_expr(out, place, depth + 1);
+            dump_expr(out, value, depth + 1);
+        }
+        Expr::Cast(x, ty) => {
+            emit(out, depth, "cast");
+            dump_expr(out, x, depth + 1);
+            dump_type(out, ty, depth + 1);
+        }
+        Expr::Call(fn_expr, args) => {
+            emit(out, depth, "call");
+            dump_expr(out, fn_expr, depth + 1);
+            dump_exprs(out, args, depth + 1);
+        }
+        Expr::Method(name, recv, args) => {
+            emit(out, depth, "method \(name)");
+            dump_expr(out, recv, depth + 1);
+            dump_exprs(out, args, depth + 1);
+        }
+        Expr::Field(name, recv) => {
+            emit(out, depth, "field \(name)");
+            dump_expr(out, recv, depth + 1);
+        }
+        Expr::Try(x) => {
+            emit(out, depth, "try");
+            dump_expr(out, x, depth + 1);
+        }
+        Expr::ErrorExpr => emit(out, depth, "<error expr>"),
+    }
+}
+
+fn dump_pat(out: List[String], p: Pat, depth: i64) {
+    match p {
+        Pat::Wild => emit(out, depth, "pat _"),
+        Pat::Lit(neg, lit) => {
+            let mark = if neg { "-" } else { "" };
+            emit(out, depth, "pat lit \(mark)");
+            dump_expr(out, lit, depth + 1);
+        }
+        Pat::Bind(mutable, name, sub) => {
+            emit(out, depth, "pat bind\(mut_mark(mutable)) \(name)");
+            match sub {
+                Option::Some(s) => dump_pat(out, s, depth + 1),
+                Option::None => {}
+            }
+        }
+        Pat::PathUnit(path) => emit(out, depth, "pat path \(path)"),
+        Pat::PathTuple(path, elems) => {
+            emit(out, depth, "pat path \(path)(..)");
+            let mut i = 0;
+            while i < elems.len() {
+                dump_pat(out, elems.at(i), depth + 1);
+                i = i + 1;
+            }
+        }
+        Pat::PathStruct(path, rest, fields) => {
+            let mark = if rest { " .." } else { "" };
+            emit(out, depth, "pat path \(path){..}\(mark)");
+            let mut i = 0;
+            while i < fields.len() {
+                emit(out, depth + 1, "field \(fields.at(i).name)");
+                dump_pat(out, fields.at(i).pat, depth + 2);
+                i = i + 1;
+            }
+        }
+        Pat::Tup(elems) => {
+            emit(out, depth, "pat tuple");
+            let mut i = 0;
+            while i < elems.len() {
+                dump_pat(out, elems.at(i), depth + 1);
+                i = i + 1;
+            }
+        }
+        Pat::Or(alts) => {
+            emit(out, depth, "pat or");
+            let mut i = 0;
+            while i < alts.len() {
+                dump_pat(out, alts.at(i), depth + 1);
+                i = i + 1;
+            }
+        }
+        Pat::ErrorPat => emit(out, depth, "<error pat>"),
+    }
+}

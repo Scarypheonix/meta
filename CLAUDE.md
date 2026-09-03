@@ -75,7 +75,8 @@ docs/spec/            THE language specification — normative; §13 collections
 docs/adr/             architecture decision records — every irreversible choice
 docs/phases/          N-complete.md, written at each phase gate
 docs/deferred.md      everything deliberately left out, each tagged with a phase
-stage1/src/           from Phase 9: the compiler for Origin, written in Origin
+stage1/src/           from Phase 9: the compiler for Origin, written in Origin --
+                      lex.origin, ast.origin and parse.origin so far
 bootstrap/            from Phase 9: the last known-good stage1 binary
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```
