@@ -1,0 +1,30 @@
+// EXPECT: accept
+// spec: 03-types.md — a lambda's unannotated parameter takes its type from the context
+// that wants the lambda. Origin has no autoref and no autoderef, so a method call inside
+// the body is resolved against one exact receiver type; that type has to be known while
+// the body is checked, not merely by the end of the call.
+//
+// Every one of these used to need `|v: Cell[i64]|` and friends.
+
+struct Holder[T] { mut item: T }
+
+impl[T] Holder[T] {
+    fn map(self, f: fn(T) -> T) {
+        self.item = f(self.item)
+    }
+}
+
+fn apply[A, B](v: A, f: fn(A) -> B) -> B {
+    f(v)
+}
+
+fn main() {
+    let h = Holder { item: Cell { value: 1 } };
+    h.map(|c| { c.set(c.get() + 1); c });
+
+    let n = apply("hello", |s| { s.len() });
+    let m = apply(Cell { value: 2 }, |c| { c.get() * 2 });
+
+    let boxed = Holder { item: "text" };
+    boxed.map(|s| { s.concat("!") });
+}

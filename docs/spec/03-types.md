@@ -80,6 +80,14 @@ concrete property (ADR-0009):
 Local `let` bindings may omit their type; lambda parameters may omit theirs when the
 expected type is known from context.
 
+A call is the context that matters, and it supplies the expectation in a fixed order: the
+callee's type is resolved first, then the arguments that are not lambdas — which is what
+solves the type variables a generic signature leaves standing — and the lambdas last,
+each checked against the parameter type the callee declares for it. So in
+`m.with(|v| v.get())` the lambda's `v` has the mutex's own element type while its body is
+being checked, which it has to: there is no autoref, so a method is found on one exact
+receiver type at the moment the lookup runs.
+
 ### Unification
 
 Unification is first-order, with the occurs check enabled. Attempting to unify a
@@ -146,6 +154,7 @@ the trap's message. Function calls in `const` initializers are DEFERRED (Phase 4
 | `let x = 1; let y: i32 = x;` | REJECTED — expected `i32`, found `i64`; no widening |
 | `let x = 1i32; let y = x as i64;` | accepted |
 | `let f = \|x\| x;` | `f: forall T. fn(T) -> T` — a lambda is code, generalized |
+| `m.with(\|v\| v.get())` where `m: Mutex[Cell[i64]]` | accepted — `v: Cell[i64]`, from the callee |
 | `let n = Option::None; let a: Option[i64] = n;` | `n: Option[i64]` — a constructor is monomorphic, so `n` unifies with its use |
 | `let n = Option::None;` used at both `Option[i64]` and `Option[String]` | REJECTED — one binding cannot have two layouts (ADR-0027) |
 | `let v = Vec::new();` | monomorphic; `Vec[?T]`, must be pinned by later use |

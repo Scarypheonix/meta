@@ -96,7 +96,7 @@ aggregate has no `mut` field to race on.
 ```origin
 use std::sync;
 
-fn Mutex::new[T](value: T) -> Mutex[T]
+fn mutex[T: Send](value: T) -> Mutex[T]
 fn (m: Mutex[T]) with[R](body: fn(T) -> R) -> R
 ```
 
@@ -107,7 +107,13 @@ unwinding, so there is no place to hang one). A closure has an end; that is the 
 mechanism.
 
 `Mutex[T]` is `Send` when `T` is. The protected value may have `mut` fields — that is the
-point — and mutating it inside `body` is exactly how shared mutable state works.
+point — and mutating it inside `body` is exactly how shared mutable state works. `with`
+returns what `body` returns and stores nothing, so a shared counter is `Mutex[Cell[i64]]`
+(or a struct of your own with a `mut` field), never `Mutex[i64]`.
+
+The constructor is the free function `sync::mutex`, not `Mutex::new`: Origin 0.1 has no
+associated functions, which `docs/deferred.md` records. `chan::channel` and `list::new`
+are spelled the same way for the same reason.
 
 Re-entering the same mutex from the thread already holding it TRAPS with
 `mutex re-entered by the same thread`, rather than deadlocking. A hang is defined

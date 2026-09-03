@@ -533,11 +533,25 @@ func plural(n int) string {
 }
 
 func (c *Checker) inferLambda(v *ast.Lambda) types.Type {
+	return c.inferLambdaExpecting(v, nil)
+}
+
+// inferLambdaExpecting checks a lambda against the function type its context wants, when
+// there is one. An unannotated parameter takes its type from `want` rather than from a
+// fresh variable, which is what makes `m.with(|v| v.get())` work: a method call inside the
+// body is resolved against the receiver's exact type (there is no autoref), so that type
+// has to be known while the body is being checked, not merely by the end of the call.
+func (c *Checker) inferLambdaExpecting(v *ast.Lambda, want *types.FnT) types.Type {
+	if want != nil && len(want.Params) != len(v.Params) {
+		want = nil // the arity error is reported by the caller's unification
+	}
 	params := make([]types.Type, 0, len(v.Params))
-	for _, p := range v.Params {
+	for i, p := range v.Params {
 		var t types.Type
 		if p.Type != nil {
 			t = c.toType(p.Type)
+		} else if want != nil {
+			t = want.Params[i]
 		} else {
 			t = c.freshFor(p.Span())
 		}
@@ -1003,11 +1017,10 @@ func (c *Checker) rejectCast(v *ast.Cast, from, to types.Type) {
 
 func (c *Checker) inferCall(v *ast.Call) types.Type {
 	callee := c.infer(v.Fn)
-	args := make([]types.Type, 0, len(v.Args))
-	for _, a := range v.Args {
-		args = append(args, c.infer(a))
-	}
 	if types.IsError(callee) {
+		for _, a := range v.Args {
+			c.infer(a) // still check them, so one mistake is one diagnostic
+		}
 		return types.Error
 	}
 
@@ -1016,6 +1029,20 @@ func (c *Checker) inferCall(v *ast.Call) types.Type {
 	types.ApplyDefaults(callee)
 
 	fn, ok := types.Prune(callee).(*types.FnT)
+	if ok && len(v.Args) == len(fn.Params) {
+		args := c.inferArgs(v.Args, fn.Params, ordinalArg)
+		_ = args
+		// The concurrency builtins carry obligations their signatures cannot: the `Send`
+		// bounds ADR-0014 rests on, and a spawned closure's captures
+		// (spec/12-concurrency.md).
+		c.checkConcurrencyCall(v, fn, fn.Ret)
+		return fn.Ret
+	}
+
+	args := make([]types.Type, 0, len(v.Args))
+	for _, a := range v.Args {
+		args = append(args, c.infer(a))
+	}
 	if !ok {
 		if _, unsolved := types.Prune(callee).(*types.Var); unsolved {
 			// The callee's type is still open: constrain it to a function rather than
@@ -1034,21 +1061,41 @@ func (c *Checker) inferCall(v *ast.Call) types.Type {
 		return types.Error
 	}
 
-	if len(args) != len(fn.Params) {
-		c.bag.Errorf("E0061", v.Span(),
-			"this function takes %d argument%s but %d %s supplied",
-			len(fn.Params), plural(len(fn.Params)), len(args), wereOrWas(len(args))).
-			Label("wrong number of arguments").
-			Note("its type is `%s`", fn)
-		return fn.Ret
-	}
-	for i := range args {
-		c.unify(fn.Params[i], args[i], v.Args[i].Span(), ordinalArg(i))
-	}
-	// The concurrency builtins carry obligations their signatures cannot: the `Send`
-	// bounds ADR-0014 rests on, and a spawned closure's captures (spec/12-concurrency.md).
-	c.checkConcurrencyCall(v, fn, fn.Ret)
+	c.bag.Errorf("E0061", v.Span(),
+		"this function takes %d argument%s but %d %s supplied",
+		len(fn.Params), plural(len(fn.Params)), len(args), wereOrWas(len(args))).
+		Label("wrong number of arguments").
+		Note("its type is `%s`", fn)
 	return fn.Ret
+}
+
+// inferArgs checks a call's arguments against the parameter types the callee declares,
+// and unifies each one.
+//
+// Lambdas go last, and that is the whole point: unifying the ordinary arguments first can
+// solve the type variables a generic signature leaves in the *lambda's* parameter types,
+// so that by the time the lambda's body is checked its parameters have real types. Before
+// this, `sort_by(nums, |a, b| a < b)` worked only because `<` on two unknowns could wait,
+// and `m.with(|v| v.get())` did not work at all -- method lookup needs the receiver's
+// exact type at the moment it runs.
+func (c *Checker) inferArgs(argExprs []ast.Expr, params []types.Type, kind func(int) string) []types.Type {
+	args := make([]types.Type, len(argExprs))
+	var lambdas []int
+	for i, a := range argExprs {
+		if _, isLambda := a.(*ast.Lambda); isLambda {
+			lambdas = append(lambdas, i)
+			continue
+		}
+		args[i] = c.infer(a)
+		c.unify(params[i], args[i], a.Span(), kind(i))
+	}
+	for _, i := range lambdas {
+		lam := argExprs[i].(*ast.Lambda)
+		want, _ := types.Prune(params[i]).(*types.FnT)
+		args[i] = c.inferLambdaExpecting(lam, want)
+		c.unify(params[i], args[i], lam.Span(), kind(i))
+	}
+	return args
 }
 
 func wereOrWas(n int) string {
@@ -1072,11 +1119,10 @@ func ordinalArg(i int) string {
 
 func (c *Checker) inferMethodCall(v *ast.MethodCall) types.Type {
 	recv := c.normalize(c.infer(v.Recv))
-	args := make([]types.Type, 0, len(v.Args))
-	for _, a := range v.Args {
-		args = append(args, c.infer(a))
-	}
 	if types.IsError(recv) {
+		for _, a := range v.Args {
+			c.infer(a) // still check them, so one mistake is one diagnostic
+		}
 		return types.Error
 	}
 	// An unsolved receiver has no methods to look up yet; defaulting it here is what
@@ -1097,6 +1143,9 @@ func (c *Checker) inferMethodCall(v *ast.MethodCall) types.Type {
 	cand, ambiguous := c.lookupMethod(recv, v.Name.Name)
 	if cand == nil {
 		c.reportNoMethod(v, recv, ambiguous)
+		for _, a := range v.Args {
+			c.infer(a)
+		}
 		return types.Error
 	}
 	c.out.Methods[v.NodeID()] = cand.Decl
@@ -1135,6 +1184,9 @@ func (c *Checker) inferMethodCall(v *ast.MethodCall) types.Type {
 		c.bag.Errorf("E0599", v.Span(), "`%s` is an associated function, not a method", v.Name.Name).
 			Label("it does not take `self`").
 			Help("call it as `%s::%s(...)`", recv, v.Name.Name)
+		for _, a := range v.Args {
+			c.infer(a)
+		}
 		return types.Error
 	}
 
@@ -1142,16 +1194,19 @@ func (c *Checker) inferMethodCall(v *ast.MethodCall) types.Type {
 	for _, p := range cand.Sig.ParamTypes {
 		params = append(params, c.normalize(types.Substitute(p, subst)))
 	}
-	if len(args) != len(params) {
+	if len(v.Args) != len(params) {
+		for _, a := range v.Args {
+			c.infer(a)
+		}
 		c.bag.Errorf("E0061", v.Span(),
 			"`%s` takes %d argument%s but %d %s supplied",
-			v.Name.Name, len(params), plural(len(params)), len(args), wereOrWas(len(args))).
+			v.Name.Name, len(params), plural(len(params)), len(v.Args), wereOrWas(len(v.Args))).
 			Label("wrong number of arguments")
 		return c.normalize(types.Substitute(cand.Sig.Ret, subst))
 	}
-	for i := range args {
-		c.unify(params[i], args[i], v.Args[i].Span(), ordinalArg(i))
-	}
+	// Arguments are checked against the parameter types the method declares, lambdas last,
+	// so that `m.with(|v| v.get())` knows what `v` is while its body is being checked.
+	c.inferArgs(v.Args, params, ordinalArg)
 	return c.normalize(types.Substitute(cand.Sig.Ret, subst))
 }
 

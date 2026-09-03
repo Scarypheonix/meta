@@ -1,0 +1,108 @@
+// Every pattern form §05 has that the other cases do not exercise -- or-patterns, guards,
+// a literal arm, patterns nested two enums deep -- plus four levels of generic nesting,
+// module-level constants, and four threads sharing one `Mutex`.
+//
+// The mutex is the part that found something. `counter.with(|v| v.set(v.get() + step))`
+// did not compile: a lambda argument's parameter types came from fresh variables rather
+// than from the callee's signature, and a method call inside the body needs the receiver's
+// exact type at the moment it is looked up, not by the end of the call. Every closure
+// passed to a higher-order function whose body called a method needed an annotation.
+
+use std::io;
+use std::list;
+use std::map;
+use std::sync;
+use std::thread;
+
+const LIMIT: i64 = 5;
+const NAME: String = "counted";
+
+enum Token { Num(i64), Word(String), Plus, Minus, Star }
+
+fn shape(t: Token) -> String {
+    match t {
+        Token::Plus | Token::Minus => "additive",
+        Token::Star => "multiplicative",
+        Token::Num(n) if n < 0 => "negative \(n)",
+        Token::Num(0) => "zero",
+        Token::Num(n) => "number \(n)",
+        Token::Word(w) => "word \(w)",
+    }
+}
+
+fn nested(o: Option[Result[i64, String]]) -> String {
+    match o {
+        Option::None => "nothing",
+        Option::Some(Result::Ok(n)) if n > LIMIT => "big \(n)",
+        Option::Some(Result::Ok(n)) => "ok \(n)",
+        Option::Some(Result::Err(e)) => "err \(e)",
+    }
+}
+
+struct Pair[A, B] { a: A, b: B }
+
+/// Four levels of generic nesting, built and then read back.
+fn deep() -> Map[String, List[Option[Pair[i64, String]]]] {
+    let m = map::new[String, List[Option[Pair[i64, String]]]]();
+    let xs = list::new[Option[Pair[i64, String]]]();
+    xs.push(Option::Some(Pair { a: 1, b: "one" }));
+    xs.push(Option::None);
+    xs.push(Option::Some(Pair { a: 3, b: "three" }));
+    m.insert(NAME, xs);
+    m
+}
+
+fn main() {
+    io::println(shape(Token::Plus));
+    io::println(shape(Token::Minus));
+    io::println(shape(Token::Star));
+    io::println(shape(Token::Num(-2)));
+    io::println(shape(Token::Num(0)));
+    io::println(shape(Token::Num(9)));
+    io::println(shape(Token::Word("hi")));
+
+    io::println(nested(Option::None));
+    io::println(nested(Option::Some(Result::Ok(9))));
+    io::println(nested(Option::Some(Result::Ok(2))));
+    io::println(nested(Option::Some(Result::Err("bad"))));
+
+    let m = deep();
+    match m.get(NAME) {
+        Option::None => io::println("missing"),
+        Option::Some(xs) => {
+            let mut out = "";
+            for item in xs {
+                match item {
+                    Option::None => { out = out.concat("_ "); }
+                    Option::Some(p) => { out = out.concat("\(p.a):\(p.b) "); }
+                }
+            }
+            io::println(out.trim());
+        }
+    }
+
+    // A mutex shared by several threads, each adding a fixed amount. What the mutex holds
+    // is an aggregate with a `mut` field: `with` returns what its body returns and stores
+    // nothing, so a shared counter is a mutation through the protected value, exactly as
+    // spec/12-concurrency.md says.
+    let counter = sync::mutex(Cell { value: 0 });
+    let handles = list::new[JoinHandle[i64]]();
+    let mut i = 0;
+    while i < 4 {
+        let step = i + 1;
+        handles.push(thread::spawn(|| -> i64 {
+            let mut k = 0;
+            while k < 10 {
+                counter.with(|v| { v.set(v.get() + step) });
+                k = k + 1;
+            }
+            step
+        }));
+        i = i + 1;
+    }
+    let mut claimed = 0;
+    for h in handles {
+        claimed = claimed + h.join();
+    }
+    io::println("claimed \(claimed) total \(counter.with(|v| { v.get() }))");
+}
