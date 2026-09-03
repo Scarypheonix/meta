@@ -27,9 +27,17 @@ mypkg::lex::token::Token      absolute, from a package name
 std::io::println              absolute, into a dependency
 lex::token::Token             relative, resolved against the current module's parent
 Token                         a name brought into scope by `use`, or declared locally
+lex::token::Token::Ident      a variant of another module's enum
 Self::Item                    an associated type of the impl's self type
 i64::MAX                      an associated const of a primitive
 ```
+
+A path's last segment names an item in the module the segments before it name — except
+for a variant, where the last *two* segments are the enum and the variant and everything
+before them is the module. `lex::token::Token::Ident` is therefore module `lex::token`,
+enum `Token`, variant `Ident`, and it means the same thing in an expression and in a
+pattern. The enum must be visible from here; the variant itself carries no separate
+visibility.
 
 Resolution order for a bare identifier, first hit wins:
 
@@ -111,3 +119,6 @@ the module-boundary contract from process rule 5 — `internal/resolve` owns it 
 | a file under `src/` never mentioned by any `use` | compiled anyway; unused-item warning |
 | `const A: i64 = B; const B: i64 = A;` | REJECTED — cyclic const |
 | `i64::MAX` | accepted — associated const on a primitive |
+| `b::Enum::Variant` where `b.origin` declares `pub enum Enum` | accepted — in an expression and in a pattern |
+| same, but `Enum` is not `pub` | REJECTED `E0603` — private, note on the declaration |
+| `b::Struct::Variant` where `Struct` is not an enum | REJECTED `E0433` — only an enum has variants |

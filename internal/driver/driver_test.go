@@ -235,3 +235,98 @@ pub fn area(s: Shape) -> f64 {
 		t.Errorf("stdout = %q", got)
 	}
 }
+
+// A variant of another module's enum is named by its full path, in an expression and in a
+// pattern. This is what a program in more than one file writes constantly -- a compiler in
+// Origin would spell every AST node this way -- and it did not resolve: the code for it sat
+// inside a branch that required `shapes::Shape` itself to name a module, which it never
+// does, so the only way to reach a variant was to `use` the enum first.
+func TestQualifiedVariantOfAnotherModulesEnum(t *testing.T) {
+	stdout, stderr, code := runPackage(t, map[string]string{
+		"main.origin": `use std::io;
+use shapes;
+
+fn main() {
+    io::println(name(shapes::Shape::Circle(2)));
+    io::println(name(shapes::Shape::Rect(3, 4)));
+    io::println(name(shapes::Shape::Dot));
+}
+
+fn name(s: shapes::Shape) -> String {
+    match s {
+        shapes::Shape::Circle(r) => "circle \(r)",
+        shapes::Shape::Rect(w, h) => "rect \(w * h)",
+        shapes::Shape::Dot => "dot",
+    }
+}
+`,
+		"shapes.origin": `pub enum Shape {
+    Circle(i64),
+    Rect(i64, i64),
+    Dot,
+}
+`,
+	})
+	if code != 0 {
+		t.Fatalf("exit %d\nstderr:\n%s", code, stderr)
+	}
+	if want := "circle 2\nrect 12\ndot\n"; stdout != want {
+		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+}
+
+// A submodule's enum, so the module prefix is more than one segment.
+func TestQualifiedVariantThroughASubmodule(t *testing.T) {
+	stdout, stderr, code := runPackage(t, map[string]string{
+		"main.origin": `use std::io;
+use ast::expr;
+
+fn main() {
+    let e = ast::expr::Node::Leaf(7);
+    match e {
+        ast::expr::Node::Leaf(n) => io::println(n.to_str()),
+        ast::expr::Node::Empty => io::println("empty"),
+    }
+}
+`,
+		"ast/expr.origin": `pub enum Node {
+    Leaf(i64),
+    Empty,
+}
+`,
+	})
+	if code != 0 {
+		t.Fatalf("exit %d\nstderr:\n%s", code, stderr)
+	}
+	if want := "7\n"; stdout != want {
+		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+}
+
+// The three ways a qualified variant path can be wrong, each with its own diagnostic
+// rather than the generic "cannot resolve this path".
+func TestQualifiedVariantDiagnostics(t *testing.T) {
+	cases := []struct {
+		name, main, want string
+	}{
+		{"private enum", "let a = other::Hidden::One;", "`Hidden` is private"},
+		{"not an enum", "let a = other::Thing::One;", "`Thing` is not an enum"},
+		{"no such item", "let a = other::Nope::One;", "has no item `Nope`"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, stderr, code := runPackage(t, map[string]string{
+				"main.origin": "use other;\n\nfn main() {\n    " + tc.main + "\n}\n",
+				"other.origin": `enum Hidden { One, Two }
+pub struct Thing { x: i64 }
+`,
+			})
+			if code == 0 {
+				t.Fatal("expected this to be rejected")
+			}
+			if !strings.Contains(stderr, tc.want) {
+				t.Errorf("stderr does not mention %q:\n%s", tc.want, stderr)
+			}
+		})
+	}
+}

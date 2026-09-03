@@ -897,25 +897,44 @@ func (r *resolver) resolvePathIn(path *ast.Path, nodeID ast.NodeID, inPattern bo
 			r.out.Refs[nodeID] = ref
 			return
 		}
-		// `mod::Enum::Variant`
-		if len(segs) >= 3 {
-			if outer := r.lookupModule(segs[:len(segs)-2]); outer != nil {
-				enumRef, pub, ok := outer.Lookup(segs[len(segs)-2].Name)
-				if ok && enumRef.Kind == Enum {
-					if !pub && outer != r.current {
-						r.reportPrivate(segs[len(segs)-2].Loc, outer, segs[len(segs)-2].Name, enumRef)
-						r.out.Refs[nodeID] = Ref{Kind: Unresolved}
-						return
-					}
-					r.resolveVariant(enumRef, last, nodeID)
-					return
-				}
-			}
-		}
 		r.bag.Errorf("E0433", last.Loc, "%s has no item `%s`", m.Describe(), last.Name).
 			Label("not found in that module")
 		r.out.Refs[nodeID] = Ref{Kind: Unresolved}
 		return
+	}
+
+	// `mod::Enum::Variant`, with as many module segments in front as there are: the last
+	// two segments are the enum and its variant, and everything before them is the module.
+	//
+	// This has to be its own step rather than a fallback inside the one above, because in
+	// `shapes::Shape::Circle` the prefix `shapes::Shape` is not a module and never will be
+	// -- so the branch that requires it to be one is never entered, and a program in more
+	// than one file could not name another module's variant at all except by importing the
+	// enum first.
+	if len(segs) >= 3 {
+		if outer := r.lookupModule(segs[:len(segs)-2]); outer != nil {
+			owner := segs[len(segs)-2]
+			enumRef, pub, ok := outer.Lookup(owner.Name)
+			if ok && enumRef.Kind == Enum {
+				if !pub && outer != r.current {
+					r.reportPrivate(owner.Loc, outer, owner.Name, enumRef)
+					r.out.Refs[nodeID] = Ref{Kind: Unresolved}
+					return
+				}
+				r.resolveVariant(enumRef, segs[len(segs)-1], nodeID)
+				return
+			}
+			if ok {
+				r.bag.Errorf("E0433", owner.Loc, "`%s` is not an enum", owner.Name).
+					Label("only an enum has variants")
+				r.out.Refs[nodeID] = Ref{Kind: Unresolved}
+				return
+			}
+			r.bag.Errorf("E0433", owner.Loc, "%s has no item `%s`", outer.Describe(), owner.Name).
+				Label("not found in that module")
+			r.out.Refs[nodeID] = Ref{Kind: Unresolved}
+			return
+		}
 	}
 
 	if !inScope {
@@ -926,7 +945,7 @@ func (r *resolver) resolvePathIn(path *ast.Path, nodeID ast.NodeID, inPattern bo
 
 	r.bag.Errorf("E0433", path.Span(), "cannot resolve `%s`", path).
 		Label("unresolved path").
-		Note("a qualified path is `module::item`, `Enum::Variant`, `Self::AssocType` or `T::AssocType`")
+		Note("a qualified path is `module::item`, `Enum::Variant`, `module::Enum::Variant`, `Self::AssocType` or `T::AssocType`")
 	r.out.Refs[nodeID] = Ref{Kind: Unresolved}
 }
 
