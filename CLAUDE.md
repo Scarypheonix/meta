@@ -76,8 +76,8 @@ docs/adr/             architecture decision records — every irreversible choic
 docs/phases/          N-complete.md, written at each phase gate
 docs/deferred.md      everything deliberately left out, each tagged with a phase
 stage1/src/           from Phase 9: the compiler for Origin, written in Origin --
-                      lex.origin, ast.origin, parse.origin, source.origin and
-                      main.origin (its own command line) so far
+                      lex.origin, ast.origin, parse.origin, source.origin,
+                      resolve.origin and main.origin (its own command line) so far
 bootstrap/            from Phase 9: the last known-good stage1 binary
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```
@@ -184,34 +184,60 @@ This project outlasts any single context window.
 ## Status
 
 **Phase 9 is in progress.** Its scope is **self-hosting**: a compiler for Origin, written
-in Origin. What exists in `stage1/src/` is the front end through parsing --
-`lex.origin`, `ast.origin`, `parse.origin`, `source.origin` -- and `main.origin`, which
-makes stage1 an actual command-line program (`stage1 dump-tokens|dump-ast|parse <file>...`)
-shaped like `cmd/originc`'s. Each component is held to the Go one it replaces over this
-repository's own ~400 `.origin` files: the token stream against `internal/lex`, the dumped
-syntax tree against `internal/ast`, the position mapping against `internal/source`, and the
-*places* syntax errors are reported against `internal/lex` + `internal/parse`. All in
-`tests/selfhost`.
+in Origin. What exists in `stage1/src/` is the front end through **name resolution** --
+`lex.origin`, `ast.origin`, `parse.origin`, `source.origin`, `resolve.origin` -- and
+`main.origin`, which makes stage1 an actual command-line program
+(`stage1 dump-tokens|dump-ast|parse|resolve <file>...`) shaped like `cmd/originc`'s. Each
+component is held to the Go one it replaces over this repository's own ~400 `.origin`
+files, all in `tests/selfhost`: the token stream against `internal/lex`, the dumped syntax
+tree against `internal/ast`, the position mapping against `internal/source`, the *places*
+syntax errors are reported against `internal/lex` + `internal/parse`, and the whole of
+resolution against `internal/resolve` — 397 packages, 744,896 trace lines, diagnostics and
+their wording included.
 
 The language grew what a compiler cannot be written without: **the command line and the
 exit status** (`docs/spec/17-process.md`) — `args()` in the prelude over `env::arg_count`
 and `env::arg_at`, and `process::exit`, which ends the *process* and not the thread on all
 three engines. `bootstrap/` is still empty; nothing has self-compiled yet.
 
-**Next action:** name resolution, which is the next component in stage1's own order and the
-first one whose oracle is not shaped like the others — `internal/resolve` produces side
-tables keyed by node id, and stage1's AST deliberately has no node ids. Decide what the
-comparable output is before writing the resolver. Also outstanding, and cheap:
-`docs/deferred.md` records stage1's diagnostic *wording* as unaligned (positions and counts
-already agree), which is a `token_name`, a hex formatter and a dozen message sites.
+**The resolution oracle is the one thing that had to be invented,** and the shape is worth
+reusing for the checker: side tables keyed by node id cannot be compared against a tree with
+no node ids, so both resolvers emit **one line per event, in order**, and the *sequence* is
+what is compared. A line's position identifies the node; what it says identifies what the
+node resolved to, naming a declaration by the `<file>:<offset>` of its own name so that two
+bindings called `x` are the same only if they were declared in the same place.
+`internal/resolve/trace.go` is the Go side.
+
+**Next action:** type checking — `internal/check` is the next component, and the same trace
+shape should carry it (one line per inferred type, in order). Before that, two things found
+while writing the resolver are worth doing first, both cheap: `docs/deferred.md` records
+stage1's *parser* diagnostic wording as unaligned (positions and counts agree; the resolver's
+wording already matches exactly), and `stage1/src/` has no `check` subcommand because nothing
+checks types yet.
 
 **What Phase 9 has found so far** — the same tell as Phase 8, and worth expecting again:
-every bug came from *running Origin*, not from reading Go. Writing `main.origin` needed a
-multi-line string, which exposed that both lexers ended a string literal at a newline while
-`docs/spec/01-lexical.md` had always said a literal may span lines. The Go lexer's own error
-note said so too, beside the condition contradicting it. Running stage1's parser over the
-corpus as a *program* exposed that its interpolation sub-parser threw its diagnostics away,
-so every syntax error inside `\(...)` vanished silently.
+every bug came from *running Origin*, not from reading Go.
+
+- Writing `main.origin` needed a multi-line string, which exposed that both lexers ended a
+  string literal at a newline while `docs/spec/01-lexical.md` had always said a literal may
+  span lines. The Go lexer's own error note said so too, beside the condition contradicting
+  it.
+- Running stage1's parser over the corpus as a *program* exposed that its interpolation
+  sub-parser threw its diagnostics away, so every syntax error inside `\(...)` vanished.
+- **`ast.Dump` was not a complete description of the tree**, which is the premise the whole
+  parse differential rests on. It printed a generic parameter's name and never its bounds,
+  never a `where` clause, never supertraits, never an assoc-type's bounds, never an impl's
+  generics, never a trait reference's type arguments, never an integer literal's overflow
+  flag, never a struct literal's type arguments, never a lambda's return type — and stage1's
+  parser had duly thrown every one of them away. **When the oracle has a hole, the thing it
+  is checking inherits it.** Both sides now carry them.
+- A **collector-era bug four phases old**: `equal_objects` compared a String's trailing
+  partial word whole, assuming the bytes above the last meaningful one were zero. True until
+  the first collection; false forever after, because every allocation then comes out of a
+  semispace that has been used before. Two strings of the same text could compare unequal —
+  only in native code, only after a collection, only for a length not a multiple of eight,
+  and only between strings built separately. A `Map` keyed by `String` has all four at once,
+  and the resolver stopped finding `std::chan` after the 131st package.
 
 **Phase 8 is complete** (`docs/phases/8-complete.md`). Two halves. The first closed the
 three places `docs/spec/` and the implementation had drifted apart since Phase 5:
