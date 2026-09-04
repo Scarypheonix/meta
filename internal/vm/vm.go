@@ -24,6 +24,10 @@ import (
 	"github.com/scarypheonix/meta/internal/prelude"
 )
 
+// exitRequest carries `process::exit`'s status out through the machine's own stack. It is
+// not a trap: nothing went wrong, and nothing is printed.
+type exitRequest struct{ code int }
+
 // TrapExitCode is the process exit status after a trap (spec/04-expressions.md).
 const TrapExitCode = 101
 
@@ -99,6 +103,9 @@ type VM struct {
 	// than exhausting the host (spec/08-memory-model.md).
 	maxFrames int
 
+	// args is the process's command line, program path first (spec/17-process.md).
+	args []string
+
 	// w is the shared world -- the scheduler, the channels, and every other thread's
 	// machine (spec/12-concurrency.md). tid identifies this thread, main being 1.
 	w   *world
@@ -118,6 +125,8 @@ type Config struct {
 	Heap      gc.Config
 	MaxFrames int
 	MaxStack  int
+	// Args is the process's command line, program path first (spec/17-process.md).
+	Args []string
 }
 
 // New builds a VM for a program.
@@ -136,6 +145,7 @@ func New(prog *bytecode.Program, cfg Config, stdout, stderr io.Writer) *VM {
 		stack:     make([]Value, 0, 256),
 		strings:   map[int]layout.Ref{},
 		maxFrames: cfg.MaxFrames,
+		args:      cfg.Args,
 		w:         newWorld(),
 		tid:       1,
 	}
@@ -236,14 +246,27 @@ func (v *VM) Run() (exitCode int) {
 		if r == nil {
 			return
 		}
-		// `dying` means another thread trapped first and this one was woken to unwind;
-		// the trap to report is that one (ADR-0026).
+		// `process::exit` is an ordinary end to the program, not a failure
+		// (spec/17-process.md).
+		if e, requested := r.(exitRequest); requested {
+			exitCode = e.code
+			return
+		}
+		// `dying` means another thread ended the process first and this one was woken to
+		// unwind; what to report is that thread's trap or its exit status (ADR-0026,
+		// spec/17-process.md).
 		if _, unwinding := r.(dying); unwinding {
 			v.w.mu.Lock()
-			t := v.w.trap
+			t, exiting, code := v.w.trap, v.w.exiting, v.w.exitCode
 			v.w.mu.Unlock()
 			if t != nil {
 				fmt.Fprintln(v.stderr, t.Error())
+				exitCode = TrapExitCode
+				return
+			}
+			if exiting {
+				exitCode = code
+				return
 			}
 			exitCode = TrapExitCode
 			return
@@ -283,12 +306,17 @@ func (v *VM) Run() (exitCode int) {
 	v.w.exec.Unlock()
 	v.w.wg.Wait()
 
+	// A thread that trapped or exited while main was finishing still ends the process
+	// (ADR-0026, spec/17-process.md).
 	v.w.mu.Lock()
-	t := v.w.trap
+	t, exiting, code := v.w.trap, v.w.exiting, v.w.exitCode
 	v.w.mu.Unlock()
 	if t != nil {
 		fmt.Fprintln(v.stderr, t.Error())
 		return TrapExitCode
+	}
+	if exiting {
+		return code
 	}
 	return 0
 }

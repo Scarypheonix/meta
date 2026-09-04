@@ -332,6 +332,19 @@ func (v *VM) callBuiltin(index, argCount int, kind bytecode.Kind, span diag.Span
 	}
 
 	switch index {
+	case compile.BuiltinArgCount:
+		v.push(intVal(int64(len(v.args))))
+		return
+	case compile.BuiltinArgAt:
+		i := args[0].Int()
+		if i < 0 || i >= int64(len(v.args)) {
+			v.trap(v.userSpan(span), "index out of range")
+		}
+		v.push(refVal(v.newString(v.args[i], span)))
+		return
+	case compile.BuiltinExit:
+		panic(exitRequest{code: int(args[0].Int()) & 0xFF})
+
 	case compile.BuiltinCharValid:
 		// Only the predicate: internal/compile builds the `Option` out of this and the
 		// value itself, which needs no conversion (spec/04-expressions.md).

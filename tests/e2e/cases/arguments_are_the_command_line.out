@@ -1,0 +1,6 @@
+count: 4
+0: tests/e2e/cases/arguments_are_the_command_line.origin
+1: alpha
+2: beta gamma
+3: 
+mine: 0, still: 4

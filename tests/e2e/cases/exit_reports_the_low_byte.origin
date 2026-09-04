@@ -1,0 +1,9 @@
+// A status is one byte, so `process::exit(code)` reports `code & 0xFF`: -1 is 255 and 256
+// is 0 (spec/17-process.md's table).
+use std::io;
+use std::process;
+
+fn main() {
+    io::println("bye");
+    process::exit(0 - 1);
+}

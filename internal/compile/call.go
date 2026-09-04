@@ -49,6 +49,10 @@ var builtinIndex = map[string]int{
 
 	"char::from_u32": BuiltinCharValid,
 
+	"env::arg_count": BuiltinArgCount,
+	"env::arg_at":    BuiltinArgAt,
+	"process::exit":  BuiltinExit,
+
 	"float::bits":      BuiltinFloatBits,
 	"float::from_bits": BuiltinFloatFromBits,
 

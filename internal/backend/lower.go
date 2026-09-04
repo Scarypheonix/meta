@@ -943,6 +943,43 @@ func (e *emitter) builtin(v *ir.Value) error {
 		}
 		return e.strConcat(v)
 
+	case compile.BuiltinArgCount:
+		if len(v.Args) != 0 {
+			return fmt.Errorf("this is a compiler bug: env::arg_count takes no arguments, got %d", len(v.Args))
+		}
+		// The first word of the argument vector is the count the kernel wrote there
+		// (spec/17-process.md); no routine is needed to read one word.
+		e.a.MovRM(scratchA, x86.At(x86.R15, rtArgvOff))
+		e.a.MovRM(scratchA, x86.At(scratchA, 0))
+		e.def(v, scratchA)
+		return nil
+
+	case compile.BuiltinArgAt:
+		if len(v.Args) != 1 {
+			return fmt.Errorf("this is a compiler bug: env::arg_at takes one argument, got %d", len(v.Args))
+		}
+		e.load(x86.RDI, v.Args[0])
+		e.a.Call(e.rt.argAt)
+		e.recordCall(v)
+		e.refusedStatus(v, "index out of range")
+		e.def(v, x86.RDX)
+		return nil
+
+	case compile.BuiltinExit:
+		if len(v.Args) != 1 {
+			return fmt.Errorf("this is a compiler bug: process::exit takes one argument, got %d", len(v.Args))
+		}
+		// It ends the process rather than the thread, so there is nothing to unwind and
+		// no scheduler to tell: the syscall is the whole of it (spec/17-process.md).
+		e.load(x86.RDI, v.Args[0])
+		e.a.AndRI(x86.RDI, 0xFF)
+		e.a.MovRI(x86.RAX, e.target.SysExit)
+		e.a.Syscall()
+		e.a.Ud2()
+		e.a.XorRR(scratchA, scratchA)
+		e.def(v, scratchA)
+		return nil
+
 	case compile.BuiltinCharValid:
 		if len(v.Args) != 1 {
 			return fmt.Errorf("this is a compiler bug: char::from_u32 takes one argument, got %d", len(v.Args))

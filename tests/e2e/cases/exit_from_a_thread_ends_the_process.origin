@@ -1,0 +1,16 @@
+use std::io;
+use std::thread;
+use std::process;
+
+// `process::exit` ends the process, not the thread that called it (spec/17-process.md):
+// the joining thread never comes back, exactly as ADR-0026 has it for a panic.
+fn main() {
+    let h = thread::spawn(|| -> i64 {
+        io::println("in the thread");
+        process::exit(7);
+        0
+    });
+    io::println("spawned");
+    let v = h.join();
+    io::println("not reached: \(v)");
+}

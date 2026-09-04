@@ -1,0 +1,11 @@
+// EXPECT: accept
+// spec: 17-process.md — `args()` comes from the prelude, so it needs no `use`.
+
+// `args()` is a prelude function, in scope everywhere without a `use`, exactly as
+// `read_to_string` is (spec/17-process.md). `io` is a module and still needs one.
+use std::io;
+
+fn main() {
+    let a: List[String] = args();
+    io::println("\(a.len())");
+}

@@ -41,6 +41,12 @@ type world struct {
 	blocked int
 	trap    *Trap
 
+	// exiting and exitCode are `process::exit` from any thread. It ends the process the
+	// way a trap does -- every parked thread is woken to unwind -- and differs only in
+	// what is reported at the end: a status, and nothing on stderr (spec/17-process.md).
+	exiting  bool
+	exitCode int
+
 	threads  map[int64]*vmThread
 	channels map[int64]*vmChannel
 	mutexes  map[int64]*vmMutex
@@ -114,6 +120,19 @@ func (w *world) fail(t *Trap) {
 	w.cond.Broadcast()
 }
 
+// requestExit records the first `process::exit` and wakes every parked thread, exactly as
+// fail does for a trap (spec/17-process.md).
+func (w *world) requestExit(code int) {
+	if !w.exiting && w.trap == nil {
+		w.exiting, w.exitCode = true, code
+	}
+	w.cond.Broadcast()
+}
+
+// ending reports whether the process is already on its way out, by a trap in some thread
+// or by `process::exit`. Called with w.mu held.
+func (w *world) ending() bool { return w.trap != nil || w.exiting }
+
 // wait parks the calling thread until ready() holds.
 //
 // The world lock is released for the duration: a parked thread is not executing, so it
@@ -125,7 +144,7 @@ func (w *world) wait(v *VM, span diag.Span, ready func() bool) {
 	defer delete(w.waiters, id)
 
 	for !ready() {
-		if w.trap != nil {
+		if w.ending() {
 			panic(dying{})
 		}
 		w.waiters[id] = ready
@@ -147,7 +166,7 @@ func (w *world) wait(v *VM, span diag.Span, ready func() bool) {
 		w.exec.Lock()
 		w.mu.Lock()
 
-		if w.trap != nil {
+		if w.ending() {
 			panic(dying{})
 		}
 	}
@@ -172,7 +191,7 @@ func (v *VM) safepoint() {
 	v.w.exec.Unlock()
 	v.w.exec.Lock()
 	v.w.mu.Lock()
-	fatal := v.w.trap != nil
+	fatal := v.w.ending()
 	v.w.mu.Unlock()
 	if fatal {
 		panic(dying{})
@@ -250,7 +269,7 @@ func (v *VM) spawn(body Value, span diag.Span) int64 {
 	child := &VM{
 		prog: v.prog, heap: v.heap, stdout: v.stdout, stderr: v.stderr,
 		stack: make([]Value, 0, 256), strings: v.strings,
-		maxFrames: v.maxFrames, w: w, tid: tid,
+		maxFrames: v.maxFrames, args: v.args, w: w, tid: tid,
 	}
 	// Registered before the goroutine starts, so a collection triggered by any thread
 	// between now and its first instruction still sees the closure it is about to call.
@@ -270,6 +289,11 @@ func (v *VM) spawn(body Value, span diag.Span) int64 {
 			if rec != nil {
 				if t, isTrap := rec.(*Trap); isTrap {
 					w.fail(t) // ADR-0026: any thread's trap ends the process
+				} else if e, requested := rec.(exitRequest); requested {
+					// `process::exit` ends the process, not the thread that called it
+					// (spec/17-process.md): the same road as a trap, and only what main
+					// reports at the end differs.
+					w.requestExit(e.code)
 				} else if _, unwinding := rec.(dying); !unwinding {
 					w.mu.Unlock()
 					w.exec.Unlock()

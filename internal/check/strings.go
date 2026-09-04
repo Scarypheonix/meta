@@ -50,6 +50,16 @@ func (c *Checker) strBuiltinType(name string) types.Type {
 	// bits; these two say so, and nothing else in the language does. They exist so that
 	// the decimal rendering of a float can be Origin source in the prelude rather than a
 	// shortest-round-trip algorithm written three times, once per engine.
+	// The process's own inputs and outcome (spec/17-process.md). `args()` is Origin in the
+	// prelude over the first two; `exit` has to be provided, since a program cannot end a
+	// process by computing anything.
+	case "env::arg_count":
+		return &types.FnT{Ret: i64}
+	case "env::arg_at":
+		return &types.FnT{Params: []types.Type{i64}, Ret: str}
+	case "process::exit":
+		return &types.FnT{Params: []types.Type{i64}, Ret: types.P(types.Never)}
+
 	// `char::from_u32` is the one compiler-provided operation whose result is a prelude
 	// type. It is spelled that way because spec/04-expressions.md and the diagnostic for a
 	// rejected `as char` both name it, and because the alternative -- a predicate plus an

@@ -1,0 +1,9 @@
+// `process::exit` ends the process with the status it is given (spec/17-process.md).
+use std::io;
+use std::process;
+
+fn main() {
+    io::println("before");
+    process::exit(3);
+    io::println("after"); // unreachable: `exit` has type `!`
+}

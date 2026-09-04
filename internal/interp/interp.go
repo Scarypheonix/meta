@@ -17,6 +17,10 @@ import (
 // TrapExitCode is the process exit status after a trap (spec/04-expressions.md).
 const TrapExitCode = 101
 
+// exitRequest carries `process::exit`'s status out through the interpreter's own stack.
+// It is not a trap: nothing went wrong, and nothing is printed.
+type exitRequest struct{ code int }
+
 // Trap is a runtime trap: an integer overflow, a bad index, an explicit panic. Traps are
 // not catchable in Origin 0.1, so they propagate as a Go panic and are recovered only at
 // the interpreter's boundary.
@@ -82,6 +86,9 @@ func (f *frame) lookup(l *resolve.Local) (Value, bool) {
 
 // Interp evaluates a resolved program.
 type Interp struct {
+	// args is the process's command line, program path first (spec/17-process.md).
+	args []string
+
 	res *resolve.Result
 	// mo is the program's instantiation set, and rootInst finds the single instance of a
 	// function that has no generic parameters of its own -- the entry point for a call
@@ -145,14 +152,29 @@ func (in *Interp) Run() (exitCode int) {
 		if r == nil {
 			return
 		}
-		// `dying` means another thread trapped first and this one was woken to unwind;
-		// the trap to report is that one, not a second invented here (ADR-0026).
+		// `process::exit` is an ordinary end to the program, not a failure: it unwinds
+		// the same way a trap does because there is nothing else that stops every green
+		// thread at once, and then reports the status it was given
+		// (spec/17-process.md).
+		if e, requested := r.(exitRequest); requested {
+			exitCode = e.code
+			return
+		}
+		// `dying` means another thread ended the process first and this one was woken to
+		// unwind; what to report is that thread's trap or its exit status, not a second
+		// one invented here (ADR-0026, spec/17-process.md).
 		if _, unwinding := r.(dying); unwinding {
 			in.rt.mu.Lock()
-			t := in.rt.trap
+			t, exiting, code := in.rt.trap, in.rt.exiting, in.rt.exitCode
 			in.rt.mu.Unlock()
 			if t != nil {
 				fmt.Fprintln(in.stderr, t.Error())
+				exitCode = TrapExitCode
+				return
+			}
+			if exiting {
+				exitCode = code
+				return
 			}
 			exitCode = TrapExitCode
 			return
@@ -182,13 +204,17 @@ func (in *Interp) Run() (exitCode int) {
 	in.rt.mu.Unlock()
 	in.rt.wg.Wait()
 
-	// A thread that trapped while main was finishing still ends the process (ADR-0026).
+	// A thread that trapped or exited while main was finishing still ends the process
+	// (ADR-0026, spec/17-process.md).
 	in.rt.mu.Lock()
-	t := in.rt.trap
+	t, exiting, code := in.rt.trap, in.rt.exiting, in.rt.exitCode
 	in.rt.mu.Unlock()
 	if t != nil {
 		fmt.Fprintln(in.stderr, t.Error())
 		return TrapExitCode
+	}
+	if exiting {
+		return code
 	}
 	return 0
 }
@@ -777,3 +803,8 @@ func (in *Interp) evalTry(t *ast.Try) (Value, ctrl) {
 	in.trap(t.Span(), "`?` applies to `Ok`, `Err`, `Some` or `None`, found `%s`", e.Variant.Name.Name)
 	return Unit{}, normal
 }
+
+// SetArgs installs the command line a program will see through `env::arg_count` and
+// `env::arg_at`. The driver supplies it; index 0 is the program's own path, so a program
+// sees the same shape here as it does when it has been compiled (spec/17-process.md).
+func (in *Interp) SetArgs(args []string) { in.args = args }

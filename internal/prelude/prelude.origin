@@ -18,6 +18,7 @@ use std::hash;
 use std::str;
 use std::fs;
 use std::float;
+use std::env;
 
 pub enum Option[T] {
     None,
@@ -1160,6 +1161,30 @@ fn is_valid_utf8(s: String) -> bool {
         i = i + width;
     }
     true
+}
+
+/// The command line the process was given, with the program's own name at index 0.
+///
+/// A fresh `List` each call: the arguments belong to the process, and a program that sorts
+/// or truncates what it got has changed nothing for the next caller (spec/17-process.md).
+///
+/// The runtimes hand over raw bytes, because ADR-0025 says a compiler-provided operation
+/// returns a primitive or a `String` and never a prelude type. The UTF-8 check is here for
+/// the same reason `read_to_string`'s is: one implementation, in Origin, rather than the
+/// same rule written three times over and agreeing by luck.
+pub fn args() -> List[String] {
+    let out = list::new[String]();
+    let n = env::arg_count();
+    let mut i = 0;
+    while i < n {
+        let a = env::arg_at(i);
+        if !is_valid_utf8(a) {
+            panic("argument is not valid UTF-8");
+        }
+        out.push(a);
+        i = i + 1;
+    }
+    out
 }
 
 /// The whole file, as text.

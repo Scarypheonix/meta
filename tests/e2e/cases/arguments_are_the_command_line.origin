@@ -1,0 +1,18 @@
+// The command line, including the program's own name at index 0 (spec/17-process.md).
+use std::io;
+
+fn main() {
+    let a = args();
+    io::println("count: \(a.len())");
+    let mut i = 0;
+    while i < a.len() {
+        io::println("\(i): \(a.at(i))");
+        i = i + 1;
+    }
+
+    // A fresh list each call: emptying what this call returned leaves the next one
+    // whole, because the arguments belong to the process rather than to the list.
+    let mine = args();
+    mine.clear();
+    io::println("mine: \(mine.len()), still: \(args().len())");
+}

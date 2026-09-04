@@ -163,6 +163,13 @@ func builtinResultKind(idx int) bytecode.Kind {
 		return bytecode.KindBool
 	case compile.BuiltinCharValid:
 		return bytecode.KindBool
+	case compile.BuiltinArgCount:
+		return bytecode.KindI64
+	case compile.BuiltinArgAt:
+		return bytecode.KindString
+	case compile.BuiltinExit:
+		// It does not return, so nothing reads a result; `!` has no representation.
+		return bytecode.KindUnit
 	case compile.BuiltinFloatBits:
 		return bytecode.KindU64
 	case compile.BuiltinFloatFromBits:

@@ -69,8 +69,13 @@ const (
 	// one per thread: only one thread runs at a time, and what the count is measuring is
 	// how long the current one has held on.
 	rtBudgetOff = 96
+	// rtArgvOff is the address the kernel left the argument vector at: the word it points
+	// to is the count, and the words after it are the pointers (spec/17-process.md).
+	// `_start` saves it before it aligns the stack, which is the only moment it exists --
+	// there is no libc to have kept a copy.
+	rtArgvOff = 104
 	// rtBlockSize is the block's size in bytes; it lives in the writable segment.
-	rtBlockSize = 104
+	rtBlockSize = 112
 
 	// wordSize is the size of everything the machine holds in a register.
 	wordSize = 8
@@ -118,6 +123,7 @@ type runtimeLabels struct {
 	// whose line is only knowable at run time (spans.go).
 	trapSpan   x86.Label
 	spanHere   x86.Label
+	argAt      x86.Label
 	panicSpan  x86.Label
 	spanLookup x86.Label
 	// The channel operations (chan.go, spec/12-concurrency.md).
@@ -195,6 +201,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.schedDrain = e.a.NewLabel("rt_drain")
 	e.rt.trapSpan = e.a.NewLabel("rt_trap_span")
 	e.rt.spanHere = e.a.NewLabel("rt_span_here")
+	e.rt.argAt = e.a.NewLabel("rt_arg_at")
 	e.rt.panicSpan = e.a.NewLabel("rt_panic_span")
 	e.rt.spanLookup = e.a.NewLabel("rt_span_lookup")
 	e.rt.chanNew = e.a.NewLabel("rt_chan_new")
@@ -255,6 +262,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitSchedDrain()
 	e.emitSpanLookup()
 	e.emitSpanHere()
+	e.emitArgAt()
 	e.emitTrapSpan()
 	e.emitPanicSpan()
 	e.emitChanNew()
@@ -388,9 +396,13 @@ func (e *emitter) emitStart(mainLabel x86.Label) {
 	a.MovMR(x86.At(x86.R15, rtEndOff), x86.RCX)
 	a.MovMR(x86.At(x86.R15, rtOtherStartOff), x86.RAX)
 
-	// The kernel hands over a 16-byte aligned stack with argc on top. Origin's `main`
-	// takes no arguments, and every call site keeps the alignment the ABI requires, so
-	// aligning once here is enough.
+	// The kernel hands over a 16-byte aligned stack with argc on top. That address is the
+	// argument vector and this is the only moment it is known, so it is saved before the
+	// alignment below moves rsp away from it (spec/17-process.md).
+	a.MovMR(x86.At(x86.R15, rtArgvOff), x86.RSP)
+
+	// Origin's `main` takes no arguments, and every call site keeps the alignment the ABI
+	// requires, so aligning once here is enough.
 	a.AndRI(x86.RSP, -16)
 
 	// The collector's rbp-chain walk (ADR-0022) stops when a frame's saved caller-rbp is

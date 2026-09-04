@@ -108,6 +108,11 @@ const (
 	// (spec/16-floats.md). Neither computes anything: on every engine the bits are
 	// already where they need to be, and what changes is only the static type that says
 	// how to read them.
+	// The process's arguments and its exit status (spec/17-process.md).
+	BuiltinArgCount
+	BuiltinArgAt
+	BuiltinExit
+
 	// BuiltinCharValid answers `is this u32 a Unicode scalar value`. It is a predicate
 	// rather than the conversion itself for the same reason `BuiltinFitsAdd` is: a runtime
 	// that returned the `Option` would have to know what the prelude's `Option` is, and the

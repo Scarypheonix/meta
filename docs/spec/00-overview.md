@@ -31,6 +31,7 @@ must be corrected in the same commit that changes behaviour.
 | `14-strings.md` | `String`'s operations, character boundaries, interpolation |
 | `15-files.md` | Reading and writing whole files |
 | `16-floats.md` | What `to_str` on a float produces, exactly |
+| `17-process.md` | Command-line arguments and the exit status |
 
 ## Design pillars
 

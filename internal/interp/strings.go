@@ -26,6 +26,21 @@ import (
 // rather than a shortest-round-trip algorithm written once per engine.
 func (in *Interp) floatBuiltin(name string, args []Value, span diag.Span) (Value, bool) {
 	switch name {
+	case "env::arg_count":
+		return Int(len(in.args)), true
+	case "env::arg_at":
+		i, ok := args[0].(Int)
+		if !ok || int(i) < 0 || int(i) >= len(in.args) {
+			in.trap(span, "index out of range")
+		}
+		return &Str{S: in.args[int(i)]}, true
+	case "process::exit":
+		code, ok := args[0].(Int)
+		if !ok {
+			in.trap(span, "`process::exit` takes an integer")
+		}
+		panic(exitRequest{code: int(code) & 0xFF})
+
 	case "char::from_u32":
 		n, ok := args[0].(Int)
 		if !ok {

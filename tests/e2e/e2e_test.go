@@ -6,6 +6,7 @@
 //	NAME.out    exact expected stdout (required, may be empty)
 //	NAME.exit   exact expected exit status, one line (required)
 //	NAME.err    exact expected stderr (optional; absent means stderr must be empty)
+//	NAME.args   the program's own arguments, one per line (optional; absent means none)
 //
 // Cases are derived from docs/spec/10-examples.md, which is normative. When a case and
 // the specification disagree, one of them is a bug; the fix is never to edit the
@@ -40,6 +41,10 @@ type caseFile struct {
 	// Src is the case's own source, read so that the harness can tell whether the
 	// program touches the filesystem (usesFiles).
 	Src string
+	// Args are the program's arguments after its own path (spec/17-process.md). Every
+	// engine gets the same ones, which is what makes a case that reads its command line
+	// part of the differential rather than an exception to it.
+	Args []string
 }
 
 func loadCases(t *testing.T) []caseFile {
@@ -81,6 +86,12 @@ func loadCases(t *testing.T) []caseFile {
 			c.RelPath = rel
 		} else {
 			c.RelPath = path
+		}
+		// Every line is one argument and the final newline terminates the last one, so
+		// an empty file means no arguments and a file of one blank line means one empty
+		// argument -- which a command line can hold and a program has to survive.
+		if rawArgs, err := os.ReadFile(stem + ".args"); err == nil && len(rawArgs) > 0 {
+			c.Args = strings.Split(strings.TrimSuffix(string(rawArgs), "\n"), "\n")
 		}
 		if wantErr, err := os.ReadFile(stem + ".err"); err == nil {
 			c.WantErr, c.HasErr = string(wantErr), true
@@ -271,7 +282,7 @@ func runCase(t *testing.T, root string, c caseFile, e engineSpec) (string, strin
 	defer func() { _ = os.Chdir(wd) }()
 
 	var stdout, stderr bytes.Buffer
-	code := driver.RunAt(c.RelPath, e.engine, e.level, &stdout, &stderr)
+	code := driver.RunAt(c.RelPath, e.engine, e.level, &stdout, &stderr, c.Args...)
 	return stdout.String(), stderr.String(), code
 }
 

@@ -32,6 +32,12 @@ type runtime struct {
 	// every parked thread is woken to unwind (ADR-0026).
 	trap *Trap
 
+	// exiting and exitCode are `process::exit` from any thread. It ends the process the
+	// way a trap does -- every parked thread is woken to unwind -- and differs only in
+	// what is reported at the end: a status, and nothing on stderr (spec/17-process.md).
+	exiting  bool
+	exitCode int
+
 	threads  map[int64]*threadState
 	channels map[int64]*channelState
 	mutexes  map[int64]*mutexState
@@ -116,6 +122,19 @@ func (r *runtime) fail(t *Trap) {
 	r.cond.Broadcast()
 }
 
+// requestExit records the first `process::exit` and wakes every parked thread so it can
+// unwind. Called with r.mu held.
+func (r *runtime) requestExit(code int) {
+	if !r.exiting && r.trap == nil {
+		r.exiting, r.exitCode = true, code
+	}
+	r.cond.Broadcast()
+}
+
+// ending reports whether the process is already on its way out, by a trap in some thread
+// or by `process::exit`. Called with r.mu held.
+func (r *runtime) ending() bool { return r.trap != nil || r.exiting }
+
 // wait parks the calling thread until ready() holds, and is where deadlock is detected.
 //
 // Called with r.mu held; returns with it held. It panics with dying{} if the process is
@@ -127,7 +146,7 @@ func (r *runtime) wait(span diag.Span, ready func() bool) {
 	defer delete(r.waiters, id)
 
 	for !ready() {
-		if r.trap != nil {
+		if r.ending() {
 			panic(dying{})
 		}
 		r.waiters[id] = ready
@@ -144,7 +163,7 @@ func (r *runtime) wait(span diag.Span, ready func() bool) {
 		r.cond.Wait()
 		r.blocked--
 		delete(r.waiters, id)
-		if r.trap != nil {
+		if r.ending() {
 			panic(dying{})
 		}
 	}
@@ -195,6 +214,11 @@ func (in *Interp) spawn(body *Closure, span diag.Span) int64 {
 					// ADR-0026: a trap in any thread ends the process. Recording it here
 					// and letting the main thread report it keeps one output path.
 					r.fail(t)
+				} else if e, requested := rec.(exitRequest); requested {
+					// `process::exit` ends the process, not the thread that called it
+					// (spec/17-process.md), so it travels the same road as a trap and
+					// only what main reports at the end differs.
+					r.requestExit(e.code)
 				} else if _, isDying := rec.(dying); !isDying {
 					r.mu.Unlock()
 					panic(rec) // a real bug in the interpreter, not a program's trap

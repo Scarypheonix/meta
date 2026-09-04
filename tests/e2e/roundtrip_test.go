@@ -31,7 +31,7 @@ func TestIRRoundTrip(t *testing.T) {
 
 			var stdout, stderr bytes.Buffer
 			var code int
-			run := func() { code = driver.RunRoundTrip(c.RelPath, &stdout, &stderr) }
+			run := func() { code = driver.RunRoundTrip(c.RelPath, &stdout, &stderr, c.Args...) }
 			// A case that touches the filesystem gets the same fresh scratch directory
 			// every other engine's run of it gets (e2e_test.go's withScratch).
 			if usesFiles(c) {

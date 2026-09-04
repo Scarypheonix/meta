@@ -314,6 +314,10 @@ var stdModules = map[string][]string{
 	// allocate raw bytes; everything else about a string is Origin source in the prelude,
 	// as the `Str` trait's default method bodies.
 	"std::str": {"len", "byte_at", "slice", "concat", "char_at", "char_width"},
+	// Phase 9 (spec/17-process.md). What a program is told and what it reports: the two
+	// things a compiler cannot be written without and Origin 0.1 could not say.
+	"std::env":     {"arg_count", "arg_at"},
+	"std::process": {"exit"},
 	// Phase 8 (spec/16-floats.md). The two operations that read a float's bits and put
 	// them back. Rendering a float in decimal is Origin source in the prelude, written
 	// over exactly these; nothing else in the language can see a float's representation.

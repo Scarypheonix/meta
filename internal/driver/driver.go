@@ -239,8 +239,8 @@ const (
 )
 
 // RunWith compiles a program and executes it on the chosen engine at -O0.
-func RunWith(path string, engine Engine, stdout, stderr io.Writer) int {
-	return RunAt(path, engine, opt.O0, stdout, stderr)
+func RunWith(path string, engine Engine, stdout, stderr io.Writer, args ...string) int {
+	return RunAt(path, engine, opt.O0, stdout, stderr, args...)
 }
 
 // RunAt compiles a program at an optimization level and executes it.
@@ -249,7 +249,11 @@ func RunWith(path string, engine Engine, stdout, stderr io.Writer) int {
 // stderr and the same exit status. That differential is the exit criterion of Phase 3
 // (two engines) and Phase 4 (three levels), and tests/e2e runs the whole corpus through
 // all of them.
-func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer) int {
+// args are the program's own, without its path: index 0 of what it sees is the path
+// itself, so that a program's argument vector has the same shape on every engine
+// (spec/17-process.md).
+func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer, args ...string) int {
+	argv := append([]string{path}, args...)
 	units, err := LoadUnits(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
@@ -260,7 +264,9 @@ func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer
 		return ExitDiagnostics
 	}
 	if engine == Interpreter {
-		return interp.New(prog.Resolved, prog.Types, prog.Mono, stdout, stderr).Run()
+		in := interp.New(prog.Resolved, prog.Types, prog.Mono, stdout, stderr)
+		in.SetArgs(argv)
+		return in.Run()
 	}
 	code, err := compile.Program(prog.Resolved, prog.Types, prog.Mono, prog.AllASTs...)
 	if err != nil {
@@ -272,9 +278,9 @@ func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer
 		return ExitDiagnostics
 	}
 	if engine == Native {
-		return runNative(code, stdout, stderr)
+		return runNative(code, stdout, stderr, argv)
 	}
-	return vm.New(code, vm.Config{}, stdout, stderr).Run()
+	return vm.New(code, vm.Config{Args: argv}, stdout, stderr).Run()
 }
 
 // runNative compiles to an executable for the host, runs it, and returns its exit
@@ -285,7 +291,7 @@ func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer
 // virtual machine. Only the host's own format can be run, which is why the container
 // verifies ELF and the Mach-O acceptance criterion belongs to the user's machine
 // (ADR-0003).
-func runNative(code *bytecode.Program, stdout, stderr io.Writer) int {
+func runNative(code *bytecode.Program, stdout, stderr io.Writer, argv []string) int {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		fmt.Fprintln(stderr, "originc: this host cannot run what it builds; use `originc build`")
 		return ExitUsage
@@ -310,6 +316,10 @@ func runNative(code *bytecode.Program, stdout, stderr io.Writer) int {
 	}
 
 	cmd := exec.Command(exe)
+	// The program is at a temporary path, but what it must see at index 0 is the path it
+	// was compiled from: every engine shows a program the same argument vector, and the
+	// end-to-end differential compares their stdout byte for byte (spec/17-process.md).
+	cmd.Args = argv
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
@@ -386,7 +396,7 @@ func defaultOutputName(path string) string {
 
 // RunRoundTrip executes a program through the IR with no optimization passes, which
 // isolates SSA construction and emission from the passes built on them.
-func RunRoundTrip(path string, stdout, stderr io.Writer) int {
+func RunRoundTrip(path string, stdout, stderr io.Writer, args ...string) int {
 	units, err := LoadUnits(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
@@ -405,11 +415,11 @@ func RunRoundTrip(path string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
 		return ExitDiagnostics
 	}
-	return vm.New(code, vm.Config{}, stdout, stderr).Run()
+	return vm.New(code, vm.Config{Args: append([]string{path}, args...)}, stdout, stderr).Run()
 }
 
 // Run compiles a file and interprets it, returning the program's exit status.
-func Run(path string, stdout, stderr io.Writer) int {
+func Run(path string, stdout, stderr io.Writer, args ...string) int {
 	units, err := LoadUnits(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
@@ -419,7 +429,9 @@ func Run(path string, stdout, stderr io.Writer) int {
 	if !ok {
 		return ExitDiagnostics
 	}
-	return interp.New(prog.Resolved, prog.Types, prog.Mono, stdout, stderr).Run()
+	in := interp.New(prog.Resolved, prog.Types, prog.Mono, stdout, stderr)
+	in.SetArgs(append([]string{path}, args...))
+	return in.Run()
 }
 
 // DumpAST compiles a file and prints its syntax tree.

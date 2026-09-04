@@ -24,7 +24,7 @@ const usage = `originc ` + Version + `
 usage:
   originc version            print the compiler version
   originc check <file>       parse and resolve, emit diagnostics only
-  originc run <file>         run a program with the tree-walking interpreter
+  originc run <file> [args]  run a program with the tree-walking interpreter
   originc run --vm <file>    run it on the bytecode virtual machine instead
   originc run --native <f>   compile it to machine code and run that
   originc run -O1 <file>     run it on the VM with the optimizer (also -O0, -O2)
@@ -128,7 +128,7 @@ func run(args []string) int {
 		if !named && level != opt.O0 {
 			engine = driver.VM
 		}
-		if len(rest) != 1 {
+		if len(rest) == 0 || (args[0] != "run" && len(rest) != 1) {
 			fmt.Fprintf(os.Stderr, "originc: `%s` takes exactly one file or directory\n", args[0])
 			return driver.ExitUsage
 		}
@@ -136,7 +136,10 @@ func run(args []string) int {
 		case "check":
 			return driver.Check(rest[0], os.Stdout, os.Stderr)
 		case "run":
-			return driver.RunAt(rest[0], engine, level, os.Stdout, os.Stderr)
+			// Everything after the file is the program's own, not the compiler's: the
+			// flag loop above stops at the first argument it does not recognize, so
+			// `originc run p.origin -O2` passes `-O2` to the program (spec/17-process.md).
+			return driver.RunAt(rest[0], engine, level, os.Stdout, os.Stderr, rest[1:]...)
 		case "dump-bytecode":
 			return driver.DumpBytecode(rest[0], os.Stdout, os.Stderr)
 		case "dump-ir":

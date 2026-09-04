@@ -1,0 +1,9 @@
+// `env::arg_at` traps rather than inventing an argument the process was not given
+// (spec/17-process.md).
+use std::io;
+use std::env;
+
+fn main() {
+    io::println("count: \(env::arg_count())");
+    io::println(env::arg_at(env::arg_count()));
+}
