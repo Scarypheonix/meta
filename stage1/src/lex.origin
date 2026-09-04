@@ -602,7 +602,9 @@ impl Lexer {
         let mut unterminated = false;
 
         while !done {
-            if self.at_end() || self.src.byte_at(self.pos) == 10 {
+            // Only the end of the file ends a string that was never closed: a literal
+            // may span lines and the newline is part of the value (spec/01-lexical.md).
+            if self.at_end() {
                 self.error(start, self.pos, "unterminated string literal");
                 unterminated = true;
                 done = true;

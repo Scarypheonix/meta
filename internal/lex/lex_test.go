@@ -220,7 +220,9 @@ func TestStringLiterals(t *testing.T) {
 		{`"\""`, `"`, false},
 		{`"\x41"`, "A", false},
 		{`"\u{1F600}"`, "\U0001F600", false},
-		{"\"line\nbreak\"", "", true}, // a newline inside a string is unterminated
+		// A literal may span lines and the newline is part of the value
+		// (spec/01-lexical.md); only the end of the file leaves one unterminated.
+		{"\"line\nbreak\"", "line\nbreak", false},
 		{`"unterminated`, "", true},
 		{`"\q"`, "", true},
 		{`"\x80"`, "", true},

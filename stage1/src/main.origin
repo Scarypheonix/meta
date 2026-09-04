@@ -1,0 +1,150 @@
+// stage1's driver: the command line of the compiler for Origin that is written in Origin.
+//
+// It is deliberately shaped like `cmd/originc`'s, because the two are meant to become
+// interchangeable: the same subcommand names, the same exit statuses (0 succeeded, 1 the
+// program was rejected, 2 the command line was wrong), and diagnostics that name a place
+// the same way. What it can do is what stage1 can do -- lexing, parsing, and reporting
+// where either one failed. Name resolution and type checking are not written yet, so
+// there is no `check` that checks types and none is pretended (process rule 8).
+
+use std::io;
+use std::list;
+use std::process;
+use source;
+use lex;
+use ast;
+use parse;
+
+const USAGE: String = "usage: stage1 <command> <file>...
+
+commands:
+  dump-tokens   print the token stream
+  dump-ast      print the parsed syntax tree
+  parse         parse and report syntax errors only
+
+exit status:
+  0    success
+  1    a file was rejected
+  2    the command line was wrong";
+
+/// One lexing or parsing error, flattened so that the two lists can be reported in one
+/// pass in source order.
+struct Problem {
+    message: String,
+    start: i64,
+}
+
+fn main() {
+    let argv = args();
+    if argv.len() < 3 {
+        io::println(USAGE);
+        process::exit(2);
+    }
+    let command = argv.at(1);
+    if command != "dump-tokens" && command != "dump-ast" && command != "parse" {
+        io::println("stage1: unknown command `\(command)`");
+        io::println(USAGE);
+        process::exit(2);
+    }
+
+    let mut rejected = false;
+    let mut i = 2;
+    while i < argv.len() {
+        if !run(command, argv.at(i)) {
+            rejected = true;
+        }
+        i = i + 1;
+    }
+    if rejected {
+        process::exit(1);
+    }
+}
+
+/// Runs one file, reporting whether it was accepted.
+fn run(command: String, path: String) -> bool {
+    match read_to_string(path) {
+        Result::Err(e) => {
+            io::println("stage1: cannot read \(path): \(e.to_str())");
+            false
+        }
+        Result::Ok(src) => {
+            let f = source::file(path, src);
+            let lexed = lex::lex(src);
+            let parsed = parse::parse(lexed.tokens);
+
+            let problems = list::new[Problem]();
+            let mut i = 0;
+            while i < lexed.errors.len() {
+                let e = lexed.errors.at(i);
+                problems.push(Problem { message: e.message, start: e.start });
+                i = i + 1;
+            }
+            let mut j = 0;
+            while j < parsed.errors.len() {
+                let e = parsed.errors.at(j);
+                problems.push(Problem { message: e.message, start: e.start });
+                j = j + 1;
+            }
+            sort_problems(problems);
+
+            let mut k = 0;
+            while k < problems.len() {
+                let p = problems.at(k);
+                io::println("\(f.locate(p.start)): \(p.message)");
+                k = k + 1;
+            }
+            if problems.len() > 0 {
+                // A tree recovered from a broken file is still printed: recovery is
+                // normative (spec/02-grammar.md), and what it produced is exactly what a
+                // reader of this output needs to see.
+                report(command, f, lexed, parsed);
+                return false;
+            }
+            report(command, f, lexed, parsed);
+            true
+        }
+    }
+}
+
+fn report(command: String, f: source::File, lexed: lex::Lexed, parsed: parse::Parsed) {
+    if command == "dump-tokens" {
+        dump_tokens(f, lexed.tokens);
+    } else {
+        if command == "dump-ast" {
+            let lines = ast::dump(parsed.file);
+            let mut i = 0;
+            while i < lines.len() {
+                io::println(lines.at(i));
+                i = i + 1;
+            }
+        }
+    }
+}
+
+/// One line per token: where it starts, what it is, and its text.
+fn dump_tokens(f: source::File, toks: List[lex::Token]) {
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks.at(i);
+        let p = f.position(t.start);
+        io::println("\(p.line):\(p.col) \(lex::kind_name(t.kind)) \(t.text)");
+        i = i + 1;
+    }
+}
+
+/// Insertion sort by starting offset, which keeps a lexer's errors and a parser's
+/// interleaved in the order a reader meets them. The list is short by construction --
+/// a file with hundreds of errors has one real error and a lot of recovery.
+fn sort_problems(ps: List[Problem]) {
+    let mut i = 1;
+    while i < ps.len() {
+        let mut j = i;
+        while j > 0 && ps.at(j - 1).start > ps.at(j).start {
+            let a = ps.at(j - 1);
+            ps.set(j - 1, ps.at(j));
+            ps.set(j, a);
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}

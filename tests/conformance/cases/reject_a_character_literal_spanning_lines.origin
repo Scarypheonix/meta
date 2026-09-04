@@ -1,0 +1,7 @@
+// EXPECT: reject E0001
+// spec: 01-lexical.md — a character literal must be closed on the line it opens.
+
+fn main() {
+    let c = 'a
+';
+}

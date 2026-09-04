@@ -1,0 +1,16 @@
+// A string literal may span lines and the newline is part of the value, exactly as `\n`
+// would be (spec/01-lexical.md). Only the end of the file leaves one unterminated.
+use std::io;
+
+const BANNER: String = "usage: stage1 <command> <file>...
+
+commands:
+  dump-ast";
+
+fn main() {
+    io::println(BANNER);
+    io::println("\(BANNER.len()) bytes");
+    let two = "a
+b";
+    io::println("\(two.len()) \(two == "a\nb")");
+}

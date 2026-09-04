@@ -120,6 +120,11 @@ CharLit = "'" ( Escape | any scalar value except "'" or "\\" ) "'" ;
 A `char` is a Unicode scalar value: `0..=0x10FFFF` excluding the surrogate range
 `0xD800..=0xDFFF`. `'\u{D800}'` is REJECTED.
 
+Unlike a string literal, a character literal must be closed on the line it opens: a
+literal newline before the closing `'` is REJECTED as an unterminated character literal.
+One scalar value never needs a line break, and an apostrophe is common enough in ordinary
+text that swallowing the rest of the file for one helps nobody.
+
 ### String literals
 
 ```
@@ -127,7 +132,8 @@ StringLit = '"' { Escape | Interpolation | any scalar value except '"' or "\\" }
 ```
 
 String literals are `String` values (§08: heap-allocated, immutable, UTF-8). A literal
-may span lines; the newline is part of the value. There are no raw strings.
+may span lines; the newline is part of the value, exactly as `\n` would be. There are no
+raw strings. Only the end of the file leaves a literal unterminated.
 
 ### Escapes
 
@@ -205,3 +211,5 @@ out-of-range span.
 | `'\u{1F600}'` | `CharLit` | valid scalar value |
 | `'\u{D800}'` | REJECTED | surrogate |
 | `"line\nbreak"` | `StringLit` | 10 scalar values |
+| a `"` , a newline, a `"` | `StringLit` | one scalar value: a literal may span lines |
+| `'` , a newline, `'` | REJECTED | a character literal may not |

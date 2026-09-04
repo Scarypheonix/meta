@@ -80,6 +80,8 @@ silently dropped. An item may move phases; it may not vanish without a line in
 | Environment variables, the current directory, spawning a process, and standard input | spec/17-process.md scoped exactly what makes a compiler invocable: which file, and whether it worked. Each of these is additive and none is needed before something asks for it. Standard input is the one with a design question attached -- it is a stream, and §15 has so far avoided handles entirely (ADR-0030) | Phase 10 |
 | A `Path` type | a path is a `String` passed to the system unchanged (spec/15-files.md). Joining, normalizing and splitting are string operations until something needs them to be more, and making them more early would mean deciding what a path *is* on two systems that disagree | Phase 8 |
 
+| stage1's diagnostic wording | `tests/selfhost` holds stage1's syntax errors to the Go compiler's file, line, column and count, over the whole corpus, but not their prose: the Go messages name the token they found as well as the one they wanted (`expected :, found `)``), quote the offending text (`` `unsafe` is a reserved word ``), and split cases stage1 collapses (`0xD800 is a surrogate` versus `above the maximum scalar value`). Mechanical to align -- a `token_name`, a hex formatter, and about a dozen message sites -- and worth doing before stage1 replaces the Go compiler for anybody's diagnostics, but position and count are what say the two parsers agree about the *file* | Phase 9 |
+
 ## Toolchain
 
 | Item | Why deferred | Phase |

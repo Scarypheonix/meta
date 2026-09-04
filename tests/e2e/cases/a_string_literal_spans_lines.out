@@ -1,0 +1,6 @@
+usage: stage1 <command> <file>...
+
+commands:
+  dump-ast
+55 bytes
+3 true

@@ -1,0 +1,128 @@
+// File identity and the byte-offset-to-line/column mapping, for the compiler written in
+// Origin.
+//
+// It is the counterpart of the Go compiler's `internal/source`, and it exists for the
+// same reason that package does: every span stage1 produces is a byte range, and the
+// rules in spec/01-lexical.md -- CRLF is one terminator, a lone CR does not terminate a
+// line, a column counts Unicode scalar values -- get exactly one implementation on this
+// side too. `tests/selfhost` holds this one to that one over the repository's own source.
+
+use std::io;
+use std::list;
+
+/// A one-based line and a one-based column, the way a diagnostic names a place.
+pub struct Pos {
+    pub line: i64,
+    pub col: i64,
+}
+
+/// An immutable source file with a precomputed line index.
+///
+/// `starts.at(i)` is the byte offset at which line `i + 1` begins, so `starts.at(0)` is
+/// always 0 and the list is sorted. Nothing here is `mut`: a file is indexed once, when it
+/// is made, and read from every span afterwards.
+pub struct File {
+    pub name: String,
+    pub src: String,
+    starts: List[i64],
+}
+
+/// Indexes `src` for position lookup. `name` appears verbatim in diagnostics.
+pub fn file(name: String, src: String) -> File {
+    let starts = list::new[i64]();
+    starts.push(0);
+    let mut i = 0;
+    while i < src.len() {
+        if src.byte_at(i) == 10 {
+            starts.push(i + 1);
+        }
+        i = i + 1;
+    }
+    File { name: name, src: src, starts: starts }
+}
+
+impl File {
+    /// How many lines the file has. A file ending in a newline does not get a trailing
+    /// empty line counted unless there is something after it.
+    pub fn line_count(self) -> i64 {
+        self.starts.len()
+    }
+
+    /// The byte offset at which a one-based line begins. Out of range clamps.
+    pub fn line_start(self, line: i64) -> i64 {
+        if line < 1 {
+            return 0;
+        }
+        if line > self.starts.len() {
+            return self.src.len();
+        }
+        self.starts.at(line - 1)
+    }
+
+    /// The one-based line containing a byte offset.
+    ///
+    /// A binary search for the first line start past the offset: the line index is that
+    /// position, because the list is zero-based and lines are one-based, which cancels the
+    /// usual minus one.
+    fn line_of(self, offset: i64) -> i64 {
+        let mut lo = 0;
+        let mut hi = self.starts.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.starts.at(mid) > offset {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    }
+
+    /// A byte offset as a one-based line and a one-based column counted in Unicode scalar
+    /// values. An offset past the end clamps to the end of the file.
+    pub fn position(self, at: i64) -> Pos {
+        let mut offset = at;
+        if offset < 0 {
+            offset = 0;
+        }
+        if offset > self.src.len() {
+            offset = self.src.len();
+        }
+        let line = self.line_of(offset);
+        let mut p = self.starts.at(line - 1);
+
+        // Scalar values, not bytes: a column is what a person counts, and `char_width`
+        // is the one place that knows how wide the scalar starting at `p` is (spec/14).
+        let mut col = 1;
+        while p < offset {
+            p = p + self.src.char_width(p);
+            col = col + 1;
+        }
+        Pos { line: line, col: col }
+    }
+
+    /// The text of a one-based line, without its terminator.
+    ///
+    /// A CRLF pair is one terminator, so the CR goes with the LF; a lone CR is ordinary
+    /// whitespace and stays (spec/01-lexical.md).
+    pub fn line_text(self, line: i64) -> String {
+        if line < 1 || line > self.starts.len() {
+            return "";
+        }
+        let start = self.starts.at(line - 1);
+        let mut end = self.src.len();
+        if line < self.starts.len() {
+            end = self.starts.at(line) - 1; // drop the \n
+        }
+        if end > start && self.src.byte_at(end - 1) == 13 {
+            end = end - 1;
+        }
+        self.src.slice(start, end)
+    }
+
+    /// `name:line:col`, which is how every diagnostic in this project names a place.
+    pub fn locate(self, offset: i64) -> String {
+        let p = self.position(offset);
+        "\(self.name):\(p.line):\(p.col)"
+    }
+}

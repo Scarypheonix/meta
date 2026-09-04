@@ -1144,7 +1144,7 @@ impl Parser {
         if k == lex::K_STR {
             self.advance();
             if t.interpolated {
-                return interpolated(t);
+                return interpolated(t, self.errors);
             }
             return ast::Expr::Str(t.str);
         }
@@ -1391,7 +1391,7 @@ impl Parser {
 // nothing downstream learns a new form: the checker sees `concat` and `to_str` and applies
 // `Str` and `Show` to them like any other call.
 
-fn interpolated(t: lex::Token) -> ast::Expr {
+fn interpolated(t: lex::Token, errors: List[ParseError]) -> ast::Expr {
     let mut out = ast::Expr::ErrorExpr;
     let mut started = false;
     let mut i = 0;
@@ -1407,7 +1407,7 @@ fn interpolated(t: lex::Token) -> ast::Expr {
                 }
             }
             lex::Part::Expr(toks) => {
-                piece = ast::Expr::Method("to_str", sub_expr(toks), list::new[ast::Expr]());
+                piece = ast::Expr::Method("to_str", sub_expr(toks, errors), list::new[ast::Expr]());
                 have = true;
             }
         }
@@ -1431,12 +1431,23 @@ fn interpolated(t: lex::Token) -> ast::Expr {
 }
 
 /// One interpolation's tokens, parsed with a parser of its own.
-fn sub_expr(toks: List[lex::Token]) -> ast::Expr {
+///
+/// The error list is the outer parser's, not a fresh one: a syntax error inside an
+/// interpolation is the file's error and has to reach the same report, and the tokens
+/// carry spans into the real source, so it already points where the programmer wrote it.
+fn sub_expr(toks: List[lex::Token], errors: List[ParseError]) -> ast::Expr {
     let p = Parser {
         toks: toks, pos: 0, no_struct: false, recovering: false,
-        errors: list::new[ParseError](),
+        errors: errors,
     };
-    p.expr()
+    let e = p.expr();
+    if !p.at_eof() {
+        // An interpolation holds exactly one expression (spec/01-lexical.md), so anything
+        // left over is a second one rather than a chunk of the string.
+        let t = p.cur();
+        p.error_at(t.start, t.end, "unexpected \(lex::kind_name(t.kind)) after the interpolated expression");
+    }
+    e
 }
 
 // --- Patterns ------------------------------------------------------------------------

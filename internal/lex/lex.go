@@ -495,7 +495,11 @@ func (l *Lexer) lexString() Token {
 	}
 
 	for {
-		if l.atEnd() || l.src[l.pos] == '\n' {
+		// Only the end of the file ends a string that was never closed. A newline does
+		// not: spec/01-lexical.md says a literal may span lines and the newline is part
+		// of the value, which is what this note has always said and what the condition
+		// beside it used to contradict.
+		if l.atEnd() {
 			l.errorf(start, min(l.pos, len(l.src)), "unterminated string literal").
 				Label("this string is never closed").
 				Note("a string literal may span lines, but this one reaches the end of the file")
