@@ -1,11 +1,15 @@
 // The Origin syntax tree, in Origin, and the dumper that renders it.
 //
-// A translation of `internal/ast`, with two differences that follow from the language
-// rather than from taste. There is no sealed interface with one struct per node kind
-// (ADR-0015): Origin has enums with payloads, so a category is one enum and a node kind is
-// one variant, and exhaustiveness is the checker's job rather than a convention. And there
-// are no node ids or spans yet -- nothing downstream of the parser exists to key a side
-// table by, and a field nothing reads is exactly the failure mode Phase 8 kept finding.
+// A translation of `internal/ast`, with one difference that follows from the language
+// rather than from taste: there is no sealed interface with one struct per node kind
+// (ADR-0015). Origin has enums with payloads, so a category is one enum, a node kind is
+// one variant, and exhaustiveness is the checker's job rather than a convention.
+//
+// What this tree does *not* have is a node id on every node. Two passes need to key by a
+// node, and each keys by the only nodes it actually reports on: name resolution files its
+// answer in a `res` slot on a path and on an identifier, and the checker files its own in
+// an `info` slot on a declaration. A field nothing reads is the failure mode Phase 8 kept
+// finding, so a slot arrives when a reader does.
 //
 // `dump` is held to `internal/ast`'s own `Dump` over every `.origin` file in this
 // repository (tests/selfhost), so its shape is not this file's to choose.
@@ -15,11 +19,16 @@ use std::str;
 
 // --- Spans and names -----------------------------------------------------------------
 //
-// Byte offsets into the file, `[start, end)`, on exactly the nodes a later pass reports a
-// diagnostic at: an identifier, a path and each of its segments, the place of an
-// assignment, a `break` or a `continue`. Nothing else carries one, for the reason the
-// header gives -- a field nothing reads is the failure mode Phase 8 kept finding -- and
-// what reads these is `resolve.origin`.
+// Byte offsets into the file, `[start, end)`. Every expression, pattern and type carries
+// one, as do an identifier and a path, because that is what a later pass reports a
+// diagnostic against -- "expected `i64`, found `String`" underlines the value, not the
+// statement around it.
+//
+// The span is on a wrapper struct rather than in each variant, which is what
+// `internal/ast` does with its embedded `Base` and what keeps `match e.node { .. }`
+// readable. It has to fall exactly where internal/parse's does: a diagnostic that is
+// right about the problem and wrong about the place is still wrong, and the two
+// compilers are compared on both.
 
 pub struct Span {
     pub start: i64,
@@ -58,7 +67,17 @@ pub const UNRESOLVED: i64 = 0 - 1;
 
 // --- Types ---------------------------------------------------------------------------
 
-pub enum Type {
+/// A syntactic type, and where it was written.
+///
+/// The span is on the wrapper rather than in each variant for the reason the header
+/// gives: a later pass reports against a node, and a node without a span cannot be
+/// reported against. `internal/ast` puts the same thing in an embedded `Base`.
+pub struct Type {
+    pub span: Span,
+    pub node: TypeKind,
+}
+
+pub enum TypeKind {
     /// A path with its type arguments: `Map[String, i64]`.
     Path(PathRef, List[Type]),
     Tuple(List[Type]),
@@ -68,6 +87,12 @@ pub enum Type {
     SelfType,
     ErrorType,
 }
+
+pub fn ty(span: Span, node: TypeKind) -> Type { Type { span: span, node: node } }
+
+/// A type that could not be parsed, at no particular place. The parser always has a span
+/// to give; this is for the places a *later* pass needs a stand-in.
+pub fn error_ty() -> Type { ty(Span { start: 0, end: 0 }, TypeKind::ErrorType) }
 
 // --- Bounds --------------------------------------------------------------------------
 
@@ -96,7 +121,12 @@ pub struct FieldPat {
     pub pat: Pat,
 }
 
-pub enum Pat {
+pub struct Pat {
+    pub span: Span,
+    pub node: PatKind,
+}
+
+pub enum PatKind {
     Wild,
     /// A literal, with the `-` a numeric one may carry.
     Lit(bool, Expr),
@@ -110,6 +140,8 @@ pub enum Pat {
     Or(List[Pat]),
     ErrorPat,
 }
+
+pub fn pat(span: Span, node: PatKind) -> Pat { Pat { span: span, node: node } }
 
 // --- Expressions ---------------------------------------------------------------------
 
@@ -134,7 +166,12 @@ pub struct BlockBody {
     pub tail: Option[Expr],
 }
 
-pub enum Expr {
+pub struct Expr {
+    pub span: Span,
+    pub node: ExprKind,
+}
+
+pub enum ExprKind {
     Int(u64, bool, String),
     Float(f64, String),
     Str(String),
@@ -152,13 +189,12 @@ pub enum Expr {
     While(Expr, Expr),
     For(Pat, Expr, Expr),
     Loop(Expr),
-    Break(Span, Option[Expr]),
-    Continue(Span),
+    Break(Option[Expr]),
+    Continue,
     Return(Option[Expr]),
     Unary(String, Expr),
     Binary(String, Expr, Expr),
-    /// The operator, the span of the place being assigned, the place, and the value.
-    Assign(String, Span, Expr, Expr),
+    Assign(String, Expr, Expr),
     Cast(Expr, Type),
     Call(Expr, List[Expr]),
     Method(String, Expr, List[Expr]),
@@ -166,6 +202,8 @@ pub enum Expr {
     Try(Expr),
     ErrorExpr,
 }
+
+pub fn expr(span: Span, node: ExprKind) -> Expr { Expr { span: span, node: node } }
 
 // --- Statements ----------------------------------------------------------------------
 
@@ -671,8 +709,8 @@ fn dump_fn(out: List[String], d: FnDecl, depth: i64) {
 }
 
 fn dump_type(out: List[String], t: Type, depth: i64) {
-    match t {
-        Type::Path(path, args) => {
+    match t.node {
+        TypeKind::Path(path, args) => {
             if args.is_empty() {
                 emit(out, depth, "type \(path.text)");
             } else {
@@ -684,7 +722,7 @@ fn dump_type(out: List[String], t: Type, depth: i64) {
                 }
             }
         }
-        Type::Tuple(elems) => {
+        TypeKind::Tuple(elems) => {
             emit(out, depth, "tuple-type");
             let mut i = 0;
             while i < elems.len() {
@@ -692,8 +730,8 @@ fn dump_type(out: List[String], t: Type, depth: i64) {
                 i = i + 1;
             }
         }
-        Type::Unit => emit(out, depth, "unit-type"),
-        Type::Func(params, ret) => {
+        TypeKind::Unit => emit(out, depth, "unit-type"),
+        TypeKind::Func(params, ret) => {
             emit(out, depth, "fn-type");
             let mut i = 0;
             while i < params.len() {
@@ -703,8 +741,8 @@ fn dump_type(out: List[String], t: Type, depth: i64) {
             emit(out, depth + 1, "->");
             dump_type(out, ret, depth + 2);
         }
-        Type::SelfType => emit(out, depth, "Self"),
-        Type::ErrorType => emit(out, depth, "<error type>"),
+        TypeKind::SelfType => emit(out, depth, "Self"),
+        TypeKind::ErrorType => emit(out, depth, "<error type>"),
     }
 }
 
@@ -740,14 +778,14 @@ fn dump_exprs(out: List[String], es: List[Expr], depth: i64) {
 }
 
 fn dump_expr(out: List[String], e: Expr, depth: i64) {
-    match e {
-        Expr::Int(v, overflow, suffix) =>
+    match e.node {
+        ExprKind::Int(v, overflow, suffix) =>
             emit(out, depth, "int \(v)\(overflow_mark(overflow))\(suffix_mark(suffix))"),
-        Expr::Float(v, suffix) => emit(out, depth, "float \(float_text(v))\(suffix_mark(suffix))"),
-        Expr::Str(v) => emit(out, depth, "str \(quote_str(v))"),
-        Expr::Char(v) => emit(out, depth, "char \(quote_char(v))"),
-        Expr::Bool(v) => emit(out, depth, "bool \(v)"),
-        Expr::Path(path, args) => {
+        ExprKind::Float(v, suffix) => emit(out, depth, "float \(float_text(v))\(suffix_mark(suffix))"),
+        ExprKind::Str(v) => emit(out, depth, "str \(quote_str(v))"),
+        ExprKind::Char(v) => emit(out, depth, "char \(quote_char(v))"),
+        ExprKind::Bool(v) => emit(out, depth, "bool \(v)"),
+        ExprKind::Path(path, args) => {
             if args.is_empty() {
                 emit(out, depth, "path \(path.text)");
             } else {
@@ -759,8 +797,8 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
                 }
             }
         }
-        Expr::SelfExpr => emit(out, depth, "self"),
-        Expr::StructLit(path, args, fields) => {
+        ExprKind::SelfExpr => emit(out, depth, "self"),
+        ExprKind::StructLit(path, args, fields) => {
             if args.is_empty() {
                 emit(out, depth, "struct-lit \(path.text)");
             } else {
@@ -778,7 +816,7 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
                 i = i + 1;
             }
         }
-        Expr::Tuple(elems) => {
+        ExprKind::Tuple(elems) => {
             if elems.is_empty() {
                 emit(out, depth, "unit");
             } else {
@@ -786,7 +824,7 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
                 dump_exprs(out, elems, depth + 1);
             }
         }
-        Expr::Lambda(params, ret, body) => {
+        ExprKind::Lambda(params, ret, body) => {
             emit(out, depth, "lambda");
             let mut i = 0;
             while i < params.len() {
@@ -807,7 +845,7 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
             }
             dump_expr(out, body, depth + 1);
         }
-        Expr::Block(b) => {
+        ExprKind::Block(b) => {
             emit(out, depth, "block");
             let mut i = 0;
             while i < b.stmts.len() {
@@ -822,7 +860,7 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
                 Option::None => {}
             }
         }
-        Expr::If(cond, then, els) => {
+        ExprKind::If(cond, then, els) => {
             emit(out, depth, "if");
             dump_expr(out, cond, depth + 1);
             dump_expr(out, then, depth + 1);
@@ -834,7 +872,7 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
                 Option::None => {}
             }
         }
-        Expr::Match(scrutinee, arms) => {
+        ExprKind::Match(scrutinee, arms) => {
             emit(out, depth, "match");
             dump_expr(out, scrutinee, depth + 1);
             let mut i = 0;
@@ -853,94 +891,94 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
                 i = i + 1;
             }
         }
-        Expr::While(cond, body) => {
+        ExprKind::While(cond, body) => {
             emit(out, depth, "while");
             dump_expr(out, cond, depth + 1);
             dump_expr(out, body, depth + 1);
         }
-        Expr::For(pat, iter, body) => {
+        ExprKind::For(pat, iter, body) => {
             emit(out, depth, "for");
             dump_pat(out, pat, depth + 1);
             dump_expr(out, iter, depth + 1);
             dump_expr(out, body, depth + 1);
         }
-        Expr::Loop(body) => {
+        ExprKind::Loop(body) => {
             emit(out, depth, "loop");
             dump_expr(out, body, depth + 1);
         }
-        Expr::Break(_, v) => {
+        ExprKind::Break(v) => {
             emit(out, depth, "break");
             match v {
                 Option::Some(x) => dump_expr(out, x, depth + 1),
                 Option::None => {}
             }
         }
-        Expr::Continue(_) => emit(out, depth, "continue"),
-        Expr::Return(v) => {
+        ExprKind::Continue => emit(out, depth, "continue"),
+        ExprKind::Return(v) => {
             emit(out, depth, "return");
             match v {
                 Option::Some(x) => dump_expr(out, x, depth + 1),
                 Option::None => {}
             }
         }
-        Expr::Unary(op, x) => {
+        ExprKind::Unary(op, x) => {
             emit(out, depth, "unary \(op)");
             dump_expr(out, x, depth + 1);
         }
-        Expr::Binary(op, l, r) => {
+        ExprKind::Binary(op, l, r) => {
             emit(out, depth, "binary \(op)");
             dump_expr(out, l, depth + 1);
             dump_expr(out, r, depth + 1);
         }
-        Expr::Assign(op, _, place, value) => {
+        ExprKind::Assign(op, place, value) => {
             emit(out, depth, "assign \(op)");
             dump_expr(out, place, depth + 1);
             dump_expr(out, value, depth + 1);
         }
-        Expr::Cast(x, ty) => {
+        ExprKind::Cast(x, ty) => {
             emit(out, depth, "cast");
             dump_expr(out, x, depth + 1);
             dump_type(out, ty, depth + 1);
         }
-        Expr::Call(fn_expr, args) => {
+        ExprKind::Call(fn_expr, args) => {
             emit(out, depth, "call");
             dump_expr(out, fn_expr, depth + 1);
             dump_exprs(out, args, depth + 1);
         }
-        Expr::Method(name, recv, args) => {
+        ExprKind::Method(name, recv, args) => {
             emit(out, depth, "method \(name)");
             dump_expr(out, recv, depth + 1);
             dump_exprs(out, args, depth + 1);
         }
-        Expr::Field(name, recv) => {
+        ExprKind::Field(name, recv) => {
             emit(out, depth, "field \(name)");
             dump_expr(out, recv, depth + 1);
         }
-        Expr::Try(x) => {
+        ExprKind::Try(x) => {
             emit(out, depth, "try");
             dump_expr(out, x, depth + 1);
         }
-        Expr::ErrorExpr => emit(out, depth, "<error expr>"),
+        ExprKind::ErrorExpr => emit(out, depth, "<error expr>"),
     }
 }
 
 fn dump_pat(out: List[String], p: Pat, depth: i64) {
-    match p {
-        Pat::Wild => emit(out, depth, "pat _"),
-        Pat::Lit(neg, lit) => {
+    match p.node {
+        PatKind::Wild => emit(out, depth, "pat _"),
+        PatKind::Lit(neg, lit) => {
             let mark = if neg { "-" } else { "" };
             emit(out, depth, "pat lit \(mark)");
             dump_expr(out, lit, depth + 1);
         }
-        Pat::Bind(mutable, name, sub) => {
+        PatKind::Bind(mutable, name, sub) => {
             emit(out, depth, "pat bind\(mut_mark(mutable)) \(name.name)");
             match sub {
                 Option::Some(s) => dump_pat(out, s, depth + 1),
                 Option::None => {}
             }
         }
-        Pat::PathUnit(path) => emit(out, depth, "pat path \(path.text)"),
-        Pat::PathTuple(path, elems) => {
+        PatKind::PathUnit(path) => emit(out, depth, "pat path \(path.text)"),
+        PatKind::PathTuple(path, elems) => {
             emit(out, depth, "pat path \(path.text)(..)");
             let mut i = 0;
             while i < elems.len() {
@@ -948,7 +986,7 @@ fn dump_pat(out: List[String], p: Pat, depth: i64) {
                 i = i + 1;
             }
         }
-        Pat::PathStruct(path, rest, fields) => {
+        PatKind::PathStruct(path, rest, fields) => {
             let mark = if rest { " .." } else { "" };
             emit(out, depth, "pat path \(path.text){..}\(mark)");
             let mut i = 0;
@@ -958,7 +996,7 @@ fn dump_pat(out: List[String], p: Pat, depth: i64) {
                 i = i + 1;
             }
         }
-        Pat::Tup(elems) => {
+        PatKind::Tup(elems) => {
             emit(out, depth, "pat tuple");
             let mut i = 0;
             while i < elems.len() {
@@ -966,7 +1004,7 @@ fn dump_pat(out: List[String], p: Pat, depth: i64) {
                 i = i + 1;
             }
         }
-        Pat::Or(alts) => {
+        PatKind::Or(alts) => {
             emit(out, depth, "pat or");
             let mut i = 0;
             while i < alts.len() {
@@ -974,6 +1012,6 @@ fn dump_pat(out: List[String], p: Pat, depth: i64) {
                 i = i + 1;
             }
         }
-        Pat::ErrorPat => emit(out, depth, "<error pat>"),
+        PatKind::ErrorPat => emit(out, depth, "<error pat>"),
     }
 }

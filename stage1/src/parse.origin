@@ -70,6 +70,32 @@ impl Parser {
         self.toks.at(self.pos - 1).end
     }
 
+    /// The span of everything from token `start` to the last one consumed, which is what
+    /// `internal/parse`'s own `base` computes and has to stay identical to: a diagnostic
+    /// that is right about the problem and wrong about the place is still wrong.
+    fn span_from(self, start: i64) -> ast::Span {
+        let mut end = self.pos - 1;
+        if end < start {
+            end = start;
+        }
+        if end >= self.toks.len() {
+            end = self.toks.len() - 1;
+        }
+        ast::Span { start: self.toks.at(start).start, end: self.toks.at(end).end }
+    }
+
+    fn mk_expr(self, start: i64, node: ast::ExprKind) -> ast::Expr {
+        ast::expr(self.span_from(start), node)
+    }
+
+    fn mk_pat(self, start: i64, node: ast::PatKind) -> ast::Pat {
+        ast::pat(self.span_from(start), node)
+    }
+
+    fn mk_type(self, start: i64, node: ast::TypeKind) -> ast::Type {
+        ast::ty(self.span_from(start), node)
+    }
+
     fn peek_is(self, n: i64, k: i64) -> bool {
         if self.pos + n >= self.toks.len() {
             return false;
@@ -470,7 +496,7 @@ impl Parser {
             } else {
                 let mutable = self.eat(lex::K_MUT);
                 let pat = self.pattern();
-                let mut ty = ast::Type::ErrorType;
+                let mut ty = ast::error_ty();
                 if self.expect(lex::K_COLON) {
                     ty = self.type_expr();
                 } else {
@@ -518,7 +544,7 @@ impl Parser {
                     }
                 }
                 Option::Some(name) => {
-                    let mut ty = ast::Type::ErrorType;
+                    let mut ty = ast::error_ty();
                     if self.expect(lex::K_COLON) {
                         ty = self.type_expr();
                     } else {
@@ -682,7 +708,7 @@ impl Parser {
             if self.at(lex::K_TYPE) {
                 self.advance();
                 let aname = self.decl_name();
-                let mut aty = ast::Type::ErrorType;
+                let mut aty = ast::error_ty();
                 if self.expect(lex::K_ASSIGN) {
                     aty = self.type_expr();
                 }
@@ -714,7 +740,7 @@ impl Parser {
         self.advance();
         let name = self.decl_name();
         let generics = self.generics();
-        let mut ty = ast::Type::ErrorType;
+        let mut ty = ast::error_ty();
         if self.expect(lex::K_ASSIGN) {
             ty = self.type_expr();
         } else {
@@ -727,11 +753,11 @@ impl Parser {
     fn const_decl(self, public: bool) -> ast::ConstDecl {
         self.advance();
         let name = self.decl_name();
-        let mut ty = ast::Type::ErrorType;
+        let mut ty = ast::error_ty();
         if self.expect(lex::K_COLON) {
             ty = self.type_expr();
         }
-        let mut value = ast::Expr::ErrorExpr;
+        let mut value = self.mk_expr(self.pos, ast::ExprKind::ErrorExpr);
         if self.expect(lex::K_ASSIGN) {
             value = self.expr();
         } else {
@@ -740,6 +766,10 @@ impl Parser {
         self.expect(lex::K_SEMI);
         ast::ConstDecl { public: public, name: name, ty: ty, value: value }
     }
+}
+
+fn ident_span(id: ast::Ident) -> ast::Span {
+    ast::Span { start: id.start, end: id.end }
 }
 
 /// A one-segment path's segment list, for the shorthand `Point { x, y }`, where the
@@ -752,16 +782,16 @@ fn one_ident(id: ast::Ident) -> List[ast::Ident] {
 
 /// A parsed type reinterpreted as a trait's path, which only a path type can be.
 fn type_as_trait_path(t: ast::Type) -> ast::PathRef {
-    match t {
-        ast::Type::Path(path, _) => path,
+    match t.node {
+        ast::TypeKind::Path(path, _) => path,
         _ => ast::PathRef { text: "", start: 0, end: 0, segs: list::new[ast::Ident](), res: ast::UNRESOLVED },
     }
 }
 
 /// The same type's arguments, which are the trait's: `impl Iterator[i64] for Counter`.
 fn type_as_trait_args(t: ast::Type) -> List[ast::Type] {
-    match t {
-        ast::Type::Path(_, args) => args,
+    match t.node {
+        ast::TypeKind::Path(_, args) => args,
         _ => list::new[ast::Type](),
     }
 }
@@ -770,14 +800,16 @@ fn type_as_trait_args(t: ast::Type) -> List[ast::Type] {
 
 impl Parser {
     fn type_expr(self) -> ast::Type {
+        let start = self.pos;
         if self.at(lex::K_SELF_TYPE) {
             // Bare `Self` is the self type; `Self::Item` is a projection, so a path.
             if !self.peek_is(1, lex::K_COLONCOLON) {
                 self.advance();
-                return ast::Type::SelfType;
+                return self.mk_type(start, ast::TypeKind::SelfType);
             }
             let path = self.path();
-            return ast::Type::Path(path, self.type_args());
+            let args = self.type_args();
+            return self.mk_type(start, ast::TypeKind::Path(path, args));
         }
         if self.at(lex::K_FN) {
             self.advance();
@@ -791,16 +823,16 @@ impl Parser {
                 }
                 self.expect(lex::K_RPAREN);
             }
-            let mut ret = ast::Type::ErrorType;
+            let mut ret = ast::error_ty();
             if self.expect(lex::K_ARROW) {
                 ret = self.type_expr();
             }
-            return ast::Type::Func(params, ret);
+            return self.mk_type(start, ast::TypeKind::Func(params, ret));
         }
         if self.at(lex::K_LPAREN) {
             self.advance();
             if self.eat(lex::K_RPAREN) {
-                return ast::Type::Unit;
+                return self.mk_type(start, ast::TypeKind::Unit);
             }
             let first = self.type_expr();
             if !self.at(lex::K_COMMA) {
@@ -816,15 +848,16 @@ impl Parser {
                 elems.push(self.type_expr());
             }
             self.expect(lex::K_RPAREN);
-            return ast::Type::Tuple(elems);
+            return self.mk_type(start, ast::TypeKind::Tuple(elems));
         }
         if self.at(lex::K_IDENT) {
             let path = self.path();
-            return ast::Type::Path(path, self.type_args());
+            let args = self.type_args();
+            return self.mk_type(start, ast::TypeKind::Path(path, args));
         }
         self.error_expected("a type");
         self.advance();
-        ast::Type::ErrorType
+        self.mk_type(start, ast::TypeKind::ErrorType)
     }
 }
 
@@ -836,13 +869,13 @@ fn starts_block_expr(k: i64) -> bool {
 }
 
 fn is_block_expr(e: ast::Expr) -> bool {
-    match e {
-        ast::Expr::Block(_) => true,
-        ast::Expr::If(_, _, _) => true,
-        ast::Expr::Match(_, _) => true,
-        ast::Expr::While(_, _) => true,
-        ast::Expr::For(_, _, _) => true,
-        ast::Expr::Loop(_) => true,
+    match e.node {
+        ast::ExprKind::Block(_) => true,
+        ast::ExprKind::If(_, _, _) => true,
+        ast::ExprKind::Match(_, _) => true,
+        ast::ExprKind::While(_, _) => true,
+        ast::ExprKind::For(_, _, _) => true,
+        ast::ExprKind::Loop(_) => true,
         _ => false,
     }
 }
@@ -855,13 +888,15 @@ struct StmtOrTail {
 
 impl Parser {
     fn block(self) -> ast::Expr {
+        let start = self.pos;
         let saved = self.no_struct;
         self.no_struct = false;
         let stmts = list::new[ast::Stmt]();
         let mut tail = Option::None;
         if !self.expect(lex::K_LBRACE) {
             self.no_struct = saved;
-            return ast::Expr::Block(ast::BlockBody { stmts: stmts, tail: tail });
+            return self.mk_expr(start,
+                ast::ExprKind::Block(ast::BlockBody { stmts: stmts, tail: tail }));
         }
         let mut going = true;
         while going {
@@ -889,7 +924,7 @@ impl Parser {
         }
         self.expect(lex::K_RBRACE);
         self.no_struct = saved;
-        ast::Expr::Block(ast::BlockBody { stmts: stmts, tail: tail })
+        self.mk_expr(start, ast::ExprKind::Block(ast::BlockBody { stmts: stmts, tail: tail }))
     }
 
     fn stmt(self) -> StmtOrTail {
@@ -930,6 +965,7 @@ impl Parser {
     }
 
     fn let_stmt(self) -> ast::Stmt {
+        let start = self.pos;
         self.advance();
         let mutable = self.eat(lex::K_MUT);
         let pat = self.pattern();
@@ -939,7 +975,8 @@ impl Parser {
         }
         if !self.expect(lex::K_ASSIGN) {
             self.sync_stmt();
-            return ast::Stmt::Let(mutable, pat, ty, ast::Expr::ErrorExpr);
+            return ast::Stmt::Let(mutable, pat, ty,
+                                  self.mk_expr(start, ast::ExprKind::ErrorExpr));
         }
         let value = self.expr();
         self.expect(lex::K_SEMI);
@@ -985,34 +1022,33 @@ impl Parser {
     }
 
     fn assign_expr(self) -> ast::Expr {
-        let start = self.cur().start;
+        let start = self.pos;
         let lhs = self.or_expr();
         let op = assign_op(self.cur().kind);
         if op.is_empty() {
             return lhs;
         }
-        // The place's span, taken before and after parsing it: the resolver reports
-        // "cannot assign to this expression" against exactly this range.
-        let place = ast::Span { start: start, end: self.prev_end() };
         self.advance();
         let rhs = self.assign_expr(); // right-associative
-        ast::Expr::Assign(op, place, lhs, rhs)
+        self.mk_expr(start, ast::ExprKind::Assign(op, lhs, rhs))
     }
 
     fn or_expr(self) -> ast::Expr {
+        let start = self.pos;
         let mut left = self.and_expr();
         while self.at(lex::K_OROR) {
             self.advance();
-            left = ast::Expr::Binary("||", left, self.and_expr());
+            left = self.mk_expr(start, ast::ExprKind::Binary("||", left, self.and_expr()));
         }
         left
     }
 
     fn and_expr(self) -> ast::Expr {
+        let start = self.pos;
         let mut left = self.cmp_expr();
         while self.at(lex::K_ANDAND) {
             self.advance();
-            left = ast::Expr::Binary("&&", left, self.cmp_expr());
+            left = self.mk_expr(start, ast::ExprKind::Binary("&&", left, self.cmp_expr()));
         }
         left
     }
@@ -1020,6 +1056,7 @@ impl Parser {
     /// Comparison is non-associative: `a < b < c` is rejected rather than silently read as
     /// `(a < b) < c`.
     fn cmp_expr(self) -> ast::Expr {
+        let start = self.pos;
         let left = self.bit_or_expr();
         let op = cmp_op(self.cur().kind);
         if op.is_empty() {
@@ -1034,47 +1071,51 @@ impl Parser {
             self.advance();
             self.bit_or_expr();
         }
-        ast::Expr::Binary(op, left, right)
+        self.mk_expr(start, ast::ExprKind::Binary(op, left, right))
     }
 
     fn bit_or_expr(self) -> ast::Expr {
+        let start = self.pos;
         let mut left = self.bit_xor_expr();
         while self.at(lex::K_PIPE) {
             self.advance();
-            left = ast::Expr::Binary("|", left, self.bit_xor_expr());
+            left = self.mk_expr(start, ast::ExprKind::Binary("|", left, self.bit_xor_expr()));
         }
         left
     }
 
     fn bit_xor_expr(self) -> ast::Expr {
+        let start = self.pos;
         let mut left = self.bit_and_expr();
         while self.at(lex::K_CARET) {
             self.advance();
-            left = ast::Expr::Binary("^", left, self.bit_and_expr());
+            left = self.mk_expr(start, ast::ExprKind::Binary("^", left, self.bit_and_expr()));
         }
         left
     }
 
     fn bit_and_expr(self) -> ast::Expr {
+        let start = self.pos;
         let mut left = self.shift_expr();
         while self.at(lex::K_AMP) {
             self.advance();
-            left = ast::Expr::Binary("&", left, self.shift_expr());
+            left = self.mk_expr(start, ast::ExprKind::Binary("&", left, self.shift_expr()));
         }
         left
     }
 
     fn shift_expr(self) -> ast::Expr {
+        let start = self.pos;
         let mut left = self.add_expr();
         let mut going = true;
         while going {
             if self.at(lex::K_SHL) {
                 self.advance();
-                left = ast::Expr::Binary("<<", left, self.add_expr());
+                left = self.mk_expr(start, ast::ExprKind::Binary("<<", left, self.add_expr()));
             } else {
                 if self.at(lex::K_SHR) {
                     self.advance();
-                    left = ast::Expr::Binary(">>", left, self.add_expr());
+                    left = self.mk_expr(start, ast::ExprKind::Binary(">>", left, self.add_expr()));
                 } else {
                     going = false;
                 }
@@ -1084,16 +1125,17 @@ impl Parser {
     }
 
     fn add_expr(self) -> ast::Expr {
+        let start = self.pos;
         let mut left = self.mul_expr();
         let mut going = true;
         while going {
             if self.at(lex::K_PLUS) {
                 self.advance();
-                left = ast::Expr::Binary("+", left, self.mul_expr());
+                left = self.mk_expr(start, ast::ExprKind::Binary("+", left, self.mul_expr()));
             } else {
                 if self.at(lex::K_MINUS) {
                     self.advance();
-                    left = ast::Expr::Binary("-", left, self.mul_expr());
+                    left = self.mk_expr(start, ast::ExprKind::Binary("-", left, self.mul_expr()));
                 } else {
                     going = false;
                 }
@@ -1103,20 +1145,21 @@ impl Parser {
     }
 
     fn mul_expr(self) -> ast::Expr {
+        let start = self.pos;
         let mut left = self.cast_expr();
         let mut going = true;
         while going {
             if self.at(lex::K_STAR) {
                 self.advance();
-                left = ast::Expr::Binary("*", left, self.cast_expr());
+                left = self.mk_expr(start, ast::ExprKind::Binary("*", left, self.cast_expr()));
             } else {
                 if self.at(lex::K_SLASH) {
                     self.advance();
-                    left = ast::Expr::Binary("/", left, self.cast_expr());
+                    left = self.mk_expr(start, ast::ExprKind::Binary("/", left, self.cast_expr()));
                 } else {
                     if self.at(lex::K_PERCENT) {
                         self.advance();
-                        left = ast::Expr::Binary("%", left, self.cast_expr());
+                        left = self.mk_expr(start, ast::ExprKind::Binary("%", left, self.cast_expr()));
                     } else {
                         going = false;
                     }
@@ -1127,27 +1170,30 @@ impl Parser {
     }
 
     fn cast_expr(self) -> ast::Expr {
+        let start = self.pos;
         let mut e = self.unary_expr();
         while self.at(lex::K_AS) {
             self.advance();
-            e = ast::Expr::Cast(e, self.type_expr());
+            e = self.mk_expr(start, ast::ExprKind::Cast(e, self.type_expr()));
         }
         e
     }
 
     fn unary_expr(self) -> ast::Expr {
+        let start = self.pos;
         if self.at(lex::K_MINUS) {
             self.advance();
-            return ast::Expr::Unary("-", self.unary_expr());
+            return self.mk_expr(start, ast::ExprKind::Unary("-", self.unary_expr()));
         }
         if self.at(lex::K_BANG) {
             self.advance();
-            return ast::Expr::Unary("!", self.unary_expr());
+            return self.mk_expr(start, ast::ExprKind::Unary("!", self.unary_expr()));
         }
         self.postfix_expr()
     }
 
     fn postfix_expr(self) -> ast::Expr {
+        let start = self.pos;
         let mut e = self.primary();
         let mut going = true;
         while going {
@@ -1155,23 +1201,24 @@ impl Parser {
                 self.advance();
                 match self.ident() {
                     Option::None => {
-                        return ast::Expr::ErrorExpr;
+                        return self.mk_expr(start, ast::ExprKind::ErrorExpr);
                     }
                     Option::Some(name) => {
                         if self.at(lex::K_LPAREN) {
-                            e = ast::Expr::Method(name.name, e, self.call_args());
+                            e = self.mk_expr(start,
+                                ast::ExprKind::Method(name.name, e, self.call_args()));
                         } else {
-                            e = ast::Expr::Field(name.name, e);
+                            e = self.mk_expr(start, ast::ExprKind::Field(name.name, e));
                         }
                     }
                 }
             } else {
                 if self.at(lex::K_LPAREN) {
-                    e = ast::Expr::Call(e, self.call_args());
+                    e = self.mk_expr(start, ast::ExprKind::Call(e, self.call_args()));
                 } else {
                     if self.at(lex::K_QUESTION) {
                         self.advance();
-                        e = ast::Expr::Try(e);
+                        e = self.mk_expr(start, ast::ExprKind::Try(e));
                     } else {
                         going = false;
                     }
@@ -1210,35 +1257,36 @@ impl Parser {
     }
 
     fn primary(self) -> ast::Expr {
+        let start = self.pos;
         let t = self.cur();
         let k = t.kind;
 
         if k == lex::K_INT {
             self.advance();
-            return ast::Expr::Int(t.int, t.overflow, t.suffix);
+            return self.mk_expr(start, ast::ExprKind::Int(t.int, t.overflow, t.suffix));
         }
         if k == lex::K_FLOAT {
             self.advance();
-            return ast::Expr::Float(t.float, t.suffix);
+            return self.mk_expr(start, ast::ExprKind::Float(t.float, t.suffix));
         }
         if k == lex::K_STR {
             self.advance();
             if t.interpolated {
-                return interpolated(t, self.errors);
+                return interpolated(t, self.errors, self.span_from(start));
             }
-            return ast::Expr::Str(t.str);
+            return self.mk_expr(start, ast::ExprKind::Str(t.str));
         }
         if k == lex::K_CHAR {
             self.advance();
-            return ast::Expr::Char(t.ch);
+            return self.mk_expr(start, ast::ExprKind::Char(t.ch));
         }
         if k == lex::K_TRUE || k == lex::K_FALSE {
             self.advance();
-            return ast::Expr::Bool(k == lex::K_TRUE);
+            return self.mk_expr(start, ast::ExprKind::Bool(k == lex::K_TRUE));
         }
         if k == lex::K_SELF_VALUE {
             self.advance();
-            return ast::Expr::SelfExpr;
+            return self.mk_expr(start, ast::ExprKind::SelfExpr);
         }
         if k == lex::K_LPAREN {
             return self.paren_or_tuple();
@@ -1255,38 +1303,43 @@ impl Parser {
         if k == lex::K_WHILE {
             self.advance();
             let cond = self.expr_no_struct();
-            return ast::Expr::While(cond, self.block());
+            let body = self.block();
+            return self.mk_expr(start, ast::ExprKind::While(cond, body));
         }
         if k == lex::K_FOR {
             self.advance();
             let pat = self.pattern();
             self.expect(lex::K_IN);
             let iter = self.expr_no_struct();
-            return ast::Expr::For(pat, iter, self.block());
+            let body = self.block();
+            return self.mk_expr(start, ast::ExprKind::For(pat, iter, body));
         }
         if k == lex::K_LOOP {
             self.advance();
-            return ast::Expr::Loop(self.block());
+            let body = self.block();
+            return self.mk_expr(start, ast::ExprKind::Loop(body));
         }
         if k == lex::K_BREAK {
-            let t = self.advance();
-            let at = ast::Span { start: t.start, end: t.end };
+            self.advance();
             if self.can_start_expr() {
-                return ast::Expr::Break(at, Option::Some(self.expr()));
+                let v = self.expr();
+                return self.mk_expr(start, ast::ExprKind::Break(Option::Some(v)));
             }
             let none: Option[ast::Expr] = Option::None;
-            return ast::Expr::Break(at, none);
+            return self.mk_expr(start, ast::ExprKind::Break(none));
         }
         if k == lex::K_CONTINUE {
-            let t = self.advance();
-            return ast::Expr::Continue(ast::Span { start: t.start, end: t.end });
+            self.advance();
+            return self.mk_expr(start, ast::ExprKind::Continue);
         }
         if k == lex::K_RETURN {
             self.advance();
             if self.can_start_expr() {
-                return ast::Expr::Return(Option::Some(self.expr()));
+                let v = self.expr();
+                return self.mk_expr(start, ast::ExprKind::Return(Option::Some(v)));
             }
-            return ast::Expr::Return(Option::None);
+            let none: Option[ast::Expr] = Option::None;
+            return self.mk_expr(start, ast::ExprKind::Return(none));
         }
         if k == lex::K_PIPE || k == lex::K_OROR {
             return self.lambda();
@@ -1297,17 +1350,18 @@ impl Parser {
 
         self.error_expected("an expression");
         self.advance();
-        ast::Expr::ErrorExpr
+        self.mk_expr(start, ast::ExprKind::ErrorExpr)
     }
 
     fn paren_or_tuple(self) -> ast::Expr {
+        let start = self.pos;
         let saved = self.no_struct;
         self.no_struct = false;
         self.advance();
         if self.at(lex::K_RPAREN) {
             self.advance();
             self.no_struct = saved;
-            return ast::Expr::Tuple(list::new[ast::Expr]());
+            return self.mk_expr(start, ast::ExprKind::Tuple(list::new[ast::Expr]()));
         }
         let first = self.expr();
         if !self.at(lex::K_COMMA) {
@@ -1325,10 +1379,11 @@ impl Parser {
         }
         self.expect(lex::K_RPAREN);
         self.no_struct = saved;
-        ast::Expr::Tuple(elems)
+        self.mk_expr(start, ast::ExprKind::Tuple(elems))
     }
 
     fn if_expr(self) -> ast::Expr {
+        let start = self.pos;
         self.advance();
         let cond = self.expr_no_struct();
         let then = self.block();
@@ -1340,15 +1395,16 @@ impl Parser {
                 els = Option::Some(self.block());
             }
         }
-        ast::Expr::If(cond, then, els)
+        self.mk_expr(start, ast::ExprKind::If(cond, then, els))
     }
 
     fn match_expr(self) -> ast::Expr {
+        let start = self.pos;
         self.advance();
         let scrutinee = self.expr_no_struct();
         let arms = list::new[ast::Arm]();
         if !self.expect(lex::K_LBRACE) {
-            return ast::Expr::Match(scrutinee, arms);
+            return self.mk_expr(start, ast::ExprKind::Match(scrutinee, arms));
         }
         let saved = self.no_struct;
         self.no_struct = false;
@@ -1379,10 +1435,11 @@ impl Parser {
         }
         self.no_struct = saved;
         self.expect(lex::K_RBRACE);
-        ast::Expr::Match(scrutinee, arms)
+        self.mk_expr(start, ast::ExprKind::Match(scrutinee, arms))
     }
 
     fn lambda(self) -> ast::Expr {
+        let start = self.pos;
         let saved = self.no_struct;
         self.no_struct = false;
         let params = list::new[ast::LambdaParam]();
@@ -1404,7 +1461,7 @@ impl Parser {
             }
             self.expect(lex::K_PIPE);
         }
-        let mut body = ast::Expr::ErrorExpr;
+        let mut body = self.mk_expr(start, ast::ExprKind::ErrorExpr);
         let mut ret = Option::None;
         if self.eat(lex::K_ARROW) {
             ret = Option::Some(self.type_expr());
@@ -1413,15 +1470,16 @@ impl Parser {
             body = self.expr();
         }
         self.no_struct = saved;
-        ast::Expr::Lambda(params, ret, body)
+        self.mk_expr(start, ast::ExprKind::Lambda(params, ret, body))
     }
 
     fn path_expr_or_struct_lit(self) -> ast::Expr {
+        let start = self.pos;
         let path = self.path();
         let args = self.type_args();
 
         if self.at(lex::K_LBRACE) && !self.no_struct {
-            return self.struct_lit(path, args);
+            return self.struct_lit(start, path, args);
         }
         // A struct literal here is what the writer meant, and exactly what §02's first
         // parser restriction forbids. `Ident :` inside the brace is a field initializer and
@@ -1431,12 +1489,12 @@ impl Parser {
             && self.peek_is(1, lex::K_IDENT) && self.peek_is(2, lex::K_COLON) {
             let t = self.cur();
             self.error_at(t.start, t.end, "a struct literal cannot appear here");
-            return self.struct_lit(path, args);
+            return self.struct_lit(start, path, args);
         }
-        ast::Expr::Path(path, args)
+        self.mk_expr(start, ast::ExprKind::Path(path, args))
     }
 
-    fn struct_lit(self, path: ast::PathRef, args: List[ast::Type]) -> ast::Expr {
+    fn struct_lit(self, start: i64, path: ast::PathRef, args: List[ast::Type]) -> ast::Expr {
         let saved = self.no_struct;
         self.no_struct = false;
         self.advance();
@@ -1454,7 +1512,8 @@ impl Parser {
                         text: name.name, start: name.start, end: name.end,
                         segs: one_ident(name), res: ast::UNRESOLVED,
                     };
-                    let mut value = ast::Expr::Path(shorthand, list::new[ast::Type]());
+                    let mut value = ast::expr(ident_span(name),
+                        ast::ExprKind::Path(shorthand, list::new[ast::Type]()));
                     if self.eat(lex::K_COLON) {
                         value = self.expr();
                     }
@@ -1468,7 +1527,7 @@ impl Parser {
         }
         self.expect(lex::K_RBRACE);
         self.no_struct = saved;
-        ast::Expr::StructLit(path, args, fields)
+        self.mk_expr(start, ast::ExprKind::StructLit(path, args, fields))
     }
 }
 
@@ -1478,23 +1537,27 @@ impl Parser {
 // nothing downstream learns a new form: the checker sees `concat` and `to_str` and applies
 // `Str` and `Show` to them like any other call.
 
-fn interpolated(t: lex::Token, errors: List[ParseError]) -> ast::Expr {
-    let mut out = ast::Expr::ErrorExpr;
+fn interpolated(t: lex::Token, errors: List[ParseError], at: ast::Span) -> ast::Expr {
+    // Every node the desugaring builds carries the whole literal's span: none of these
+    // calls is anything the programmer wrote a location for, which is what internal/parse
+    // does too.
+    let mut out = ast::expr(at, ast::ExprKind::ErrorExpr);
     let mut started = false;
     let mut i = 0;
     while i < t.parts.len() {
-        let mut piece = ast::Expr::ErrorExpr;
+        let mut piece = ast::expr(at, ast::ExprKind::ErrorExpr);
         let mut have = false;
         match t.parts.at(i) {
             lex::Part::Text(text) => {
                 // An empty chunk between two interpolations contributes nothing.
                 if !text.is_empty() {
-                    piece = ast::Expr::Str(text);
+                    piece = ast::expr(at, ast::ExprKind::Str(text));
                     have = true;
                 }
             }
             lex::Part::Expr(toks) => {
-                piece = ast::Expr::Method("to_str", sub_expr(toks, errors), list::new[ast::Expr]());
+                piece = ast::expr(at, ast::ExprKind::Method(
+                    "to_str", sub_expr(toks, errors, at), list::new[ast::Expr]()));
                 have = true;
             }
         }
@@ -1502,7 +1565,7 @@ fn interpolated(t: lex::Token, errors: List[ParseError]) -> ast::Expr {
             if started {
                 let args = list::new[ast::Expr]();
                 args.push(piece);
-                out = ast::Expr::Method("concat", out, args);
+                out = ast::expr(at, ast::ExprKind::Method("concat", out, args));
             } else {
                 out = piece;
                 started = true;
@@ -1512,7 +1575,7 @@ fn interpolated(t: lex::Token, errors: List[ParseError]) -> ast::Expr {
     }
     if !started {
         // Every part was an empty chunk, which the lexer produces only for `""` itself.
-        return ast::Expr::Str("");
+        return ast::expr(at, ast::ExprKind::Str(""));
     }
     out
 }
@@ -1522,7 +1585,7 @@ fn interpolated(t: lex::Token, errors: List[ParseError]) -> ast::Expr {
 /// The error list is the outer parser's, not a fresh one: a syntax error inside an
 /// interpolation is the file's error and has to reach the same report, and the tokens
 /// carry spans into the real source, so it already points where the programmer wrote it.
-fn sub_expr(toks: List[lex::Token], errors: List[ParseError]) -> ast::Expr {
+fn sub_expr(toks: List[lex::Token], errors: List[ParseError], at: ast::Span) -> ast::Expr {
     let p = Parser {
         toks: toks, pos: 0, no_struct: false, recovering: false,
         errors: errors,
@@ -1541,6 +1604,7 @@ fn sub_expr(toks: List[lex::Token], errors: List[ParseError]) -> ast::Expr {
 
 impl Parser {
     fn pattern(self) -> ast::Pat {
+        let start = self.pos;
         let first = self.pattern_no_or();
         if !self.at(lex::K_PIPE) {
             return first;
@@ -1550,28 +1614,31 @@ impl Parser {
         while self.eat(lex::K_PIPE) {
             alts.push(self.pattern_no_or());
         }
-        ast::Pat::Or(alts)
+        self.mk_pat(start, ast::PatKind::Or(alts))
     }
 
     fn pattern_no_or(self) -> ast::Pat {
+        let start = self.pos;
         let k = self.cur().kind;
 
         if k == lex::K_UNDERSCORE {
             self.advance();
-            return ast::Pat::Wild;
+            return self.mk_pat(start, ast::PatKind::Wild);
         }
         if k == lex::K_INT || k == lex::K_FLOAT || k == lex::K_STR || k == lex::K_CHAR
             || k == lex::K_TRUE || k == lex::K_FALSE {
-            return ast::Pat::Lit(false, self.literal_for_pattern());
+            let lit = self.literal_for_pattern();
+            return self.mk_pat(start, ast::PatKind::Lit(false, lit));
         }
         if k == lex::K_MINUS {
             self.advance();
             if !self.at(lex::K_INT) && !self.at(lex::K_FLOAT) {
                 self.error_expected("a numeric literal after `-` in a pattern");
                 self.advance();
-                return ast::Pat::ErrorPat;
+                return self.mk_pat(start, ast::PatKind::ErrorPat);
             }
-            return ast::Pat::Lit(true, self.literal_for_pattern());
+            let lit = self.literal_for_pattern();
+            return self.mk_pat(start, ast::PatKind::Lit(true, lit));
         }
         if k == lex::K_LPAREN {
             return self.tuple_pattern();
@@ -1579,24 +1646,23 @@ impl Parser {
         if k == lex::K_MUT {
             self.advance();
             match self.ident() {
-                Option::None => { return ast::Pat::ErrorPat; }
+                Option::None => { return self.mk_pat(start, ast::PatKind::ErrorPat); }
                 Option::Some(name) => {
                     let mut sub = Option::None;
                     if self.eat(lex::K_AT) {
                         sub = Option::Some(self.pattern_no_or());
                     }
-                    return ast::Pat::Bind(true, name, sub);
+                    return self.mk_pat(start, ast::PatKind::Bind(true, name, sub));
                 }
             }
         }
         if k == lex::K_IDENT || k == lex::K_SELF_TYPE {
-            let start = self.pos;
             let path = self.path();
             if self.at(lex::K_LPAREN) {
-                return self.tuple_variant_pattern(path);
+                return self.tuple_variant_pattern(start, path);
             }
             if self.at(lex::K_LBRACE) {
-                return self.struct_pattern(path);
+                return self.struct_pattern(start, path);
             }
             // A bare name is a binding unless it resolves to a unit variant or a constant,
             // and that decision belongs to name resolution rather than to the parser.
@@ -1605,39 +1671,41 @@ impl Parser {
                 if self.eat(lex::K_AT) {
                     sub = Option::Some(self.pattern_no_or());
                 }
-                return ast::Pat::Bind(false, path.segs.at(0), sub);
+                return self.mk_pat(start, ast::PatKind::Bind(false, path.segs.at(0), sub));
             }
-            return ast::Pat::PathUnit(path);
+            return self.mk_pat(start, ast::PatKind::PathUnit(path));
         }
 
         self.error_expected("a pattern");
         self.advance();
-        ast::Pat::ErrorPat
+        self.mk_pat(start, ast::PatKind::ErrorPat)
     }
 
     /// Patterns admit literals and never arbitrary expressions.
     fn literal_for_pattern(self) -> ast::Expr {
+        let start = self.pos;
         let t = self.advance();
         if t.kind == lex::K_INT {
-            return ast::Expr::Int(t.int, t.overflow, t.suffix);
+            return self.mk_expr(start, ast::ExprKind::Int(t.int, t.overflow, t.suffix));
         }
         if t.kind == lex::K_FLOAT {
-            return ast::Expr::Float(t.float, t.suffix);
+            return self.mk_expr(start, ast::ExprKind::Float(t.float, t.suffix));
         }
         if t.kind == lex::K_STR {
-            return ast::Expr::Str(t.str);
+            return self.mk_expr(start, ast::ExprKind::Str(t.str));
         }
         if t.kind == lex::K_CHAR {
-            return ast::Expr::Char(t.ch);
+            return self.mk_expr(start, ast::ExprKind::Char(t.ch));
         }
-        ast::Expr::Bool(t.kind == lex::K_TRUE)
+        self.mk_expr(start, ast::ExprKind::Bool(t.kind == lex::K_TRUE))
     }
 
     fn tuple_pattern(self) -> ast::Pat {
+        let start = self.pos;
         self.advance();
         if self.at(lex::K_RPAREN) {
             self.advance();
-            return ast::Pat::Tup(list::new[ast::Pat]());
+            return self.mk_pat(start, ast::PatKind::Tup(list::new[ast::Pat]()));
         }
         let first = self.pattern();
         if !self.at(lex::K_COMMA) {
@@ -1653,10 +1721,10 @@ impl Parser {
             elems.push(self.pattern());
         }
         self.expect(lex::K_RPAREN);
-        ast::Pat::Tup(elems)
+        self.mk_pat(start, ast::PatKind::Tup(elems))
     }
 
-    fn tuple_variant_pattern(self, path: ast::PathRef) -> ast::Pat {
+    fn tuple_variant_pattern(self, start: i64, path: ast::PathRef) -> ast::Pat {
         self.advance();
         let elems = list::new[ast::Pat]();
         while !self.at(lex::K_RPAREN) && !self.at_eof() {
@@ -1670,10 +1738,10 @@ impl Parser {
             }
         }
         self.expect(lex::K_RPAREN);
-        ast::Pat::PathTuple(path, elems)
+        self.mk_pat(start, ast::PatKind::PathTuple(path, elems))
     }
 
-    fn struct_pattern(self, path: ast::PathRef) -> ast::Pat {
+    fn struct_pattern(self, start: i64, path: ast::PathRef) -> ast::Pat {
         self.advance();
         let fields = list::new[ast::FieldPat]();
         let mut rest = false;
@@ -1691,7 +1759,9 @@ impl Parser {
                     }
                 }
                 Option::Some(name) => {
-                    let mut pat = ast::Pat::Bind(false, name, Option::None);
+                    let none: Option[ast::Pat] = Option::None;
+                    let mut pat = ast::pat(ident_span(name),
+                        ast::PatKind::Bind(false, name, none));
                     if self.eat(lex::K_COLON) {
                         pat = self.pattern();
                     }
@@ -1703,6 +1773,6 @@ impl Parser {
             }
         }
         self.expect(lex::K_RBRACE);
-        ast::Pat::PathStruct(path, rest, fields)
+        self.mk_pat(start, ast::PatKind::PathStruct(path, rest, fields))
     }
 }

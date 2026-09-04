@@ -1041,8 +1041,8 @@ impl Resolver {
     /// The names inside a syntactic type. The checker reads the result and never consults
     /// a scope itself (spec/07-modules.md).
     fn resolve_type(self, t: ast::Type) {
-        match t {
-            ast::Type::Path(p, args) => {
+        match t.node {
+            ast::TypeKind::Path(p, args) => {
                 self.resolve_path(p, false);
                 let mut i = 0;
                 while i < args.len() {
@@ -1050,14 +1050,14 @@ impl Resolver {
                     i = i + 1;
                 }
             }
-            ast::Type::Tuple(elems) => {
+            ast::TypeKind::Tuple(elems) => {
                 let mut i = 0;
                 while i < elems.len() {
                     self.resolve_type(elems.at(i));
                     i = i + 1;
                 }
             }
-            ast::Type::Func(params, ret) => {
+            ast::TypeKind::Func(params, ret) => {
                 let mut i = 0;
                 while i < params.len() {
                     self.resolve_type(params.at(i));
@@ -1065,9 +1065,9 @@ impl Resolver {
                 }
                 self.resolve_type(ret);
             }
-            ast::Type::Unit => {}
-            ast::Type::SelfType => {}
-            ast::Type::ErrorType => {}
+            ast::TypeKind::Unit => {}
+            ast::TypeKind::SelfType => {}
+            ast::TypeKind::ErrorType => {}
         }
     }
 
@@ -1111,12 +1111,12 @@ impl Resolver {
     /// variant or a constant matches that value instead of binding (spec/02-grammar.md);
     /// that decision is made here, not in the parser.
     fn bind_pattern(self, p: ast::Pat, mutable: bool) {
-        match p {
-            ast::Pat::Wild => {}
-            ast::Pat::ErrorPat => {}
-            ast::Pat::Lit(_, _) => {}
+        match p.node {
+            ast::PatKind::Wild => {}
+            ast::PatKind::ErrorPat => {}
+            ast::PatKind::Lit(_, _) => {}
 
-            ast::Pat::Bind(pat_mut, name, sub) => {
+            ast::PatKind::Bind(pat_mut, name, sub) => {
                 if !pat_mut && !mutable {
                     match self.scope.lookup(name.name) {
                         Option::Some(r) => {
@@ -1146,9 +1146,9 @@ impl Resolver {
                 }
             }
 
-            ast::Pat::PathUnit(path) => { self.resolve_path(path, true); }
+            ast::PatKind::PathUnit(path) => { self.resolve_path(path, true); }
 
-            ast::Pat::PathTuple(path, elems) => {
+            ast::PatKind::PathTuple(path, elems) => {
                 self.resolve_path(path, true);
                 let mut i = 0;
                 while i < elems.len() {
@@ -1157,7 +1157,7 @@ impl Resolver {
                 }
             }
 
-            ast::Pat::PathStruct(path, _, fields) => {
+            ast::PatKind::PathStruct(path, _, fields) => {
                 self.resolve_path(path, true);
                 let mut i = 0;
                 while i < fields.len() {
@@ -1166,7 +1166,7 @@ impl Resolver {
                 }
             }
 
-            ast::Pat::Tup(elems) => {
+            ast::PatKind::Tup(elems) => {
                 let mut i = 0;
                 while i < elems.len() {
                     self.bind_pattern(elems.at(i), mutable);
@@ -1176,7 +1176,7 @@ impl Resolver {
 
             // Every alternative must bind the same names; that check belongs to the
             // checker (spec/05-patterns.md). Here each alternative is simply resolved.
-            ast::Pat::Or(alts) => {
+            ast::PatKind::Or(alts) => {
                 let mut i = 0;
                 while i < alts.len() {
                     self.bind_pattern(alts.at(i), mutable);
@@ -1438,21 +1438,21 @@ impl Resolver {
     }
 
     fn resolve_expr(self, e: ast::Expr) {
-        match e {
-            ast::Expr::Int(_, _, _) => {}
-            ast::Expr::Float(_, _) => {}
-            ast::Expr::Str(_) => {}
-            ast::Expr::Char(_) => {}
-            ast::Expr::Bool(_) => {}
-            ast::Expr::SelfExpr => {}
-            ast::Expr::ErrorExpr => {}
-            ast::Expr::Continue(at) => {
+        match e.node {
+            ast::ExprKind::Int(_, _, _) => {}
+            ast::ExprKind::Float(_, _) => {}
+            ast::ExprKind::Str(_) => {}
+            ast::ExprKind::Char(_) => {}
+            ast::ExprKind::Bool(_) => {}
+            ast::ExprKind::SelfExpr => {}
+            ast::ExprKind::ErrorExpr => {}
+            ast::ExprKind::Continue => {
                 if self.loop_depth == 0 {
-                    self.error("E0433", at, "`continue` outside of a loop");
+                    self.error("E0433", e.span, "`continue` outside of a loop");
                 }
             }
 
-            ast::Expr::Path(p, args) => {
+            ast::ExprKind::Path(p, args) => {
                 self.resolve_path(p, false);
                 let mut i = 0;
                 while i < args.len() {
@@ -1461,7 +1461,7 @@ impl Resolver {
                 }
             }
 
-            ast::Expr::StructLit(p, args, fields) => {
+            ast::ExprKind::StructLit(p, args, fields) => {
                 self.resolve_path(p, false);
                 let mut a = 0;
                 while a < args.len() {
@@ -1475,7 +1475,7 @@ impl Resolver {
                 }
             }
 
-            ast::Expr::Tuple(elems) => {
+            ast::ExprKind::Tuple(elems) => {
                 let mut i = 0;
                 while i < elems.len() {
                     self.resolve_expr(elems.at(i));
@@ -1483,11 +1483,11 @@ impl Resolver {
                 }
             }
 
-            ast::Expr::Lambda(params, ret, body) => self.resolve_lambda(params, ret, body),
+            ast::ExprKind::Lambda(params, ret, body) => self.resolve_lambda(params, ret, body),
 
-            ast::Expr::Block(b) => self.resolve_block(b),
+            ast::ExprKind::Block(b) => self.resolve_block(b),
 
-            ast::Expr::If(cond, then, els) => {
+            ast::ExprKind::If(cond, then, els) => {
                 self.resolve_expr(cond);
                 self.resolve_expr(then);
                 match els {
@@ -1496,7 +1496,7 @@ impl Resolver {
                 }
             }
 
-            ast::Expr::Match(scrutinee, arms) => {
+            ast::ExprKind::Match(scrutinee, arms) => {
                 self.resolve_expr(scrutinee);
                 let mut i = 0;
                 while i < arms.len() {
@@ -1514,14 +1514,14 @@ impl Resolver {
                 }
             }
 
-            ast::Expr::While(cond, body) => {
+            ast::ExprKind::While(cond, body) => {
                 self.resolve_expr(cond);
                 self.loop_depth = self.loop_depth + 1;
                 self.resolve_expr(body);
                 self.loop_depth = self.loop_depth - 1;
             }
 
-            ast::Expr::For(pat, iter, body) => {
+            ast::ExprKind::For(pat, iter, body) => {
                 self.resolve_expr(iter);
                 let saved = self.scope;
                 self.scope = new_scope(Option::Some(saved));
@@ -1532,15 +1532,15 @@ impl Resolver {
                 self.scope = saved;
             }
 
-            ast::Expr::Loop(body) => {
+            ast::ExprKind::Loop(body) => {
                 self.loop_depth = self.loop_depth + 1;
                 self.resolve_expr(body);
                 self.loop_depth = self.loop_depth - 1;
             }
 
-            ast::Expr::Break(at, value) => {
+            ast::ExprKind::Break(value) => {
                 if self.loop_depth == 0 {
-                    self.error("E0433", at, "`break` outside of a loop");
+                    self.error("E0433", e.span, "`break` outside of a loop");
                 }
                 match value {
                     Option::Some(x) => self.resolve_expr(x),
@@ -1548,32 +1548,32 @@ impl Resolver {
                 }
             }
 
-            ast::Expr::Return(value) => {
+            ast::ExprKind::Return(value) => {
                 match value {
                     Option::Some(x) => self.resolve_expr(x),
                     Option::None => {}
                 }
             }
 
-            ast::Expr::Unary(_, x) => self.resolve_expr(x),
+            ast::ExprKind::Unary(_, x) => self.resolve_expr(x),
 
-            ast::Expr::Binary(_, l, r) => {
+            ast::ExprKind::Binary(_, l, r) => {
                 self.resolve_expr(l);
                 self.resolve_expr(r);
             }
 
-            ast::Expr::Assign(_, at, place, value) => {
+            ast::ExprKind::Assign(_, place, value) => {
                 self.resolve_expr(place);
                 self.resolve_expr(value);
-                self.check_assignable(at, place);
+                self.check_assignable(place.span, place);
             }
 
-            ast::Expr::Cast(x, ty) => {
+            ast::ExprKind::Cast(x, ty) => {
                 self.resolve_expr(x);
                 self.resolve_type(ty);
             }
 
-            ast::Expr::Call(f, args) => {
+            ast::ExprKind::Call(f, args) => {
                 self.resolve_expr(f);
                 let mut i = 0;
                 while i < args.len() {
@@ -1582,7 +1582,7 @@ impl Resolver {
                 }
             }
 
-            ast::Expr::Method(_, recv, args) => {
+            ast::ExprKind::Method(_, recv, args) => {
                 self.resolve_expr(recv);
                 let mut i = 0;
                 while i < args.len() {
@@ -1591,9 +1591,9 @@ impl Resolver {
                 }
             }
 
-            ast::Expr::Field(_, recv) => self.resolve_expr(recv),
+            ast::ExprKind::Field(_, recv) => self.resolve_expr(recv),
 
-            ast::Expr::Try(x) => self.resolve_expr(x),
+            ast::ExprKind::Try(x) => self.resolve_expr(x),
         }
     }
 
@@ -1601,8 +1601,8 @@ impl Resolver {
     /// declared `mut`. Field mutability needs the receiver's type and belongs to a later
     /// pass.
     fn check_assignable(self, at: ast::Span, place: ast::Expr) {
-        match place {
-            ast::Expr::Path(p, _) => {
+        match place.node {
+            ast::ExprKind::Path(p, _) => {
                 // Resolved a moment ago by resolve_expr, so this cannot report twice.
                 match self.lookup_place(p) {
                     Option::None => {} // already reported
@@ -1633,7 +1633,7 @@ impl Resolver {
                 }
             }
             // Checked once field types exist.
-            ast::Expr::Field(_, _) => {}
+            ast::ExprKind::Field(_, _) => {}
             _ => {
                 self.error("E0594", at, "cannot assign to this expression");
             }

@@ -583,10 +583,10 @@ impl Checker {
     /// generic parameters and `Self`. Every name comes from the resolver's side table;
     /// this never consults a scope.
     fn to_type(self, t: ast::Type) -> types::Type {
-        match t {
-            ast::Type::Unit => types::unit(),
-            ast::Type::ErrorType => types::error_type(),
-            ast::Type::SelfType => {
+        match t.node {
+            ast::TypeKind::Unit => types::unit(),
+            ast::TypeKind::ErrorType => types::error_type(),
+            ast::TypeKind::SelfType => {
                 if !self.env.has_self {
                     // A bare `Self` in a type position outside a trait or impl. There is
                     // no span on the node, so it is reported against the whole item by the
@@ -595,10 +595,10 @@ impl Checker {
                 }
                 self.env.self_ty
             }
-            ast::Type::Tuple(elems) => types::Type::Tuple(self.to_types(elems)),
-            ast::Type::Func(params, ret) =>
+            ast::TypeKind::Tuple(elems) => types::Type::Tuple(self.to_types(elems)),
+            ast::TypeKind::Func(params, ret) =>
                 types::Type::Func(self.to_types(params), self.to_type(ret)),
-            ast::Type::Path(p, args) => self.path_type(p, args),
+            ast::TypeKind::Path(p, args) => self.path_type(p, args),
         }
     }
 
@@ -1157,7 +1157,7 @@ fn self_less_impl() -> ast::ImplDecl {
             res: ast::UNRESOLVED,
         },
         has_trait: false, trait_args: list::new[ast::Type](),
-        where_preds: list::new[ast::WherePred](), ty: ast::Type::ErrorType,
+        where_preds: list::new[ast::WherePred](), ty: ast::error_ty(),
         assoc: list::new[ast::AssocType](), methods: list::new[ast::FnDecl](),
     }
 }
