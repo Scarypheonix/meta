@@ -299,6 +299,7 @@ func (c *Checker) instantiateFn(v *ast.PathExpr, fn *ast.FnDecl) types.Type {
 		inst.Args = append(inst.Args, subst[p])
 	}
 	c.out.Insts[v.NodeID()] = inst
+	c.noteInst("inst", inst)
 	params := make([]types.Type, 0, len(sig.ParamTypes))
 	for _, p := range sig.ParamTypes {
 		params = append(params, types.Substitute(p, subst))
@@ -1149,6 +1150,7 @@ func (c *Checker) inferMethodCall(v *ast.MethodCall) types.Type {
 		return types.Error
 	}
 	c.out.Methods[v.NodeID()] = cand.Decl
+	c.noteText("method", declSite(cand.Decl))
 
 	subst := map[*types.Param]types.Type{}
 	for k, val := range cand.Subst {
@@ -1387,4 +1389,5 @@ func (c *Checker) recordMethodInst(into map[ast.NodeID]*Inst, nodeID ast.NodeID,
 		inst.Args = append(inst.Args, arg)
 	}
 	into[nodeID] = inst
+	c.noteInst("minst", inst)
 }

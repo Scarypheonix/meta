@@ -409,6 +409,7 @@ type pendingVar struct {
 // record stores an expression's type in the side table.
 func (c *Checker) record(id ast.NodeID, t types.Type) types.Type {
 	c.out.ExprTypes[id] = t
+	c.noteType("expr", t)
 	return t
 }
 
@@ -455,6 +456,8 @@ func (c *Checker) bindPatternScheme(p ast.Pattern, s *types.Scheme, irrefutable 
 			c.schemes[local] = s
 			c.out.LocalTypes[local] = s.Type
 			c.out.PatTypes[b.NodeID()] = s.Type
+			c.noteType("scheme", s.Type)
+			c.noteLocal(local, s.Type)
 			return
 		}
 	}

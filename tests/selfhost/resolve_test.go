@@ -13,6 +13,7 @@ import (
 	"github.com/scarypheonix/meta/internal/driver"
 	"github.com/scarypheonix/meta/internal/opt"
 	"github.com/scarypheonix/meta/internal/parse"
+	"github.com/scarypheonix/meta/internal/prelude"
 	"github.com/scarypheonix/meta/internal/resolve"
 	"github.com/scarypheonix/meta/internal/source"
 	"github.com/scarypheonix/meta/internal/testutil"
@@ -37,8 +38,11 @@ import (
 // `originc check <file>` compiles in -- two files that both declare `main` are not a
 // package.
 
-// preludePath is where stage1 reads the prelude from, and the name the Go side gives it,
-// so that a declaration in the prelude is named identically by both traces.
+// preludePath is where the prelude is read from. The *name* it is known by is
+// prelude.Name -- the literal `<prelude>` -- on both sides, because that name is
+// load-bearing rather than cosmetic: internal/check's DeclaredInPrelude, internal/mono
+// and the two runtimes all decide "is this the prelude?" by comparing it, so a second
+// compiler that called the file anything else would not be the same compiler.
 const preludePath = "internal/prelude/prelude.origin"
 
 // goResolution renders the Go resolver's answer for one file, in stage1's own output
@@ -93,7 +97,7 @@ func TestStage1ResolverMatchesTheGoResolver(t *testing.T) {
 			// One id generator and one parse of the prelude for the whole run, matching
 			// what stage1 does: resolution does not write into the tree.
 			ids := ast.NewIDGen()
-			preludeTree := parse.FileWith(source.NewFile(preludePath, string(pdata)), diag.New(), ids)
+			preludeTree := parse.FileWith(source.NewFile(prelude.Name, string(pdata)), diag.New(), ids)
 			var want []string
 			for _, path := range files {
 				want = append(want, goResolution(t, ids, preludeTree, filepath.Join(root, path))...)

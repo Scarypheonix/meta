@@ -13,6 +13,7 @@ func (c *Checker) bindPattern(p ast.Pattern, want types.Type, irrefutable bool) 
 	want = c.normalize(want)
 	if p != nil {
 		c.out.PatTypes[p.NodeID()] = want
+		c.noteType("pat", want)
 	}
 
 	switch v := p.(type) {
@@ -36,6 +37,7 @@ func (c *Checker) bindPattern(p ast.Pattern, want types.Type, irrefutable bool) 
 		default:
 			if local, ok := c.res.Bindings[v.NodeID()]; ok {
 				c.out.LocalTypes[local] = want
+				c.noteLocal(local, want)
 			}
 		}
 		if v.Sub != nil {

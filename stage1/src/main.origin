@@ -73,6 +73,14 @@ fn main() {
     }
 }
 
+/// The name the prelude is known by, whatever path it was read from.
+///
+/// It is load-bearing rather than cosmetic, which is why it is a constant here and not
+/// the file's own path: the Go compiler decides "was this declared in the prelude?" by
+/// comparing this exact name (its `DeclaredInPrelude`), and so must anything that means
+/// to be the same compiler.
+const PRELUDE_NAME: String = "<prelude>";
+
 /// Resolves each file named after the first as its own package, with the first as the
 /// prelude, and prints the resolution trace of each under a `== path` header.
 ///
@@ -111,7 +119,7 @@ fn run_resolve(argv: List[String]) -> bool {
                 let tree = parse::parse(lex::lex(src).tokens).file;
                 let inputs = list::new[resolve::Input]();
                 inputs.push(resolve::Input {
-                    file: prelude_path, module: "", tree: prelude_tree, prelude: true,
+                    file: PRELUDE_NAME, module: "", tree: prelude_tree, prelude: true,
                 });
                 inputs.push(resolve::Input {
                     file: path, module: "", tree: tree, prelude: false,

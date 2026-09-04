@@ -232,6 +232,9 @@ type Checker struct {
 	generalized map[*types.Var]bool
 	// loopValues stacks the type each enclosing `loop` breaks with.
 	loopValues []types.Type
+	// trace, when not nil, collects one entry per checking event, in order. It is the
+	// oracle stage1's own checker is held to (tests/selfhost); see trace.go.
+	trace *[]traceEntry
 }
 
 // typeEnv maps the type names in scope for one declaration.
@@ -248,6 +251,18 @@ type typeEnv struct {
 // Program runs the checker over the resolved files. It always returns a Result; check
 // bag.HasErrors before trusting it.
 func Program(bag *diag.Bag, res *resolve.Result, files ...*ast.File) *Result {
+	res2, _ := program(bag, res, false, files...)
+	return res2
+}
+
+// Trace checks like Program and additionally returns one line per inference event, in
+// the order the checker produced them. See trace.go.
+func Trace(bag *diag.Bag, res *resolve.Result, files ...*ast.File) (*Result, []string) {
+	return program(bag, res, true, files...)
+}
+
+func program(bag *diag.Bag, res *resolve.Result, traced bool, files ...*ast.File) (*Result, []string) {
+	var entries []traceEntry
 	c := &Checker{
 		bag: bag, res: res, ctx: types.NewCtx(),
 		out: &Result{
@@ -269,6 +284,10 @@ func Program(bag *diag.Bag, res *resolve.Result, files ...*ast.File) *Result {
 		implsBySelf: map[string][]*ImplInfo{},
 		schemes:     map[*resolve.Local]*types.Scheme{},
 		generalized: map[*types.Var]bool{},
+	}
+
+	if traced {
+		c.trace = &entries
 	}
 
 	// Declarations are collected in dependency order: nominal shells first (so a type
@@ -296,7 +315,7 @@ func Program(bag *diag.Bag, res *resolve.Result, files ...*ast.File) *Result {
 	}
 	c.out.Defs = c.defs
 	c.out.Lookup = &Resolver{c: c}
-	return c.out
+	return c.out, renderTrace(entries)
 }
 
 // ---------------------------------------------------------------------------
