@@ -169,6 +169,13 @@ pub struct BlockBody {
 pub struct Expr {
     pub span: Span,
     pub node: ExprKind,
+    /// Where name resolution files a lambda's capture list; -1 on every other expression
+    /// and on a lambda until it is resolved. It is here rather than in the `Lambda`
+    /// variant because a variant's payload cannot be written to, and it is needed because
+    /// a closure's captures are the one thing a *type* cannot carry: `fn() -> i64` is one
+    /// type whether the closure captured a mutable counter or an immutable one, and
+    /// `Send` turns on exactly that (spec/12-concurrency.md).
+    pub mut captures: i64,
 }
 
 pub enum ExprKind {
@@ -203,7 +210,9 @@ pub enum ExprKind {
     ErrorExpr,
 }
 
-pub fn expr(span: Span, node: ExprKind) -> Expr { Expr { span: span, node: node } }
+pub fn expr(span: Span, node: ExprKind) -> Expr {
+    Expr { span: span, node: node, captures: UNRESOLVED }
+}
 
 // --- Statements ----------------------------------------------------------------------
 

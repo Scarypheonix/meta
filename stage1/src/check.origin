@@ -199,6 +199,8 @@ struct PendingVar {
 
 pub struct Checker {
     refs: List[resolve::Ref],
+    /// Each lambda's captures, indexed by an expression's `captures` slot.
+    captures: List[List[resolve::Local]],
     ctx: types::Ctx,
     trace: List[TraceEntry],
     errors: List[CheckError],
@@ -222,14 +224,29 @@ pub struct Checker {
     mut body_vars: List[PendingVar],
     mut int_lits: List[LiteralUse],
     mut op_checks: List[OperandCheck],
+    /// Every binding's type, keyed by the binding's own identity.
+    local_keys: List[resolve::Local],
+    local_types: List[types::Type],
     /// The generalized type of each `let` binding that generalized, and the variables they
     /// quantified over -- deliberately unsolved, which is what polymorphism is, so the
     /// end-of-body check skips them.
     scheme_locals: List[resolve::Local],
     scheme_values: List[types::Scheme],
     mut generalized: List[types::Var],
-    /// The type each enclosing `loop` breaks with.
+    /// The type each enclosing `loop` breaks with, and whether one has been set: a `loop`
+    /// with no `break` produces no value at all, which is not the same as breaking with
+    /// `()`.
     mut loop_values: List[types::Type],
+    mut loop_set: List[bool],
+    /// The receiver type of the field access most recently inferred.
+    ///
+    /// The Go checker reads it back from a side table keyed by node id; this tree has none
+    /// on an expression, and re-inferring the receiver would record a second trace entry
+    /// and a second diagnostic. A field access always infers its receiver immediately
+    /// before it finishes, and `check_place` always runs immediately after the place was
+    /// inferred, so the last one recorded is the one being asked about -- including for
+    /// `a.b.c`, where the inner access finishes first and the outer overwrites it.
+    mut last_recv: types::Type,
     /// The file whose declarations are being checked, for spans in its diagnostics.
     mut file: String,
 }
@@ -329,6 +346,7 @@ pub struct Unit {
 pub fn program(res: resolve::Resolved, units: List[Unit]) -> Checked {
     let c = Checker {
         refs: res.refs,
+        captures: res.captures,
         ctx: types::new_ctx(),
         trace: list::new[TraceEntry](),
         errors: list::new[CheckError](),
@@ -345,10 +363,14 @@ pub fn program(res: resolve::Resolved, units: List[Unit]) -> Checked {
         body_vars: list::new[PendingVar](),
         int_lits: list::new[LiteralUse](),
         op_checks: list::new[OperandCheck](),
+        local_keys: list::new[resolve::Local](),
+        local_types: list::new[types::Type](),
         scheme_locals: list::new[resolve::Local](),
         scheme_values: list::new[types::Scheme](),
         generalized: list::new[types::Var](),
         loop_values: list::new[types::Type](),
+        loop_set: list::new[bool](),
+        last_recv: types::error_type(),
         file: "",
     };
 
@@ -1232,7 +1254,10 @@ impl Checker {
     /// parameters, plus the substitution used.
     fn instantiate_impl_self(self, info: ImplInfo) -> Instantiated {
         if info.params.is_empty() {
-            return Instantiated { self_ty: info.self_ty, subst: types::new_subst() };
+            return Instantiated {
+                self_ty: info.self_ty, subst: types::new_subst(),
+                args: list::new[types::Type](),
+            };
         }
         let s = types::new_subst();
         let mut i = 0;
@@ -1240,7 +1265,10 @@ impl Checker {
             s.set(info.params.at(i), self.ctx.fresh());
             i = i + 1;
         }
-        Instantiated { self_ty: types::substitute(info.self_ty, s), subst: s }
+        Instantiated {
+            self_ty: types::substitute(info.self_ty, s), subst: s,
+            args: list::new[types::Type](),
+        }
     }
 
     /// A method defined twice for the same type across separate inherent impls, which
@@ -1388,10 +1416,12 @@ impl Checker {
     }
 }
 
-/// An impl's self type with its parameters instantiated, and how.
+/// A declaration's parameters instantiated: the substitution, the arguments in
+/// declaration order, and -- for an impl -- the self type they were applied to.
 struct Instantiated {
     self_ty: types::Type,
     subst: types::Subst,
+    args: List[types::Type],
 }
 
 fn trait_name_of(info: ImplInfo) -> String {
@@ -1957,24 +1987,3643 @@ impl Checker {
 }
 
 // --- Pass 6: bodies -------------------------------------------------------------------------
-//
-// Not written yet, and it is blocked on the syntax tree rather than on the checker.
-//
-// Almost every type error is reported against an expression -- "expected `i64`, found
-// `String`" underlines the value, not the statement -- and this tree carries a span only on
-// the nodes name resolution reports at: a path, a binding's identifier, an assignment's
-// place, a `break`, a `continue` (ast.origin's header). Inference needs one on every
-// expression and every pattern, and needs them to fall where `internal/ast`'s do, or the
-// differential compares diagnostics that are right in different places.
-//
-// So the next step is the tree, not this file: wrap `Expr`, `Pat` and `Type` each in a
-// struct carrying its span and its kind, and set those spans where internal/parse sets
-// its own. Everything above this line -- declarations, traits, impls, coherence, bound
-// solving, `Send`, associated types -- needs no span it does not already have, which is
-// why it is written and this is not.
 
 impl Checker {
+    /// Type-checks every function body in an item. Signatures are already known
+    /// (ADR-0009), so each body is checked in isolation.
     fn check_body_item(self, item: ast::Item) {
-        panic("unimplemented: checking a function body needs spans on expressions");
+        match item {
+            ast::Item::Fn(v) => self.check_fn(v, BodyContext {
+                outer: list::new[types::Param](), has_self: false,
+                self_ty: types::error_type(), trait_info: Option::None, bounds: no_bounds(),
+            }),
+
+            ast::Item::Const(v) => self.check_const(v),
+
+            ast::Item::Impl(v) => {
+                if v.info >= 0 && v.info < self.impls.len() {
+                    let info = self.impls.at(v.info);
+                    let mut i = 0;
+                    let ctx = BodyContext {
+                        outer: info.params, has_self: true, self_ty: info.self_ty,
+                        trait_info: Option::None, bounds: info.bounds,
+                    };
+                    while i < v.methods.len() {
+                        self.check_fn(v.methods.at(i), ctx);
+                        i = i + 1;
+                    }
+                }
+            }
+
+            ast::Item::Trait(v) => {
+                match self.trait_at(v.info) {
+                    Option::None => {}
+                    Option::Some(ti) => {
+                        let self_ty = types::Type::ParamT(ti.self_param);
+                        // A default body is checked once against the trait's own bounds,
+                        // not per impl (spec/06-traits-generics.md).
+                        let self_bounds = no_bounds();
+                        self_bounds.push(Bound {
+                            ty: self_ty, trait_info: ti, args: list::new[types::Type](),
+                            at: ident_span(ti.decl.name), code: "", what: "",
+                        });
+                        let mut s = 0;
+                        while s < ti.supertraits.len() {
+                            self_bounds.push(ti.supertraits.at(s));
+                            s = s + 1;
+                        }
+                        let names = ti.assoc_bounds.keys();
+                        let mut n = 0;
+                        while n < names.len() {
+                            match ti.assoc_bounds.get(names.at(n)) {
+                                Option::Some(bs) => {
+                                    let mut b = 0;
+                                    while b < bs.len() {
+                                        self_bounds.push(bs.at(b));
+                                        b = b + 1;
+                                    }
+                                }
+                                Option::None => {}
+                            }
+                            n = n + 1;
+                        }
+                        let ctx = BodyContext {
+                            outer: concat_params(ti.params, one_param(ti.self_param)),
+                            has_self: true, self_ty: self_ty,
+                            trait_info: Option::Some(ti), bounds: self_bounds,
+                        };
+                        let mut m = 0;
+                        while m < v.methods.len() {
+                            let method = v.methods.at(m);
+                            match method.body {
+                                // A required method declares a signature only.
+                                Option::None => {}
+                                Option::Some(_) => self.check_fn(method, ctx),
+                            }
+                            m = m + 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
+
+    fn check_const(self, v: ast::ConstDecl) {
+        self.env = empty_env();
+        let want = self.to_type(v.ty);
+        self.begin_body(types::unit());
+        let got = self.infer(v.value);
+        self.unify_at(want, got, v.value.span, "in this constant's value");
+        self.end_body();
+    }
+
+    /// Prepares the per-body inference state.
+    fn begin_body(self, ret: types::Type) {
+        self.ret = ret;
+        self.obligations = no_bounds();
+        self.body_vars = list::new[PendingVar]();
+        self.loop_values = list::new[types::Type]();
+        self.loop_set = list::new[bool]();
+        self.int_lits = list::new[LiteralUse]();
+        self.op_checks = list::new[OperandCheck]();
+    }
+
+    /// Finishes a body: solve bounds, apply literal defaults, then report anything still
+    /// unsolved. The order matters -- defaulting happens once, after all constraints are
+    /// solved (spec/03-types.md).
+    fn end_body(self) {
+        // Defaulting first: a bound on an integer literal's type cannot be judged while
+        // the type is still an unsolved variable, and `needs_ord(1)` must know it means
+        // `i64`.
+        let mut i = 0;
+        while i < self.int_lits.len() {
+            types::apply_defaults(self.int_lits.at(i).ty);
+            i = i + 1;
+        }
+        self.solve_obligations();
+        let mut v = 0;
+        while v < self.body_vars.len() {
+            let pv = self.body_vars.at(v);
+            let mut skip = false;
+            match types::as_var(pv.ty) {
+                Option::Some(var) => { skip = self.was_generalized(var); }
+                Option::None => {}
+            }
+            if !skip && !types::apply_defaults(pv.ty) {
+                self.error_in("E0309", pv.file, pv.at, "cannot infer this type");
+            }
+            v = v + 1;
+        }
+        self.check_literal_ranges();
+        self.run_operand_checks();
+        self.body_vars = list::new[PendingVar]();
+        self.int_lits = list::new[LiteralUse]();
+        self.op_checks = list::new[OperandCheck]();
+    }
+
+    fn was_generalized(self, v: types::Var) -> bool {
+        let mut i = 0;
+        while i < self.generalized.len() {
+            if ref_eq(self.generalized.at(i), v) {
+                return true;
+            }
+            i = i + 1;
+        }
+        false
+    }
+
+    /// Checks one function body against its declared signature.
+    fn check_fn(self, fn_decl: ast::FnDecl, ctx: BodyContext) {
+        let outer = ctx.outer;
+        let has_self = ctx.has_self;
+        let self_ty = ctx.self_ty;
+        let tr = ctx.trait_info;
+        let outer_bounds = ctx.bounds;
+        match fn_decl.body {
+            Option::None => {}
+            Option::Some(body) => {
+                match self.sig_at(fn_decl.info) {
+                    Option::None => {}
+                    Option::Some(sig) => {
+                        let all = concat_params(outer, sig.params);
+                        self.env = env_for(all, has_self, self_ty, tr);
+                        self.env.bounds = concat_bounds(outer_bounds, sig.bounds);
+
+                        self.begin_body(sig.ret);
+
+                        match fn_decl.self_param {
+                            Option::Some(_) => {
+                                if !has_self {
+                                    self.error("E0424", ident_span(fn_decl.name),
+                                        "`self` is not available here");
+                                }
+                            }
+                            Option::None => {}
+                        }
+                        let mut i = 0;
+                        while i < fn_decl.params.len() {
+                            if i < sig.param_types.len() {
+                                self.bind_pattern(fn_decl.params.at(i).pat,
+                                                  sig.param_types.at(i), true);
+                            }
+                            i = i + 1;
+                        }
+
+                        let got = self.infer(body);
+                        // A body that always diverges satisfies any return type.
+                        if !types::is_never(got) {
+                            self.unify_at(sig.ret, got, tail_span(fn_decl, body),
+                                          "in this function's body");
+                        }
+                        self.end_body();
+                        self.env = empty_env();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How a path pattern was written: which of the three shapes, and what it holds.
+struct PatShape {
+    kind: i64,
+    elems: List[ast::Pat],
+    fields: List[ast::FieldPat],
+    rest: bool,
+}
+
+fn unit_shape() -> PatShape {
+    PatShape {
+        kind: ast::VARIANT_UNIT, elems: list::new[ast::Pat](),
+        fields: list::new[ast::FieldPat](), rest: false,
+    }
+}
+
+/// The named fields of a struct or a struct variant: their declarations, their types, and
+/// what to call the thing in a diagnostic. Bundled for the reason `BodyContext` is.
+struct FieldShape {
+    decls: List[ast::Field],
+    types: List[types::Type],
+    name: String,
+}
+
+/// What a body is checked in: the enclosing declaration's generic parameters, its self
+/// type, its trait when it has one, and the bounds in scope.
+///
+/// It is a struct rather than five parameters because the native backend passes at most
+/// six arguments in registers and stops loudly past that (docs/deferred.md); a method with
+/// a receiver and six of its own is over the line. Bundling them is what the Go checker's
+/// own signature would have grown into anyway.
+struct BodyContext {
+    outer: List[types::Param],
+    has_self: bool,
+    self_ty: types::Type,
+    trait_info: Option[TraitInfo],
+    bounds: List[Bound],
+}
+
+fn one_param(p: types::Param) -> List[types::Param] {
+    let out = list::new[types::Param]();
+    out.push(p);
+    out
+}
+
+fn concat_bounds(a: List[Bound], b: List[Bound]) -> List[Bound] {
+    let out = no_bounds();
+    let mut i = 0;
+    while i < a.len() {
+        out.push(a.at(i));
+        i = i + 1;
+    }
+    let mut j = 0;
+    while j < b.len() {
+        out.push(b.at(j));
+        j = j + 1;
+    }
+    out
+}
+
+/// Points at the expression that produces a function's value, so a return-type mismatch is
+/// reported where the value is rather than on the whole body.
+fn tail_span(fn_decl: ast::FnDecl, body: ast::Expr) -> ast::Span {
+    match body.node {
+        ast::ExprKind::Block(b) => {
+            match b.tail {
+                Option::Some(t) => t.span,
+                Option::None => ident_span(fn_decl.name),
+            }
+        }
+        _ => ident_span(fn_decl.name),
+    }
+}
+
+fn block_tail_span(body: ast::Expr) -> ast::Span {
+    match body.node {
+        ast::ExprKind::Block(b) => {
+            match b.tail {
+                Option::Some(t) => t.span,
+                Option::None => body.span,
+            }
+        }
+        _ => body.span,
+    }
+}
+
+// --- Unification with diagnostics -------------------------------------------------------
+
+impl Checker {
+    /// Makes `want` and `got` equal, reporting a mismatch if they cannot be.
+    ///
+    /// This is the only place a type mismatch is phrased, which is how spec/09-errors.md's
+    /// rule 3 stays enforceable: types always print in source syntax, and the message
+    /// always says which side was expected.
+    fn unify_at(self, want_in: types::Type, got_in: types::Type, at: ast::Span,
+                context: String) -> bool {
+        let want = self.normalize(want_in);
+        let got = self.normalize(got_in);
+        match types::unify(want, got) {
+            Option::None => true,
+            Option::Some(e) => {
+                if e.infinite {
+                    self.error("E0310", at, "infinite type");
+                    return false;
+                }
+                if !e.detail.is_empty() {
+                    self.error("E0308", at, e.detail);
+                    return false;
+                }
+                self.error("E0308", at,
+                    "expected `\(types::show(e.want))`, found `\(types::show(e.got))`");
+                false
+            }
+        }
+    }
+}
+
+// --- Blocks and statements -----------------------------------------------------------------
+
+impl Checker {
+    fn check_block(self, b: ast::BlockBody) -> types::Type {
+        let mut i = 0;
+        while i < b.stmts.len() {
+            self.check_stmt(b.stmts.at(i));
+            i = i + 1;
+        }
+        match b.tail {
+            Option::None => types::unit(),
+            Option::Some(t) => self.infer(t),
+        }
+    }
+
+    fn check_stmt(self, s: ast::Stmt) {
+        match s {
+            ast::Stmt::Let(mutable, pat, ty, value) => self.check_let(mutable, pat, ty, value),
+            ast::Stmt::ExprStmt(e, semi) => {
+                let t = self.infer(e);
+                if semi {
+                    self.warn_unused_result(e, t);
+                }
+            }
+            // A nested item is checked where it is declared; this checks items at file
+            // level only.
+            ast::Stmt::ItemStmt(_) => {}
+        }
+    }
+
+    /// spec/09-errors.md: an ignored `Result` is a warning, not an error.
+    fn warn_unused_result(self, e: ast::Expr, t: types::Type) {
+        match types::as_named(t) {
+            Option::None => {}
+            Option::Some(d) => {
+                if d.name == "Result" && produces_a_result(e) {
+                    self.warn("W0001", e.span, "unused `Result`");
+                }
+            }
+        }
+    }
+
+    fn warn(self, code: String, at: ast::Span, message: String) {
+        self.errors.push(CheckError {
+            code: code, message: message, file: self.file, start: at.start, end: at.end,
+        });
+    }
+
+    fn check_let(self, mutable: bool, pat: ast::Pat, ty: Option[ast::Type], value: ast::Expr) {
+        let mut want = types::error_type();
+        let mut annotated = false;
+        match ty {
+            Option::Some(t) => {
+                want = self.to_type(t);
+                annotated = true;
+            }
+            Option::None => {}
+        }
+
+        // The right-hand side is inferred one level deeper, so the variables it creates
+        // are candidates for generalization (spec/03-types.md's value restriction).
+        self.ctx.enter_level();
+        let mut got = self.infer(value);
+        self.ctx.exit_level();
+
+        if annotated {
+            self.unify_at(want, got, value.span, "in this binding's value");
+            got = want;
+        }
+
+        let mut scheme = types::mono(got);
+        if is_syntactic_value(self, value) {
+            // Only a syntactic value generalizes. `let v = list::new();` must stay
+            // monomorphic, or pushing an i64 and reading back a String would type-check.
+            scheme = self.ctx.generalize(got);
+            let mut i = 0;
+            while i < scheme.vars.len() {
+                self.generalized.push(scheme.vars.at(i));
+                i = i + 1;
+            }
+        }
+        self.bind_pattern_scheme(pat, scheme, true);
+    }
+}
+
+/// Only a call produces a `Result` worth warning about; reading a variable does not.
+fn produces_a_result(e: ast::Expr) -> bool {
+    match e.node {
+        ast::ExprKind::Call(_, _) => true,
+        ast::ExprKind::Method(_, _, _) => true,
+        _ => false,
+    }
+}
+
+/// Whether a `let` binding generalizes (spec/03-types.md's value restriction), and the
+/// answer is narrower than "is this a value?".
+///
+/// The classical restriction exists to stop a *mutable* aggregate being generalized.
+/// Origin needs a stronger one, because ADR-0010 monomorphizes and ADR-0019 gives every
+/// instantiation its own exact layout: a generalized `let n = Option::None;` has no single
+/// runtime type to be, since `Option[i64]::None` and `Option[String]::None` are different
+/// object descriptors.
+///
+/// So only things whose representation does not depend on the type they are used at may
+/// generalize: a lambda, and a path naming a function. Those are *code*, and code is
+/// monomorphized per call site already. A literal is deliberately excluded too:
+/// `let x = 1;` generalized to every integer type would have the same problem, and
+/// defaulting is what settles a literal's type.
+fn is_syntactic_value(c: Checker, e: ast::Expr) -> bool {
+    match e.node {
+        ast::ExprKind::Lambda(_, _, _) => true,
+        // A function's name generalizes; a variant's name builds an object and does not.
+        ast::ExprKind::Path(p, _) => c.ref_of(p.res).kind == resolve::K_FN,
+        _ => false,
+    }
+}
+
+// --- Expressions ------------------------------------------------------------------------
+
+impl Checker {
+    /// Computes an expression's type, records it, and returns it.
+    fn infer(self, e: ast::Expr) -> types::Type {
+        let t = self.infer_kind(e);
+        self.note_type("expr", t);
+        t
+    }
+
+    fn infer_kind(self, e: ast::Expr) -> types::Type {
+        match e.node {
+            ast::ExprKind::ErrorExpr => types::error_type(),
+            ast::ExprKind::Int(v, overflow, suffix) => self.infer_int_lit(e, v, overflow, suffix),
+            ast::ExprKind::Float(_, suffix) => {
+                if suffix == "f32" { return types::Type::Prim(types::P_F32); }
+                if suffix == "f64" { return types::Type::Prim(types::P_F64); }
+                self.ctx.fresh_defaulting(types::D_FLOAT)
+            }
+            ast::ExprKind::Str(_) => types::Type::Prim(types::P_STRING),
+            ast::ExprKind::Char(_) => types::Type::Prim(types::P_CHAR),
+            ast::ExprKind::Bool(_) => types::Type::Prim(types::P_BOOL),
+
+            ast::ExprKind::SelfExpr => {
+                if !self.env.has_self {
+                    self.error("E0424", e.span, "`self` is not available here");
+                    return types::error_type();
+                }
+                self.env.self_ty
+            }
+
+            ast::ExprKind::Path(p, args) => self.infer_path(e, p, args),
+            ast::ExprKind::StructLit(p, args, fields) => self.infer_struct_lit(e, p, args, fields),
+
+            ast::ExprKind::Tuple(elems) => {
+                if elems.is_empty() {
+                    return types::unit();
+                }
+                let out = list::new[types::Type]();
+                let mut i = 0;
+                while i < elems.len() {
+                    out.push(self.infer(elems.at(i)));
+                    i = i + 1;
+                }
+                types::Type::Tuple(out)
+            }
+
+            ast::ExprKind::Lambda(params, ret, body) =>
+                self.infer_lambda(e, params, ret, body, Option::None),
+
+            ast::ExprKind::Block(b) => self.check_block(b),
+            ast::ExprKind::If(cond, then, els) => self.infer_if(cond, then, els),
+            ast::ExprKind::Match(scrutinee, arms) => self.infer_match(e, scrutinee, arms),
+
+            ast::ExprKind::While(cond, body) => {
+                self.expect_bool(cond, "a `while` condition");
+                self.expect_unit_block(body, "a `while` body");
+                types::unit()
+            }
+
+            ast::ExprKind::For(pat, iter, body) => self.infer_for(e, pat, iter, body),
+            ast::ExprKind::Loop(body) => self.infer_loop(body),
+            ast::ExprKind::Break(value) => self.infer_break(e, value),
+            ast::ExprKind::Continue => types::never(),
+
+            ast::ExprKind::Return(value) => {
+                let mut got = types::unit();
+                match value {
+                    Option::Some(x) => { got = self.infer(x); }
+                    Option::None => {}
+                }
+                self.unify_at(self.ret, got, e.span, "in this `return`");
+                types::never()
+            }
+
+            ast::ExprKind::Unary(op, x) => self.infer_unary(e, op, x),
+            ast::ExprKind::Binary(op, l, r) => self.infer_binary(e, op, l, r),
+            ast::ExprKind::Assign(op, place, value) => self.infer_assign(e, op, place, value),
+            ast::ExprKind::Cast(x, ty) => self.infer_cast(e, x, ty),
+            ast::ExprKind::Call(f, args) => self.infer_call(e, f, args),
+            ast::ExprKind::Method(name, recv, args) => self.infer_method_call(e, name, recv, args),
+            ast::ExprKind::Field(name, recv) => self.infer_field(e, name, recv),
+            ast::ExprKind::Try(x) => self.infer_try(e, x),
+        }
+    }
+
+    fn infer_int_lit(self, e: ast::Expr, v: u64, overflow: bool, suffix: String) -> types::Type {
+        let mut t = self.ctx.fresh_defaulting(types::D_INT);
+        if !suffix.is_empty() {
+            let k = types::prim_of_name(suffix);
+            if k >= 0 {
+                t = types::Type::Prim(k);
+            }
+        }
+        self.int_lits.push(LiteralUse {
+            value: v, negated: overflow, ty: t, at: e.span, file: self.file,
+        });
+        t
+    }
+
+    /// Every integer literal fits the type inference gave it (spec/01-lexical.md).
+    fn check_literal_ranges(self) {
+        let mut i = 0;
+        while i < self.int_lits.len() {
+            let use_it = self.int_lits.at(i);
+            let k = types::as_prim(use_it.ty);
+            if k >= 0 && types::is_integer(k) {
+                if use_it.negated || !fits_in(use_it.value, k) {
+                    self.error_in("E0308", use_it.file, use_it.at,
+                        "literal out of range for `\(types::prim_name(k))`");
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    fn infer_path(self, e: ast::Expr, p: ast::PathRef, args: List[ast::Type]) -> types::Type {
+        let r = self.ref_of(p.res);
+        if r.kind == resolve::K_UNRESOLVED {
+            return types::error_type();
+        }
+        if r.kind == resolve::K_LOCAL {
+            match r.local {
+                Option::None => return types::error_type(),
+                Option::Some(l) => return self.instantiate_local(l, e.span),
+            }
+        }
+        if r.kind == resolve::K_FN {
+            match r.fn_decl {
+                Option::None => return types::error_type(),
+                Option::Some(fd) => return self.instantiate_fn(e, fd, args),
+            }
+        }
+        if r.kind == resolve::K_CONST {
+            match r.const_decl {
+                Option::None => return types::error_type(),
+                Option::Some(cd) => return self.const_type(cd),
+            }
+        }
+        if r.kind == resolve::K_VARIANT {
+            return self.variant_value(e, r, args);
+        }
+        if r.kind == resolve::K_BUILTIN {
+            return self.builtin_type(r.builtin, args, e.span);
+        }
+        if r.kind == resolve::K_PRIMCONST {
+            let k = types::prim_of_name(r.name);
+            if k < 0 || !types::is_integer(k) {
+                self.error("E0599", e.span,
+                    "`\(r.name)` has no associated constant `\(r.member)`");
+                return types::error_type();
+            }
+            if r.member == "BITS" {
+                return types::Type::Prim(types::P_U32);
+            }
+            return types::Type::Prim(k);
+        }
+        if r.kind == resolve::K_STRUCT || r.kind == resolve::K_ENUM
+            || r.kind == resolve::K_TRAIT || r.kind == resolve::K_ALIAS
+            || r.kind == resolve::K_PRIM {
+            self.error("E0423", e.span, "`\(p.text)` is a type, not a value");
+            return types::error_type();
+        }
+        types::error_type()
+    }
+
+    /// A constant's declared type. Constants are checked separately, so this only reads
+    /// the annotation.
+    fn const_type(self, decl: ast::ConstDecl) -> types::Type {
+        let saved = self.env;
+        self.env = empty_env();
+        let t = self.to_type(decl.ty);
+        self.env = saved;
+        t
+    }
+
+    fn instantiate_local(self, l: resolve::Local, at: ast::Span) -> types::Type {
+        let s = self.local_scheme(l);
+        if s.vars.is_empty() {
+            return s.ty;
+        }
+        let t = self.ctx.instantiate(s);
+        self.body_vars.push(PendingVar { ty: t, at: at, file: self.file });
+        t
+    }
+
+    fn local_scheme(self, l: resolve::Local) -> types::Scheme {
+        let mut i = 0;
+        while i < self.scheme_locals.len() {
+            if ref_eq(self.scheme_locals.at(i), l) {
+                return self.scheme_values.at(i);
+            }
+            i = i + 1;
+        }
+        match self.local_type(l) {
+            Option::Some(t) => types::mono(t),
+            Option::None => types::mono(types::error_type()),
+        }
+    }
+
+    fn local_type(self, l: resolve::Local) -> Option[types::Type] {
+        let mut i = 0;
+        while i < self.local_keys.len() {
+            if ref_eq(self.local_keys.at(i), l) {
+                return Option::Some(self.local_types.at(i));
+            }
+            i = i + 1;
+        }
+        Option::None
+    }
+
+    fn set_local_type(self, l: resolve::Local, t: types::Type) {
+        let mut i = 0;
+        while i < self.local_keys.len() {
+            if ref_eq(self.local_keys.at(i), l) {
+                self.local_types.set(i, t);
+                self.note_local(l, t);
+                return;
+            }
+            i = i + 1;
+        }
+        self.local_keys.push(l);
+        self.local_types.push(t);
+        self.note_local(l, t);
+    }
+
+    /// A function reference's type at this use site, with fresh variables for its generic
+    /// parameters and its bounds recorded as obligations.
+    fn instantiate_fn(self, e: ast::Expr, fd: ast::FnDecl, args: List[ast::Type]) -> types::Type {
+        match self.sig_at(fd.info) {
+            Option::None => types::error_type(),
+            Option::Some(sig) => {
+                let subst = self.instantiate_params(sig.params, args, e.span, fd.name.name);
+                let mut b = 0;
+                while b < sig.bounds.len() {
+                    let bd = sig.bounds.at(b);
+                    self.require_bound(types::substitute(bd.ty, subst), bd.trait_info, e.span);
+                    b = b + 1;
+                }
+                // The arguments are recorded unresolved: inference has not run yet. A
+                // *non-generic* callee is recorded too, with no arguments -- what that says
+                // is that this call site reaches it at all, which is how monomorphization
+                // knows a prelude function is used and every other one is not.
+                let inst_args = list::new[types::Type]();
+                let mut p = 0;
+                while p < sig.params.len() {
+                    inst_args.push(subst.get(sig.params.at(p)).unwrap_or(types::error_type()));
+                    p = p + 1;
+                }
+                self.note_inst("inst", Inst {
+                    decl: fd, params: sig.params, args: inst_args,
+                    recv: types::error_type(), has_recv: false, method: "",
+                });
+                let params = list::new[types::Type]();
+                let mut i = 0;
+                while i < sig.param_types.len() {
+                    params.push(types::substitute(sig.param_types.at(i), subst));
+                    i = i + 1;
+                }
+                types::Type::Func(params, types::substitute(sig.ret, subst))
+            }
+        }
+    }
+
+    /// The substitution for a generic use site, honouring explicit type arguments when
+    /// they are written.
+    fn instantiate_params(self, params: List[types::Param], args: List[ast::Type],
+                          at: ast::Span, what: String) -> types::Subst {
+        let subst = types::new_subst();
+        let mut given = args;
+        if !args.is_empty() && args.len() != params.len() {
+            self.error("E0107", at,
+                "`\(what)` takes \(params.len()) type argument(s) but \(args.len()) were supplied");
+            given = list::new[ast::Type]();
+        }
+        let mut i = 0;
+        while i < params.len() {
+            if i < given.len() {
+                subst.set(params.at(i), self.to_type(given.at(i)));
+            } else {
+                subst.set(params.at(i), self.fresh_for(at));
+            }
+            i = i + 1;
+        }
+        subst
+    }
+
+    /// An inference variable that remembers where it came from, so an unsolved one is
+    /// reported where it arose.
+    fn fresh_for(self, at: ast::Span) -> types::Type {
+        let v = self.ctx.fresh();
+        self.body_vars.push(PendingVar { ty: v, at: at, file: self.file });
+        v
+    }
+}
+
+fn fits_in(v: u64, k: i64) -> bool {
+    let bits = types::prim_bits(k);
+    if bits == 0 {
+        return true;
+    }
+    if types::is_signed(k) {
+        // Negation is a separate operator, so the literal itself must fit the positive
+        // range: `-128i8` is `-(128i8)`, and `128` does not fit `i8`. The minimum is
+        // written `i8::MIN` (spec/01-lexical.md).
+        if bits >= 64 {
+            return v <= 9223372036854775807u64;
+        }
+        return v <= pow2(bits - 1) - 1u64;
+    }
+    if bits >= 64 {
+        return true;
+    }
+    v < pow2(bits)
+}
+
+fn pow2(n: i64) -> u64 {
+    let mut out = 1u64;
+    let mut i = 0;
+    while i < n {
+        out = out * 2u64;
+        i = i + 1;
+    }
+    out
+}
+
+// --- Expressions: the rest ------------------------------------------------------------
+
+/// The function type a lambda is being checked against, when its context supplies one.
+struct Expected {
+    has: bool,
+    params: List[types::Type],
+    ret: types::Type,
+}
+
+fn no_expectation() -> Expected {
+    Expected { has: false, params: list::new[types::Type](), ret: types::error_type() }
+}
+
+fn expectation(t: types::Type) -> Expected {
+    match types::prune(t) {
+        types::Type::Func(params, ret) => Expected { has: true, params: params, ret: ret },
+        _ => no_expectation(),
+    }
+}
+
+impl Checker {
+    /// An enum variant used as an expression: a unit variant is a value, a tuple variant
+    /// is its constructor function.
+    fn variant_value(self, e: ast::Expr, r: resolve::Ref, targs: List[ast::Type]) -> types::Type {
+        match r.enum_decl {
+            Option::None => types::error_type(),
+            Option::Some(ed) => {
+                match self.def_at(ed.info) {
+                    Option::None => types::error_type(),
+                    Option::Some(def) => {
+                        let inst = self.fresh_args(def, targs, e.span);
+                        let result = types::Type::Named(def, inst.args);
+                        match r.variant {
+                            Option::None => types::error_type(),
+                            Option::Some(va) => {
+                                let idx = variant_index(ed, va);
+                                if idx < 0 {
+                                    return types::error_type();
+                                }
+                                if va.kind == ast::VARIANT_UNIT {
+                                    return result;
+                                }
+                                if va.kind == ast::VARIANT_TUPLE {
+                                    let params = list::new[types::Type]();
+                                    let payload = def.variant_types.at(idx);
+                                    let mut i = 0;
+                                    while i < payload.len() {
+                                        params.push(types::substitute(payload.at(i), inst.subst));
+                                        i = i + 1;
+                                    }
+                                    return types::Type::Func(params, result);
+                                }
+                                self.error("E0533", e.span,
+                                    "`\(va.name.name)` is a struct variant");
+                                types::error_type()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A definition's generic parameters instantiated with fresh variables, or with the
+    /// explicit type arguments if any were written.
+    fn fresh_args(self, def: types::Def, explicit: List[ast::Type], at: ast::Span) -> Instantiated {
+        let subst = self.instantiate_params(def.params, explicit, at, def.name);
+        let args = list::new[types::Type]();
+        let mut i = 0;
+        while i < def.params.len() {
+            args.push(subst.get(def.params.at(i)).unwrap_or(types::error_type()));
+            i = i + 1;
+        }
+        Instantiated { self_ty: types::error_type(), subst: subst, args: args }
+    }
+
+    fn infer_struct_lit(self, e: ast::Expr, p: ast::PathRef, targs: List[ast::Type],
+                        fields: List[ast::FieldInit]) -> types::Type {
+        let r = self.ref_of(p.res);
+        if r.kind == resolve::K_UNRESOLVED {
+            self.infer_field_values(fields);
+            return types::error_type();
+        }
+        if r.kind == resolve::K_STRUCT {
+            match r.struct_decl {
+                Option::None => return types::error_type(),
+                Option::Some(sd) => {
+                    match self.def_at(sd.info) {
+                        Option::None => return types::error_type(),
+                        Option::Some(def) => {
+                            let inst = self.fresh_args(def, targs, e.span);
+                            self.check_field_inits(e, fields, FieldShape {
+                                decls: sd.fields, types: def.field_types, name: def.name,
+                            }, inst.subst);
+                            return types::Type::Named(def, inst.args);
+                        }
+                    }
+                }
+            }
+        }
+        if r.kind == resolve::K_VARIANT {
+            match r.enum_decl {
+                Option::None => return types::error_type(),
+                Option::Some(ed) => {
+                    match self.def_at(ed.info) {
+                        Option::None => return types::error_type(),
+                        Option::Some(def) => {
+                            match r.variant {
+                                Option::None => return types::error_type(),
+                                Option::Some(va) => {
+                                    if va.kind != ast::VARIANT_STRUCT {
+                                        self.error("E0533", e.span,
+                                            "`\(va.name.name)` is not a struct variant");
+                                        return types::error_type();
+                                    }
+                                    let inst = self.fresh_args(def, targs, e.span);
+                                    let idx = variant_index(ed, va);
+                                    if idx >= 0 {
+                                        self.check_field_inits(e, fields, FieldShape {
+                                            decls: va.fields,
+                                            types: def.variant_types.at(idx),
+                                            name: va.name.name,
+                                        }, inst.subst);
+                                    }
+                                    return types::Type::Named(def, inst.args);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.error("E0574", e.span, "`\(p.text)` cannot be built with a struct literal");
+        types::error_type()
+    }
+
+    fn infer_field_values(self, fields: List[ast::FieldInit]) {
+        let mut i = 0;
+        while i < fields.len() {
+            self.infer(fields.at(i).value);
+            i = i + 1;
+        }
+    }
+
+    /// A struct literal supplies exactly the declared fields, with the right types.
+    /// Initializers are checked in source order, matching the evaluation order
+    /// spec/04-expressions.md specifies.
+    fn check_field_inits(self, whole: ast::Expr, inits: List[ast::FieldInit],
+                         shape: FieldShape, subst: types::Subst) {
+        let decls = shape.decls;
+        let field_types = shape.types;
+        let name = shape.name;
+        let seen = list::new[String]();
+        let mut i = 0;
+        while i < inits.len() {
+            let init = inits.at(i);
+            let idx = field_index(decls, init.name.name);
+            if idx < 0 {
+                self.infer(init.value);
+                self.error("E0560", ident_span(init.name),
+                    "`\(name)` has no field `\(init.name.name)`");
+            } else {
+                if contains_string(seen, init.name.name) {
+                    self.error("E0062", ident_span(init.name),
+                        "field `\(init.name.name)` is initialized twice");
+                }
+                seen.push(init.name.name);
+                let got = self.infer(init.value);
+                if idx < field_types.len() {
+                    let want = types::substitute(field_types.at(idx), subst);
+                    self.unify_at(want, got, init.value.span, "in this field's value");
+                }
+            }
+            i = i + 1;
+        }
+        let missing = list::new[String]();
+        let mut d = 0;
+        while d < decls.len() {
+            if !contains_string(seen, decls.at(d).name.name) {
+                missing.push("`\(decls.at(d).name.name)`");
+            }
+            d = d + 1;
+        }
+        if !missing.is_empty() {
+            self.error("E0063", whole.span, "missing field\(plural(missing.len())) in `\(name)`");
+        }
+    }
+
+    /// Checks a lambda against the function type its context wants, when there is one.
+    ///
+    /// An unannotated parameter takes its type from `want` rather than from a fresh
+    /// variable, which is what makes `m.with(|v| v.get())` work: a method call inside the
+    /// body is resolved against the receiver's exact type (there is no autoref), so that
+    /// type has to be known while the body is being checked.
+    fn infer_lambda(self, e: ast::Expr, params: List[ast::LambdaParam],
+                    ret: Option[ast::Type], body: ast::Expr, want_in: Option[Expected]) -> types::Type {
+        let mut want = no_expectation();
+        match want_in {
+            Option::Some(w) => { want = w; }
+            Option::None => {}
+        }
+        if want.has && want.params.len() != params.len() {
+            // The arity error is reported by the caller's unification.
+            want = no_expectation();
+        }
+
+        let ptypes = list::new[types::Type]();
+        let mut i = 0;
+        while i < params.len() {
+            let p = params.at(i);
+            let mut t = types::error_type();
+            match p.ty {
+                Option::Some(annotated) => { t = self.to_type(annotated); }
+                Option::None => {
+                    if want.has {
+                        t = want.params.at(i);
+                    } else {
+                        t = self.fresh_for(p.pat.span);
+                    }
+                }
+            }
+            ptypes.push(t);
+            // A lambda parameter binds every value it is given, so its pattern must be
+            // irrefutable, exactly like a function parameter.
+            self.bind_pattern(p.pat, t, true);
+            i = i + 1;
+        }
+
+        let saved_ret = self.ret;
+        let mut declared = types::error_type();
+        let mut has_declared = false;
+        match ret {
+            Option::Some(t) => {
+                declared = self.to_type(t);
+                has_declared = true;
+                self.ret = declared;
+            }
+            Option::None => { self.ret = self.fresh_for(e.span); }
+        }
+        let mut got = self.infer(body);
+        if has_declared {
+            if !types::is_never(got) {
+                self.unify_at(declared, got, body.span, "in this lambda's body");
+            }
+            got = declared;
+        } else {
+            // `return` inside a lambda targets the lambda's return type, so reconcile.
+            self.unify_at(self.ret, got, body.span, "in this lambda's body");
+            got = self.ret;
+        }
+        self.ret = saved_ret;
+        types::Type::Func(ptypes, got)
+    }
+
+    fn infer_if(self, cond: ast::Expr, then: ast::Expr, els: Option[ast::Expr]) -> types::Type {
+        self.expect_bool(cond, "an `if` condition");
+        let then_ty = self.infer(then);
+        match els {
+            Option::None => {
+                // spec/04-expressions.md: an `if` without `else` has type `()`.
+                if !types::is_never(then_ty) {
+                    self.unify_at(types::unit(), then_ty, block_tail_span(then),
+                                  "in an `if` with no `else`");
+                }
+                types::unit()
+            }
+            Option::Some(other) => {
+                let else_ty = self.infer(other);
+                if types::is_never(then_ty) {
+                    return else_ty;
+                }
+                if types::is_never(else_ty) {
+                    return then_ty;
+                }
+                self.unify_at(then_ty, else_ty, block_tail_span(other), "this branch");
+                then_ty
+            }
+        }
+    }
+
+    fn expect_bool(self, e: ast::Expr, what: String) {
+        let got = self.infer(e);
+        if !types::is_never(got) {
+            self.unify_at(types::Type::Prim(types::P_BOOL), got, e.span,
+                          "\(what) must be a `bool`");
+        }
+    }
+
+    fn expect_unit_block(self, body: ast::Expr, what: String) {
+        let got = self.infer(body);
+        if !types::is_never(got) {
+            self.unify_at(types::unit(), got, block_tail_span(body),
+                          "\(what) produces no value");
+        }
+    }
+
+    fn infer_match(self, e: ast::Expr, scrutinee: ast::Expr, arms: List[ast::Arm]) -> types::Type {
+        let scrut = self.infer(scrutinee);
+        if arms.is_empty() {
+            self.error("E0004", e.span, "`match` with no arms");
+            return types::error_type();
+        }
+        let mut result = types::error_type();
+        let mut have = false;
+        let mut i = 0;
+        while i < arms.len() {
+            let arm = arms.at(i);
+            self.bind_pattern(arm.pat, scrut, false);
+            match arm.guard {
+                Option::Some(g) => self.expect_bool(g, "a match guard"),
+                Option::None => {}
+            }
+            let got = self.infer(arm.body);
+            if !types::is_never(got) {
+                if have {
+                    self.unify_at(result, got, arm.body.span, "this arm");
+                } else {
+                    result = got;
+                    have = true;
+                }
+            }
+            i = i + 1;
+        }
+        self.check_exhaustive(e, arms, scrut);
+        if have { result } else { types::never() }
+    }
+
+    fn infer_loop(self, body: ast::Expr) -> types::Type {
+        self.loop_values.push(types::error_type());
+        self.loop_set.push(false);
+        self.infer(body);
+        let result = self.loop_values.pop().unwrap_or(types::error_type());
+        let was_set = self.loop_set.pop().unwrap_or(false);
+        // A `loop` with no `break` never produces a value.
+        if was_set { result } else { types::unit() }
+    }
+
+    fn infer_break(self, e: ast::Expr, value: Option[ast::Expr]) -> types::Type {
+        let mut got = types::unit();
+        match value {
+            Option::Some(x) => { got = self.infer(x); }
+            Option::None => {}
+        }
+        if self.loop_values.is_empty() {
+            // `break` in a `while` or `for`, or outside a loop entirely; the resolver
+            // already rejected the latter.
+            match value {
+                Option::Some(_) => {
+                    self.error("E0571", e.span,
+                        "`break` with a value is only allowed in `loop`");
+                }
+                Option::None => {}
+            }
+            return types::never();
+        }
+        let top = self.loop_values.len() - 1;
+        if self.loop_set.at(top) {
+            self.unify_at(self.loop_values.at(top), got, e.span, "this `break`");
+        } else {
+            self.loop_values.set(top, got);
+            self.loop_set.set(top, true);
+        }
+        types::never()
+    }
+
+    fn infer_unary(self, e: ast::Expr, op: String, x: ast::Expr) -> types::Type {
+        let got = self.infer(x);
+        if op == "!" {
+            self.unify_at(types::Type::Prim(types::P_BOOL), got, x.span,
+                          "`!` applies to `bool`");
+            return types::Type::Prim(types::P_BOOL);
+        }
+        let k = types::as_prim(got);
+        if k >= 0 {
+            if types::is_signed(k) || types::is_float(k) {
+                return got;
+            }
+            if types::is_integer(k) {
+                self.error("E0600", e.span, "cannot negate `\(types::prim_name(k))`");
+                return got;
+            }
+        }
+        if types::is_error(got) || types::is_never(got) {
+            return got;
+        }
+        match types::as_var(got) {
+            // Defaulting will settle it.
+            Option::Some(_) => return got,
+            Option::None => {}
+        }
+        self.error("E0600", e.span, "cannot negate `\(types::show(got))`");
+        types::error_type()
+    }
+}
+
+fn variant_index(ed: ast::EnumDecl, va: ast::Variant) -> i64 {
+    let mut i = 0;
+    while i < ed.variants.len() {
+        if ref_eq(ed.variants.at(i), va) {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+fn field_index(decls: List[ast::Field], name: String) -> i64 {
+    let mut i = 0;
+    while i < decls.len() {
+        if decls.at(i).name.name == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+fn plural(n: i64) -> String {
+    if n == 1 { "" } else { "s" }
+}
+
+// --- Operators, assignment and casts -------------------------------------------------------
+
+impl Checker {
+    /// Types an infix operator. Operators are built in on primitives only: Origin 0.1 has
+    /// no operator overloading.
+    fn infer_binary(self, e: ast::Expr, op: String, l: ast::Expr, r: ast::Expr) -> types::Type {
+        let left = self.infer(l);
+        let right = self.infer(r);
+
+        if op == "&&" || op == "||" {
+            self.unify_at(types::Type::Prim(types::P_BOOL), left, l.span,
+                          "`\(op)` applies to `bool`");
+            self.unify_at(types::Type::Prim(types::P_BOOL), right, r.span,
+                          "`\(op)` applies to `bool`");
+            return types::Type::Prim(types::P_BOOL);
+        }
+        if op == "==" || op == "!=" {
+            // `==` is structural and total for every non-function type
+            // (spec/04-expressions.md), so the operands need only agree.
+            self.unify_at(left, right, r.span,
+                          "both operands of `\(op)` must have the same type");
+            match types::prune(left) {
+                types::Type::Func(_, _) => {
+                    self.error("E0369", e.span, "function values cannot be compared");
+                }
+                _ => {}
+            }
+            return types::Type::Prim(types::P_BOOL);
+        }
+        if !self.unify_at(left, right, r.span,
+                          "both operands of `\(op)` must have the same type") {
+            return binary_result(op, types::error_type());
+        }
+        // The operand check cannot run now: `1.0 & 2.0` has an unsolved float variable at
+        // this point, and `let x: u8 = 1 + 2;` would be broken by defaulting the literals
+        // early.
+        self.op_checks.push(OperandCheck { op: op, ty: left, at: e.span, file: self.file });
+        binary_result(op, left)
+    }
+
+    fn run_operand_checks(self) {
+        let mut i = 0;
+        while i < self.op_checks.len() {
+            let oc = self.op_checks.at(i);
+            self.verify_operand(oc);
+            i = i + 1;
+        }
+    }
+
+    fn verify_operand(self, oc: OperandCheck) {
+        if types::is_error(oc.ty) || types::is_never(oc.ty) {
+            return;
+        }
+        types::apply_defaults(oc.ty);
+        match types::as_var(oc.ty) {
+            // Reported as an uninferred type instead.
+            Option::Some(_) => return,
+            Option::None => {}
+        }
+        let k = types::as_prim(oc.ty);
+        let shown = types::show(oc.ty);
+        let op = oc.op;
+
+        if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
+            if k >= 0 && types::is_numeric(k) {
+                return;
+            }
+            self.error_in("E0369", oc.file, oc.at, "`\(op)` is not defined on `\(shown)`");
+            return;
+        }
+        if op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>" {
+            if k >= 0 && types::is_integer(k) {
+                return;
+            }
+            self.error_in("E0369", oc.file, oc.at, "`\(op)` is not defined on `\(shown)`");
+            return;
+        }
+        if op == "<" || op == "<=" || op == ">" || op == ">=" {
+            if k >= 0 && types::is_ordered(k) {
+                return;
+            }
+            self.error_in("E0369", oc.file, oc.at, "`\(op)` is not defined on `\(shown)`");
+        }
+    }
+
+    /// Types an assignment. Its value is always `()`, which is why `a = b = c` is rejected
+    /// unless `a: ()` (spec/04-expressions.md).
+    fn infer_assign(self, e: ast::Expr, op: String, place: ast::Expr,
+                    value: ast::Expr) -> types::Type {
+        let place_ty = self.infer(place);
+        self.check_place(place, place_ty);
+        let value_ty = self.infer(value);
+
+        if op == "=" {
+            self.unify_at(place_ty, value_ty, value.span, "in this assignment");
+        } else {
+            self.unify_at(place_ty, value_ty, value.span,
+                          "both sides of `\(op)` must have the same type");
+            self.op_checks.push(OperandCheck {
+                op: compound_op(op), ty: place_ty, at: e.span, file: self.file,
+            });
+        }
+        types::unit()
+    }
+
+    /// The field half of the place rule (spec/04-expressions.md). The binding half is
+    /// checked by the resolver, which knows about `mut` without needing types; this half
+    /// needs the receiver's type, so it lands here.
+    fn check_place(self, place: ast::Expr, place_ty: types::Type) {
+        match place.node {
+            ast::ExprKind::Field(name, recv) => {
+                let recv_ty = self.last_recv;
+                match types::as_named(recv_ty) {
+                    Option::None => {}
+                    Option::Some(def) => {
+                        match def.struct_decl {
+                            Option::None => {}
+                            Option::Some(sd) => {
+                                let idx = field_index(sd.fields, name);
+                                if idx >= 0 && !sd.fields.at(idx).mutable {
+                                    self.error("E0594", place.span,
+                                        "field `\(name)` of `\(def.name)` is not declared `mut`");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The `as` matrix of spec/04-expressions.md. Every conversion in Origin is written,
+    /// so this is the only place a type changes without unification.
+    fn infer_cast(self, e: ast::Expr, x: ast::Expr, ty: ast::Type) -> types::Type {
+        let from = self.infer(x);
+        let to = self.to_type(ty);
+        if types::is_error(from) || types::is_error(to) {
+            return to;
+        }
+        // An unsolved source defaults now: `1 as u8` must decide what `1` is first.
+        types::apply_defaults(from);
+
+        let f = types::as_prim(from);
+        let t = types::as_prim(to);
+        if f < 0 || t < 0 {
+            self.error("E0605", e.span,
+                "cannot cast `\(types::show(from))` to `\(types::show(to))`");
+            return to;
+        }
+        if types::is_numeric(f) && types::is_numeric(t) {
+            return to;
+        }
+        if f == types::P_BOOL && types::is_integer(t) {
+            return to;
+        }
+        if f == types::P_CHAR && types::is_integer(t) {
+            return to;
+        }
+        if types::is_integer(f) && t == types::P_CHAR {
+            self.error("E0605", e.span,
+                "cannot cast `\(types::prim_name(f))` to `char`");
+            return to;
+        }
+        self.error("E0605", e.span,
+            "cannot cast `\(types::show(from))` to `\(types::show(to))`");
+        to
+    }
+}
+
+fn binary_result(op: String, operand: types::Type) -> types::Type {
+    if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+        return types::Type::Prim(types::P_BOOL);
+    }
+    operand
+}
+
+/// The operator inside a compound assignment: `+=` is `+`.
+fn compound_op(op: String) -> String {
+    op.slice(0, op.len() - 1)
+}
+
+// --- Calls, methods, fields and `?` ---------------------------------------------------------
+
+impl Checker {
+    fn infer_call(self, e: ast::Expr, f: ast::Expr, args: List[ast::Expr]) -> types::Type {
+        let callee = self.infer(f);
+        if types::is_error(callee) {
+            // Still check them, so one mistake is one diagnostic.
+            self.infer_all(args);
+            return types::error_type();
+        }
+        // Settle a literal's type first, so that calling a number reports "not callable"
+        // rather than a mismatch against an invented function type.
+        types::apply_defaults(callee);
+
+        let want = expectation(callee);
+        if want.has && args.len() == want.params.len() {
+            self.infer_args(args, want.params);
+            // The concurrency builtins carry obligations their signatures cannot: the
+            // `Send` bounds ADR-0014 rests on, and a spawned closure's captures.
+            self.check_concurrency_call(e, f, args, want.ret);
+            return want.ret;
+        }
+
+        let got = self.infer_all(args);
+        if !want.has {
+            match types::as_var(callee) {
+                Option::Some(_) => {
+                    // The callee's type is still open: constrain it to a function rather
+                    // than guessing. The result variable is registered only once that
+                    // succeeds, so a failure produces one diagnostic and not a second
+                    // about an unsolved type.
+                    let ret = self.ctx.fresh();
+                    if !self.unify_at(types::Type::Func(got, ret), callee, f.span,
+                                      "this is called as a function") {
+                        return types::error_type();
+                    }
+                    self.body_vars.push(PendingVar { ty: ret, at: e.span, file: self.file });
+                    return ret;
+                }
+                Option::None => {}
+            }
+            self.error("E0618", f.span, "`\(types::show(callee))` is not callable");
+            return types::error_type();
+        }
+        self.error("E0061", e.span,
+            "this function takes \(want.params.len()) argument\(plural(want.params.len())) but \(got.len()) \(were_or_was(got.len())) supplied");
+        want.ret
+    }
+
+    fn infer_all(self, args: List[ast::Expr]) -> List[types::Type] {
+        let out = list::new[types::Type]();
+        let mut i = 0;
+        while i < args.len() {
+            out.push(self.infer(args.at(i)));
+            i = i + 1;
+        }
+        out
+    }
+
+    /// Checks a call's arguments against the parameter types the callee declares.
+    ///
+    /// Lambdas go last, and that is the whole point: unifying the ordinary arguments first
+    /// can solve the type variables a generic signature leaves in the *lambda's* parameter
+    /// types, so that by the time the lambda's body is checked its parameters have real
+    /// types. Method lookup needs the receiver's exact type at the moment it runs.
+    fn infer_args(self, args: List[ast::Expr], params: List[types::Type]) {
+        let lambdas = list::new[i64]();
+        let mut i = 0;
+        while i < args.len() {
+            if is_lambda(args.at(i)) {
+                lambdas.push(i);
+            } else {
+                let got = self.infer(args.at(i));
+                self.unify_at(params.at(i), got, args.at(i).span, ordinal_arg(i));
+            }
+            i = i + 1;
+        }
+        let mut j = 0;
+        while j < lambdas.len() {
+            let at = lambdas.at(j);
+            let lam = args.at(at);
+            match lam.node {
+                ast::ExprKind::Lambda(ps, ret, body) => {
+                    let got = self.infer_lambda(lam, ps, ret, body,
+                                                Option::Some(expectation(params.at(at))));
+                    self.note_type("expr", got);
+                    self.unify_at(params.at(at), got, lam.span, ordinal_arg(at));
+                }
+                _ => {}
+            }
+            j = j + 1;
+        }
+    }
+
+    fn infer_method_call(self, e: ast::Expr, name: String, recv_expr: ast::Expr,
+                         args: List[ast::Expr]) -> types::Type {
+        let recv = self.normalize(self.infer(recv_expr));
+        if types::is_error(recv) {
+            self.infer_all(args);
+            return types::error_type();
+        }
+        // An unsolved receiver has no methods to look up yet; defaulting it here is what
+        // makes `1.to_str()` work without an annotation.
+        types::apply_defaults(recv);
+        match types::as_var(recv) {
+            Option::Some(_) => {
+                self.error("E0309", recv_expr.span, "cannot infer the type of this value");
+                return types::error_type();
+            }
+            Option::None => {}
+        }
+
+        let found = self.lookup_method(recv, name);
+        if !found.ok {
+            self.report_no_method(e, name, recv, found.ambiguous);
+            self.infer_all(args);
+            return types::error_type();
+        }
+        self.note_text("method", decl_site(found.decl));
+
+        let subst = found.subst.clone();
+        let mut p = 0;
+        while p < found.sig.params.len() {
+            subst.set(found.sig.params.at(p), self.fresh_for(e.span));
+            p = p + 1;
+        }
+        // `Self` is one of the generic parameters of a trait's own declaration, so it has
+        // to be in the substitution before the instantiation is recorded -- otherwise a
+        // default method body, whose declaration *is* the trait's, is recorded with `Self`
+        // unknown and reaches no instance at all.
+        match found.trait_info {
+            Option::Some(ti) => { subst.set(ti.self_param, recv); }
+            Option::None => {}
+        }
+        self.record_method_inst(name, found, recv, subst);
+
+        // The impl's own bounds are obligations of the call as much as the method's are:
+        // `impl[T: Show] Show for Box[T]` gives `Box[Opaque]` a `to_str` only if `Opaque`
+        // has one.
+        match found.impl_info {
+            Option::Some(info) => {
+                let mut b = 0;
+                while b < info.bounds.len() {
+                    let bd = info.bounds.at(b);
+                    self.require_bound(types::substitute(bd.ty, subst), bd.trait_info, e.span);
+                    b = b + 1;
+                }
+            }
+            Option::None => {}
+        }
+        let mut b = 0;
+        while b < found.sig.bounds.len() {
+            let bd = found.sig.bounds.at(b);
+            self.require_bound(types::substitute(bd.ty, subst), bd.trait_info, e.span);
+            b = b + 1;
+        }
+
+        match found.sig.decl.self_param {
+            Option::None => {
+                self.error("E0599", e.span,
+                    "`\(name)` is an associated function, not a method");
+                self.infer_all(args);
+                return types::error_type();
+            }
+            Option::Some(_) => {}
+        }
+
+        let params = list::new[types::Type]();
+        let mut i = 0;
+        while i < found.sig.param_types.len() {
+            params.push(self.normalize(types::substitute(found.sig.param_types.at(i), subst)));
+            i = i + 1;
+        }
+        if args.len() != params.len() {
+            self.infer_all(args);
+            self.error("E0061", e.span,
+                "`\(name)` takes \(params.len()) argument\(plural(params.len())) but \(args.len()) \(were_or_was(args.len())) supplied");
+            return self.normalize(types::substitute(found.sig.ret, subst));
+        }
+        // Arguments are checked against the parameter types the method declares, lambdas
+        // last, so that `m.with(|v| v.get())` knows what `v` is while its body is checked.
+        self.infer_args(args, params);
+        self.normalize(types::substitute(found.sig.ret, subst))
+    }
+
+    fn report_no_method(self, e: ast::Expr, name: String, recv: types::Type,
+                        ambiguous: List[String]) {
+        if !ambiguous.is_empty() {
+            self.error("E0034", e.span,
+                "`\(name)` is ambiguous on `\(types::show(recv))`");
+            return;
+        }
+        self.error("E0599", e.span,
+            "no method `\(name)` on `\(types::show(recv))`");
+    }
+
+    fn infer_field(self, e: ast::Expr, name: String, recv_expr: ast::Expr) -> types::Type {
+        let recv = self.normalize(self.infer(recv_expr));
+        self.last_recv = recv;
+        if types::is_error(recv) {
+            return types::error_type();
+        }
+        // Settle a literal's type before looking for the field, so that `1.field` reports
+        // "`i64` has no fields" rather than "cannot infer this type".
+        types::apply_defaults(recv);
+        self.last_recv = recv;
+        match types::as_named(recv) {
+            Option::None => {
+                match types::as_var(recv) {
+                    Option::Some(_) => {
+                        self.error("E0309", e.span, "cannot infer the type of this value");
+                        return types::error_type();
+                    }
+                    Option::None => {}
+                }
+                self.error("E0609", e.span, "`\(types::show(recv))` has no fields");
+                types::error_type()
+            }
+            Option::Some(def) => {
+                match def.struct_decl {
+                    Option::None => {
+                        self.error("E0609", e.span,
+                            "`\(def.name)` is an enum, so it has no fields to read directly");
+                        types::error_type()
+                    }
+                    Option::Some(sd) => {
+                        let idx = field_index(sd.fields, name);
+                        if idx < 0 {
+                            self.error("E0609", e.span,
+                                "`\(def.name)` has no field `\(name)`");
+                            return types::error_type();
+                        }
+                        let args = types::named_args(recv);
+                        let subst = types::new_subst();
+                        let mut j = 0;
+                        while j < def.params.len() {
+                            if j < args.len() {
+                                subst.set(def.params.at(j), args.at(j));
+                            }
+                            j = j + 1;
+                        }
+                        types::substitute(def.field_types.at(idx), subst)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `?` operator (spec/09-errors.md).
+    ///
+    /// It applies to `Result[T, E]` and to `Option[T]`, and in both cases the *enclosing*
+    /// function must return the same enum: `?` returns early with a value of the
+    /// function's own return type, and there is nothing it could build out of an `Option`
+    /// to satisfy a `Result` or the other way round.
+    fn infer_try(self, e: ast::Expr, x: ast::Expr) -> types::Type {
+        let got = self.normalize(self.infer(x));
+        if types::is_error(got) {
+            return types::error_type();
+        }
+        match types::as_named(got) {
+            Option::None => {
+                self.error("E0277", e.span,
+                    "`?` applies to a `Result` or an `Option`, found `\(types::show(got))`");
+                types::error_type()
+            }
+            Option::Some(def) => {
+                let args = types::named_args(got);
+                if def.name == "Option" {
+                    if args.len() != 1 {
+                        return types::error_type();
+                    }
+                    match types::as_named(self.ret) {
+                        Option::Some(outer) => {
+                            if outer.name != "Option" || types::named_args(self.ret).len() != 1 {
+                                self.error("E0277", e.span,
+                                    "`?` on an `Option` is only allowed in a function returning `Option`");
+                            }
+                        }
+                        Option::None => {
+                            self.error("E0277", e.span,
+                                "`?` on an `Option` is only allowed in a function returning `Option`");
+                        }
+                    }
+                    return args.at(0);
+                }
+                if def.name != "Result" {
+                    self.error("E0277", e.span,
+                        "`?` applies to a `Result` or an `Option`, found `\(types::show(got))`");
+                    return types::error_type();
+                }
+                if args.len() != 2 {
+                    return types::error_type();
+                }
+                let outer_args = types::named_args(self.ret);
+                let mut ok = false;
+                match types::as_named(self.ret) {
+                    Option::Some(outer) => { ok = outer.name == "Result" && outer_args.len() == 2; }
+                    Option::None => {}
+                }
+                if !ok {
+                    self.error("E0277", e.span,
+                        "`?` on a `Result` is only allowed in a function returning `Result`");
+                    return args.at(0);
+                }
+                if !self.unify_at(outer_args.at(1), args.at(1), e.span,
+                                  "the error types must match") {
+                    self.error("E0277", e.span, "`?` cannot convert between error types");
+                }
+                args.at(0)
+            }
+        }
+    }
+}
+
+fn is_lambda(e: ast::Expr) -> bool {
+    match e.node {
+        ast::ExprKind::Lambda(_, _, _) => true,
+        _ => false,
+    }
+}
+
+fn were_or_was(n: i64) -> String {
+    if n == 1 { "was" } else { "were" }
+}
+
+fn ordinal_arg(i: i64) -> String {
+    if i == 0 { return "the first argument"; }
+    if i == 1 { return "the second argument"; }
+    if i == 2 { return "the third argument"; }
+    "argument \(i + 1)"
+}
+
+// --- Method resolution ------------------------------------------------------------------
+
+/// A resolved method call target.
+struct Candidate {
+    ok: bool,
+    decl: ast::FnDecl,
+    sig: FnSig,
+    /// The impl's and the method's generic parameters mapped to the types this call
+    /// instantiates them at.
+    subst: types::Subst,
+    /// The trait the method came from, absent for an inherent method.
+    trait_info: Option[TraitInfo],
+    /// The impl block it was found in, absent when the receiver is a type parameter and
+    /// the method came from one of its bounds.
+    impl_info: Option[ImplInfo],
+    /// The traits that all supply the name, when more than one does.
+    ambiguous: List[String],
+}
+
+fn no_candidate(ambiguous: List[String]) -> Candidate {
+    Candidate {
+        ok: false, decl: no_fn_decl(), sig: no_sig(), subst: types::new_subst(),
+        trait_info: Option::None, impl_info: Option::None, ambiguous: ambiguous,
+    }
+}
+
+fn no_sig() -> FnSig {
+    FnSig {
+        decl: no_fn_decl(), params: list::new[types::Param](), has_self: false,
+        self_ty: types::error_type(), param_types: list::new[types::Type](),
+        ret: types::error_type(), bounds: no_bounds(),
+        generics: list::new[types::Param](),
+    }
+}
+
+impl Checker {
+    /// The resolution order of spec/06-traits-generics.md: inherent methods first, then
+    /// trait methods. Origin has no autoref and no autoderef, so the receiver type must
+    /// match exactly.
+    fn lookup_method(self, recv_in: types::Type, name: String) -> Candidate {
+        let recv = types::prune(recv_in);
+
+        // A rigid parameter's methods come from its declared bounds. So do an unresolved
+        // projection's: inside a trait's own default body `Self::Tag` is no more known
+        // than `Self` is, and `type Tag: Show;` is the only thing that says it has a
+        // `to_str`.
+        if is_rigid(recv) {
+            let mut i = 0;
+            while i < self.env.bounds.len() {
+                let b = self.env.bounds.at(i);
+                if same_rigid(b.ty, recv) {
+                    let direct = self.trait_method(b.trait_info, recv, name);
+                    if direct.ok {
+                        return direct;
+                    }
+                    let mut s = 0;
+                    while s < b.trait_info.supertraits.len() {
+                        let via = self.trait_method(b.trait_info.supertraits.at(s).trait_info,
+                                                    recv, name);
+                        if via.ok {
+                            return via;
+                        }
+                        s = s + 1;
+                    }
+                }
+                i = i + 1;
+            }
+            return no_candidate(list::new[String]());
+        }
+
+        let inherent = list::new[Candidate]();
+        let via_trait = list::new[Candidate]();
+        let cands = self.candidate_impls(recv);
+        let mut j = 0;
+        while j < cands.len() {
+            let info = cands.at(j);
+            let inst = self.instantiate_impl_self(info);
+            match types::unify(inst.self_ty, recv) {
+                Option::Some(_) => {}
+                Option::None => {
+                    let mut decl = no_fn_decl();
+                    let mut have = false;
+                    match info.methods.get(name) {
+                        Option::Some(m) => { decl = m; have = true; }
+                        Option::None => {
+                            // A trait impl may inherit a default method body from the
+                            // trait, and a compiler-provided impl has no bodies at all:
+                            // its methods are the trait's declarations, implemented by
+                            // the runtimes.
+                            match info.trait_info {
+                                Option::Some(ti) => {
+                                    match ti.methods.get(name) {
+                                        Option::Some(d) => {
+                                            let has_body = match d.body {
+                                                Option::Some(_) => true,
+                                                Option::None => false,
+                                            };
+                                            if has_body || info.builtin {
+                                                decl = d;
+                                                have = true;
+                                            }
+                                        }
+                                        Option::None => {}
+                                    }
+                                }
+                                Option::None => {}
+                            }
+                        }
+                    }
+                    if have {
+                        match self.sig_of(decl, info, name) {
+                            Option::None => {}
+                            Option::Some(sig) => {
+                                let cand = Candidate {
+                                    ok: true, decl: decl, sig: sig, subst: inst.subst,
+                                    trait_info: info.trait_info,
+                                    impl_info: Option::Some(info),
+                                    ambiguous: list::new[String](),
+                                };
+                                match info.trait_info {
+                                    Option::None => { inherent.push(cand); }
+                                    Option::Some(_) => { via_trait.push(cand); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            j = j + 1;
+        }
+
+        if inherent.len() == 1 {
+            return inherent.at(0);
+        }
+        if inherent.len() > 1 {
+            let names = list::new[String]();
+            names.push("more than one inherent method");
+            return no_candidate(names);
+        }
+        if via_trait.len() == 1 {
+            return via_trait.at(0);
+        }
+        if via_trait.len() > 1 {
+            let names = list::new[String]();
+            let mut i = 0;
+            while i < via_trait.len() {
+                match via_trait.at(i).trait_info {
+                    Option::Some(ti) => { names.push(ti.decl.name.name); }
+                    Option::None => {}
+                }
+                i = i + 1;
+            }
+            sort_strings(names);
+            return no_candidate(names);
+        }
+        no_candidate(list::new[String]())
+    }
+
+    fn sig_of(self, decl: ast::FnDecl, info: ImplInfo, name: String) -> Option[FnSig] {
+        match self.sig_at(decl.info) {
+            Option::Some(s) => Option::Some(s),
+            Option::None => {
+                match info.trait_info {
+                    Option::None => Option::None,
+                    Option::Some(ti) => ti.sigs.get(name),
+                }
+            }
+        }
+    }
+
+    /// A candidate for calling a trait method on a rigid parameter.
+    fn trait_method(self, ti: TraitInfo, self_ty: types::Type, name: String) -> Candidate {
+        match ti.methods.get(name) {
+            Option::None => no_candidate(list::new[String]()),
+            Option::Some(decl) => {
+                match ti.sigs.get(name) {
+                    Option::None => no_candidate(list::new[String]()),
+                    Option::Some(sig) => {
+                        let s = types::new_subst();
+                        s.set(ti.self_param, self_ty);
+                        Candidate {
+                            ok: true, decl: decl, sig: sig, subst: s,
+                            trait_info: Option::Some(ti), impl_info: Option::None,
+                            ambiguous: list::new[String](),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Notes which copy of a method a call site needs.
+    ///
+    /// The receiver is recorded along with the parameters, because it is what
+    /// monomorphization resolves against: a trait method called on a type parameter names
+    /// the trait's own declaration here, and only the substituted receiver says which impl
+    /// actually runs.
+    fn record_method_inst(self, name: String, cand: Candidate, recv: types::Type,
+                          subst: types::Subst) {
+        let params = list::new[types::Param]();
+        let args = list::new[types::Type]();
+        let mut i = 0;
+        while i < cand.sig.generics.len() {
+            let p = cand.sig.generics.at(i);
+            match subst.get(p) {
+                Option::None => return,
+                Option::Some(arg) => {
+                    params.push(p);
+                    args.push(arg);
+                }
+            }
+            i = i + 1;
+        }
+        self.note_inst("minst", Inst {
+            decl: cand.decl, params: params, args: args, recv: recv, has_recv: true,
+            method: name,
+        });
+    }
+}
+
+/// Insertion sort, so that a diagnostic listing traits is deterministic.
+fn sort_strings(l: List[String]) {
+    let mut i = 1;
+    while i < l.len() {
+        let mut j = i;
+        while j > 0 && l.at(j - 1) > l.at(j) {
+            let a = l.at(j - 1);
+            l.set(j - 1, l.at(j));
+            l.set(j, a);
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+// --- Patterns ---------------------------------------------------------------------------
+
+impl Checker {
+    /// Checks a pattern against the type it matches and records the types of the bindings
+    /// it introduces.
+    fn bind_pattern(self, p: ast::Pat, want_in: types::Type, irrefutable: bool) {
+        let want = self.normalize(want_in);
+        self.note_type("pat", want);
+
+        match p.node {
+            ast::PatKind::ErrorPat => {}
+            ast::PatKind::Wild => {}
+            ast::PatKind::Lit(neg, lit) => self.bind_lit_pattern(p, neg, lit, want),
+
+            ast::PatKind::Bind(_, name, sub) => {
+                let r = self.ref_of(name.res);
+                if r.kind == resolve::K_VARIANT {
+                    self.bind_variant_pattern(p, r, want, unit_shape());
+                } else {
+                    if r.kind == resolve::K_CONST {
+                        match r.const_decl {
+                            Option::Some(cd) => {
+                                let got = self.const_type(cd);
+                                self.unify_at(want, got, p.span, "this constant pattern");
+                            }
+                            Option::None => {}
+                        }
+                    } else {
+                        match r.local {
+                            Option::Some(l) => { self.set_local_type(l, want); }
+                            Option::None => {}
+                        }
+                    }
+                }
+                match sub {
+                    Option::Some(s) => self.bind_pattern(s, want, irrefutable),
+                    Option::None => {}
+                }
+            }
+
+            ast::PatKind::Tup(elems) => {
+                let ts = list::new[types::Type]();
+                let mut i = 0;
+                while i < elems.len() {
+                    ts.push(self.fresh_for(p.span));
+                    i = i + 1;
+                }
+                if !self.unify_at(want, types::Type::Tuple(ts), p.span, "this tuple pattern") {
+                    let mut j = 0;
+                    while j < elems.len() {
+                        self.bind_pattern(elems.at(j), types::error_type(), irrefutable);
+                        j = j + 1;
+                    }
+                } else {
+                    let mut j = 0;
+                    while j < elems.len() {
+                        self.bind_pattern(elems.at(j), ts.at(j), irrefutable);
+                        j = j + 1;
+                    }
+                }
+            }
+
+            ast::PatKind::Or(alts) => {
+                let mut i = 0;
+                while i < alts.len() {
+                    self.bind_pattern(alts.at(i), want, irrefutable);
+                    i = i + 1;
+                }
+                self.check_or_pattern_bindings(alts);
+            }
+
+            ast::PatKind::PathUnit(path) =>
+                self.bind_path_pattern(p, path, want, unit_shape()),
+            ast::PatKind::PathTuple(path, elems) =>
+                self.bind_path_pattern(p, path, want, PatShape {
+                    kind: ast::VARIANT_TUPLE, elems: elems,
+                    fields: list::new[ast::FieldPat](), rest: false,
+                }),
+            ast::PatKind::PathStruct(path, rest, fields) =>
+                self.bind_path_pattern(p, path, want, PatShape {
+                    kind: ast::VARIANT_STRUCT, elems: list::new[ast::Pat](),
+                    fields: fields, rest: rest,
+                }),
+        }
+
+        if irrefutable && self.is_refutable(p) {
+            self.error("E0005", p.span,
+                "refutable pattern where an irrefutable one is required");
+        }
+    }
+
+    fn bind_lit_pattern(self, p: ast::Pat, neg: bool, lit: ast::Expr, want: types::Type) {
+        // spec/05-patterns.md: float literal patterns are rejected, because NaN and -0.0
+        // make equality the wrong primitive for matching.
+        match lit.node {
+            ast::ExprKind::Float(_, _) => {
+                self.error("E0658", p.span, "a float literal cannot be a pattern");
+                return;
+            }
+            _ => {}
+        }
+        let got = self.infer(lit);
+        if neg {
+            let k = types::as_prim(got);
+            if k >= 0 && !types::is_signed(k) && types::is_integer(k) {
+                self.error("E0600", p.span, "cannot negate `\(types::prim_name(k))`");
+            }
+        }
+        self.unify_at(want, got, p.span, "this literal pattern");
+    }
+
+    fn bind_path_pattern(self, p: ast::Pat, path: ast::PathRef, want: types::Type,
+                         shape: PatShape) {
+        let r = self.ref_of(path.res);
+        if r.kind == resolve::K_UNRESOLVED {
+            return;
+        }
+        if r.kind == resolve::K_VARIANT {
+            self.bind_variant_pattern(p, r, want, shape);
+            return;
+        }
+        if r.kind == resolve::K_STRUCT {
+            self.bind_struct_pattern(p, r, want, shape);
+            return;
+        }
+        self.error("E0532", p.span, "`\(path.text)` cannot be matched as a pattern");
+    }
+
+    fn bind_variant_pattern(self, p: ast::Pat, r: resolve::Ref, want: types::Type,
+                            shape: PatShape) {
+        let kind = shape.kind;
+        let elems = shape.elems;
+        let fields = shape.fields;
+        let rest = shape.rest;
+        match r.enum_decl {
+            Option::None => {}
+            Option::Some(ed) => {
+                match self.def_at(ed.info) {
+                    Option::None => {}
+                    Option::Some(def) => {
+                        let inst = self.fresh_args(def, list::new[ast::Type](), p.span);
+                        if !self.unify_at(want, types::Type::Named(def, inst.args), p.span,
+                                          "this pattern") {
+                            return;
+                        }
+                        match r.variant {
+                            Option::None => {}
+                            Option::Some(va) => {
+                                let idx = variant_index(ed, va);
+                                if idx < 0 {
+                                    return;
+                                }
+                                let payload = def.variant_types.at(idx);
+                                if kind == ast::VARIANT_UNIT {
+                                    if va.kind != ast::VARIANT_UNIT {
+                                        self.error("E0532", p.span,
+                                            "`\(va.name.name)` carries a payload");
+                                    }
+                                } else {
+                                    if kind == ast::VARIANT_TUPLE {
+                                        if elems.len() != payload.len() {
+                                            self.error("E0023", p.span,
+                                                "`\(va.name.name)` carries \(payload.len()) value\(plural(payload.len())) but this pattern has \(elems.len())");
+                                            return;
+                                        }
+                                        let mut i = 0;
+                                        while i < elems.len() {
+                                            self.bind_pattern(elems.at(i),
+                                                types::substitute(payload.at(i), inst.subst),
+                                                false);
+                                            i = i + 1;
+                                        }
+                                    } else {
+                                        self.bind_named_field_patterns(p, FieldShape {
+                                            decls: va.fields, types: payload,
+                                            name: va.name.name,
+                                        }, inst.subst, fields, rest);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn bind_struct_pattern(self, p: ast::Pat, r: resolve::Ref, want: types::Type,
+                           shape: PatShape) {
+        let kind = shape.kind;
+        let fields = shape.fields;
+        let rest = shape.rest;
+        match r.struct_decl {
+            Option::None => {}
+            Option::Some(sd) => {
+                match self.def_at(sd.info) {
+                    Option::None => {}
+                    Option::Some(def) => {
+                        let inst = self.fresh_args(def, list::new[ast::Type](), p.span);
+                        if !self.unify_at(want, types::Type::Named(def, inst.args), p.span,
+                                          "this pattern") {
+                            return;
+                        }
+                        if kind != ast::VARIANT_STRUCT {
+                            self.error("E0532", p.span, "`\(def.name)` is a struct");
+                            return;
+                        }
+                        self.bind_named_field_patterns(p, FieldShape {
+                            decls: sd.fields, types: def.field_types, name: def.name,
+                        }, inst.subst, fields, rest);
+                    }
+                }
+            }
+        }
+    }
+
+    fn bind_named_field_patterns(self, p: ast::Pat, shape: FieldShape, subst: types::Subst,
+                                 pats: List[ast::FieldPat], rest: bool) {
+        let decls = shape.decls;
+        let field_types = shape.types;
+        let name = shape.name;
+        let seen = list::new[String]();
+        let mut i = 0;
+        while i < pats.len() {
+            let fp = pats.at(i);
+            let idx = field_index(decls, fp.name.name);
+            if idx < 0 {
+                self.error("E0026", ident_span(fp.name),
+                    "`\(name)` has no field `\(fp.name.name)`");
+                self.bind_pattern(fp.pat, types::error_type(), false);
+            } else {
+                seen.push(fp.name.name);
+                self.bind_pattern(fp.pat, types::substitute(field_types.at(idx), subst), false);
+            }
+            i = i + 1;
+        }
+        if rest {
+            return;
+        }
+        let missing = list::new[String]();
+        let mut d = 0;
+        while d < decls.len() {
+            if !contains_string(seen, decls.at(d).name.name) {
+                missing.push("`\(decls.at(d).name.name)`");
+            }
+            d = d + 1;
+        }
+        if !missing.is_empty() {
+            self.error("E0027", p.span, "pattern does not mention \(join_names(missing))");
+        }
+    }
+
+    /// Every alternative of an or-pattern binds the same names at the same types
+    /// (spec/05-patterns.md).
+    fn check_or_pattern_bindings(self, alts: List[ast::Pat]) {
+        if alts.len() < 2 {
+            return;
+        }
+        let first = self.pattern_bindings(alts.at(0));
+        let mut a = 1;
+        while a < alts.len() {
+            let other = self.pattern_bindings(alts.at(a));
+            let mut i = 0;
+            while i < first.len() {
+                let l = first.at(i);
+                match find_local(other, l.name) {
+                    Option::None => {
+                        self.error("E0007", alts.at(a).span,
+                            "`\(l.name)` is not bound in all alternatives");
+                    }
+                    Option::Some(o) => {
+                        match self.local_type(l) {
+                            Option::None => {}
+                            Option::Some(wt) => {
+                                match self.local_type(o) {
+                                    Option::None => {}
+                                    Option::Some(gt) => {
+                                        self.unify_at(wt, gt, alts.at(a).span,
+                                            "`\(l.name)` must have the same type in every alternative");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            let mut j = 0;
+            while j < other.len() {
+                let o = other.at(j);
+                match find_local(first, o.name) {
+                    Option::None => {
+                        self.error("E0007", alts.at(0).span,
+                            "`\(o.name)` is not bound in all alternatives");
+                    }
+                    Option::Some(_) => {}
+                }
+                j = j + 1;
+            }
+            a = a + 1;
+        }
+    }
+
+    fn pattern_bindings(self, p: ast::Pat) -> List[resolve::Local] {
+        let out = list::new[resolve::Local]();
+        self.collect_bindings(p, out);
+        out
+    }
+
+    fn collect_bindings(self, p: ast::Pat, out: List[resolve::Local]) {
+        match p.node {
+            ast::PatKind::Bind(_, name, sub) => {
+                match self.ref_of(name.res).local {
+                    Option::Some(l) => { out.push(l); }
+                    Option::None => {}
+                }
+                match sub {
+                    Option::Some(s) => self.collect_bindings(s, out),
+                    Option::None => {}
+                }
+            }
+            ast::PatKind::Tup(elems) => self.collect_bindings_all(elems, out),
+            ast::PatKind::Or(alts) => self.collect_bindings_all(alts, out),
+            ast::PatKind::PathTuple(_, elems) => self.collect_bindings_all(elems, out),
+            ast::PatKind::PathStruct(_, _, fields) => {
+                let mut i = 0;
+                while i < fields.len() {
+                    self.collect_bindings(fields.at(i).pat, out);
+                    i = i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_bindings_all(self, ps: List[ast::Pat], out: List[resolve::Local]) {
+        let mut i = 0;
+        while i < ps.len() {
+            self.collect_bindings(ps.at(i), out);
+            i = i + 1;
+        }
+    }
+
+    /// Whether a pattern can fail to match some value of its type.
+    fn is_refutable(self, p: ast::Pat) -> bool {
+        match p.node {
+            ast::PatKind::Wild => false,
+            ast::PatKind::ErrorPat => false,
+            ast::PatKind::Lit(_, _) => true,
+            ast::PatKind::Bind(_, name, sub) => {
+                let k = self.ref_of(name.res).kind;
+                if k == resolve::K_VARIANT || k == resolve::K_CONST {
+                    return true;
+                }
+                match sub {
+                    Option::Some(s) => self.is_refutable(s),
+                    Option::None => false,
+                }
+            }
+            ast::PatKind::Tup(elems) => self.any_refutable(elems),
+            ast::PatKind::Or(alts) => self.any_refutable(alts),
+            ast::PatKind::PathUnit(path) => self.refutable_path(path, list::new[ast::Pat](),
+                                                               list::new[ast::FieldPat]()),
+            ast::PatKind::PathTuple(path, elems) =>
+                self.refutable_path(path, elems, list::new[ast::FieldPat]()),
+            ast::PatKind::PathStruct(path, _, fields) =>
+                self.refutable_path(path, list::new[ast::Pat](), fields),
+        }
+    }
+
+    fn refutable_path(self, path: ast::PathRef, elems: List[ast::Pat],
+                      fields: List[ast::FieldPat]) -> bool {
+        let r = self.ref_of(path.res);
+        if r.kind == resolve::K_VARIANT {
+            // A single-variant enum is irrefutable; anything else can fail.
+            match r.enum_decl {
+                Option::Some(ed) => {
+                    if ed.variants.len() > 1 {
+                        return true;
+                    }
+                }
+                Option::None => {}
+            }
+        }
+        if self.any_refutable(elems) {
+            return true;
+        }
+        let mut i = 0;
+        while i < fields.len() {
+            if self.is_refutable(fields.at(i).pat) {
+                return true;
+            }
+            i = i + 1;
+        }
+        false
+    }
+
+    fn any_refutable(self, ps: List[ast::Pat]) -> bool {
+        let mut i = 0;
+        while i < ps.len() {
+            if self.is_refutable(ps.at(i)) {
+                return true;
+            }
+            i = i + 1;
+        }
+        false
+    }
+
+    /// Binds a pattern to a possibly-polymorphic type. `let` patterns must be irrefutable
+    /// (spec/05-patterns.md), which is what `irrefutable` records.
+    fn bind_pattern_scheme(self, p: ast::Pat, s: types::Scheme, irrefutable: bool) {
+        if !s.vars.is_empty() {
+            match p.node {
+                ast::PatKind::Bind(_, name, _) => {
+                    match self.ref_of(name.res).local {
+                        Option::Some(l) => {
+                            self.scheme_locals.push(l);
+                            self.scheme_values.push(s);
+                            self.set_local_type_quiet(l, s.ty);
+                            self.note_type("scheme", s.ty);
+                            self.note_local(l, s.ty);
+                            return;
+                        }
+                        Option::None => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.bind_pattern(p, s.ty, irrefutable);
+    }
+
+    fn set_local_type_quiet(self, l: resolve::Local, t: types::Type) {
+        let mut i = 0;
+        while i < self.local_keys.len() {
+            if ref_eq(self.local_keys.at(i), l) {
+                self.local_types.set(i, t);
+                return;
+            }
+            i = i + 1;
+        }
+        self.local_keys.push(l);
+        self.local_types.push(t);
+    }
+}
+
+fn find_local(l: List[resolve::Local], name: String) -> Option[resolve::Local] {
+    let mut i = 0;
+    while i < l.len() {
+        if l.at(i).name == name {
+            return Option::Some(l.at(i));
+        }
+        i = i + 1;
+    }
+    Option::None
+}
+
+fn join_names(names: List[String]) -> String {
+    if names.is_empty() { return ""; }
+    if names.len() == 1 { return names.at(0); }
+    if names.len() == 2 { return "\(names.at(0)) and \(names.at(1))"; }
+    let mut out = "";
+    let mut i = 0;
+    while i + 1 < names.len() {
+        if i > 0 {
+            out = out.concat(", ");
+        }
+        out = out.concat(names.at(i));
+        i = i + 1;
+    }
+    "\(out) and \(names.at(names.len() - 1))"
+}
+
+// --- `for`, and the builtins' signatures ---------------------------------------------------
+
+impl Checker {
+    fn infer_for(self, e: ast::Expr, pat: ast::Pat, iter_expr: ast::Expr,
+                 body: ast::Expr) -> types::Type {
+        let iter = self.infer(iter_expr);
+        let elem = self.for_element_type(e, iter_expr, iter);
+        self.bind_pattern(pat, elem, true);
+        self.expect_unit_block(body, "a `for` body");
+        types::unit()
+    }
+
+    /// The desugaring in spec/04-expressions.md: `e.into_iter()`, then `next()` yielding
+    /// `Option[Item]`.
+    ///
+    /// Neither implicit call becomes an AST node, so both are recorded against the `for`
+    /// itself -- which on this side means the trace gets both instantiations in the order
+    /// the Go checker files them.
+    fn for_element_type(self, e: ast::Expr, iter_expr: ast::Expr,
+                        iter: types::Type) -> types::Type {
+        if types::is_error(iter) {
+            return types::error_type();
+        }
+        match self.trait_by_name("IntoIterator") {
+            Option::None => types::error_type(),
+            Option::Some(into_iter) => {
+                self.require_bound(iter, into_iter, iter_expr.span);
+                let elem = self.normalize(
+                    types::Type::Assoc(into_iter.decl, "Item", iter));
+
+                let got = self.record_for_call(iter, "into_iter", iter_expr.span);
+                if !got.ok {
+                    // `iter` does not implement `IntoIterator`: the bound above reports it
+                    // once the body finishes.
+                    return elem;
+                }
+                match self.trait_by_name("Iterator") {
+                    Option::Some(it) => { self.require_bound(got.ty, it, e.span); }
+                    Option::None => {}
+                }
+                self.record_for_call(got.ty, "next", e.span);
+                elem
+            }
+        }
+    }
+
+    /// Resolves and records the instantiation of a trait method called with no arguments
+    /// beyond `self`, the shape both halves of the `for` desugaring have.
+    fn record_for_call(self, recv: types::Type, name: String, at: ast::Span) -> Resolved1 {
+        let found = self.lookup_method(recv, name);
+        if !found.ok {
+            return Resolved1 { ok: false, ty: types::error_type() };
+        }
+        let subst = found.subst.clone();
+        let mut p = 0;
+        while p < found.sig.params.len() {
+            subst.set(found.sig.params.at(p), self.fresh_for(at));
+            p = p + 1;
+        }
+        match found.trait_info {
+            Option::Some(ti) => { subst.set(ti.self_param, recv); }
+            Option::None => {}
+        }
+        self.record_method_inst(name, found, recv, subst);
+        let mut b = 0;
+        while b < found.sig.bounds.len() {
+            let bd = found.sig.bounds.at(b);
+            self.require_bound(types::substitute(bd.ty, subst), bd.trait_info, at);
+            b = b + 1;
+        }
+        Resolved1 { ok: true, ty: self.normalize(types::substitute(found.sig.ret, subst)) }
+    }
+
+    /// A prelude type applied to arguments, or the error type when the prelude does not
+    /// declare it -- which is a broken prelude, reported elsewhere.
+    fn prelude_named(self, name: String, args: List[types::Type]) -> types::Type {
+        match self.prelude_defs.get(name) {
+            Option::None => types::error_type(),
+            Option::Some(d) => types::Type::Named(d, args),
+        }
+    }
+
+    /// The compiler-provided functions' signatures.
+    fn builtin_type(self, name: String, targs: List[ast::Type], at: ast::Span) -> types::Type {
+        let unit = types::unit();
+        let i64t = types::Type::Prim(types::P_I64);
+        let str = types::Type::Prim(types::P_STRING);
+        let bool_t = types::Type::Prim(types::P_BOOL);
+
+        if name == "io::print" || name == "io::println" {
+            return types::Type::Func(one_type(str), unit);
+        }
+        if name == "panic" {
+            return types::Type::Func(one_type(str), types::never());
+        }
+        if name == "ref_eq" {
+            // Compares two aggregates of the same type for identity.
+            let v = self.fresh_for(at);
+            return types::Type::Func(two_types(v, v), bool_t);
+        }
+
+        // The string operations (spec/14-strings.md), the file operations (§15), the
+        // float's bits (§16) and the process's own inputs and outcome (§17). Every one
+        // returns a primitive or a `String`: a runtime that had to build a prelude type
+        // would have to know what the prelude's is, and the native backend has no way to
+        // construct one (ADR-0025).
+        if name == "str::len" { return types::Type::Func(one_type(str), i64t); }
+        if name == "str::byte_at" || name == "str::char_width" {
+            return types::Type::Func(two_types(str, i64t), i64t);
+        }
+        if name == "str::char_at" {
+            return types::Type::Func(two_types(str, i64t), types::Type::Prim(types::P_CHAR));
+        }
+        if name == "str::slice" {
+            return types::Type::Func(three_types(str, i64t, i64t), str);
+        }
+        if name == "str::concat" { return types::Type::Func(two_types(str, str), str); }
+        if name == "fs::read_file" { return types::Type::Func(one_type(str), i64t); }
+        if name == "fs::taken_text" { return types::Type::Func(list::new[types::Type](), str); }
+        if name == "fs::write_file" { return types::Type::Func(two_types(str, str), i64t); }
+        if name == "fs::file_exists" { return types::Type::Func(one_type(str), bool_t); }
+        if name == "env::arg_count" { return types::Type::Func(list::new[types::Type](), i64t); }
+        if name == "env::arg_at" { return types::Type::Func(one_type(i64t), str); }
+        if name == "process::exit" { return types::Type::Func(one_type(i64t), types::never()); }
+        if name == "float::bits" {
+            return types::Type::Func(one_type(types::Type::Prim(types::P_F64)),
+                                     types::Type::Prim(types::P_U64));
+        }
+        if name == "float::from_bits" {
+            return types::Type::Func(one_type(types::Type::Prim(types::P_U64)),
+                                     types::Type::Prim(types::P_F64));
+        }
+        if name == "char::from_u32" {
+            // The one compiler-provided operation whose result is a prelude type: the
+            // alternative -- a predicate plus an unchecked conversion -- would put a way
+            // to make an invalid `char` in reach, so internal/compile builds the `Option`.
+            return types::Type::Func(one_type(types::Type::Prim(types::P_U32)),
+                self.prelude_named("Option", one_type(types::Type::Prim(types::P_CHAR))));
+        }
+
+        // Each of the rest is generic in a single element type. An explicit type argument
+        // -- `channel[i64](0)`, `array::new[i64](8)` -- names it directly, which a value
+        // that is created and never read would otherwise have no way to fix.
+        if name == "map::new" {
+            let mut k = types::error_type();
+            let mut v = types::error_type();
+            if targs.is_empty() {
+                k = self.fresh_for(at);
+                v = self.fresh_for(at);
+            } else {
+                if targs.len() == 2 {
+                    k = self.to_type(targs.at(0));
+                    v = self.to_type(targs.at(1));
+                } else {
+                    self.error("E0107", at,
+                        "`\(name)` takes 2 type arguments but \(targs.len()) were supplied");
+                }
+            }
+            return types::Type::Func(list::new[types::Type](),
+                                     self.prelude_named("Map", two_types(k, v)));
+        }
+
+        let elem = self.builtin_elem(name, targs, at);
+        if name == "hash::of" { return types::Type::Func(one_type(elem), i64t); }
+        if name == "list::new" {
+            return types::Type::Func(list::new[types::Type](),
+                                     self.prelude_named("List", one_type(elem)));
+        }
+        let array = types::Type::Named(self.array_def(), one_type(elem));
+        if name == "array::new" { return types::Type::Func(one_type(i64t), array); }
+        if name == "array::len" || name == "array::cap" {
+            return types::Type::Func(one_type(array), i64t);
+        }
+        if name == "array::at" { return types::Type::Func(two_types(array, i64t), elem); }
+        if name == "array::set" {
+            return types::Type::Func(three_types(array, i64t, elem), unit);
+        }
+        if name == "array::push" { return types::Type::Func(two_types(array, elem), bool_t); }
+        if name == "array::truncate" {
+            return types::Type::Func(two_types(array, i64t), unit);
+        }
+
+        // The concurrency operations (spec/12-concurrency.md). `spawn`'s `Send` bound is
+        // imposed at the call site rather than carried here, because a builtin's type is a
+        // plain function type with nowhere to put a bound.
+        if name == "thread::spawn" {
+            return types::Type::Func(
+                one_type(types::Type::Func(list::new[types::Type](), elem)),
+                self.prelude_named("JoinHandle", one_type(elem)));
+        }
+        if name == "thread::join_thread" {
+            return types::Type::Func(
+                one_type(self.prelude_named("JoinHandle", one_type(elem))), elem);
+        }
+        if name == "chan::channel" {
+            let pair = two_types(self.prelude_named("Sender", one_type(elem)),
+                                 self.prelude_named("Receiver", one_type(elem)));
+            return types::Type::Func(one_type(i64t), types::Type::Tuple(pair));
+        }
+        if name == "chan::send_value" {
+            return types::Type::Func(
+                two_types(self.prelude_named("Sender", one_type(elem)), elem), unit);
+        }
+        if name == "chan::await_value" {
+            return types::Type::Func(
+                one_type(self.prelude_named("Receiver", one_type(elem))), bool_t);
+        }
+        if name == "chan::taken_value" {
+            return types::Type::Func(
+                one_type(self.prelude_named("Receiver", one_type(elem))), elem);
+        }
+        if name == "chan::close_sender" {
+            return types::Type::Func(
+                one_type(self.prelude_named("Sender", one_type(elem))), unit);
+        }
+        if name == "sync::mutex" {
+            return types::Type::Func(one_type(elem),
+                                     self.prelude_named("Mutex", one_type(elem)));
+        }
+        if name == "sync::with_lock" {
+            let r = self.fresh_for(at);
+            return types::Type::Func(
+                two_types(self.prelude_named("Mutex", one_type(elem)),
+                          types::Type::Func(one_type(elem), r)), r);
+        }
+        types::error_type()
+    }
+
+    fn builtin_elem(self, name: String, targs: List[ast::Type], at: ast::Span) -> types::Type {
+        if targs.len() == 1 {
+            return self.to_type(targs.at(0));
+        }
+        if targs.len() > 1 {
+            self.error("E0107", at,
+                "`\(name)` takes 1 type argument but \(targs.len()) were supplied");
+        }
+        self.fresh_for(at)
+    }
+
+    /// What the concurrency signatures cannot carry: the `Send` obligations that make
+    /// ADR-0014's no-data-races claim true, and the capture check no function type can
+    /// express.
+    fn check_concurrency_call(self, e: ast::Expr, f: ast::Expr, args: List[ast::Expr],
+                              result: types::Type) {
+        let r = self.ref_of(callee_path_res(f));
+        if r.kind != resolve::K_BUILTIN {
+            return;
+        }
+        match self.trait_by_name("Send") {
+            Option::None => {}
+            Option::Some(send) => {
+                if r.builtin == "thread::spawn" && args.len() == 1 {
+                    // The thread's result crosses back to whoever joins it, so it must be
+                    // `Send`. Reported against the closure, where it can be changed.
+                    let h = types::named_args(result);
+                    if h.len() == 1 {
+                        self.require_send_as(h.at(0), send, args.at(0).span, "E0702",
+                                             "cannot be returned from a thread");
+                    }
+                    self.check_spawn_captures(args.at(0));
+                }
+                if r.builtin == "chan::channel" {
+                    // Nothing crosses yet, but the element type is fixed here, and
+                    // reporting it at the `channel` call names the line that chose it.
+                    match types::prune(result) {
+                        types::Type::Tuple(elems) => {
+                            if elems.len() == 2 {
+                                let sargs = types::named_args(elems.at(0));
+                                if sargs.len() == 1 {
+                                    self.require_send_as(sargs.at(0), send, e.span, "E0700",
+                                        "cannot be a channel's element type");
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// A closure passed to `spawn` that captures something not `Send`.
+    ///
+    /// This is the check a type cannot do: `fn() -> i64` is one type whether the closure
+    /// captured a mutable counter or an immutable one, so the capture list recorded by
+    /// resolution is the only place the answer exists.
+    fn check_spawn_captures(self, arg: ast::Expr) {
+        if !is_lambda(arg) {
+            return; // a named function has no captures
+        }
+        if arg.captures < 0 || arg.captures >= self.captures.len() {
+            return;
+        }
+        let caps = self.captures.at(arg.captures);
+        let mut i = 0;
+        while i < caps.len() {
+            let cap = caps.at(i);
+            match self.local_type(cap) {
+                Option::None => {}
+                Option::Some(t) => {
+                    if !self.send_reason(t, list::new[types::Def]()).is_empty() {
+                        self.error("E0701", arg.span,
+                            "this closure cannot be spawned: it captures `\(cap.name)`, which is not `Send`");
+                        return;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+/// One resolved implicit call: whether it resolved, and what it returns.
+struct Resolved1 {
+    ok: bool,
+    ty: types::Type,
+}
+
+fn one_type(a: types::Type) -> List[types::Type] {
+    let out = list::new[types::Type]();
+    out.push(a);
+    out
+}
+
+fn two_types(a: types::Type, b: types::Type) -> List[types::Type] {
+    let out = one_type(a);
+    out.push(b);
+    out
+}
+
+fn three_types(a: types::Type, b: types::Type, c: types::Type) -> List[types::Type] {
+    let out = two_types(a, b);
+    out.push(c);
+    out
+}
+
+/// The `res` slot of a callee that is a bare path, or -1 for anything else.
+fn callee_path_res(f: ast::Expr) -> i64 {
+    match f.node {
+        ast::ExprKind::Path(p, _) => p.res,
+        _ => ast::UNRESOLVED,
+    }
+}
+
+// --- Exhaustiveness -----------------------------------------------------------------------
+//
+// Maranget's usefulness algorithm ("Warnings for pattern matching", JFP 2007), which
+// spec/05-patterns.md names as the required algorithm.
+//
+// Two questions fall out of one procedure. A `match` is exhaustive when the all-wildcard
+// row is *not* useful against its arms; an arm is reachable when it *is* useful against the
+// arms above it. Both are errors in Origin rather than warnings, which is why the trap
+// table in spec/04-expressions.md has no "match failed" entry and why the code generator
+// may emit a jump table with no default arm.
+
+const C_VARIANT: i64 = 0;
+const C_TUPLE: i64 = 1;
+const C_STRUCT: i64 = 2;
+const C_BOOL: i64 = 3;
+/// Covers integer, char and String literals, whose constructor space is too large to
+/// enumerate: a column of them is never a complete signature, so only a wildcard can make
+/// it exhaustive.
+const C_LIT: i64 = 4;
+
+/// A pattern's head constructor.
+struct Ctor {
+    kind: i64,
+    variant: i64,
+    boolean: bool,
+    lit: String,
+}
+
+fn ctor_of(kind: i64, variant: i64, boolean: bool, lit: String) -> Ctor {
+    Ctor { kind: kind, variant: variant, boolean: boolean, lit: lit }
+}
+
+fn same_ctor(a: Ctor, b: Ctor) -> bool {
+    a.kind == b.kind && a.variant == b.variant && a.boolean == b.boolean && a.lit == b.lit
+}
+
+/// A pattern reduced to what the algorithm needs: a head constructor and its arguments, or
+/// a wildcard.
+struct Pat2 {
+    wild: bool,
+    c: Ctor,
+    args: List[Pat2],
+}
+
+fn wildcard() -> Pat2 {
+    Pat2 { wild: true, c: ctor_of(C_LIT, 0, false, ""), args: list::new[Pat2]() }
+}
+
+fn ctor_pat(c: Ctor, args: List[Pat2]) -> Pat2 {
+    Pat2 { wild: false, c: c, args: args }
+}
+
+fn one_pat(p: Pat2) -> List[Pat2] {
+    let out = list::new[Pat2]();
+    out.push(p);
+    out
+}
+
+/// One row of the pattern matrix.
+struct Row { cells: List[Pat2] }
+
+fn row_of(cells: List[Pat2]) -> Row { Row { cells: cells } }
+
+/// Bounds or-pattern expansion. A pattern needing more rows than this is pathological; the
+/// checker says so rather than hanging.
+const MAX_ROWS: i64 = 4096;
+
+/// A usefulness answer: whether q matches something no row covers, and the witness if so.
+struct Witness {
+    useful: bool,
+    cells: List[Pat2],
+}
+
+fn not_useful() -> Witness { Witness { useful: false, cells: list::new[Pat2]() } }
+fn useful_with(cells: List[Pat2]) -> Witness { Witness { useful: true, cells: cells } }
+
+impl Checker {
+    fn check_exhaustive(self, e: ast::Expr, arms: List[ast::Arm], scrut_in: types::Type) {
+        let scrut = self.normalize(scrut_in);
+        if types::is_error(scrut) {
+            return;
+        }
+        types::apply_defaults(scrut);
+
+        let covered = list::new[Row]();
+        let mut truncated = false;
+
+        let mut i = 0;
+        while i < arms.len() && !truncated {
+            let arm = arms.at(i);
+            let alts = self.to_pats(arm.pat, scrut);
+
+            // Usefulness: an arm is unreachable when nothing it matches is left uncovered.
+            if !alts.is_empty() {
+                let mut reachable = false;
+                let mut a = 0;
+                while a < alts.len() && !reachable {
+                    if self.useful(covered, row_of(one_pat(alts.at(a))),
+                                   one_type(scrut)).useful {
+                        reachable = true;
+                    }
+                    a = a + 1;
+                }
+                if !reachable {
+                    self.error("E0006", arm.pat.span, "unreachable pattern");
+                }
+            }
+
+            // Coverage: a guarded arm contributes nothing, because its guard may fail
+            // (spec/05-patterns.md).
+            let guarded = match arm.guard {
+                Option::Some(_) => true,
+                Option::None => false,
+            };
+            if !guarded {
+                let mut a = 0;
+                while a < alts.len() && !truncated {
+                    covered.push(row_of(one_pat(alts.at(a))));
+                    if covered.len() > MAX_ROWS {
+                        truncated = true;
+                    }
+                    a = a + 1;
+                }
+            }
+            i = i + 1;
+        }
+
+        if truncated {
+            self.error("E0004", e.span,
+                "this `match` has too many pattern combinations to check");
+            return;
+        }
+
+        let w = self.useful(covered, row_of(one_pat(wildcard())), one_type(scrut));
+        if !w.useful {
+            return;
+        }
+        self.error("E0004", e.span,
+            "non-exhaustive match: `\(self.render_witness(w.cells.at(0), scrut))` is not covered");
+    }
+
+    /// Maranget's I: a witness when q matches some value no row of the matrix does.
+    fn useful(self, matrix: List[Row], q: Row, col_types: List[types::Type]) -> Witness {
+        if q.cells.is_empty() {
+            if matrix.is_empty() {
+                // Nothing covers it: useful, and the witness is empty.
+                return useful_with(list::new[Pat2]());
+            }
+            return not_useful();
+        }
+
+        let head = q.cells.at(0);
+        let rest = row_of(tail_of(q.cells));
+        let head_type = col_types.at(0);
+
+        if !head.wild {
+            return self.useful_specialized(matrix, head.c, head.args, rest, col_types);
+        }
+
+        // A wildcard head: if the column's constructors form a complete signature, the
+        // wildcard is only useful when it is useful for some constructor.
+        let sig = column_ctors(matrix);
+        let full = self.complete_signature(head_type, sig);
+        if full.complete {
+            let mut i = 0;
+            while i < full.all.len() {
+                let cc = full.all.at(i);
+                let arity = self.ctor_arg_types(head_type, cc);
+                let args = wildcards_for(arity);
+                let w = self.useful_specialized(matrix, cc, args, rest, col_types);
+                if w.useful {
+                    return w;
+                }
+                i = i + 1;
+            }
+            return not_useful();
+        }
+
+        // Incomplete: recurse on the default matrix, then name a missing constructor.
+        let w = self.useful(default_matrix(matrix), rest, tail_of_types(col_types));
+        if !w.useful {
+            return not_useful();
+        }
+        let cells = one_pat(self.missing_ctor(head_type, sig));
+        let mut j = 0;
+        while j < w.cells.len() {
+            cells.push(w.cells.at(j));
+            j = j + 1;
+        }
+        useful_with(cells)
+    }
+
+    /// Maranget's S composed with I for a known head constructor.
+    fn useful_specialized(self, matrix: List[Row], cc: Ctor, args: List[Pat2], rest: Row,
+                          col_types: List[types::Type]) -> Witness {
+        let arg_types = self.ctor_arg_types(col_types.at(0), cc);
+        let new_cols = list::new[types::Type]();
+        let mut i = 0;
+        while i < arg_types.len() {
+            new_cols.push(arg_types.at(i));
+            i = i + 1;
+        }
+        let mut j = 1;
+        while j < col_types.len() {
+            new_cols.push(col_types.at(j));
+            j = j + 1;
+        }
+
+        let spec = specialize(matrix, cc, arg_types.len());
+        let cells = list::new[Pat2]();
+        let mut a = 0;
+        while a < args.len() {
+            cells.push(args.at(a));
+            a = a + 1;
+        }
+        let mut r = 0;
+        while r < rest.cells.len() {
+            cells.push(rest.cells.at(r));
+            r = r + 1;
+        }
+
+        let w = self.useful(spec, row_of(cells), new_cols);
+        if !w.useful {
+            return not_useful();
+        }
+        // Rebuild the witness: fold the first arg_types.len() entries back into cc.
+        let head_args = list::new[Pat2]();
+        let mut k = 0;
+        while k < arg_types.len() && k < w.cells.len() {
+            head_args.push(w.cells.at(k));
+            k = k + 1;
+        }
+        let out = one_pat(ctor_pat(cc, head_args));
+        let mut m = arg_types.len();
+        while m < w.cells.len() {
+            out.push(w.cells.at(m));
+            m = m + 1;
+        }
+        useful_with(out)
+    }
+
+    /// Whether the constructors seen cover the column's type, and the full signature when
+    /// the type has an enumerable one.
+    fn complete_signature(self, t: types::Type, seen: List[Ctor]) -> Signature {
+        match types::prune(t) {
+            types::Type::Prim(k) => {
+                if k == types::P_BOOL {
+                    let all = list::new[Ctor]();
+                    all.push(ctor_of(C_BOOL, 0, false, ""));
+                    all.push(ctor_of(C_BOOL, 0, true, ""));
+                    return Signature {
+                        complete: seen_has(seen, all.at(0)) && seen_has(seen, all.at(1)),
+                        all: all,
+                    };
+                }
+                if k == types::P_UNIT {
+                    let all = list::new[Ctor]();
+                    all.push(ctor_of(C_TUPLE, 0, false, ""));
+                    return Signature { complete: seen_has(seen, all.at(0)), all: all };
+                }
+                // Integers, floats, char and String have no enumerable signature; only a
+                // wildcard makes such a column exhaustive (spec/05-patterns.md).
+                Signature { complete: false, all: list::new[Ctor]() }
+            }
+            types::Type::Tuple(_) => {
+                let all = list::new[Ctor]();
+                all.push(ctor_of(C_TUPLE, 0, false, ""));
+                Signature { complete: seen_has(seen, all.at(0)), all: all }
+            }
+            types::Type::Named(def, _) => {
+                if def.kind == types::DEF_STRUCT {
+                    let all = list::new[Ctor]();
+                    all.push(ctor_of(C_STRUCT, 0, false, ""));
+                    return Signature { complete: seen_has(seen, all.at(0)), all: all };
+                }
+                match def.enum_decl {
+                    Option::None => Signature { complete: false, all: list::new[Ctor]() },
+                    Option::Some(ed) => {
+                        let all = list::new[Ctor]();
+                        let mut complete = true;
+                        let mut i = 0;
+                        while i < ed.variants.len() {
+                            let cc = ctor_of(C_VARIANT, i, false, "");
+                            all.push(cc);
+                            if !seen_has(seen, cc) {
+                                complete = false;
+                            }
+                            i = i + 1;
+                        }
+                        Signature { complete: complete, all: all }
+                    }
+                }
+            }
+            _ => Signature { complete: false, all: list::new[Ctor]() },
+        }
+    }
+
+    /// The types a constructor's arguments have in a column of type t.
+    fn ctor_arg_types(self, t: types::Type, cc: Ctor) -> List[types::Type] {
+        match types::prune(t) {
+            types::Type::Tuple(elems) => elems,
+            types::Type::Named(def, args) => {
+                let subst = types::new_subst();
+                let mut i = 0;
+                while i < def.params.len() {
+                    if i < args.len() {
+                        subst.set(def.params.at(i), args.at(i));
+                    }
+                    i = i + 1;
+                }
+                if def.kind == types::DEF_STRUCT {
+                    return substitute_each(def.field_types, subst);
+                }
+                if cc.kind == C_VARIANT && cc.variant < def.variant_types.len() {
+                    return substitute_each(def.variant_types.at(cc.variant), subst);
+                }
+                list::new[types::Type]()
+            }
+            _ => list::new[types::Type](),
+        }
+    }
+
+    /// A constructor absent from `seen`, to name in the witness.
+    fn missing_ctor(self, t: types::Type, seen: List[Ctor]) -> Pat2 {
+        match types::prune(t) {
+            types::Type::Prim(k) => {
+                if k == types::P_BOOL {
+                    let f = ctor_of(C_BOOL, 0, false, "");
+                    if !seen_has(seen, f) { return ctor_pat(f, list::new[Pat2]()); }
+                    let tt = ctor_of(C_BOOL, 0, true, "");
+                    if !seen_has(seen, tt) { return ctor_pat(tt, list::new[Pat2]()); }
+                    return wildcard();
+                }
+                // For a literal column, name a value nobody matched, which is far more
+                // useful than printing `_`.
+                if types::is_integer(k) || k == types::P_CHAR || k == types::P_STRING {
+                    return ctor_pat(ctor_of(C_LIT, 0, false, fresh_literal(k, seen)),
+                                    list::new[Pat2]());
+                }
+                wildcard()
+            }
+            types::Type::Named(def, _) => {
+                match def.enum_decl {
+                    Option::None => wildcard(),
+                    Option::Some(ed) => {
+                        let mut i = 0;
+                        while i < ed.variants.len() {
+                            let cc = ctor_of(C_VARIANT, i, false, "");
+                            if !seen_has(seen, cc) {
+                                return ctor_pat(cc, wildcards_for(self.ctor_arg_types(t, cc)));
+                            }
+                            i = i + 1;
+                        }
+                        wildcard()
+                    }
+                }
+            }
+            _ => wildcard(),
+        }
+    }
+}
+
+struct Signature {
+    complete: bool,
+    all: List[Ctor],
+}
+
+fn seen_has(seen: List[Ctor], c: Ctor) -> bool {
+    let mut i = 0;
+    while i < seen.len() {
+        if same_ctor(seen.at(i), c) {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+/// Maranget's S(c, P): keep rows whose head is c or a wildcard, replacing the head with
+/// its arguments.
+fn specialize(matrix: List[Row], cc: Ctor, arity: i64) -> List[Row] {
+    let out = list::new[Row]();
+    let mut i = 0;
+    while i < matrix.len() {
+        let r = matrix.at(i);
+        if !r.cells.is_empty() {
+            let head = r.cells.at(0);
+            if head.wild {
+                let cells = list::new[Pat2]();
+                let mut a = 0;
+                while a < arity {
+                    cells.push(wildcard());
+                    a = a + 1;
+                }
+                append_tail(cells, r.cells);
+                out.push(row_of(cells));
+            } else {
+                if same_ctor(head.c, cc) {
+                    let cells = list::new[Pat2]();
+                    let mut a = 0;
+                    while a < head.args.len() {
+                        cells.push(head.args.at(a));
+                        a = a + 1;
+                    }
+                    append_tail(cells, r.cells);
+                    out.push(row_of(cells));
+                }
+            }
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// Maranget's D(P): keep only the rows whose head is a wildcard.
+fn default_matrix(matrix: List[Row]) -> List[Row] {
+    let out = list::new[Row]();
+    let mut i = 0;
+    while i < matrix.len() {
+        let r = matrix.at(i);
+        if !r.cells.is_empty() && r.cells.at(0).wild {
+            out.push(row_of(tail_of(r.cells)));
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// The constructors appearing in the first column.
+fn column_ctors(matrix: List[Row]) -> List[Ctor] {
+    let out = list::new[Ctor]();
+    let mut i = 0;
+    while i < matrix.len() {
+        let r = matrix.at(i);
+        if !r.cells.is_empty() && !r.cells.at(0).wild && !seen_has(out, r.cells.at(0).c) {
+            out.push(r.cells.at(0).c);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+fn tail_of(cells: List[Pat2]) -> List[Pat2] {
+    let out = list::new[Pat2]();
+    let mut i = 1;
+    while i < cells.len() {
+        out.push(cells.at(i));
+        i = i + 1;
+    }
+    out
+}
+
+fn tail_of_types(ts: List[types::Type]) -> List[types::Type] {
+    let out = list::new[types::Type]();
+    let mut i = 1;
+    while i < ts.len() {
+        out.push(ts.at(i));
+        i = i + 1;
+    }
+    out
+}
+
+fn append_tail(into: List[Pat2], cells: List[Pat2]) {
+    let mut i = 1;
+    while i < cells.len() {
+        into.push(cells.at(i));
+        i = i + 1;
+    }
+}
+
+fn wildcards_for(ts: List[types::Type]) -> List[Pat2] {
+    let out = list::new[Pat2]();
+    let mut i = 0;
+    while i < ts.len() {
+        out.push(wildcard());
+        i = i + 1;
+    }
+    out
+}
+
+fn substitute_each(ts: List[types::Type], s: types::Subst) -> List[types::Type] {
+    let out = list::new[types::Type]();
+    let mut i = 0;
+    while i < ts.len() {
+        out.push(types::substitute(ts.at(i), s));
+        i = i + 1;
+    }
+    out
+}
+
+/// Invents a value of the given kind that no pattern in the column matched.
+fn fresh_literal(k: i64, seen: List[Ctor]) -> String {
+    if k == types::P_CHAR {
+        let letters = "abcdefghijklmnopqrstuvwxyz";
+        let mut i = 0;
+        while i < letters.len() {
+            let s = "'\(letters.slice(i, i + 1))'";
+            if !seen_has(seen, ctor_of(C_LIT, 0, false, s)) {
+                return s;
+            }
+            i = i + 1;
+        }
+        return "'_'";
+    }
+    if k == types::P_STRING {
+        let mut i = 0;
+        while i < 100 {
+            let s = "\"\("x".repeat(i + 1))\"";
+            if !seen_has(seen, ctor_of(C_LIT, 0, false, s)) {
+                return s;
+            }
+            i = i + 1;
+        }
+        return "\"...\"";
+    }
+    let mut i = 0;
+    while i < 1000 {
+        let s = i.to_str();
+        if !seen_has(seen, ctor_of(C_LIT, 0, false, s)) {
+            return s;
+        }
+        i = i + 1;
+    }
+    "_"
+}
+
+// --- Converting the syntax tree to the algorithm's patterns ---------------------------------
+
+impl Checker {
+    /// One AST pattern as the alternatives it stands for. An or-pattern becomes several;
+    /// everything else becomes one.
+    fn to_pats(self, p: ast::Pat, t_in: types::Type) -> List[Pat2] {
+        let t = self.normalize(t_in);
+        match p.node {
+            ast::PatKind::ErrorPat => one_pat(wildcard()),
+            ast::PatKind::Wild => one_pat(wildcard()),
+
+            ast::PatKind::Bind(_, name, sub) => {
+                let r = self.ref_of(name.res);
+                if r.kind == resolve::K_VARIANT {
+                    return self.variant_pats(r, list::new[ast::Pat](),
+                                             list::new[ast::FieldPat](), t);
+                }
+                if r.kind == resolve::K_CONST {
+                    // A constant pattern matches one value; treat it as an opaque literal
+                    // so it never completes a signature.
+                    return one_pat(ctor_pat(ctor_of(C_LIT, 0, false, r.name),
+                                            list::new[Pat2]()));
+                }
+                match sub {
+                    Option::Some(s) => self.to_pats(s, t),
+                    Option::None => one_pat(wildcard()),
+                }
+            }
+
+            ast::PatKind::Lit(neg, lit) => one_pat(literal_pat(neg, lit)),
+
+            ast::PatKind::Or(alts) => {
+                let out = list::new[Pat2]();
+                let mut i = 0;
+                while i < alts.len() {
+                    let got = self.to_pats(alts.at(i), t);
+                    let mut j = 0;
+                    while j < got.len() {
+                        out.push(got.at(j));
+                        j = j + 1;
+                    }
+                    if out.len() > MAX_ROWS {
+                        return out;
+                    }
+                    i = i + 1;
+                }
+                out
+            }
+
+            ast::PatKind::Tup(elems) => {
+                let ts = tuple_elems(t, elems.len());
+                self.product_pats(ctor_of(C_TUPLE, 0, false, ""), self.sub_pats(elems, ts))
+            }
+
+            ast::PatKind::PathUnit(path) =>
+                self.path_pats(path, list::new[ast::Pat](), list::new[ast::FieldPat](), t),
+            ast::PatKind::PathTuple(path, elems) =>
+                self.path_pats(path, elems, list::new[ast::FieldPat](), t),
+            ast::PatKind::PathStruct(path, _, fields) =>
+                self.path_pats(path, list::new[ast::Pat](), fields, t),
+        }
+    }
+
+    fn path_pats(self, path: ast::PathRef, elems: List[ast::Pat],
+                 fields: List[ast::FieldPat], t: types::Type) -> List[Pat2] {
+        let r = self.ref_of(path.res);
+        if r.kind == resolve::K_VARIANT {
+            return self.variant_pats(r, elems, fields, t);
+        }
+        if r.kind == resolve::K_STRUCT {
+            match types::as_named(t) {
+                Option::None => return one_pat(wildcard()),
+                Option::Some(def) => {
+                    match def.struct_decl {
+                        Option::None => return one_pat(wildcard()),
+                        Option::Some(sd) => {
+                            let cc = ctor_of(C_STRUCT, 0, false, "");
+                            let arg_types = self.ctor_arg_types(t, cc);
+                            return self.product_pats(cc,
+                                self.field_pats(sd.fields, fields, arg_types));
+                        }
+                    }
+                }
+            }
+        }
+        one_pat(wildcard())
+    }
+
+    /// The alternatives for an enum-variant pattern.
+    fn variant_pats(self, r: resolve::Ref, elems: List[ast::Pat],
+                    fields: List[ast::FieldPat], t: types::Type) -> List[Pat2] {
+        match types::as_named(t) {
+            Option::None => one_pat(wildcard()),
+            Option::Some(def) => {
+                match def.enum_decl {
+                    Option::None => one_pat(wildcard()),
+                    Option::Some(ed) => {
+                        match r.variant {
+                            Option::None => one_pat(wildcard()),
+                            Option::Some(va) => {
+                                let idx = variant_index(ed, va);
+                                if idx < 0 {
+                                    return one_pat(wildcard());
+                                }
+                                let cc = ctor_of(C_VARIANT, idx, false, "");
+                                let arg_types = self.ctor_arg_types(t, cc);
+                                if va.kind == ast::VARIANT_UNIT {
+                                    return one_pat(ctor_pat(cc, list::new[Pat2]()));
+                                }
+                                if va.kind == ast::VARIANT_TUPLE {
+                                    if elems.len() != arg_types.len() {
+                                        return one_pat(ctor_pat(cc, wildcards_for(arg_types)));
+                                    }
+                                    return self.product_pats(cc,
+                                        self.sub_pats(elems, arg_types));
+                                }
+                                self.product_pats(cc,
+                                    self.field_pats(va.fields, fields, arg_types))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn sub_pats(self, elems: List[ast::Pat], ts: List[types::Type]) -> List[List[Pat2]] {
+        let out = list::new[List[Pat2]]();
+        let mut i = 0;
+        while i < elems.len() {
+            let mut t = types::error_type();
+            if i < ts.len() {
+                t = ts.at(i);
+            }
+            out.push(self.to_pats(elems.at(i), t));
+            i = i + 1;
+        }
+        out
+    }
+
+    /// Orders named field patterns by declaration, filling omitted fields with wildcards,
+    /// which is what `..` and shorthand both reduce to.
+    fn field_pats(self, decls: List[ast::Field], given: List[ast::FieldPat],
+                  arg_types: List[types::Type]) -> List[List[Pat2]] {
+        let out = list::new[List[Pat2]]();
+        let mut i = 0;
+        while i < decls.len() {
+            let mut alts = one_pat(wildcard());
+            let mut g = 0;
+            while g < given.len() {
+                let fp = given.at(g);
+                if fp.name.name == decls.at(i).name.name {
+                    let mut ft = types::error_type();
+                    if i < arg_types.len() {
+                        ft = arg_types.at(i);
+                    }
+                    alts = self.to_pats(fp.pat, ft);
+                }
+                g = g + 1;
+            }
+            out.push(alts);
+            i = i + 1;
+        }
+        out
+    }
+
+    /// The cartesian product of sub-pattern alternatives under a constructor.
+    fn product_pats(self, cc: Ctor, subs: List[List[Pat2]]) -> List[Pat2] {
+        let out = one_pat(ctor_pat(cc, list::new[Pat2]()));
+        let mut s = 0;
+        while s < subs.len() {
+            let alts = subs.at(s);
+            let next = list::new[Pat2]();
+            let mut b = 0;
+            while b < out.len() {
+                let base = out.at(b);
+                let mut a = 0;
+                while a < alts.len() {
+                    let args = list::new[Pat2]();
+                    let mut k = 0;
+                    while k < base.args.len() {
+                        args.push(base.args.at(k));
+                        k = k + 1;
+                    }
+                    args.push(alts.at(a));
+                    next.push(ctor_pat(cc, args));
+                    a = a + 1;
+                }
+                b = b + 1;
+            }
+            if next.len() > MAX_ROWS {
+                return next;
+            }
+            s = s + 1;
+            // `out` is replaced wholesale each round, so the product grows one column at
+            // a time rather than all at once.
+            out.clear();
+            let mut n = 0;
+            while n < next.len() {
+                out.push(next.at(n));
+                n = n + 1;
+            }
+        }
+        out
+    }
+
+    /// Prints a witness the way a programmer would write it, so the diagnostic can be
+    /// pasted into the match.
+    fn render_witness(self, p: Pat2, t: types::Type) -> String {
+        if p.wild {
+            return "_";
+        }
+        if p.c.kind == C_BOOL {
+            if p.c.boolean { return "true"; }
+            return "false";
+        }
+        if p.c.kind == C_LIT {
+            return p.c.lit;
+        }
+        if p.c.kind == C_TUPLE {
+            let elems = tuple_elems(t, p.args.len());
+            if p.args.is_empty() {
+                return "()";
+            }
+            let parts = list::new[String]();
+            let mut i = 0;
+            while i < p.args.len() {
+                let mut et = types::error_type();
+                if i < elems.len() {
+                    et = elems.at(i);
+                }
+                parts.push(self.render_witness(p.args.at(i), et));
+                i = i + 1;
+            }
+            if parts.len() == 1 {
+                return "(\(parts.at(0)),)";
+            }
+            return "(\(join_with(parts, ", ")))";
+        }
+        if p.c.kind == C_STRUCT {
+            match types::as_named(t) {
+                Option::None => "_",
+                Option::Some(def) => {
+                    match def.struct_decl {
+                        Option::None => "_",
+                        Option::Some(sd) =>
+                            "\(def.name) { \(self.render_named(sd.fields, p.args, self.ctor_arg_types(t, p.c))) }",
+                    }
+                }
+            }
+        } else {
+            match types::as_named(t) {
+                Option::None => "_",
+                Option::Some(def) => {
+                    match def.enum_decl {
+                        Option::None => "_",
+                        Option::Some(ed) => {
+                            if p.c.variant >= ed.variants.len() {
+                                return "_";
+                            }
+                            let va = ed.variants.at(p.c.variant);
+                            let qualified = "\(def.name)::\(va.name.name)";
+                            if va.kind == ast::VARIANT_UNIT {
+                                return qualified;
+                            }
+                            let arg_types = self.ctor_arg_types(t, p.c);
+                            if va.kind == ast::VARIANT_TUPLE {
+                                if p.args.is_empty() {
+                                    return qualified;
+                                }
+                                let parts = list::new[String]();
+                                let mut i = 0;
+                                while i < p.args.len() {
+                                    let mut at = types::error_type();
+                                    if i < arg_types.len() {
+                                        at = arg_types.at(i);
+                                    }
+                                    parts.push(self.render_witness(p.args.at(i), at));
+                                    i = i + 1;
+                                }
+                                return "\(qualified)(\(join_with(parts, ", ")))";
+                            }
+                            "\(qualified) { \(self.render_named(va.fields, p.args, arg_types)) }"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Named fields, collapsing an all-wildcard list to `..`.
+    fn render_named(self, decls: List[ast::Field], args: List[Pat2],
+                    arg_types: List[types::Type]) -> String {
+        let mut all_wild = true;
+        let mut i = 0;
+        while i < args.len() {
+            if !args.at(i).wild {
+                all_wild = false;
+            }
+            i = i + 1;
+        }
+        if all_wild || decls.is_empty() {
+            return "..";
+        }
+        let parts = list::new[String]();
+        let mut d = 0;
+        while d < decls.len() && d < args.len() {
+            let mut ft = types::error_type();
+            if d < arg_types.len() {
+                ft = arg_types.at(d);
+            }
+            parts.push("\(decls.at(d).name.name): \(self.render_witness(args.at(d), ft))");
+            d = d + 1;
+        }
+        join_with(parts, ", ")
+    }
+}
+
+fn literal_pat(neg: bool, lit: ast::Expr) -> Pat2 {
+    match lit.node {
+        ast::ExprKind::Bool(v) => ctor_pat(ctor_of(C_BOOL, 0, v, ""), list::new[Pat2]()),
+        ast::ExprKind::Int(v, _, _) => {
+            let mut text = v.to_str();
+            if neg {
+                text = "-\(text)";
+            }
+            ctor_pat(ctor_of(C_LIT, 0, false, text), list::new[Pat2]())
+        }
+        ast::ExprKind::Char(v) => ctor_pat(ctor_of(C_LIT, 0, false, quote_char_lit(v)),
+                                           list::new[Pat2]()),
+        ast::ExprKind::Str(v) => ctor_pat(ctor_of(C_LIT, 0, false, "\"\(v)\""),
+                                          list::new[Pat2]()),
+        _ => wildcard(),
+    }
+}
+
+fn quote_char_lit(v: i64) -> String {
+    match char::from_u32(v as u32) {
+        Option::Some(c) => "'\(c)'",
+        Option::None => "'?'",
+    }
+}
+
+fn tuple_elems(t: types::Type, n: i64) -> List[types::Type] {
+    match types::prune(t) {
+        types::Type::Tuple(elems) => elems,
+        _ => {
+            let out = list::new[types::Type]();
+            let mut i = 0;
+            while i < n {
+                out.push(types::error_type());
+                i = i + 1;
+            }
+            out
+        }
+    }
+}
+
+fn join_with(parts: List[String], sep: String) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < parts.len() {
+        if i > 0 {
+            out = out.concat(sep);
+        }
+        out = out.concat(parts.at(i));
+        i = i + 1;
+    }
+    out
 }

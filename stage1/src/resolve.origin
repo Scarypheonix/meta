@@ -278,6 +278,9 @@ pub struct Input {
 pub struct Resolved {
     pub trace: List[String],
     pub errors: List[ResolveError],
+    /// Each lambda's captures, in the order the lambdas closed. An `ast::Expr`'s
+    /// `captures` slot indexes this.
+    pub captures: List[List[Local]],
     /// Every reference the resolver made, in the order it made them. An `ast::PathRef`'s
     /// or `ast::Ident`'s `res` is an index into this: the side table later passes read,
     /// with the key kept in the node rather than beside it.
@@ -294,6 +297,7 @@ struct LambdaCtx {
 pub struct Resolver {
     trace: List[String],
     refs: List[Ref],
+    captures: List[List[Local]],
     errors: List[ResolveError],
     root: Module,
     std_root: Module,
@@ -383,6 +387,7 @@ pub fn program(inputs: List[Input]) -> Resolved {
     let r = Resolver {
         trace: list::new[String](),
         refs: list::new[Ref](),
+        captures: list::new[List[Local]](),
         errors: list::new[ResolveError](),
         root: root,
         std_root: new_module("std", Option::None),
@@ -488,7 +493,7 @@ pub fn program(inputs: List[Input]) -> Resolved {
         d = d + 1;
     }
 
-    Resolved { trace: r.trace, errors: r.errors, refs: r.refs }
+    Resolved { trace: r.trace, errors: r.errors, refs: r.refs, captures: r.captures }
 }
 
 impl Resolver {
@@ -1483,7 +1488,7 @@ impl Resolver {
                 }
             }
 
-            ast::ExprKind::Lambda(params, ret, body) => self.resolve_lambda(params, ret, body),
+            ast::ExprKind::Lambda(params, ret, body) => self.resolve_lambda(e, params, ret, body),
 
             ast::ExprKind::Block(b) => self.resolve_block(b),
 
@@ -1654,7 +1659,8 @@ impl Resolver {
         }
     }
 
-    fn resolve_lambda(self, params: List[ast::LambdaParam], ret: Option[ast::Type], body: ast::Expr) {
+    fn resolve_lambda(self, whole: ast::Expr, params: List[ast::LambdaParam],
+                      ret: Option[ast::Type], body: ast::Expr) {
         let saved = self.scope;
         let saved_depth = self.fn_depth;
         let saved_loop = self.loop_depth;
@@ -1685,6 +1691,8 @@ impl Resolver {
         self.fn_depth = saved_depth;
         self.loop_depth = saved_loop;
         self.lambdas.pop();
+        self.captures.push(lc.captured);
+        whole.captures = self.captures.len() - 1;
         self.note_captures(lc.captured);
     }
 }
