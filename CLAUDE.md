@@ -76,7 +76,8 @@ docs/adr/             architecture decision records — every irreversible choic
 docs/phases/          N-complete.md, written at each phase gate
 docs/deferred.md      everything deliberately left out, each tagged with a phase
 stage1/src/           from Phase 9: the compiler for Origin, written in Origin --
-                      lex.origin, ast.origin and parse.origin so far
+                      lex.origin, ast.origin, parse.origin, source.origin and
+                      main.origin (its own command line) so far
 bootstrap/            from Phase 9: the last known-good stage1 binary
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```
@@ -182,6 +183,36 @@ This project outlasts any single context window.
 
 ## Status
 
+**Phase 9 is in progress.** Its scope is **self-hosting**: a compiler for Origin, written
+in Origin. What exists in `stage1/src/` is the front end through parsing --
+`lex.origin`, `ast.origin`, `parse.origin`, `source.origin` -- and `main.origin`, which
+makes stage1 an actual command-line program (`stage1 dump-tokens|dump-ast|parse <file>...`)
+shaped like `cmd/originc`'s. Each component is held to the Go one it replaces over this
+repository's own ~400 `.origin` files: the token stream against `internal/lex`, the dumped
+syntax tree against `internal/ast`, the position mapping against `internal/source`, and the
+*places* syntax errors are reported against `internal/lex` + `internal/parse`. All in
+`tests/selfhost`.
+
+The language grew what a compiler cannot be written without: **the command line and the
+exit status** (`docs/spec/17-process.md`) — `args()` in the prelude over `env::arg_count`
+and `env::arg_at`, and `process::exit`, which ends the *process* and not the thread on all
+three engines. `bootstrap/` is still empty; nothing has self-compiled yet.
+
+**Next action:** name resolution, which is the next component in stage1's own order and the
+first one whose oracle is not shaped like the others — `internal/resolve` produces side
+tables keyed by node id, and stage1's AST deliberately has no node ids. Decide what the
+comparable output is before writing the resolver. Also outstanding, and cheap:
+`docs/deferred.md` records stage1's diagnostic *wording* as unaligned (positions and counts
+already agree), which is a `token_name`, a hex formatter and a dozen message sites.
+
+**What Phase 9 has found so far** — the same tell as Phase 8, and worth expecting again:
+every bug came from *running Origin*, not from reading Go. Writing `main.origin` needed a
+multi-line string, which exposed that both lexers ended a string literal at a newline while
+`docs/spec/01-lexical.md` had always said a literal may span lines. The Go lexer's own error
+note said so too, beside the condition contradicting it. Running stage1's parser over the
+corpus as a *program* exposed that its interpolation sub-parser threw its diagnostics away,
+so every syntax error inside `\(...)` vanished silently.
+
 **Phase 8 is complete** (`docs/phases/8-complete.md`). Two halves. The first closed the
 three places `docs/spec/` and the implementation had drifted apart since Phase 5:
 arithmetic happens at the width the operand type declares (`internal/arith`, one definition
@@ -262,14 +293,9 @@ or a finished thread's stack; `std::fs` has no directory listing, metadata, rena
 or streaming, and there is no `Path` type (ADR-0030); and error conversion in `?` via `Into`
 needs a blanket-impl story (`map_err` now exists, so the explicit form is real).
 
-**Next action:** Phase 9's scope is not decided, and rule 7 puts that choice with the user.
-The project's own arc points at **self-hosting**: a compiler for Origin, written in Origin,
-which is what every phase so far has been building toward and what `bootstrap/` is reserved
-for. Multi-file packages, recursive enums, maps, strings, files, `?` and now `Option`/
-`Result` methods all work and are covered by end-to-end cases; what a self-hosting compiler
-would still miss is recorded above. The cheapest next thing that is not that: keep writing
-Origin. Nine of nine bugs this phase came from running programs, none from reading Go.
-Nothing is in flight.
+**On Phase 9's scope:** rule 7 put the choice with the user, and the project's own arc
+pointed at self-hosting — what every phase so far has been building toward and what
+`bootstrap/` is reserved for. That is what Phase 9 is doing; see the top of this section.
 
 **A note on the history:** the VM's concurrency runtime landed inside commit `6b073de`,
 whose message describes only ADR-0027 — the bug the VM work uncovered. The commit is
