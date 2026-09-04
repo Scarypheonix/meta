@@ -52,7 +52,8 @@ pub struct PathRef {
     pub mut res: i64,
 }
 
-/// A path or identifier that has not been resolved yet.
+/// A path or identifier that has not been resolved yet, and a declaration the checker has
+/// not filed anything about yet.
 pub const UNRESOLVED: i64 = 0 - 1;
 
 // --- Types ---------------------------------------------------------------------------
@@ -185,6 +186,13 @@ pub struct Param {
 }
 
 pub struct FnDecl {
+    /// Which file it was declared in, stamped by the checker as it walks each one. A
+    /// call site names the callee by where it was written, and a span is only an offset.
+    pub mut file: String,
+    /// Where the checker files its signature; -1 until it has. It is `Ident`'s `res` slot
+    /// one pass later: a declaration is what the checker keys by, and scanning for one
+    /// by identity would be quadratic over a corpus this size.
+    pub mut info: i64,
     pub public: bool,
     pub name: Ident,
     pub generics: List[GenericParam],
@@ -204,6 +212,10 @@ pub struct Field {
 }
 
 pub struct StructDecl {
+    /// Where the checker files its type definition; -1 until it has. It is `Ident`'s `res` slot
+    /// one pass later: a declaration is what the checker keys by, and scanning for one
+    /// by identity would be quadratic over a corpus this size.
+    pub mut info: i64,
     pub public: bool,
     pub name: Ident,
     pub generics: List[GenericParam],
@@ -223,6 +235,10 @@ pub struct Variant {
 }
 
 pub struct EnumDecl {
+    /// Where the checker files its type definition; -1 until it has. It is `Ident`'s `res` slot
+    /// one pass later: a declaration is what the checker keys by, and scanning for one
+    /// by identity would be quadratic over a corpus this size.
+    pub mut info: i64,
     pub public: bool,
     pub name: Ident,
     pub generics: List[GenericParam],
@@ -237,6 +253,10 @@ pub struct AssocType {
 }
 
 pub struct TraitDecl {
+    /// Where the checker files what it declares; -1 until it has. It is `Ident`'s `res` slot
+    /// one pass later: a declaration is what the checker keys by, and scanning for one
+    /// by identity would be quadratic over a corpus this size.
+    pub mut info: i64,
     pub public: bool,
     pub name: Ident,
     pub generics: List[GenericParam],
@@ -247,6 +267,8 @@ pub struct TraitDecl {
 }
 
 pub struct ImplDecl {
+    /// Where the checker files what this impl provides; -1 until it has (see `FnDecl`).
+    pub mut info: i64,
     pub generics: List[GenericParam],
     /// The trait's path; meaningful only when `has_trait`.
     pub trait_path: PathRef,
@@ -259,6 +281,10 @@ pub struct ImplDecl {
 }
 
 pub struct AliasDecl {
+    /// Where the checker files what it expands to; -1 until it has. It is `Ident`'s `res` slot
+    /// one pass later: a declaration is what the checker keys by, and scanning for one
+    /// by identity would be quadratic over a corpus this size.
+    pub mut info: i64,
     pub public: bool,
     pub name: Ident,
     pub generics: List[GenericParam],

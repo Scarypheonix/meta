@@ -440,7 +440,7 @@ impl Parser {
 
         if self.eat(lex::K_SEMI) {
             return ast::FnDecl {
-                public: public, name: name, generics: generics, where_preds: where_preds,
+                file: "", info: ast::UNRESOLVED, public: public, name: name, generics: generics, where_preds: where_preds,
                 self_param: self_param, params: params, ret: ret, body: Option::None,
             };
         }
@@ -452,7 +452,7 @@ impl Parser {
             self.sync_item();
         }
         ast::FnDecl {
-            public: public, name: name, generics: generics, where_preds: where_preds,
+            file: "", info: ast::UNRESOLVED, public: public, name: name, generics: generics, where_preds: where_preds,
             self_param: self_param, params: params, ret: ret, body: body,
         }
     }
@@ -500,7 +500,7 @@ impl Parser {
             self.sync_item();
         }
         ast::StructDecl {
-            public: public, name: name, generics: generics, where_preds: where_preds,
+            info: ast::UNRESOLVED, public: public, name: name, generics: generics, where_preds: where_preds,
             fields: fields,
         }
     }
@@ -543,7 +543,7 @@ impl Parser {
         if !self.expect(lex::K_LBRACE) {
             self.sync_item();
             return ast::EnumDecl {
-                public: public, name: name, generics: generics, where_preds: where_preds,
+                info: ast::UNRESOLVED, public: public, name: name, generics: generics, where_preds: where_preds,
                 variants: variants,
             };
         }
@@ -594,7 +594,7 @@ impl Parser {
                    where_preds: List[ast::WherePred], variants: List[ast::Variant]) -> ast::EnumDecl {
         self.expect(lex::K_RBRACE);
         ast::EnumDecl {
-            public: public, name: name, generics: generics, where_preds: where_preds,
+            info: ast::UNRESOLVED, public: public, name: name, generics: generics, where_preds: where_preds,
             variants: variants,
         }
     }
@@ -613,7 +613,7 @@ impl Parser {
         if !self.expect(lex::K_LBRACE) {
             self.sync_item();
             return ast::TraitDecl {
-                public: public, name: name, generics: generics, supertraits: supertraits,
+                info: ast::UNRESOLVED, public: public, name: name, generics: generics, supertraits: supertraits,
                 where_preds: where_preds, assoc: assoc, methods: methods,
             };
         }
@@ -642,7 +642,7 @@ impl Parser {
         }
         self.expect(lex::K_RBRACE);
         ast::TraitDecl {
-            public: public, name: name, generics: generics, supertraits: supertraits,
+            info: ast::UNRESOLVED, public: public, name: name, generics: generics, supertraits: supertraits,
             where_preds: where_preds, assoc: assoc, methods: methods,
         }
     }
@@ -671,7 +671,7 @@ impl Parser {
         if !self.expect(lex::K_LBRACE) {
             self.sync_item();
             return ast::ImplDecl {
-                generics: generics, trait_path: trait_path, has_trait: has_trait,
+                info: ast::UNRESOLVED, generics: generics, trait_path: trait_path, has_trait: has_trait,
                 trait_args: trait_args, where_preds: where_preds, ty: ty, assoc: assoc,
                 methods: methods,
             };
@@ -704,7 +704,7 @@ impl Parser {
         }
         self.expect(lex::K_RBRACE);
         ast::ImplDecl {
-            generics: generics, trait_path: trait_path, has_trait: has_trait,
+            info: ast::UNRESOLVED, generics: generics, trait_path: trait_path, has_trait: has_trait,
             trait_args: trait_args, where_preds: where_preds, ty: ty, assoc: assoc,
             methods: methods,
         }
@@ -721,7 +721,7 @@ impl Parser {
             self.sync_item();
         }
         self.expect(lex::K_SEMI);
-        ast::AliasDecl { public: public, name: name, generics: generics, ty: ty }
+        ast::AliasDecl { info: ast::UNRESOLVED, public: public, name: name, generics: generics, ty: ty }
     }
 
     fn const_decl(self, public: bool) -> ast::ConstDecl {

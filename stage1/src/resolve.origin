@@ -66,24 +66,42 @@ pub struct Ref {
     /// The full name of a compiler-provided operation, such as `io::println`.
     pub builtin: String,
     /// The projected member, for `K_PRIMCONST` and `K_ASSOC`.
-    pub member: String,
+    pub mut member: String,
     /// What an associated-type projection is based on: `K_SELFTY` or `K_TYPEPARAM`.
-    pub base_kind: i64,
-    pub local: Option[Local],
-    /// The declaration, for `K_ENUM`, so that `Enum::Variant` can be looked up.
-    pub enum_decl: Option[ast::EnumDecl],
-    pub module: Option[Module],
+    pub mut base_kind: i64,
+    pub mut local: Option[Local],
+    /// The declaration this names, for the kinds that have one. Exactly one is set,
+    /// according to `kind`. The resolver itself needs only the enum -- to look up
+    /// `Enum::Variant` -- but a later pass needs to reach any of them: what the checker
+    /// asks of a name is not "where was it written" but "which declaration is it".
+    pub mut struct_decl: Option[ast::StructDecl],
+    pub mut enum_decl: Option[ast::EnumDecl],
+    pub mut trait_decl: Option[ast::TraitDecl],
+    pub mut alias_decl: Option[ast::AliasDecl],
+    pub mut fn_decl: Option[ast::FnDecl],
+    pub mut const_decl: Option[ast::ConstDecl],
+    /// The variant itself, for `K_VARIANT`, beside the enum that declares it.
+    pub mut variant: Option[ast::Variant],
+    pub mut module: Option[Module],
 }
 
 fn no_local() -> Option[Local] { Option::None }
+fn no_struct() -> Option[ast::StructDecl] { Option::None }
 fn no_enum() -> Option[ast::EnumDecl] { Option::None }
+fn no_trait() -> Option[ast::TraitDecl] { Option::None }
+fn no_alias() -> Option[ast::AliasDecl] { Option::None }
+fn no_fn() -> Option[ast::FnDecl] { Option::None }
+fn no_const() -> Option[ast::ConstDecl] { Option::None }
+fn no_variant() -> Option[ast::Variant] { Option::None }
 fn no_module() -> Option[Module] { Option::None }
 
 /// A reference to nothing: the name was not found and a diagnostic was already reported.
 pub fn unresolved() -> Ref {
     Ref {
         kind: K_UNRESOLVED, name: "", file: "", at: 0, builtin: "", member: "",
-        base_kind: 0, local: no_local(), enum_decl: no_enum(), module: no_module(),
+        base_kind: 0, local: no_local(), struct_decl: no_struct(), enum_decl: no_enum(),
+        trait_decl: no_trait(), alias_decl: no_alias(), fn_decl: no_fn(),
+        const_decl: no_const(), variant: no_variant(), module: no_module(),
     }
 }
 
@@ -91,7 +109,9 @@ fn ref_decl(kind: i64, name: String, file: String, at: i64) -> Ref {
     let r = unresolved();
     Ref {
         kind: kind, name: name, file: file, at: at, builtin: "", member: "",
-        base_kind: 0, local: no_local(), enum_decl: no_enum(), module: no_module(),
+        base_kind: 0, local: no_local(), struct_decl: no_struct(), enum_decl: no_enum(),
+        trait_decl: no_trait(), alias_decl: no_alias(), fn_decl: no_fn(),
+        const_decl: no_const(), variant: no_variant(), module: no_module(),
     }
 }
 
@@ -102,30 +122,58 @@ fn ref_named(kind: i64, name: String) -> Ref {
 fn ref_builtin(full: String, name: String) -> Ref {
     Ref {
         kind: K_BUILTIN, name: name, file: "", at: 0, builtin: full, member: "",
-        base_kind: 0, local: no_local(), enum_decl: no_enum(), module: no_module(),
+        base_kind: 0, local: no_local(), struct_decl: no_struct(), enum_decl: no_enum(),
+        trait_decl: no_trait(), alias_decl: no_alias(), fn_decl: no_fn(),
+        const_decl: no_const(), variant: no_variant(), module: no_module(),
     }
 }
 
 fn ref_local(l: Local) -> Ref {
-    Ref {
-        kind: K_LOCAL, name: l.name, file: l.file, at: l.at, builtin: "", member: "",
-        base_kind: 0, local: Option::Some(l), enum_decl: no_enum(), module: no_module(),
-    }
+    let r = ref_decl(K_LOCAL, l.name, l.file, l.at);
+    r.local = Option::Some(l);
+    r
 }
 
 fn ref_enum(d: ast::EnumDecl, file: String) -> Ref {
-    Ref {
-        kind: K_ENUM, name: d.name.name, file: file, at: d.name.start, builtin: "",
-        member: "", base_kind: 0, local: no_local(), enum_decl: Option::Some(d),
-        module: no_module(),
-    }
+    let r = ref_decl(K_ENUM, d.name.name, file, d.name.start);
+    r.enum_decl = Option::Some(d);
+    r
+}
+
+fn ref_struct(d: ast::StructDecl, file: String) -> Ref {
+    let r = ref_decl(K_STRUCT, d.name.name, file, d.name.start);
+    r.struct_decl = Option::Some(d);
+    r
+}
+
+fn ref_trait(d: ast::TraitDecl, file: String) -> Ref {
+    let r = ref_decl(K_TRAIT, d.name.name, file, d.name.start);
+    r.trait_decl = Option::Some(d);
+    r
+}
+
+fn ref_alias(d: ast::AliasDecl, file: String) -> Ref {
+    let r = ref_decl(K_ALIAS, d.name.name, file, d.name.start);
+    r.alias_decl = Option::Some(d);
+    r
+}
+
+fn ref_fn(d: ast::FnDecl, file: String) -> Ref {
+    let r = ref_decl(K_FN, d.name.name, file, d.name.start);
+    r.fn_decl = Option::Some(d);
+    r
+}
+
+fn ref_const(d: ast::ConstDecl, file: String) -> Ref {
+    let r = ref_decl(K_CONST, d.name.name, file, d.name.start);
+    r.const_decl = Option::Some(d);
+    r
 }
 
 fn ref_module(m: Module) -> Ref {
-    Ref {
-        kind: K_MODULE, name: m.name, file: "", at: 0, builtin: "", member: "",
-        base_kind: 0, local: no_local(), enum_decl: no_enum(), module: Option::Some(m),
-    }
+    let r = ref_named(K_MODULE, m.name);
+    r.module = Option::Some(m);
+    r
 }
 
 /// Whether two references name the same thing.
@@ -584,12 +632,12 @@ fn kind_word(k: i64) -> String {
 impl Resolver {
     fn declare_item(self, item: ast::Item) {
         match item {
-            ast::Item::Fn(d) => self.declare(d.name, ref_decl(K_FN, d.name.name, self.file, d.name.start)),
-            ast::Item::Struct(d) => self.declare(d.name, ref_decl(K_STRUCT, d.name.name, self.file, d.name.start)),
+            ast::Item::Fn(d) => self.declare(d.name, ref_fn(d, self.file)),
+            ast::Item::Struct(d) => self.declare(d.name, ref_struct(d, self.file)),
             ast::Item::Enum(d) => self.declare(d.name, ref_enum(d, self.file)),
-            ast::Item::Const(d) => self.declare(d.name, ref_decl(K_CONST, d.name.name, self.file, d.name.start)),
-            ast::Item::Trait(d) => self.declare(d.name, ref_decl(K_TRAIT, d.name.name, self.file, d.name.start)),
-            ast::Item::Alias(d) => self.declare(d.name, ref_decl(K_ALIAS, d.name.name, self.file, d.name.start)),
+            ast::Item::Const(d) => self.declare(d.name, ref_const(d, self.file)),
+            ast::Item::Trait(d) => self.declare(d.name, ref_trait(d, self.file)),
+            ast::Item::Alias(d) => self.declare(d.name, ref_alias(d, self.file)),
             // An impl declares no top-level name at all: its methods are reached through
             // the receiver's type, which is the checker's question rather than this one's.
             ast::Item::Impl(_) => {}
@@ -1177,12 +1225,10 @@ impl Resolver {
                     // trait supplies the member depends on bounds, so the checker
                     // finishes the job.
                     if base.kind == K_SELFTY || base.kind == K_TYPEPARAM {
-                        let a = unresolved();
-                        return Ref {
-                            kind: K_ASSOC, name: first.name, file: "", at: 0, builtin: "",
-                            member: segs.at(1).name, base_kind: base.kind,
-                            local: no_local(), enum_decl: no_enum(), module: no_module(),
-                        };
+                        let a = ref_named(K_ASSOC, first.name);
+                        a.member = segs.at(1).name;
+                        a.base_kind = base.kind;
+                        return a;
                     }
                     if base.kind == K_ENUM {
                         return self.variant_of(base, segs.at(1));
@@ -1284,11 +1330,9 @@ impl Resolver {
                 "`\(prim)` has no associated constant `\(member.name)`");
             return unresolved();
         }
-        Ref {
-            kind: K_PRIMCONST, name: prim, file: "", at: 0, builtin: "",
-            member: member.name, base_kind: 0, local: no_local(), enum_decl: no_enum(),
-            module: no_module(),
-        }
+        let r = ref_named(K_PRIMCONST, prim);
+        r.member = member.name;
+        r
     }
 
     /// A reference to one variant of an enum.
@@ -1300,8 +1344,11 @@ impl Resolver {
                 while i < d.variants.len() {
                     let v = d.variants.at(i);
                     if v.name.name == want.name {
-                        return ref_decl(K_VARIANT, "\(d.name.name)::\(v.name.name)",
+                        let vr = ref_decl(K_VARIANT, "\(d.name.name)::\(v.name.name)",
                             enum_ref.file, v.name.start);
+                        vr.enum_decl = Option::Some(d);
+                        vr.variant = Option::Some(v);
+                        return vr;
                     }
                     i = i + 1;
                 }

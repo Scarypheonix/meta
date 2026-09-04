@@ -1,0 +1,1980 @@
+// Origin's type checker, in Origin.
+//
+// A translation of `internal/check`, and the same contract: it implements
+// spec/03-types.md's inference strategy -- mandatory signatures, so every body is checked
+// in isolation against a known type; inference inside a body; the value restriction on
+// `let` generalization; and defaulting once, at the end. It also owns exhaustiveness
+// (spec/05) and trait bounds and coherence (spec/06).
+//
+// It never resolves a name. Everything an identifier refers to comes from the resolver's
+// side table, reached through the `res` slot the node carries (spec/07-modules.md), which
+// is the layering that lets both passes be tested independently.
+//
+// It is held to the Go checker by an inference trace: one entry per checking event, in
+// order, rendered at the end so that a variable bound after it was recorded shows the
+// answer rather than the guess. `internal/check/trace.go` is the other side.
+
+use std::list;
+use std::map;
+use ast;
+use resolve;
+use types;
+
+// --- Obligations and declarations -------------------------------------------------------
+
+/// One trait obligation: `Type: Trait`.
+pub struct Bound {
+    pub ty: types::Type,
+    pub trait_info: TraitInfo,
+    pub args: List[types::Type],
+    pub at: ast::Span,
+    /// Overrides the diagnostic an unsatisfied bound reports, and what the value was being
+    /// used for. A `Send` bound means something different at each place it arises -- a
+    /// channel's element, a thread's result -- and one code for all of them would make the
+    /// registry less useful, not more (spec/12-concurrency.md). Empty means the default.
+    pub code: String,
+    pub what: String,
+}
+
+fn no_bounds() -> List[Bound] { list::new[Bound]() }
+
+/// A function's declared type. Signatures are mandatory (ADR-0009), so this is always
+/// known before any body is checked.
+pub struct FnSig {
+    pub decl: ast::FnDecl,
+    /// The function's own generic parameters.
+    pub params: List[types::Param],
+    /// The receiver's type for a method; `has_self` says whether there is one.
+    pub has_self: bool,
+    pub self_ty: types::Type,
+    pub param_types: List[types::Type],
+    pub ret: types::Type,
+    pub bounds: List[Bound],
+    /// The generic parameters the body may mention, in one fixed order: the enclosing
+    /// declaration's, then `Self` when that is a trait, then the function's own.
+    /// Monomorphization keys an instantiation on exactly this list, so the order lives
+    /// here and nowhere else.
+    pub generics: List[types::Param],
+}
+
+/// A declared trait.
+pub struct TraitInfo {
+    pub decl: ast::TraitDecl,
+    pub params: List[types::Param],
+    pub mut supertraits: List[Bound],
+    /// The associated type names, in declaration order.
+    pub assoc_types: List[String],
+    /// The bounds an associated type declaration carries: `type Iter: Iterator;` is one.
+    /// They work the way every other bound does, in both directions -- in scope in the
+    /// trait's default bodies as `Self::Iter: Iterator`, and required of whatever an impl
+    /// defines the associated type to be.
+    pub assoc_bounds: Map[String, List[Bound]],
+    pub methods: Map[String, ast::FnDecl],
+    /// Each method's signature, with `Self` left as the trait's own self parameter so it
+    /// can be substituted per impl.
+    pub sigs: Map[String, FnSig],
+    /// The rigid parameter standing for `Self` inside the trait.
+    pub self_param: types::Param,
+}
+
+/// One impl block.
+pub struct ImplInfo {
+    pub decl: ast::ImplDecl,
+    pub params: List[types::Param],
+    pub self_ty: types::Type,
+    /// Absent for an inherent impl.
+    pub has_trait: bool,
+    pub mut trait_info: Option[TraitInfo],
+    pub mut trait_args: List[types::Type],
+    pub mut bounds: List[Bound],
+    pub methods: Map[String, ast::FnDecl],
+    pub assoc: Map[String, types::Type],
+    /// Which file the impl was written in, for its own diagnostics. Empty for a builtin.
+    pub impl_file: String,
+    /// Marks a compiler-provided impl for a primitive type. Such impls have no AST.
+    pub builtin: bool,
+    /// The builtin impls' method signatures, since there is no declaration to read.
+    pub builtin_sigs: Map[String, FnSig],
+}
+
+/// One instantiation of a callee at a call site.
+pub struct Inst {
+    /// The function or method called. For a trait method called on a type parameter this
+    /// is the trait's own declaration, which may have no body: the concrete impl is only
+    /// known once the parameter is substituted.
+    pub decl: ast::FnDecl,
+    /// Parallel: the generic parameters the callee's body may mention, and the type each
+    /// was instantiated at.
+    pub params: List[types::Param],
+    pub args: List[types::Type],
+    pub recv: types::Type,
+    pub has_recv: bool,
+    /// Empty for a plain function call.
+    pub method: String,
+}
+
+/// The type names in scope for one declaration.
+pub struct TypeEnv {
+    pub params: Map[String, types::Param],
+    pub has_self: bool,
+    pub self_ty: types::Type,
+    /// Set inside a trait declaration, so `Self::Item` knows its trait.
+    pub self_trait: Option[TraitInfo],
+    /// The declared obligations in scope, which is how `T::Item` finds the trait that
+    /// supplies `Item`.
+    pub mut bounds: List[Bound],
+}
+
+fn empty_env() -> TypeEnv {
+    TypeEnv {
+        params: map::new[String, types::Param](), has_self: false,
+        self_ty: types::error_type(), self_trait: Option::None, bounds: no_bounds(),
+    }
+}
+
+/// The type environment for a declaration's generic parameters.
+fn env_for(params: List[types::Param], has_self: bool, self_ty: types::Type,
+           tr: Option[TraitInfo]) -> TypeEnv {
+    let m = map::new[String, types::Param]();
+    let mut i = 0;
+    while i < params.len() {
+        m.insert(params.at(i).name, params.at(i));
+        i = i + 1;
+    }
+    TypeEnv {
+        params: m, has_self: has_self, self_ty: self_ty, self_trait: tr, bounds: no_bounds(),
+    }
+}
+
+pub struct CheckError {
+    pub code: String,
+    pub message: String,
+    pub file: String,
+    pub start: i64,
+    pub end: i64,
+}
+
+pub struct Checked {
+    pub trace: List[String],
+    pub errors: List[CheckError],
+}
+
+// --- The checker --------------------------------------------------------------------------
+
+/// One recorded event. The type is rendered at the end rather than now: a type recorded
+/// mid-body is often an unsolved variable that later unification binds and end-of-body
+/// defaulting resolves, and printing then would record the guess instead of the answer.
+struct TraceEntry {
+    what: String,
+    text: String,
+    ty: types::Type,
+    has_ty: bool,
+}
+
+/// An integer literal whose type is not settled yet, range-checked once it is.
+struct LiteralUse {
+    value: u64,
+    negated: bool,
+    ty: types::Type,
+    at: ast::Span,
+    file: String,
+}
+
+/// An operator application whose operand type is not settled yet. `1.0 & 2.0` and
+/// `let x: u8 = 1 + 2;` both depend on what the literals turn out to be.
+struct OperandCheck {
+    op: String,
+    ty: types::Type,
+    at: ast::Span,
+    file: String,
+}
+
+/// An inference variable created for the current body, with where it came from, so that an
+/// unsolved leftover is reported where it arose.
+struct PendingVar {
+    ty: types::Type,
+    at: ast::Span,
+    file: String,
+}
+
+pub struct Checker {
+    refs: List[resolve::Ref],
+    ctx: types::Ctx,
+    trace: List[TraceEntry],
+    errors: List[CheckError],
+
+    /// Indexed by a declaration's `info` slot.
+    defs: List[types::Def],
+    fn_sigs: List[FnSig],
+    trait_infos: List[TraitInfo],
+    aliases: List[types::Type],
+    impls: List[ImplInfo],
+    /// Impls by the name of the type they are for, which is how method resolution finds
+    /// candidates without scanning every impl.
+    impls_by_self: Map[String, List[ImplInfo]],
+    /// The prelude's nominal types by name, for the builtins' signatures.
+    prelude_defs: Map[String, types::Def],
+
+    mut env: TypeEnv,
+    /// The return type of the body being checked.
+    mut ret: types::Type,
+    mut obligations: List[Bound],
+    mut body_vars: List[PendingVar],
+    mut int_lits: List[LiteralUse],
+    mut op_checks: List[OperandCheck],
+    /// The generalized type of each `let` binding that generalized, and the variables they
+    /// quantified over -- deliberately unsolved, which is what polymorphism is, so the
+    /// end-of-body check skips them.
+    scheme_locals: List[resolve::Local],
+    scheme_values: List[types::Scheme],
+    mut generalized: List[types::Var],
+    /// The type each enclosing `loop` breaks with.
+    mut loop_values: List[types::Type],
+    /// The file whose declarations are being checked, for spans in its diagnostics.
+    mut file: String,
+}
+
+impl Checker {
+    fn error(self, code: String, at: ast::Span, message: String) {
+        self.errors.push(CheckError {
+            code: code, message: message, file: self.file, start: at.start, end: at.end,
+        });
+    }
+
+    fn error_in(self, code: String, file: String, at: ast::Span, message: String) {
+        self.errors.push(CheckError {
+            code: code, message: message, file: file, start: at.start, end: at.end,
+        });
+    }
+
+    // --- the trace ---
+
+    fn note_type(self, what: String, t: types::Type) {
+        self.trace.push(TraceEntry { what: what, text: "", ty: t, has_ty: true });
+    }
+
+    fn note_text(self, what: String, text: String) {
+        self.trace.push(TraceEntry {
+            what: what, text: text, ty: types::error_type(), has_ty: false,
+        });
+    }
+
+    fn note_local(self, l: resolve::Local, t: types::Type) {
+        self.trace.push(TraceEntry {
+            what: "local \(l.name)", text: "", ty: t, has_ty: true,
+        });
+    }
+
+    /// Records a call site's instantiation: which declaration, and the type each of its
+    /// generic parameters was given here. The arguments are packed into a tuple so that
+    /// they render, and are pruned, the way any other type is.
+    fn note_inst(self, what: String, inst: Inst) {
+        self.trace.push(TraceEntry {
+            what: what, text: decl_site(inst.decl), ty: types::Type::Tuple(inst.args),
+            has_ty: true,
+        });
+    }
+
+    /// What one identifier occurrence resolved to, or a reference to nothing when the
+    /// resolver reported the name already.
+    fn ref_of(self, at: i64) -> resolve::Ref {
+        if at < 0 || at >= self.refs.len() {
+            return resolve::unresolved();
+        }
+        self.refs.at(at)
+    }
+}
+
+/// Names a declaration by where its own name was written, which is the identity the
+/// resolution trace already uses.
+fn decl_site(fn_decl: ast::FnDecl) -> String {
+    "\(fn_decl.name.name) \(fn_decl.file):\(fn_decl.name.start)"
+}
+
+/// Turns the recorded entries into lines, after every type in them has been solved as far
+/// as it is going to be.
+fn render_trace(entries: List[TraceEntry]) -> List[String] {
+    let out = list::new[String]();
+    let mut i = 0;
+    while i < entries.len() {
+        let e = entries.at(i);
+        if !e.has_ty {
+            out.push("\(e.what) \(e.text)");
+        } else {
+            if !e.text.is_empty() {
+                out.push("\(e.what) \(e.text) \(types::show(e.ty))");
+            } else {
+                out.push("\(e.what) \(types::show(e.ty))");
+            }
+        }
+        i = i + 1;
+    }
+    out
+}
+
+// --- Program -----------------------------------------------------------------------------
+
+/// One file to check, in the order the resolver saw it.
+pub struct Unit {
+    pub file: String,
+    pub tree: ast::File,
+}
+
+/// Checks a whole program against the resolver's answers.
+///
+/// Declarations are collected in dependency order, and the order is the point: nominal
+/// shells first, so a type can refer to any other; then traits; then fields, signatures
+/// and impls; then bodies. Nothing looks at a body until every name in the program has a
+/// type.
+pub fn program(res: resolve::Resolved, units: List[Unit]) -> Checked {
+    let c = Checker {
+        refs: res.refs,
+        ctx: types::new_ctx(),
+        trace: list::new[TraceEntry](),
+        errors: list::new[CheckError](),
+        defs: list::new[types::Def](),
+        fn_sigs: list::new[FnSig](),
+        trait_infos: list::new[TraitInfo](),
+        aliases: list::new[types::Type](),
+        impls: list::new[ImplInfo](),
+        impls_by_self: map::new[String, List[ImplInfo]](),
+        prelude_defs: map::new[String, types::Def](),
+        env: empty_env(),
+        ret: types::unit(),
+        obligations: no_bounds(),
+        body_vars: list::new[PendingVar](),
+        int_lits: list::new[LiteralUse](),
+        op_checks: list::new[OperandCheck](),
+        scheme_locals: list::new[resolve::Local](),
+        scheme_values: list::new[types::Scheme](),
+        generalized: list::new[types::Var](),
+        loop_values: list::new[types::Type](),
+        file: "",
+    };
+
+    c.each(units, 1);  // shells
+    c.each(units, 2);  // traits
+    c.each(units, 3);  // fields and enum payloads
+    c.each(units, 4);  // signatures
+    c.register_builtin_impls();
+    c.each(units, 5);  // impls
+    c.check_coherence();
+    c.check_assoc_bounds();
+    // Bodies are pass 6 and are not written; see the comment there. Nothing calls this
+    // function yet for the same reason -- a checker that stops before the bodies would
+    // report a program clean that is not, which is worse than not being wired up at all.
+
+    Checked { trace: render_trace(c.trace), errors: c.errors }
+}
+
+impl Checker {
+    /// Runs one pass over every unit. The passes are numbered rather than named because
+    /// each is a whole traversal and the order between them is what makes the whole thing
+    /// work; `program` above is where they are named.
+    fn each(self, units: List[Unit], pass: i64) {
+        let mut i = 0;
+        while i < units.len() {
+            let u = units.at(i);
+            self.file = u.file;
+            let items = u.tree.items;
+            let mut j = 0;
+            while j < items.len() {
+                self.item_pass(items.at(j), pass);
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        self.env = empty_env();
+    }
+
+    fn item_pass(self, item: ast::Item, pass: i64) {
+        if pass == 1 { self.collect_shell(item); return; }
+        if pass == 2 { self.collect_trait(item); return; }
+        if pass == 3 { self.collect_fields(item); return; }
+        if pass == 4 { self.collect_signature(item); return; }
+        if pass == 5 { self.collect_impl(item); return; }
+        self.check_body_item(item);
+    }
+}
+
+// --- Pass 1: nominal shells ----------------------------------------------------------------
+
+impl Checker {
+    fn collect_shell(self, item: ast::Item) {
+        match item {
+            ast::Item::Struct(d) => {
+                d.info = self.file_def(types::Def {
+                    kind: types::DEF_STRUCT, name: d.name.name,
+                    params: self.generic_params(d.generics),
+                    struct_decl: Option::Some(d), enum_decl: Option::None,
+                    file: self.file, at: d.name.start,
+                    field_types: list::new[types::Type](),
+                    variant_types: list::new[List[types::Type]](),
+                });
+            }
+            ast::Item::Enum(d) => {
+                d.info = self.file_def(types::Def {
+                    kind: types::DEF_ENUM, name: d.name.name,
+                    params: self.generic_params(d.generics),
+                    struct_decl: Option::None, enum_decl: Option::Some(d),
+                    file: self.file, at: d.name.start,
+                    field_types: list::new[types::Type](),
+                    variant_types: list::new[List[types::Type]](),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn file_def(self, d: types::Def) -> i64 {
+        self.defs.push(d);
+        // The prelude is where the builtins' signatures find `Option`, `List` and the
+        // concurrency handles. A program may declare a type with a name the prelude also
+        // uses -- `enum List` is an ordinary thing to write -- and what must not happen is
+        // a builtin's signature getting the *program's*.
+        if d.file == PRELUDE_NAME && !self.prelude_defs.contains(d.name) {
+            self.prelude_defs.insert(d.name, d);
+        }
+        self.defs.len() - 1
+    }
+
+    fn generic_params(self, gs: List[ast::GenericParam]) -> List[types::Param] {
+        let out = list::new[types::Param]();
+        let mut i = 0;
+        while i < gs.len() {
+            out.push(self.ctx.new_param(gs.at(i).name.name));
+            i = i + 1;
+        }
+        out
+    }
+
+    fn def_at(self, at: i64) -> Option[types::Def] {
+        if at < 0 || at >= self.defs.len() {
+            return Option::None;
+        }
+        Option::Some(self.defs.at(at))
+    }
+}
+
+/// The name the prelude is known by. It is load-bearing: "was this declared in the
+/// prelude?" is answered by comparing it, here as in the Go checker.
+pub const PRELUDE_NAME: String = "<prelude>";
+
+// --- Pass 2: traits -------------------------------------------------------------------------
+
+impl Checker {
+    fn collect_trait(self, item: ast::Item) {
+        match item {
+            ast::Item::Trait(v) => {
+                let ti = TraitInfo {
+                    decl: v,
+                    params: self.generic_params(v.generics),
+                    supertraits: no_bounds(),
+                    assoc_types: list::new[String](),
+                    assoc_bounds: map::new[String, List[Bound]](),
+                    methods: map::new[String, ast::FnDecl](),
+                    sigs: map::new[String, FnSig](),
+                    self_param: self.ctx.new_param("Self"),
+                };
+                let mut i = 0;
+                while i < v.assoc.len() {
+                    ti.assoc_types.push(v.assoc.at(i).name.name);
+                    i = i + 1;
+                }
+                let mut m = 0;
+                while m < v.methods.len() {
+                    let method = v.methods.at(m);
+                    method.file = self.file;
+                    match ti.methods.get(method.name.name) {
+                        Option::Some(prev) => {
+                            self.error("E0034", ident_span(method.name),
+                                "trait `\(v.name.name)` declares `\(method.name.name)` twice");
+                        }
+                        Option::None => { ti.methods.insert(method.name.name, method); }
+                    }
+                    m = m + 1;
+                }
+                self.trait_infos.push(ti);
+                v.info = self.trait_infos.len() - 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn trait_at(self, at: i64) -> Option[TraitInfo] {
+        if at < 0 || at >= self.trait_infos.len() {
+            return Option::None;
+        }
+        Option::Some(self.trait_infos.at(at))
+    }
+}
+
+fn ident_span(id: ast::Ident) -> ast::Span {
+    ast::Span { start: id.start, end: id.end }
+}
+
+fn path_span(p: ast::PathRef) -> ast::Span {
+    ast::Span { start: p.start, end: p.end }
+}
+
+// --- Pass 3: struct fields, enum payloads and aliases ----------------------------------------
+
+impl Checker {
+    fn collect_fields(self, item: ast::Item) {
+        match item {
+            ast::Item::Struct(v) => {
+                match self.def_at(v.info) {
+                    Option::None => {}
+                    Option::Some(def) => {
+                        self.env = env_for(def.params, false, types::error_type(), Option::None);
+                        let mut i = 0;
+                        while i < v.fields.len() {
+                            def.field_types.push(self.to_type(v.fields.at(i).ty));
+                            i = i + 1;
+                        }
+                    }
+                }
+            }
+            ast::Item::Enum(v) => {
+                match self.def_at(v.info) {
+                    Option::None => {}
+                    Option::Some(def) => {
+                        self.env = env_for(def.params, false, types::error_type(), Option::None);
+                        let mut i = 0;
+                        while i < v.variants.len() {
+                            let va = v.variants.at(i);
+                            let payload = list::new[types::Type]();
+                            if va.kind == ast::VARIANT_TUPLE {
+                                let mut j = 0;
+                                while j < va.types.len() {
+                                    payload.push(self.to_type(va.types.at(j)));
+                                    j = j + 1;
+                                }
+                            } else {
+                                if va.kind == ast::VARIANT_STRUCT {
+                                    let mut j = 0;
+                                    while j < va.fields.len() {
+                                        payload.push(self.to_type(va.fields.at(j).ty));
+                                        j = j + 1;
+                                    }
+                                }
+                            }
+                            def.variant_types.push(payload);
+                            i = i + 1;
+                        }
+                    }
+                }
+            }
+            ast::Item::Alias(v) => {
+                self.env = env_for(self.generic_params(v.generics), false,
+                                   types::error_type(), Option::None);
+                self.aliases.push(self.to_type(v.ty));
+                v.info = self.aliases.len() - 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+// --- Types ------------------------------------------------------------------------------------
+
+impl Checker {
+    /// Converts a syntactic type to a semantic one, using the current environment for
+    /// generic parameters and `Self`. Every name comes from the resolver's side table;
+    /// this never consults a scope.
+    fn to_type(self, t: ast::Type) -> types::Type {
+        match t {
+            ast::Type::Unit => types::unit(),
+            ast::Type::ErrorType => types::error_type(),
+            ast::Type::SelfType => {
+                if !self.env.has_self {
+                    // A bare `Self` in a type position outside a trait or impl. There is
+                    // no span on the node, so it is reported against the whole item by the
+                    // caller; here it is only the error type.
+                    return types::error_type();
+                }
+                self.env.self_ty
+            }
+            ast::Type::Tuple(elems) => types::Type::Tuple(self.to_types(elems)),
+            ast::Type::Func(params, ret) =>
+                types::Type::Func(self.to_types(params), self.to_type(ret)),
+            ast::Type::Path(p, args) => self.path_type(p, args),
+        }
+    }
+
+    fn to_types(self, ts: List[ast::Type]) -> List[types::Type] {
+        let out = list::new[types::Type]();
+        let mut i = 0;
+        while i < ts.len() {
+            out.push(self.to_type(ts.at(i)));
+            i = i + 1;
+        }
+        out
+    }
+
+    fn path_type(self, p: ast::PathRef, arg_nodes: List[ast::Type]) -> types::Type {
+        let r = self.ref_of(p.res);
+        if r.kind == resolve::K_UNRESOLVED {
+            return types::error_type(); // the resolver already reported it
+        }
+        let args = self.to_types(arg_nodes);
+        let at = path_span(p);
+
+        if r.kind == resolve::K_PRIM {
+            // `Array[T]` is the one primitive that is generic (ADR-0028): the compiler
+            // provides the type, and its arity is checked like any nominal type's.
+            if r.name == "Array" {
+                return self.apply_def(at, Option::Some(self.array_def()), args);
+            }
+            if !args.is_empty() {
+                self.error("E0109", at, "`\(r.name)` takes no type arguments");
+            }
+            return types::Type::Prim(types::prim_of_name(r.name));
+        }
+
+        if r.kind == resolve::K_TYPEPARAM {
+            match self.env.params.get(r.name) {
+                Option::None => {
+                    self.error("E0412", at,
+                        "type parameter `\(r.name)` is not in scope here");
+                    types::error_type()
+                }
+                Option::Some(param) => {
+                    if !args.is_empty() {
+                        self.error("E0109", at,
+                            "type parameter `\(r.name)` takes no type arguments");
+                    }
+                    types::Type::ParamT(param)
+                }
+            }
+        } else {
+            if r.kind == resolve::K_SELFTY {
+                if !self.env.has_self {
+                    self.error("E0411", at, "`Self` is not available here");
+                    return types::error_type();
+                }
+                return self.env.self_ty;
+            }
+            if r.kind == resolve::K_STRUCT || r.kind == resolve::K_ENUM {
+                return self.apply_def(at, self.def_of_ref(r), args);
+            }
+            if r.kind == resolve::K_ALIAS {
+                // Aliases are transparent.
+                match self.alias_of_ref(r) {
+                    Option::Some(expanded) => return expanded,
+                    Option::None => return types::error_type(),
+                }
+            }
+            if r.kind == resolve::K_ASSOC {
+                return self.assoc_projection(at, r);
+            }
+            self.error("E0573", at, "`\(p.text)` is not a type");
+            types::error_type()
+        }
+    }
+
+    /// The declaration a reference to a struct or enum names. A reference carries where
+    /// the declaration was written, and the checker filed its definition at the same
+    /// place, so the lookup is by the `info` slot on the declaration itself.
+    fn def_of_ref(self, r: resolve::Ref) -> Option[types::Def] {
+        match r.struct_decl {
+            Option::Some(sd) => return self.def_at(sd.info),
+            Option::None => {}
+        }
+        match r.enum_decl {
+            Option::Some(ed) => return self.def_at(ed.info),
+            Option::None => {}
+        }
+        Option::None
+    }
+
+    fn alias_of_ref(self, r: resolve::Ref) -> Option[types::Type] {
+        match r.alias_decl {
+            Option::None => Option::None,
+            Option::Some(ad) => {
+                if ad.info < 0 || ad.info >= self.aliases.len() {
+                    return Option::None;
+                }
+                Option::Some(self.aliases.at(ad.info))
+            }
+        }
+    }
+
+    /// Instantiates a nominal type, checking its arity.
+    fn apply_def(self, at: ast::Span, d: Option[types::Def], args: List[types::Type]) -> types::Type {
+        match d {
+            Option::None => types::error_type(),
+            Option::Some(def) => {
+                let mut use_args = args;
+                if args.len() != def.params.len() {
+                    self.error("E0107", at,
+                        "`\(def.name)` takes \(def.params.len()) type argument(s) but \(args.len()) were supplied");
+                    // Recover with the error type so one arity mistake does not cascade.
+                    use_args = list::new[types::Type]();
+                    let mut i = 0;
+                    while i < def.params.len() {
+                        use_args.push(types::error_type());
+                        i = i + 1;
+                    }
+                }
+                types::Type::Named(def, use_args)
+            }
+        }
+    }
+}
+
+// --- Pass 4: signatures ---------------------------------------------------------------------
+
+impl Checker {
+    fn collect_signature(self, item: ast::Item) {
+        match item {
+            ast::Item::Fn(v) => {
+                v.file = self.file;
+                self.signature(v, list::new[types::Param](), false, types::error_type(),
+                               Option::None);
+            }
+            ast::Item::Trait(v) => {
+                match self.trait_at(v.info) {
+                    Option::None => {}
+                    Option::Some(ti) => {
+                        let self_ty = types::Type::ParamT(ti.self_param);
+                        let mut i = 0;
+                        while i < v.methods.len() {
+                            let m = v.methods.at(i);
+                            match ti.methods.get(m.name.name) {
+                                // Only the first declaration of a duplicated name.
+                                Option::Some(kept) => {
+                                    if ref_eq(kept, m) {
+                                        let sig = self.signature(m, ti.params, true, self_ty,
+                                                                 Option::Some(ti));
+                                        ti.sigs.insert(m.name.name, sig);
+                                    }
+                                }
+                                Option::None => {}
+                            }
+                            i = i + 1;
+                        }
+                        let mut s = 0;
+                        while s < v.supertraits.len() {
+                            self.env = env_for(ti.params, true, self_ty, Option::Some(ti));
+                            match self.to_bound(self_ty, v.supertraits.at(s)) {
+                                Option::Some(b) => { ti.supertraits.push(b); }
+                                Option::None => {}
+                            }
+                            s = s + 1;
+                        }
+                        let mut a = 0;
+                        while a < v.assoc.len() {
+                            let at = v.assoc.at(a);
+                            if !at.bounds.is_empty() {
+                                self.env = env_for(ti.params, true, self_ty, Option::Some(ti));
+                                let proj = types::Type::Assoc(v, at.name.name, self_ty);
+                                let got = no_bounds();
+                                let mut b = 0;
+                                while b < at.bounds.len() {
+                                    match self.to_bound(proj, at.bounds.at(b)) {
+                                        Option::Some(bd) => { got.push(bd); }
+                                        Option::None => {}
+                                    }
+                                    b = b + 1;
+                                }
+                                if !got.is_empty() {
+                                    ti.assoc_bounds.insert(at.name.name, got);
+                                }
+                            }
+                            a = a + 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A function's declared type. `outer` is the enclosing declaration's generic
+    /// parameters, a trait's or an impl's.
+    fn signature(self, fn_decl: ast::FnDecl, outer: List[types::Param], has_self: bool,
+                 self_ty: types::Type, tr: Option[TraitInfo]) -> FnSig {
+        fn_decl.file = self.file;
+        let own = self.generic_params(fn_decl.generics);
+        let all = concat_params(outer, own);
+        self.env = env_for(all, has_self, self_ty, tr);
+
+        // The generic parameters the body may mention, in one fixed order: the enclosing
+        // declaration's, then `Self` when the enclosing declaration is a trait, then the
+        // function's own. Monomorphization keys an instantiation on exactly this list, so
+        // the order lives here and nowhere else.
+        let generics = list::new[types::Param]();
+        let mut g = 0;
+        while g < outer.len() {
+            generics.push(outer.at(g));
+            g = g + 1;
+        }
+        match self_param_of(self_ty) {
+            Option::Some(p) => { generics.push(p); }
+            Option::None => {}
+        }
+        let mut o = 0;
+        while o < own.len() {
+            generics.push(own.at(o));
+            o = o + 1;
+        }
+
+        // Bounds are collected before the parameter and return types are converted: a
+        // projection such as `T::Item` finds the trait that declares `Item` by looking at
+        // the bounds in scope.
+        let bounds = self.collect_bounds(fn_decl.generics, fn_decl.where_preds, own);
+        self.env.bounds = bounds;
+
+        let param_types = list::new[types::Type]();
+        let mut i = 0;
+        while i < fn_decl.params.len() {
+            param_types.push(self.to_type(fn_decl.params.at(i).ty));
+            i = i + 1;
+        }
+        let mut ret = types::unit();
+        match fn_decl.ret {
+            Option::Some(t) => { ret = self.to_type(t); }
+            Option::None => {}
+        }
+
+        let sig = FnSig {
+            decl: fn_decl, params: own, has_self: has_self, self_ty: self_ty,
+            param_types: param_types, ret: ret, bounds: bounds, generics: generics,
+        };
+        self.fn_sigs.push(sig);
+        fn_decl.info = self.fn_sigs.len() - 1;
+        sig
+    }
+
+    fn sig_at(self, at: i64) -> Option[FnSig] {
+        if at < 0 || at >= self.fn_sigs.len() {
+            return Option::None;
+        }
+        Option::Some(self.fn_sigs.at(at))
+    }
+
+    /// Turns inline bounds and where predicates into obligations.
+    fn collect_bounds(self, gs: List[ast::GenericParam], where_preds: List[ast::WherePred],
+                      own: List[types::Param]) -> List[Bound] {
+        let out = no_bounds();
+        let mut i = 0;
+        while i < gs.len() {
+            let g = gs.at(i);
+            match find_param(own, g.name.name) {
+                Option::None => {}
+                Option::Some(p) => {
+                    let mut b = 0;
+                    while b < g.bounds.len() {
+                        match self.to_bound(types::Type::ParamT(p), g.bounds.at(b)) {
+                            Option::Some(bound) => { out.push(bound); }
+                            Option::None => {}
+                        }
+                        b = b + 1;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        let mut w = 0;
+        while w < where_preds.len() {
+            let pred = where_preds.at(w);
+            let subject = self.to_type(pred.ty);
+            let mut b = 0;
+            while b < pred.bounds.len() {
+                match self.to_bound(subject, pred.bounds.at(b)) {
+                    Option::Some(bound) => { out.push(bound); }
+                    Option::None => {}
+                }
+                b = b + 1;
+            }
+            w = w + 1;
+        }
+        out
+    }
+
+    /// Resolves a syntactic trait reference against a subject type.
+    fn to_bound(self, subject: types::Type, tr: ast::TraitRef) -> Option[Bound] {
+        let r = self.ref_of(tr.path.res);
+        if r.kind == resolve::K_UNRESOLVED {
+            return Option::None; // already reported by the resolver
+        }
+        if r.kind != resolve::K_TRAIT {
+            self.error("E0404", path_span(tr.path), "`\(tr.path.text)` is not a trait");
+            return Option::None;
+        }
+        match r.trait_decl {
+            Option::None => Option::None,
+            Option::Some(td) => {
+                match self.trait_at(td.info) {
+                    Option::None => Option::None,
+                    Option::Some(ti) => Option::Some(Bound {
+                        ty: subject, trait_info: ti, args: self.to_types(tr.args),
+                        at: path_span(tr.path), code: "", what: "",
+                    }),
+                }
+            }
+        }
+    }
+}
+
+fn concat_params(a: List[types::Param], b: List[types::Param]) -> List[types::Param] {
+    let out = list::new[types::Param]();
+    let mut i = 0;
+    while i < a.len() {
+        out.push(a.at(i));
+        i = i + 1;
+    }
+    let mut j = 0;
+    while j < b.len() {
+        out.push(b.at(j));
+        j = j + 1;
+    }
+    out
+}
+
+fn find_param(ps: List[types::Param], name: String) -> Option[types::Param] {
+    let mut i = 0;
+    while i < ps.len() {
+        if ps.at(i).name == name {
+            return Option::Some(ps.at(i));
+        }
+        i = i + 1;
+    }
+    Option::None
+}
+
+/// The rigid parameter a self type is, when it is one -- which it is inside a trait, where
+/// `Self` is a parameter the impl substitutes.
+fn self_param_of(t: types::Type) -> Option[types::Param] {
+    match types::prune(t) {
+        types::Type::ParamT(p) => Option::Some(p),
+        _ => Option::None,
+    }
+}
+
+// --- Pass 5: impls --------------------------------------------------------------------------
+
+impl Checker {
+    fn collect_impl(self, item: ast::Item) {
+        match item {
+            ast::Item::Impl(v) => {
+                let params = self.generic_params(v.generics);
+                self.env = env_for(params, false, types::error_type(), Option::None);
+                let self_ty = self.to_type(v.ty);
+
+                let info = ImplInfo {
+                    decl: v, params: params, self_ty: self_ty, has_trait: v.has_trait,
+                    trait_info: Option::None, trait_args: list::new[types::Type](),
+                    bounds: no_bounds(), methods: map::new[String, ast::FnDecl](),
+                    assoc: map::new[String, types::Type](), impl_file: self.file,
+                    builtin: false, builtin_sigs: map::new[String, FnSig](),
+                };
+                self.env = env_for(params, true, self_ty, Option::None);
+                // Both spellings, and they mean the same thing: `impl[T: Show] Box[T]` and
+                // `impl[T] Box[T] where T: Show`. Collecting only the second was a silent
+                // hole in the Go checker once -- the parser accepted the first and the
+                // checker dropped it.
+                info.bounds = self.collect_bounds(v.generics, v.where_preds, params);
+
+                if v.has_trait {
+                    let tr = ast::TraitRef { path: v.trait_path, args: v.trait_args };
+                    match self.to_bound(self_ty, tr) {
+                        Option::Some(b) => {
+                            info.trait_info = Option::Some(b.trait_info);
+                            info.trait_args = b.args;
+                        }
+                        Option::None => {}
+                    }
+                }
+                let mut a = 0;
+                while a < v.assoc.len() {
+                    let at = v.assoc.at(a);
+                    match at.ty {
+                        Option::Some(t) => { info.assoc.insert(at.name.name, self.to_type(t)); }
+                        Option::None => {}
+                    }
+                    a = a + 1;
+                }
+                let mut m = 0;
+                while m < v.methods.len() {
+                    let method = v.methods.at(m);
+                    match info.methods.get(method.name.name) {
+                        Option::Some(_) => {
+                            self.error("E0034", ident_span(method.name),
+                                "this impl defines `\(method.name.name)` twice");
+                        }
+                        Option::None => {
+                            info.methods.insert(method.name.name, method);
+                            self.signature(method, params, true, self_ty, Option::None);
+                        }
+                    }
+                    m = m + 1;
+                }
+                self.impls.push(info);
+                v.info = self.impls.len() - 1;
+                self.index_impl(info);
+                self.check_impl_completeness(info);
+            }
+            _ => {}
+        }
+    }
+
+    fn index_impl(self, info: ImplInfo) {
+        let key = self_key(info.self_ty);
+        match self.impls_by_self.get(key) {
+            Option::Some(l) => { l.push(info); }
+            Option::None => {
+                let l = list::new[ImplInfo]();
+                l.push(info);
+                self.impls_by_self.insert(key, l);
+            }
+        }
+    }
+
+    fn candidate_impls(self, t: types::Type) -> List[ImplInfo] {
+        self.impls_by_self.get(self_key(t)).unwrap_or(list::new[ImplInfo]())
+    }
+
+    /// `Array[T]`, the declaration it does not have. One value for the whole checker,
+    /// compared by identity, so that "is this an array?" has one answer rather than a name
+    /// match (ADR-0028).
+    fn array_def(self) -> types::Def {
+        match self.prelude_defs.get(ARRAY_KEY) {
+            Option::Some(d) => d,
+            Option::None => {
+                let params = list::new[types::Param]();
+                params.push(self.ctx.new_param("T"));
+                let d = types::Def {
+                    kind: types::DEF_BUILTIN, name: "Array", params: params,
+                    struct_decl: Option::None, enum_decl: Option::None,
+                    file: "", at: 0,
+                    field_types: list::new[types::Type](),
+                    variant_types: list::new[List[types::Type]](),
+                };
+                self.prelude_defs.insert(ARRAY_KEY, d);
+                d
+            }
+        }
+    }
+}
+
+/// The key `Array`'s own definition is filed under. It is not a name a source file can
+/// collide with, since `Array` is a primitive and no declaration may shadow one.
+const ARRAY_KEY: String = " Array";
+
+/// The index key for a self type: a nominal type's name, or a primitive's.
+fn self_key(t: types::Type) -> String {
+    match types::prune(t) {
+        types::Type::Named(d, _) => d.name,
+        types::Type::Prim(k) => types::prim_name(k),
+        types::Type::Tuple(_) => "(tuple)",
+        types::Type::Func(_, _) => "(fn)",
+        _ => "(other)",
+    }
+}
+
+// --- Builtin impls ---------------------------------------------------------------------------
+
+impl Checker {
+    /// The compiler-provided impls for primitive types.
+    ///
+    /// Declaring them rather than special-casing bound checking keeps one code path:
+    /// `i64: Show` is satisfied by finding an impl, exactly like `MyType: Show`. The floats
+    /// are absent from `Show` on purpose -- `Show for f64` is Origin source in the prelude,
+    /// because the shortest decimal that reads back as the same float needs exact
+    /// arithmetic wider than sixty-four bits (spec/16-floats.md, ADR-0031).
+    fn register_builtin_impls(self) {
+        // In name order, so the impl order and therefore the diagnostics are deterministic.
+        self.register_builtin("Int", integer_kinds());
+        self.register_builtin("Ord", ordered_kinds());
+        self.register_builtin("Show", showable_kinds());
+    }
+
+    fn register_builtin(self, trait_name: String, kinds: List[i64]) {
+        match self.trait_by_name(trait_name) {
+            Option::None => {}  // the prelude does not declare it; nothing to register
+            Option::Some(ti) => {
+                let mut i = 0;
+                while i < kinds.len() {
+                    let info = ImplInfo {
+                        decl: self_less_impl(), params: list::new[types::Param](),
+                        self_ty: types::Type::Prim(kinds.at(i)), has_trait: true,
+                        trait_info: Option::Some(ti), trait_args: list::new[types::Type](),
+                        bounds: no_bounds(), methods: map::new[String, ast::FnDecl](),
+                        assoc: map::new[String, types::Type](), impl_file: "",
+                        builtin: true, builtin_sigs: map::new[String, FnSig](),
+                    };
+                    self.impls.push(info);
+                    self.index_impl(info);
+                    i = i + 1;
+                }
+            }
+        }
+    }
+
+    fn trait_by_name(self, name: String) -> Option[TraitInfo] {
+        let mut i = 0;
+        while i < self.trait_infos.len() {
+            if self.trait_infos.at(i).decl.name.name == name {
+                return Option::Some(self.trait_infos.at(i));
+            }
+            i = i + 1;
+        }
+        Option::None
+    }
+}
+
+fn integer_kinds() -> List[i64] {
+    let out = list::new[i64]();
+    out.push(types::P_I8); out.push(types::P_I16); out.push(types::P_I32);
+    out.push(types::P_I64); out.push(types::P_U8); out.push(types::P_U16);
+    out.push(types::P_U32); out.push(types::P_U64);
+    out
+}
+
+fn ordered_kinds() -> List[i64] {
+    let out = integer_kinds();
+    out.push(types::P_F32); out.push(types::P_F64);
+    out.push(types::P_CHAR); out.push(types::P_STRING);
+    out
+}
+
+fn showable_kinds() -> List[i64] {
+    let out = integer_kinds();
+    out.push(types::P_BOOL); out.push(types::P_CHAR); out.push(types::P_STRING);
+    out
+}
+
+/// A stand-in declaration for a compiler-provided impl, which has no source. Nothing reads
+/// it: `builtin` is what says an impl has no AST, and every path that would look at the
+/// declaration checks that first.
+fn self_less_impl() -> ast::ImplDecl {
+    ast::ImplDecl {
+        info: ast::UNRESOLVED, generics: list::new[ast::GenericParam](),
+        trait_path: ast::PathRef {
+            text: "", start: 0, end: 0, segs: list::new[ast::Ident](),
+            res: ast::UNRESOLVED,
+        },
+        has_trait: false, trait_args: list::new[ast::Type](),
+        where_preds: list::new[ast::WherePred](), ty: ast::Type::ErrorType,
+        assoc: list::new[ast::AssocType](), methods: list::new[ast::FnDecl](),
+    }
+}
+
+// --- Coherence ---------------------------------------------------------------------------
+
+impl Checker {
+    /// The overlap rule from spec/06-traits-generics.md: no two impls of the same trait may
+    /// apply to the same type.
+    ///
+    /// The orphan rule is the other half. Origin 0.1 compiles one package, so every trait
+    /// and every type is local and the orphan rule cannot be violated yet.
+    fn check_coherence(self) {
+        let mut i = 0;
+        while i < self.impls.len() {
+            let a = self.impls.at(i);
+            match a.trait_info {
+                Option::None => {}
+                Option::Some(ta) => {
+                    let mut j = i + 1;
+                    while j < self.impls.len() {
+                        let b = self.impls.at(j);
+                        match b.trait_info {
+                            Option::None => {}
+                            Option::Some(tb) => {
+                                if ref_eq(ta, tb) && !(a.builtin && b.builtin)
+                                    && self.impls_overlap(a, b) {
+                                    self.report_overlap(a, b);
+                                }
+                            }
+                        }
+                        j = j + 1;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        self.check_inherent_method_clashes();
+    }
+
+    fn report_overlap(self, a: ImplInfo, b: ImplInfo) {
+        // Report against the impl the programmer wrote, whichever side it is on.
+        let mut user = a;
+        let mut other = b;
+        if a.builtin {
+            user = b;
+            other = a;
+        }
+        let tname = trait_name_of(user);
+        if other.builtin {
+            self.error_in("E0119", decl_file(user), impl_span(user),
+                "conflicting implementations of trait `\(tname)` for `\(types::show(user.self_ty))`");
+            return;
+        }
+        self.error_in("E0119", decl_file(user), impl_span(user),
+            "conflicting implementations of trait `\(tname)`");
+    }
+
+    /// Whether two impls of the same trait can apply to one type. Each impl's generic
+    /// parameters are instantiated with fresh variables first, so `impl[T] Trait for Vec[T]`
+    /// and `impl Trait for Vec[i64]` are correctly found to overlap.
+    fn impls_overlap(self, a: ImplInfo, b: ImplInfo) -> bool {
+        let sa = self.instantiate_impl_self(a).self_ty;
+        let sb = self.instantiate_impl_self(b).self_ty;
+        match types::unify(sa, sb) {
+            Option::None => true,
+            Option::Some(_) => false,
+        }
+    }
+
+    /// The impl's self type with fresh inference variables in place of its generic
+    /// parameters, plus the substitution used.
+    fn instantiate_impl_self(self, info: ImplInfo) -> Instantiated {
+        if info.params.is_empty() {
+            return Instantiated { self_ty: info.self_ty, subst: types::new_subst() };
+        }
+        let s = types::new_subst();
+        let mut i = 0;
+        while i < info.params.len() {
+            s.set(info.params.at(i), self.ctx.fresh());
+            i = i + 1;
+        }
+        Instantiated { self_ty: types::substitute(info.self_ty, s), subst: s }
+    }
+
+    /// A method defined twice for the same type across separate inherent impls, which
+    /// method resolution would find ambiguous.
+    fn check_inherent_method_clashes(self) {
+        let seen = map::new[String, ast::FnDecl]();
+        let mut i = 0;
+        while i < self.impls.len() {
+            let info = self.impls.at(i);
+            match info.trait_info {
+                Option::Some(_) => {}
+                Option::None => {
+                    let key = self_key(info.self_ty);
+                    let names = info.methods.keys();
+                    let mut n = 0;
+                    while n < names.len() {
+                        let name = names.at(n);
+                        let full = "\(key)#\(name)";
+                        match seen.get(full) {
+                            Option::Some(_) => {
+                                let m = info.methods.get(name).unwrap_or(no_fn_decl());
+                                self.error_in("E0034", decl_file(info), ident_span(m.name),
+                                    "`\(key)` has two inherent methods named `\(name)`");
+                            }
+                            Option::None => {
+                                seen.insert(full, info.methods.get(name).unwrap_or(no_fn_decl()));
+                            }
+                        }
+                        n = n + 1;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Each impl keeps the promises its trait's associated type declarations make:
+    /// `type Iter: Iterator;` means whatever an impl defines `Iter` to be must implement
+    /// `Iterator`.
+    ///
+    /// A pass of its own rather than part of completeness checking because the answer
+    /// depends on *other* impls -- `impl IntoIterator for Counter { type Iter = Counter; }`
+    /// is satisfied by the `impl Iterator for Counter` written below it -- and completeness
+    /// is checked as each impl is collected, when the later ones do not exist yet.
+    fn check_assoc_bounds(self) {
+        let mut i = 0;
+        while i < self.impls.len() {
+            let info = self.impls.at(i);
+            match info.trait_info {
+                Option::None => {}
+                Option::Some(ti) => {
+                    if ti.assoc_bounds.len() > 0 {
+                        // The impl's own parameters and bounds are in scope: an associated
+                        // type may be defined in terms of them.
+                        self.env = env_for(info.params, true, info.self_ty, Option::None);
+                        self.env.bounds = info.bounds;
+                        let mut n = 0;
+                        while n < ti.assoc_types.len() {
+                            let name = ti.assoc_types.at(n);
+                            match info.assoc.get(name) {
+                                Option::None => {}  // already reported as missing
+                                Option::Some(def) => {
+                                    match ti.assoc_bounds.get(name) {
+                                        Option::None => {}
+                                        Option::Some(bs) => {
+                                            let mut b = 0;
+                                            while b < bs.len() {
+                                                let bd = bs.at(b);
+                                                if !self.satisfies(def, bd.trait_info) {
+                                                    self.error_in("E0277", decl_file(info),
+                                                        impl_span(info),
+                                                        "`\(types::show(def))` does not implement `\(bd.trait_info.decl.name.name)`");
+                                                }
+                                                b = b + 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            n = n + 1;
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        self.env = empty_env();
+    }
+
+    /// A trait impl defines everything the trait requires and nothing it does not
+    /// (spec/06-traits-generics.md).
+    fn check_impl_completeness(self, info: ImplInfo) {
+        match info.trait_info {
+            Option::None => {}
+            Option::Some(ti) => {
+                let tname = ti.decl.name.name;
+                let mut i = 0;
+                while i < ti.assoc_types.len() {
+                    let name = ti.assoc_types.at(i);
+                    if !info.assoc.contains(name) {
+                        self.error("E0046", impl_span(info),
+                            "missing associated type `\(name)` in this impl");
+                    }
+                    i = i + 1;
+                }
+                let mine = info.assoc.keys();
+                let mut a = 0;
+                while a < mine.len() {
+                    if !contains_string(ti.assoc_types, mine.at(a)) {
+                        self.error("E0046", impl_span(info),
+                            "trait `\(tname)` has no associated type `\(mine.at(a))`");
+                    }
+                    a = a + 1;
+                }
+                let required = ti.methods.keys();
+                let mut r = 0;
+                while r < required.len() {
+                    let name = required.at(r);
+                    if !info.methods.contains(name) {
+                        let decl = ti.methods.get(name).unwrap_or(no_fn_decl());
+                        match decl.body {
+                            // The trait supplies a default.
+                            Option::Some(_) => {}
+                            Option::None => {
+                                self.error("E0046", impl_span(info),
+                                    "missing method `\(name)` in this impl");
+                            }
+                        }
+                    }
+                    r = r + 1;
+                }
+                let defined = info.methods.keys();
+                let mut d = 0;
+                while d < defined.len() {
+                    let name = defined.at(d);
+                    if !ti.methods.contains(name) {
+                        let m = info.methods.get(name).unwrap_or(no_fn_decl());
+                        self.error("E0407", ident_span(m.name),
+                            "trait `\(tname)` has no method `\(name)`");
+                    }
+                    d = d + 1;
+                }
+            }
+        }
+    }
+}
+
+/// An impl's self type with its parameters instantiated, and how.
+struct Instantiated {
+    self_ty: types::Type,
+    subst: types::Subst,
+}
+
+fn trait_name_of(info: ImplInfo) -> String {
+    match info.trait_info {
+        Option::Some(ti) => ti.decl.name.name,
+        Option::None => "",
+    }
+}
+
+/// Where an impl was written. A builtin impl has no source, and nothing reports against
+/// one: `report_overlap` always names the impl the programmer wrote.
+fn impl_span(info: ImplInfo) -> ast::Span {
+    ast::Span { start: info.decl.trait_path.start, end: info.decl.trait_path.end }
+}
+
+fn decl_file(info: ImplInfo) -> String { info.impl_file }
+
+fn contains_string(l: List[String], s: String) -> bool {
+    let mut i = 0;
+    while i < l.len() {
+        if l.at(i) == s {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn no_fn_decl() -> ast::FnDecl {
+    ast::FnDecl {
+        file: "", info: ast::UNRESOLVED, public: false,
+        name: ast::Ident { name: "", start: 0, end: 0, res: ast::UNRESOLVED },
+        generics: list::new[ast::GenericParam](),
+        where_preds: list::new[ast::WherePred](), self_param: Option::None,
+        params: list::new[ast::Param](), ret: Option::None, body: Option::None,
+    }
+}
+
+// --- Bound solving --------------------------------------------------------------------------
+
+impl Checker {
+    /// Whether `subject` implements the trait.
+    fn satisfies(self, subject_in: types::Type, ti: TraitInfo) -> bool {
+        let subject = types::prune(subject_in);
+        if types::is_error(subject) || types::is_never(subject) {
+            return true; // already reported, or diverging
+        }
+        // An unsolved variable cannot be judged yet; treat it as satisfied and let the
+        // unsolved-type check report it, so one mistake produces one diagnostic.
+        match types::as_var(subject) {
+            Option::Some(_) => return true,
+            Option::None => {}
+        }
+
+        // `Send` is derived from a type's structure rather than found among impls
+        // (ADR-0014). A concrete type is judged directly; a rigid parameter still needs a
+        // declared bound, since nothing is known about what it will be instantiated with,
+        // so that case falls through to the ordinary lookup below.
+        if ti.decl.name.name == "Send" {
+            match self_param_of(subject) {
+                Option::None => return self.is_send(subject),
+                Option::Some(_) => {}
+            }
+        }
+
+        // A rigid type -- a generic parameter, or a projection through one -- is satisfied
+        // only by a declared bound, directly or through a supertrait. Nothing is known
+        // about what it will be instantiated with, so there is no impl to find.
+        if is_rigid(subject) {
+            let mut i = 0;
+            while i < self.env.bounds.len() {
+                let b = self.env.bounds.at(i);
+                if same_rigid(b.ty, subject)
+                    && (ref_eq(b.trait_info, ti) || supertrait_reaches(b.trait_info, ti)) {
+                    return true;
+                }
+                i = i + 1;
+            }
+            return false;
+        }
+
+        let cands = self.candidate_impls(subject);
+        let mut j = 0;
+        while j < cands.len() {
+            let info = cands.at(j);
+            match info.trait_info {
+                Option::None => {}
+                Option::Some(it) => {
+                    if ref_eq(it, ti) {
+                        let inst = self.instantiate_impl_self(info);
+                        match types::unify(inst.self_ty, subject) {
+                            Option::Some(_) => {}
+                            Option::None => {
+                                // The impl's own bounds must hold at this instantiation.
+                                let mut ok = true;
+                                let mut b = 0;
+                                while b < info.bounds.len() {
+                                    let bd = info.bounds.at(b);
+                                    if !self.satisfies(types::substitute(bd.ty, inst.subst),
+                                                       bd.trait_info) {
+                                        ok = false;
+                                        b = info.bounds.len();
+                                    } else {
+                                        b = b + 1;
+                                    }
+                                }
+                                if ok {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            j = j + 1;
+        }
+        false
+    }
+
+    /// Records an obligation to be verified once the body's inference is done.
+    fn require_bound(self, subject: types::Type, ti: TraitInfo, at: ast::Span) {
+        self.obligations.push(Bound {
+            ty: subject, trait_info: ti, args: list::new[types::Type](), at: at,
+            code: "", what: "",
+        });
+    }
+
+    /// `require_bound` for a `Send` obligation that reports its own diagnostic rather than
+    /// the generic one: what the value was being used for is the whole content of the
+    /// message (spec/12-concurrency.md).
+    fn require_send_as(self, subject: types::Type, ti: TraitInfo, at: ast::Span,
+                       code: String, what: String) {
+        self.obligations.push(Bound {
+            ty: subject, trait_info: ti, args: list::new[types::Type](), at: at,
+            code: code, what: what,
+        });
+    }
+
+    /// Checks every bound collected while checking a body.
+    fn solve_obligations(self) {
+        let mut i = 0;
+        while i < self.obligations.len() {
+            let b = self.obligations.at(i);
+            if !self.satisfies(b.ty, b.trait_info) {
+                // `Send` is derived, so the generic advice -- "nothing implements it yet;
+                // write an impl" -- is not merely unhelpful but wrong.
+                if b.trait_info.decl.name.name == "Send" {
+                    self.report_not_send(b);
+                } else {
+                    self.error(b_code(b), b.at,
+                        "`\(types::show(b.ty))` does not implement `\(b.trait_info.decl.name.name)`");
+                }
+            }
+            i = i + 1;
+        }
+        self.obligations = no_bounds();
+    }
+}
+
+fn b_code(b: Bound) -> String {
+    if b.code.is_empty() { "E0277" } else { b.code }
+}
+
+/// Whether a type is one the checker cannot look inside: a generic parameter, or an
+/// associated type projected through one. Both get their methods and their trait
+/// memberships from declared bounds rather than from an impl.
+fn is_rigid(t: types::Type) -> bool {
+    match types::prune(t) {
+        types::Type::ParamT(_) => true,
+        types::Type::Assoc(_, _, self_ty) => is_rigid(self_ty),
+        _ => false,
+    }
+}
+
+/// Whether two rigid types are the same one. A parameter is compared by identity, a
+/// projection by its trait, its member and the type it projects through.
+fn same_rigid(a: types::Type, b: types::Type) -> bool {
+    match types::prune(a) {
+        types::Type::ParamT(x) => {
+            match types::prune(b) {
+                types::Type::ParamT(y) => ref_eq(x, y),
+                _ => false,
+            }
+        }
+        types::Type::Assoc(xt, xm, xs) => {
+            match types::prune(b) {
+                types::Type::Assoc(yt, ym, ys) =>
+                    ref_eq(xt, yt) && xm == ym && same_rigid(xs, ys),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether `have` implies `want` through supertraits.
+fn supertrait_reaches(have: TraitInfo, want: TraitInfo) -> bool {
+    if ref_eq(have, want) {
+        return true;
+    }
+    let mut i = 0;
+    while i < have.supertraits.len() {
+        if supertrait_reaches(have.supertraits.at(i).trait_info, want) {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// --- Send ------------------------------------------------------------------------------------
+//
+// `Send` is derived, not implemented (spec/08-memory-model.md, ADR-0014). No program writes
+// `impl Send for T`; a type either has the structure that makes concurrent sharing safe or
+// it does not, and the compiler works that out.
+//
+// The rule, and the whole reason Origin has no data races without a borrow checker: a type
+// is `Send` when it carries no mutable state reachable from another thread. Since ADR-0004
+// makes mutability a syntactic, field-level property, that is decidable by looking at
+// declarations: every primitive and `String`; a struct with no `mut` field whose field
+// types are all `Send`; an enum whose payload types are all `Send` (a variant's payload is
+// never `mut`, since a variant is rebound rather than mutated); a tuple of `Send` elements;
+// and a function value whose captures are all `Send` -- checked at the closure, since a
+// function *type* does not record what a particular closure captured.
+//
+// Recursion is possible (a list whose tail is a list), so the walk carries the definitions
+// already being judged and treats a cycle as satisfied: a cycle adds no new mutable field.
+
+/// Why a type is not `Send`, as a chain: the outermost failure and what explains it.
+struct SendFailure {
+    /// The specific type that failed, which may be nested inside the one asked about:
+    /// `Outer` is not `Send` *because* `Inner.n` is `mut`.
+    ty: types::Type,
+    /// The offending field, empty when the type itself is the problem.
+    field: String,
+    /// The phrase completing "because ...".
+    reason: String,
+    /// Whether `field` is an enum variant rather than a struct field, since calling a
+    /// variant a "field" in a diagnostic is simply wrong.
+    variant: bool,
+    has_cause: bool,
+    cause: List[SendFailure],
+}
+
+fn sends() -> List[SendFailure] { list::new[SendFailure]() }
+
+fn send_ok() -> List[SendFailure] { sends() }
+
+fn send_fail(ty: types::Type, field: String, reason: String, variant: bool,
+             cause: List[SendFailure]) -> List[SendFailure] {
+    let out = sends();
+    out.push(SendFailure {
+        ty: ty, field: field, reason: reason, variant: variant,
+        has_cause: !cause.is_empty(), cause: cause,
+    });
+    out
+}
+
+impl SendFailure {
+    fn message(self) -> String {
+        if !self.field.is_empty() {
+            let kind = if self.variant { "variant" } else { "field" };
+            return "`\(types::show(self.ty))` is not `Send` because its \(kind) `\(self.field)` \(self.reason)";
+        }
+        "`\(types::show(self.ty))` is not `Send` because it \(self.reason)"
+    }
+}
+
+impl Checker {
+    fn is_send(self, t: types::Type) -> bool {
+        self.send_reason(t, list::new[types::Def]()).is_empty()
+    }
+
+    /// Empty when t is `Send`, or the first reason it is not.
+    ///
+    /// "First" is by declaration order, so the diagnostic names the field a programmer
+    /// would find first when reading the type.
+    fn send_reason(self, t_in: types::Type, visiting: List[types::Def]) -> List[SendFailure] {
+        let t = types::prune(t_in);
+        match t {
+            // Already reported; one mistake, one diagnostic.
+            types::Type::ErrorT => send_ok(),
+            // Every primitive is a value, and `String` is immutable.
+            types::Type::Prim(_) => send_ok(),
+            types::Type::Tuple(elems) => {
+                let mut i = 0;
+                while i < elems.len() {
+                    let f = self.send_reason(elems.at(i), visiting);
+                    if !f.is_empty() {
+                        return f;
+                    }
+                    i = i + 1;
+                }
+                send_ok()
+            }
+            // A function *type* says nothing about captures; the closure that produced the
+            // value does, and that is checked at the expression.
+            types::Type::Func(_, _) => send_ok(),
+            // Unsolved: the unsolved-type check reports it instead.
+            types::Type::VarT(_) => send_ok(),
+            // A rigid parameter is `Send` only if it was declared so, and reaching here
+            // means no such bound exists.
+            types::Type::ParamT(_) =>
+                send_fail(t, "", "is a type parameter with no `Send` bound", false, sends()),
+            types::Type::Named(d, args) => self.named_send_reason(t, d, args, visiting),
+            _ => send_fail(t, "", "is not a type that can be sent", false, sends()),
+        }
+    }
+
+    fn named_send_reason(self, whole: types::Type, def: types::Def, args: List[types::Type],
+                         visiting: List[types::Def]) -> List[SendFailure] {
+        // A recursive type is judged by its fields, and a cycle introduces none that are
+        // new.
+        let mut v = 0;
+        while v < visiting.len() {
+            if ref_eq(visiting.at(v), def) {
+                return send_ok();
+            }
+            v = v + 1;
+        }
+        visiting.push(def);
+
+        // Field types are written in terms of the definition's own parameters, so they
+        // have to be substituted at this instantiation: `Holder[C]` is unsendable exactly
+        // when `C` is, and `Holder[i64]` may be fine.
+        let subst = types::new_subst();
+        let mut p = 0;
+        while p < def.params.len() {
+            if p < args.len() {
+                subst.set(def.params.at(p), args.at(p));
+            }
+            p = p + 1;
+        }
+
+        let mut out = send_ok();
+        if def.kind == types::DEF_STRUCT {
+            match def.struct_decl {
+                Option::None => {}
+                Option::Some(sd) => {
+                    let mut i = 0;
+                    while i < sd.fields.len() && out.is_empty() {
+                        let field = sd.fields.at(i);
+                        if field.mutable {
+                            out = send_fail(whole, field.name.name, "is `mut`", false, sends());
+                        } else {
+                            if i < def.field_types.len() {
+                                let inner = self.send_reason(
+                                    types::substitute(def.field_types.at(i), subst), visiting);
+                                if !inner.is_empty() {
+                                    // Name the field the programmer can see, and keep the
+                                    // inner failure as the cause rather than splicing its
+                                    // sentence into this one.
+                                    out = send_fail(whole, field.name.name,
+                                        "has type `\(types::show(inner.at(0).ty))`", false, inner);
+                                }
+                            }
+                        }
+                        i = i + 1;
+                    }
+                }
+            }
+        } else {
+            if def.kind == types::DEF_ENUM {
+                // A variant's payload is never `mut`: a variant is replaced, never
+                // mutated, so only the payload types matter.
+                let mut vi = 0;
+                while vi < def.variant_types.len() && out.is_empty() {
+                    let payload = def.variant_types.at(vi);
+                    let mut j = 0;
+                    while j < payload.len() && out.is_empty() {
+                        let inner = self.send_reason(
+                            types::substitute(payload.at(j), subst), visiting);
+                        if !inner.is_empty() {
+                            let mut name = "";
+                            match def.enum_decl {
+                                Option::Some(ed) => {
+                                    if vi < ed.variants.len() {
+                                        name = ed.variants.at(vi).name.name;
+                                    }
+                                }
+                                Option::None => {}
+                            }
+                            if name.is_empty() {
+                                out = inner;
+                            } else {
+                                out = send_fail(whole, name,
+                                    "carries a `\(types::show(inner.at(0).ty))`", true, inner);
+                            }
+                        }
+                        j = j + 1;
+                    }
+                    vi = vi + 1;
+                }
+            }
+        }
+        visiting.pop();
+        out
+    }
+
+    /// Diagnoses a failed `Send` bound.
+    ///
+    /// The generic "nothing implements it; write an impl" advice is wrong for a derived
+    /// trait: no program makes a type `Send` by writing an impl. What is actionable is the
+    /// field standing in the way.
+    fn report_not_send(self, b: Bound) {
+        let subject = types::prune(b.ty);
+        let mut code = b.code;
+        if code.is_empty() {
+            code = "E0700";
+        }
+        let mut what = b.what;
+        if what.is_empty() {
+            what = "cannot cross a thread boundary";
+        }
+        self.error(code, b.at, "`\(types::show(subject))` \(what)");
+    }
+}
+
+// --- Associated types ---------------------------------------------------------------------
+
+impl Checker {
+    /// Builds `T::Item`, finding which of T's bounds declares the member.
+    fn assoc_projection(self, at: ast::Span, r: resolve::Ref) -> types::Type {
+        let mut self_ty = types::error_type();
+        let mut bounds = no_bounds();
+
+        if r.base_kind == resolve::K_SELFTY {
+            if !self.env.has_self {
+                self.error("E0411", at, "`Self` is not available here");
+                return types::error_type();
+            }
+            self_ty = self.env.self_ty;
+            match self.env.self_trait {
+                Option::Some(ti) => {
+                    // Inside the trait that declares it, `Self::Item` refers to the
+                    // trait's own associated type.
+                    if contains_string(ti.assoc_types, r.member) {
+                        return types::Type::Assoc(ti.decl, r.member, self_ty);
+                    }
+                }
+                Option::None => {}
+            }
+            bounds = self.bounds_on(self_ty);
+        } else {
+            match self.env.params.get(r.name) {
+                Option::None => {
+                    self.error("E0412", at,
+                        "type parameter `\(r.name)` is not in scope here");
+                    return types::error_type();
+                }
+                Option::Some(p) => {
+                    self_ty = types::Type::ParamT(p);
+                    bounds = self.bounds_on(self_ty);
+                }
+            }
+        }
+
+        let mut i = 0;
+        while i < bounds.len() {
+            let b = bounds.at(i);
+            if contains_string(b.trait_info.assoc_types, r.member) {
+                return types::Type::Assoc(b.trait_info.decl, r.member, self_ty);
+            }
+            i = i + 1;
+        }
+        self.error("E0220", at, "cannot determine `\(r.name)::\(r.member)`");
+        types::error_type()
+    }
+
+    /// The declared bounds that apply to a rigid type in the current declaration.
+    fn bounds_on(self, t: types::Type) -> List[Bound] {
+        let out = no_bounds();
+        let mut i = 0;
+        while i < self.env.bounds.len() {
+            let b = self.env.bounds.at(i);
+            match types::unify(b.ty, t) {
+                Option::None => { out.push(b); }
+                Option::Some(_) => {}
+            }
+            i = i + 1;
+        }
+        out
+    }
+
+    /// Reduces every associated-type projection in a type, not only one at the top.
+    /// `Option[Self::Item]` is the ordinary shape -- `Iterator::next` returns one -- and a
+    /// caller that needs a concrete type needs the whole of it concrete.
+    fn normalize_deep(self, t: types::Type) -> types::Type {
+        match types::prune(t) {
+            types::Type::Assoc(tr, member, self_ty) => {
+                let reduced = self.normalize(
+                    types::Type::Assoc(tr, member, self.normalize_deep(self_ty)));
+                match types::prune(reduced) {
+                    // Irreducible: the self type is still rigid.
+                    types::Type::Assoc(_, _, _) => reduced,
+                    _ => self.normalize_deep(reduced),
+                }
+            }
+            types::Type::Named(d, args) => {
+                if args.is_empty() {
+                    return types::Type::Named(d, args);
+                }
+                types::Type::Named(d, self.normalize_deep_all(args))
+            }
+            types::Type::Tuple(elems) => types::Type::Tuple(self.normalize_deep_all(elems)),
+            types::Type::Func(params, ret) =>
+                types::Type::Func(self.normalize_deep_all(params), self.normalize_deep(ret)),
+            _ => types::prune(t),
+        }
+    }
+
+    fn normalize_deep_all(self, ts: List[types::Type]) -> List[types::Type] {
+        let out = list::new[types::Type]();
+        let mut i = 0;
+        while i < ts.len() {
+            out.push(self.normalize_deep(ts.at(i)));
+            i = i + 1;
+        }
+        out
+    }
+
+    /// Reduces an associated-type projection when the impl that defines it is known. An
+    /// unreduced projection is not an error: it stays symbolic while the self type is
+    /// still a rigid parameter.
+    fn normalize(self, t: types::Type) -> types::Type {
+        match types::prune(t) {
+            types::Type::Assoc(tr, member, proj_self) => {
+                let self_ty = self.normalize(proj_self);
+                match self_param_of(self_ty) {
+                    Option::Some(_) => return types::Type::Assoc(tr, member, self_ty),
+                    Option::None => {}
+                }
+                let cands = self.candidate_impls(self_ty);
+                let mut i = 0;
+                while i < cands.len() {
+                    let info = cands.at(i);
+                    match info.trait_info {
+                        Option::None => {}
+                        Option::Some(it) => {
+                            if ref_eq(it.decl, tr) {
+                                let inst = self.instantiate_impl_self(info);
+                                match types::unify(inst.self_ty, self_ty) {
+                                    Option::Some(_) => {}
+                                    Option::None => {
+                                        match info.assoc.get(member) {
+                                            Option::Some(def) =>
+                                                return self.normalize(
+                                                    types::substitute(def, inst.subst)),
+                                            Option::None => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    i = i + 1;
+                }
+                types::Type::Assoc(tr, member, self_ty)
+            }
+            _ => t,
+        }
+    }
+}
+
+// --- Pass 6: bodies -------------------------------------------------------------------------
+//
+// Not written yet, and it is blocked on the syntax tree rather than on the checker.
+//
+// Almost every type error is reported against an expression -- "expected `i64`, found
+// `String`" underlines the value, not the statement -- and this tree carries a span only on
+// the nodes name resolution reports at: a path, a binding's identifier, an assignment's
+// place, a `break`, a `continue` (ast.origin's header). Inference needs one on every
+// expression and every pattern, and needs them to fall where `internal/ast`'s do, or the
+// differential compares diagnostics that are right in different places.
+//
+// So the next step is the tree, not this file: wrap `Expr`, `Pat` and `Type` each in a
+// struct carrying its span and its kind, and set those spans where internal/parse sets
+// its own. Everything above this line -- declarations, traits, impls, coherence, bound
+// solving, `Send`, associated types -- needs no span it does not already have, which is
+// why it is written and this is not.
+
+impl Checker {
+    fn check_body_item(self, item: ast::Item) {
+        panic("unimplemented: checking a function body needs spans on expressions");
+    }
+}
