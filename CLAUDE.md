@@ -208,12 +208,26 @@ node resolved to, naming a declaration by the `<file>:<offset>` of its own name 
 bindings called `x` are the same only if they were declared in the same place.
 `internal/resolve/trace.go` is the Go side.
 
-**Next action:** type checking — `internal/check` is the next component, and the same trace
-shape should carry it (one line per inferred type, in order). Before that, two things found
-while writing the resolver are worth doing first, both cheap: `docs/deferred.md` records
-stage1's *parser* diagnostic wording as unaligned (positions and counts agree; the resolver's
-wording already matches exactly), and `stage1/src/` has no `check` subcommand because nothing
-checks types yet.
+**Next action: type checking.** It is the largest component left — `internal/check` is 4,900
+lines of Go over `internal/types`'s 1,000 — and it is a multi-session piece, so start it with
+the two decisions rather than the code.
+
+*The oracle.* Reuse the resolution trace's shape: **one line per event, in order**, since
+the checker's output is also side tables keyed by node id. One line per expression whose
+type is inferred, in traversal order, giving the type as text; plus a line at each
+generalization, each trait obligation discharged (naming the impl by its `<file>:<offset>`),
+and each monomorphized instance. Rendering a type as text is the only new problem, and it
+has the same answer the trace's declarations do: name a nominal type by where it was
+declared, not by a number.
+
+*The order.* `internal/types` (terms, unification, generalization) comes first and has no
+consumer of its own — so do not land it alone, or it is a field nothing reads, which is the
+failure mode this phase keeps finding. Land it together with enough of `internal/check` to
+type one expression end to end, and put the differential in the same commit.
+
+Two smaller things are done and no longer outstanding: stage1's parser diagnostics now match
+the Go compiler's word for word (as the resolver's already did), and `docs/deferred.md`
+records what that took.
 
 **What Phase 9 has found so far** — the same tell as Phase 8, and worth expecting again:
 every bug came from *running Origin*, not from reading Go.
