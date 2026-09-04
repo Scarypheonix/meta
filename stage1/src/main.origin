@@ -3,9 +3,10 @@
 // It is deliberately shaped like `cmd/originc`'s, because the two are meant to become
 // interchangeable: the same subcommand names, the same exit statuses (0 succeeded, 1 the
 // program was rejected, 2 the command line was wrong), and diagnostics that name a place
-// the same way. What it can do is what stage1 can do -- lexing, parsing, and reporting
-// where either one failed. Name resolution and type checking are not written yet, so
-// there is no `check` that checks types and none is pretended (process rule 8).
+// the same way. What it can do is what stage1 can do -- lexing, parsing, name resolution,
+// type checking and monomorphization -- either one file at a time or, with `--package`,
+// a whole package the way a compiler actually compiles one. What it cannot do yet, emit
+// code, it does not pretend to (process rule 8): there is no `run` and no `build`.
 
 use std::io;
 use std::list;
@@ -16,6 +17,7 @@ use ast;
 use parse;
 use resolve;
 use check;
+use mono;
 
 const USAGE: String = "usage: stage1 <command> <file>...
 
@@ -27,6 +29,17 @@ commands:
                 first as the prelude, and print the resolution trace
   check         resolve and type-check each file after the first the same way,
                 and print the inference trace
+  mono          check each file after the first the same way and print the
+                monomorphization trace: which copy of each generic function the
+                program needs, and which copy every call site reaches
+
+`resolve`, `check` and `mono` also take
+
+  <prelude> --package <root> <file>...
+
+which makes every file one module of a *single* package rather than a package of
+its own, taking each module path from where the file sits under <root>. The files
+are named rather than found because listing a directory is not written yet.
 
 exit status:
   0    success
@@ -48,17 +61,17 @@ fn main() {
     }
     let command = argv.at(1);
     if command != "dump-tokens" && command != "dump-ast" && command != "parse"
-        && command != "resolve" && command != "check" {
+        && command != "resolve" && command != "check" && command != "mono" {
         io::println("stage1: unknown command `\(command)`");
         io::println(USAGE);
         process::exit(2);
     }
 
-    // `resolve` and `check` are whole-package commands: a module cannot be resolved
-    // without the ones it imports (spec/07-modules.md), and nothing can be checked before
-    // it is resolved.
-    if command == "resolve" || command == "check" {
-        if !run_package(argv, command == "check") {
+    // `resolve`, `check` and `mono` are whole-package commands: a module cannot be
+    // resolved without the ones it imports (spec/07-modules.md), nothing can be checked
+    // before it is resolved, and nothing can be monomorphized before it is checked.
+    if command == "resolve" || command == "check" || command == "mono" {
+        if !run_package(argv, command) {
             process::exit(1);
         }
         return;
@@ -92,12 +105,20 @@ const PRELUDE_NAME: String = "<prelude>";
 /// `originc check <file>` compiles in and the shape the differential compares: two files
 /// that both declare `main` are not a package. The prelude is parsed once and shared,
 /// since resolution does not write into the tree.
-fn run_package(argv: List[String], typed: bool) -> bool {
+fn run_package(argv: List[String], command: String) -> bool {
+    let typed = command == "check" || command == "mono";
     if argv.len() < 4 {
         io::println("stage1: this command takes the prelude and at least one file");
         return false;
     }
     let prelude_path = argv.at(2);
+    if argv.len() > 4 && argv.at(3) == "--package" {
+        if argv.len() < 6 {
+            io::println("stage1: `--package` takes a source root and at least one file");
+            return false;
+        }
+        return run_one_package(argv, command, prelude_path);
+    }
     let mut prelude_tree = ast::File { uses: list::new[ast::Use](), items: list::new[ast::Item]() };
     match read_to_string(prelude_path) {
         Result::Err(e) => {
@@ -131,15 +152,31 @@ fn run_package(argv: List[String], typed: bool) -> bool {
                 let resolved = resolve::program(inputs);
                 // The resolution trace is `resolve`'s output; `check`'s is the inference
                 // trace, and printing both would be two answers to one question.
-                if !report_resolution(resolved, !typed) {
+                if !report_resolution(resolved, command == "resolve") {
                     ok = false;
                 } else {
                     if typed {
                         let units = list::new[check::Unit]();
                         units.push(check::Unit { file: PRELUDE_NAME, tree: prelude_tree });
                         units.push(check::Unit { file: path, tree: tree });
-                        if !report_check(check::program(resolved, units)) {
+                        let checked = check::program(resolved, units);
+                        if !report_check(checked, command == "check") {
                             ok = false;
+                        } else {
+                            if command == "mono" {
+                                // Monomorphization runs as part of deciding a program's
+                                // legality (ADR-0010): a polymorphic-recursion chain past
+                                // the depth limit is E0055, and `check` must reach the same
+                                // verdict as `run`.
+                                let munits = list::new[mono::Unit]();
+                                munits.push(mono::Unit {
+                                    file: PRELUDE_NAME, tree: prelude_tree,
+                                });
+                                munits.push(mono::Unit { file: path, tree: tree });
+                                if !report_mono(mono::program(checked, munits)) {
+                                    ok = false;
+                                }
+                            }
                         }
                     }
                 }
@@ -148,6 +185,157 @@ fn run_package(argv: List[String], typed: bool) -> bool {
         i = i + 1;
     }
     ok
+}
+
+// --- One package of many files -----------------------------------------------------------
+//
+// The shape a compiler actually compiles in, and the shape stage1 has to reach to compile
+// itself: every file after the source root is one module of a single package, its module
+// path taken from where it sits under that root (spec/07-modules.md -- the filesystem is
+// the module tree). The root is passed rather than discovered because listing a directory
+// is Phase 10 (docs/deferred.md); the caller already knows every file it wants.
+
+fn run_one_package(argv: List[String], command: String, prelude_path: String) -> bool {
+    let root = argv.at(4);
+    let mut prelude_tree = ast::File { uses: list::new[ast::Use](), items: list::new[ast::Item]() };
+    match read_to_string(prelude_path) {
+        Result::Err(e) => {
+            io::println("stage1: cannot read \(prelude_path): \(e.to_str())");
+            return false;
+        }
+        Result::Ok(src) => {
+            prelude_tree = parse::parse(lex::lex(src).tokens).file;
+        }
+    }
+
+    let paths = list::new[String]();
+    let modules = list::new[String]();
+    let mut i = 5;
+    while i < argv.len() {
+        paths.push(argv.at(i));
+        modules.push(module_path(argv.at(i), root));
+        i = i + 1;
+    }
+    // The root module first, then the rest by module path, so that the unit order does not
+    // depend on the order the command line happened to list them in.
+    sort_units(paths, modules);
+
+    io::println("== \(root)");
+    let trees = list::new[ast::File]();
+    let inputs = list::new[resolve::Input]();
+    inputs.push(resolve::Input {
+        file: PRELUDE_NAME, module: "", tree: prelude_tree, prelude: true,
+    });
+    let mut u = 0;
+    while u < paths.len() {
+        match read_to_string(paths.at(u)) {
+            Result::Err(e) => {
+                io::println("stage1: cannot read \(paths.at(u)): \(e.to_str())");
+                return false;
+            }
+            Result::Ok(src) => {
+                let tree = parse::parse(lex::lex(src).tokens).file;
+                trees.push(tree);
+                inputs.push(resolve::Input {
+                    file: paths.at(u), module: modules.at(u), tree: tree, prelude: false,
+                });
+            }
+        }
+        u = u + 1;
+    }
+
+    let resolved = resolve::program(inputs);
+    if !report_resolution(resolved, command == "resolve") {
+        return false;
+    }
+    if !typed_command(command) {
+        return true;
+    }
+    let units = list::new[check::Unit]();
+    units.push(check::Unit { file: PRELUDE_NAME, tree: prelude_tree });
+    let mut k = 0;
+    while k < trees.len() {
+        units.push(check::Unit { file: paths.at(k), tree: trees.at(k) });
+        k = k + 1;
+    }
+    let checked = check::program(resolved, units);
+    if !report_check(checked, command == "check") {
+        return false;
+    }
+    if command != "mono" {
+        return true;
+    }
+    let munits = list::new[mono::Unit]();
+    munits.push(mono::Unit { file: PRELUDE_NAME, tree: prelude_tree });
+    let mut m = 0;
+    while m < trees.len() {
+        munits.push(mono::Unit { file: paths.at(m), tree: trees.at(m) });
+        m = m + 1;
+    }
+    report_mono(mono::program(checked, munits))
+}
+
+fn typed_command(command: String) -> bool { command == "check" || command == "mono" }
+
+/// A path under the source root becomes a module path: `resolve.origin` is `resolve`,
+/// `a/b.origin` is `a::b`, and `main.origin` or `lib.origin` at the root is the root
+/// module itself.
+fn module_path(path: String, root: String) -> String {
+    let mut rel = path;
+    if root != "" && rel.starts_with(root) {
+        rel = rel.slice(root.len(), rel.len());
+    }
+    while rel.starts_with("/") {
+        rel = rel.slice(1, rel.len());
+    }
+    if rel.ends_with(".origin") {
+        rel = rel.slice(0, rel.len() - 7);
+    }
+    if rel == "main" || rel == "lib" {
+        return "";
+    }
+    replace_all(rel, "/", "::")
+}
+
+fn replace_all(s: String, from: String, to: String) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < s.len() {
+        if i + from.len() <= s.len() && s.slice(i, i + from.len()) == from {
+            out = "\(out)\(to)";
+            i = i + from.len();
+        } else {
+            out = "\(out)\(s.slice(i, i + 1))";
+            i = i + 1;
+        }
+    }
+    out
+}
+
+/// Sorts the units the way `internal/driver` does: the root module first, then by module
+/// path. Both lists are permuted together, since a unit is a path and a module path.
+fn sort_units(paths: List[String], modules: List[String]) {
+    let mut i = 1;
+    while i < modules.len() {
+        let pm = modules.at(i);
+        let pp = paths.at(i);
+        let mut j = i;
+        while j > 0 && unit_before(pm, modules.at(j - 1)) {
+            modules.set(j, modules.at(j - 1));
+            paths.set(j, paths.at(j - 1));
+            j = j - 1;
+        }
+        modules.set(j, pm);
+        paths.set(j, pp);
+        i = i + 1;
+    }
+}
+
+fn unit_before(a: String, b: String) -> bool {
+    if (a == "") != (b == "") {
+        return a == "";
+    }
+    str_less(a, b)
 }
 
 /// Compares two strings the way Go's `<` does: byte by byte, and on a shared prefix
@@ -195,7 +383,41 @@ fn sort_by[T](xs: List[T], less: fn(T, T) -> bool) {
     }
 }
 
-fn report_check(out: check::Checked) -> bool {
+fn report_check(out: check::Checked, with_trace: bool) -> bool {
+    let errors = out.errors;
+    sort_by(errors, |a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
+    let mut e = 0;
+    while e < errors.len() {
+        let err = errors.at(e);
+        io::println("error \(err.code) \(err.file):\(err.start):\(err.end): \(err.message)");
+        e = e + 1;
+    }
+    if with_trace {
+        let mut t = 0;
+        while t < out.trace.len() {
+            io::println(out.trace.at(t));
+            t = t + 1;
+        }
+    }
+    // A warning is printed and then stepped over: the program compiles, the passes after
+    // this one run, and the exit status is success. Counting diagnostics rather than
+    // errors here made `stage1 check` reject a program `originc check` accepts.
+    !any_error(errors)
+}
+
+/// Whether any of these diagnostics stops compilation.
+fn any_error(errors: List[check::CheckError]) -> bool {
+    let mut i = 0;
+    while i < errors.len() {
+        if !errors.at(i).warning {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn report_mono(out: mono::Result) -> bool {
     let errors = out.errors;
     sort_by(errors, |a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
     let mut e = 0;

@@ -176,6 +176,16 @@ pub struct Expr {
     /// type whether the closure captured a mutable counter or an immutable one, and
     /// `Send` turns on exactly that (spec/12-concurrency.md).
     pub mut captures: i64,
+    /// Where the checker files the instantiation a call site needs; -1 on every
+    /// expression that is not one. It is `captures` one pass later, and it is here for
+    /// the same reason: monomorphization has to ask what copy of the callee this call
+    /// reaches, and there is no node id to key a side table by.
+    ///
+    /// Three expressions carry one -- a path naming a function, a method call, and a
+    /// `for` loop, whose `next` is a call the source never wrote. The loop's *other*
+    /// implicit call needs `iter_inst`, because both hang off the one node.
+    pub mut inst: i64,
+    pub mut iter_inst: i64,
 }
 
 pub enum ExprKind {
@@ -211,7 +221,7 @@ pub enum ExprKind {
 }
 
 pub fn expr(span: Span, node: ExprKind) -> Expr {
-    Expr { span: span, node: node, captures: UNRESOLVED }
+    Expr { span: span, node: node, captures: UNRESOLVED, inst: UNRESOLVED, iter_inst: UNRESOLVED }
 }
 
 // --- Statements ----------------------------------------------------------------------

@@ -4,8 +4,8 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Phases 0 through 8 are complete** (see `docs/phases/`). Phase 9 has not started, and
-its scope is the user's to set.
+**Phases 0 through 8 are complete** (see `docs/phases/`). **Phase 9 is in progress** — see
+Status, at the bottom of this file, for what exists and what is next.
 
 ---
 
@@ -77,7 +77,8 @@ docs/phases/          N-complete.md, written at each phase gate
 docs/deferred.md      everything deliberately left out, each tagged with a phase
 stage1/src/           from Phase 9: the compiler for Origin, written in Origin --
                       lex.origin, ast.origin, parse.origin, source.origin,
-                      resolve.origin and main.origin (its own command line) so far
+                      resolve.origin, types.origin, check.origin, mono.origin and
+                      main.origin (its own command line) so far
 bootstrap/            from Phase 9: the last known-good stage1 binary
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```
@@ -184,18 +185,25 @@ This project outlasts any single context window.
 ## Status
 
 **Phase 9 is in progress.** Its scope is **self-hosting**: a compiler for Origin, written
-in Origin. What exists in `stage1/src/` is the front end through **type checking** --
+in Origin. What exists in `stage1/src/` is the front end through **monomorphization** --
 `lex.origin`, `ast.origin`, `parse.origin`, `source.origin`, `resolve.origin`,
-`types.origin`, `check.origin` -- and `main.origin`, which makes stage1 an actual
-command-line program (`stage1 dump-tokens|dump-ast|parse|resolve|check <file>...`) shaped
-like `cmd/originc`'s. That is about 12,600 lines of Origin, and every component is held to
-the Go one it replaces over this repository's own ~400 `.origin` files, all in
-`tests/selfhost`: the token stream against `internal/lex`, the dumped syntax tree against
-`internal/ast`, the position mapping against `internal/source`, the *places* syntax errors
-are reported against `internal/lex` + `internal/parse`, resolution against
-`internal/resolve` (397 packages, 744,896 trace lines), and inference against
-`internal/check` — **399 packages, 1,647,768 trace lines, byte-identical on all three
-engines**, diagnostics and their spans included.
+`types.origin`, `check.origin`, `mono.origin` -- and `main.origin`, which makes stage1 an
+actual command-line program (`stage1 dump-tokens|dump-ast|parse|resolve|check|mono
+<file>...`, plus `--package <root>` for a whole package) shaped like `cmd/originc`'s. That
+is about 13,200 lines of Origin, and every component is held to the Go one it replaces over
+this repository's own ~400 `.origin` files, all in `tests/selfhost`: the token stream
+against `internal/lex`, the dumped syntax tree against `internal/ast`, the position mapping
+against `internal/source`, the *places* syntax errors are reported against `internal/lex` +
+`internal/parse`, resolution against `internal/resolve` (397 packages, 744,896 trace
+lines), inference against `internal/check` — **399 packages, 1,647,768 trace lines,
+byte-identical on all three engines** — and the instantiation set against `internal/mono`.
+
+**stage1 now monomorphizes its own source.** `stage1/src` compiled as one package, with the
+prelude, gives 7,225 trace lines identical to the Go compiler's, which is the closest the
+project has come to self-compilation: the corpus files are each compiled alone, so a module
+that imports its siblings never gets past name resolution there, and most of stage1 is such
+a module. Compiling them as one package is what exercises the generic machinery stage1 is
+actually built out of.
 
 The language grew what a compiler cannot be written without: **the command line and the
 exit status** (`docs/spec/17-process.md`) — `args()` in the prelude over `env::arg_count`
@@ -208,21 +216,38 @@ tree with no node ids, so both compilers emit **one line per event, in order**, 
 *sequence* is what is compared. A line's position identifies the node; what it says
 identifies what the node became, naming a declaration by the `<file>:<offset>` of its own
 name so that two things called `x` are the same only if they were written in the same
-place. `internal/resolve/trace.go` and `internal/check/trace.go` are the Go sides. The
-checker's differs in one way worth knowing before writing another: an entry is rendered at
-the **end** of the run, not when it is made, because a type recorded mid-body is usually an
-unsolved variable that later unification binds and end-of-body defaulting resolves —
-printing at record time compares the checker's intermediate state instead of its answer.
+place. `internal/resolve/trace.go`, `internal/check/trace.go` and `internal/mono/trace.go`
+are the Go sides. Two of them differ from the first in a way worth knowing before writing
+another. The checker's entries are rendered at the **end** of the run, not when they are
+made, because a type recorded mid-body is usually an unsolved variable that later
+unification binds and end-of-body defaulting resolves — printing at record time compares the
+checker's intermediate state instead of its answer. The monomorphizer's names a copy by the
+**number** it was created at rather than by its name, because a name is not an identity: two
+declarations in different modules may share one, and what the trace has to pin is that two
+call sites reaching the same copy say the same thing.
 
-**Next action: the back half of the compiler**, which is roughly 22,000 lines of Go and
-several sessions' work. Its natural order is `internal/mono` (528 lines) -> `internal/compile`
-(2,377) -> `internal/bytecode` (292) first, since that reaches a *running* stage1-compiled
-program on the VM without touching machine code; then `internal/ir` (1,800) and
-`internal/opt` (1,338); then `internal/x86` (722), `internal/obj` (1,135) and
-`internal/backend` (7,064), with `layout`, `arith`, `dwarf` and `codesign` (1,479 between
-them) pulled in as their consumers need them. The oracle for the first stretch is not a
-trace but the thing itself: `dump-bytecode` already exists on the Go side, and two
-compilers that emit the same bytecode for the same input are comparable directly.
+The tree also grew the two slots monomorphization reads (`Expr.inst`, `Expr.iter_inst`),
+which is where stage1 keeps what `internal/check` keeps in a map keyed by `ast.NodeID`. The
+rule `ast.origin` states — a slot arrives when a reader does — is why they landed in the
+same commit as the reader.
+
+**Next action: `internal/compile` (2,377 lines) and `internal/bytecode` (292)**, which
+together reach a *running* stage1-compiled program on the VM without touching machine code.
+Everything they read is now in place: `mono.origin` says which copy of each function to emit
+and which copy each call site reaches, and `check.origin` says what type every expression
+has. After that come `internal/ir` (1,800) and `internal/opt` (1,338), then `internal/x86`
+(722), `internal/obj` (1,135) and `internal/backend` (7,064), with `layout`, `arith`,
+`dwarf` and `codesign` (1,479 between them) pulled in as their consumers need them —
+roughly 20,000 lines of Go still to translate.
+
+The oracle changes here, and for the better: it stops being a trace and becomes the artefact.
+`originc dump-bytecode` already exists, and two compilers that emit the same bytecode for the
+same input are comparable directly, with no invented format in between. One hazard is visible
+from here: the disassembler renders a string constant with Go's `%q`, so every string literal
+in the program goes through `strconv.Quote`. stage1 needs the same quoting or the dump format
+needs to stop depending on it — the parser differential already has one unreachable
+divergence of exactly that shape (`docs/deferred.md`), and here it would be reachable on the
+first program with a tab in a literal.
 
 **What Phase 9 has found so far** — the same tell as Phase 8, and worth expecting again:
 every bug came from *running Origin*, not from reading Go.
@@ -249,6 +274,13 @@ every bug came from *running Origin*, not from reading Go.
   the first of a duplicated name wins. The degenerate input is the most valuable file in
   the corpus, and a fourth case of the same thing — `checkBodies` visiting an impl's methods
   in map order — was found the same way.
+- **stage1 treated a warning as an error.** `check.origin` filed W0001 in the same list as
+  the errors with nothing to tell them apart, so `stage1 check` rejected a program
+  `originc check` accepts and the passes after checking never ran. Invisible to the check
+  differential, which compares the diagnostic *lines* and not the exit status — it only
+  surfaced when monomorphization was wired in behind the same test and one corpus file
+  stopped producing a trace. A diagnostic now carries its severity, and the reporter counts
+  errors rather than diagnostics, which is what `diag.Bag.HasErrors` has always done.
 - **A lambda passed as a call argument had no type in `ExprTypes`.** `inferArgs` checks
   lambdas last, on purpose (ADR-0010: unifying the ordinary arguments first is what gives
   `m.with(|v| v.get())` a known receiver), and that path called `inferLambdaExpecting`

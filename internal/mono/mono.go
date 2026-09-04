@@ -51,6 +51,7 @@ type Instance struct {
 	IterCalls map[ast.NodeID]*Instance
 
 	key    string
+	index  int
 	depth  int
 	parent *Instance
 }
@@ -90,13 +91,23 @@ type walker struct {
 	tys   *check.Result
 	out   *Result
 	queue []*Instance
+	trace *[]string
 }
 
 // Program computes the instantiation set of a checked program.
 func Program(bag *diag.Bag, tys *check.Result, files ...*ast.File) *Result {
+	out, _ := program(bag, tys, false, files...)
+	return out
+}
+
+func program(bag *diag.Bag, tys *check.Result, traced bool, files ...*ast.File) (*Result, []string) {
+	var lines []string
 	w := &walker{
 		bag: bag, tys: tys,
 		out: &Result{byKey: map[string]*Instance{}},
+	}
+	if traced {
+		w.trace = &lines
 	}
 
 	// Every function that is not generic is a root: it is compiled whether or not
@@ -132,9 +143,11 @@ func Program(bag *diag.Bag, tys *check.Result, files ...*ast.File) *Result {
 	for len(w.queue) > 0 {
 		inst := w.queue[0]
 		w.queue = w.queue[1:]
+		w.noteBody(inst)
 		w.walkBody(inst)
 	}
-	return w.out
+	w.noteEntry()
+	return w.out, lines
 }
 
 // isPrelude reports whether an item was declared in the prelude, by the file its span
@@ -186,12 +199,14 @@ func (w *walker) instance(decl *ast.FnDecl, params []*types.Param, args []types.
 		Calls:     map[ast.NodeID]*Instance{},
 		IterCalls: map[ast.NodeID]*Instance{},
 		key:       key,
+		index:     len(w.out.Instances),
 		depth:     depth,
 		parent:    from,
 	}
 	w.out.byKey[key] = inst
 	w.out.Instances = append(w.out.Instances, inst)
 	w.queue = append(w.queue, inst)
+	w.noteInstance(inst)
 	return inst
 }
 
@@ -205,11 +220,13 @@ func (w *walker) walkBody(inst *Instance) {
 		if ci, ok := w.tys.Insts[n.NodeID()]; ok {
 			if target := w.resolve(inst, ci, n.Span()); target != nil {
 				inst.Calls[n.NodeID()] = target
+				w.noteCall("call", n.Span(), target)
 			}
 		}
 		if ci, ok := w.tys.IterInsts[n.NodeID()]; ok {
 			if target := w.resolve(inst, ci, n.Span()); target != nil {
 				inst.IterCalls[n.NodeID()] = target
+				w.noteCall("iter", n.Span(), target)
 			}
 		}
 		return true

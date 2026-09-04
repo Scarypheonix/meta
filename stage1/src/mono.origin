@@ -1,0 +1,625 @@
+// Monomorphization: which specialized copy of each generic function a program needs, and
+// which copy every call site reaches.
+//
+// A translation of `internal/mono`. ADR-0010 chose monomorphization over dictionaries, so
+// this is where a type variable stops existing: the bytecode compiler emits one function
+// per instance and looks a call site up here, and the native backend never sees a type
+// parameter at all.
+//
+// It runs as part of checking rather than of code generation, because rejecting
+// polymorphic recursion (E0055, spec/06-traits-generics.md) is a decision about whether a
+// program is legal, and `check` must reach the same verdict as `run`.
+//
+// The one thing that is shaped differently from the Go original is how a call site is
+// identified. `internal/mono` keys an instance's call table by `ast.NodeID`; this tree has
+// none, so it keys by the index the checker filed on the expression -- `e.inst`, which is
+// unique per call site because the checker allocates one entry per site. That is the same
+// identity by a different route, and it is available precisely because the checker had to
+// invent one for itself.
+
+use std::list;
+use std::map;
+use std::str;
+
+use ast;
+use check;
+use types;
+
+/// The instantiation chain's depth limit. Polymorphic recursion -- a generic function that
+/// calls itself at a strictly larger type -- has an infinite instantiation set, and the
+/// depth limit is how spec/06-traits-generics.md says to detect it.
+const MAX_DEPTH: i64 = 64;
+
+/// One specialized copy of a function.
+pub struct Instance {
+    pub decl: ast::FnDecl,
+    /// The types its generic parameters were instantiated at, parallel to the callee's
+    /// `FnSig.generics`. Empty for a function that is not generic, which therefore has
+    /// exactly one instance.
+    pub args: List[types::Type],
+    /// Each of those parameters mapped to its type. Compiling the body reads types from
+    /// the checker's tables and substitutes through this, so every type the code generator
+    /// sees is concrete.
+    pub subst: types::Subst,
+    /// What the instance is called in a bytecode dump: `max2[Money]`.
+    pub name: String,
+    /// A call site inside this body, by its `inst` index, mapped to the copy it reaches.
+    /// A site with no entry is one no copy can be named for: a method whose impl the
+    /// compiler provides, which the code generator lowers to a builtin.
+    pub calls: Map[i64, i64],
+    /// A `for` loop's `into_iter`, by its `iter_inst` index. It is a table of its own
+    /// because the loop's other implicit call, `next`, hangs off the same expression.
+    pub iter_calls: Map[i64, i64],
+
+    pub index: i64,
+    depth: i64,
+    /// The copy whose body needed this one, or -1 for a root. It is what the depth
+    /// diagnostic walks back up.
+    parent: i64,
+}
+
+pub struct MonoError {
+    pub code: String,
+    pub message: String,
+    pub file: String,
+    pub start: i64,
+    pub end: i64,
+}
+
+/// The whole program's instantiation set.
+pub struct Result {
+    /// The roots in declaration order, then each instance the walk discovered, in the
+    /// order it discovered it.
+    pub instances: List[Instance],
+    /// The copy of `main`, or -1 when the program has none.
+    pub entry: i64,
+    pub trace: List[String],
+    pub errors: List[MonoError],
+}
+
+/// One file to monomorphize, in the order the checker saw it.
+pub struct Unit {
+    pub file: String,
+    pub tree: ast::File,
+}
+
+struct Walker {
+    tys: check::Checked,
+    instances: List[Instance],
+    by_key: Map[String, i64],
+    queue: List[i64],
+    mut head: i64,
+    mut entry: i64,
+    trace: List[String],
+    errors: List[MonoError],
+    /// The file whose declarations are being rooted, for a diagnostic's own span.
+    mut file: String,
+}
+
+/// Computes the instantiation set of a checked program.
+pub fn program(tys: check::Checked, units: List[Unit]) -> Result {
+    let w = Walker {
+        tys: tys,
+        instances: list::new[Instance](),
+        by_key: map::new[String, i64](),
+        queue: list::new[i64](),
+        head: 0,
+        entry: ast::UNRESOLVED,
+        trace: list::new[String](),
+        errors: list::new[MonoError](),
+        file: "",
+    };
+
+    // Every function that is not generic is a root: it is compiled whether or not anything
+    // calls it, exactly as before monomorphization existed. A generic function has no code
+    // of its own and appears only through a call site.
+    let mut u = 0;
+    while u < units.len() {
+        let unit = units.at(u);
+        w.file = unit.file;
+        let mut i = 0;
+        while i < unit.tree.items.len() {
+            w.root_item(unit.tree.items.at(i));
+            i = i + 1;
+        }
+        u = u + 1;
+    }
+
+    while w.head < w.queue.len() {
+        let at = w.queue.at(w.head);
+        w.head = w.head + 1;
+        w.trace.push("body \(at)");
+        w.walk_body(at);
+    }
+    if w.entry < 0 {
+        w.trace.push("entry none");
+    } else {
+        w.trace.push("entry \(w.entry)");
+    }
+    Result {
+        instances: w.instances, entry: w.entry, trace: w.trace, errors: w.errors,
+    }
+}
+
+impl Walker {
+    fn root_item(self, item: ast::Item) {
+        match item {
+            ast::Item::Fn(v) => { self.root(v); }
+            ast::Item::Impl(v) => {
+                let mut i = 0;
+                while i < v.methods.len() {
+                    self.root(v.methods.at(i));
+                    i = i + 1;
+                }
+            }
+            ast::Item::Trait(v) => {
+                let mut i = 0;
+                while i < v.methods.len() {
+                    self.root(v.methods.at(i));
+                    i = i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn root(self, decl: ast::FnDecl) {
+        // The prelude is a library, not a program: a declaration in it is compiled because
+        // something reaches it, and one nothing reaches is not compiled at all. Rooting it
+        // the way a user's own declaration is rooted was free while the prelude's
+        // non-generic items were a handful, and stopped being free the moment it grew --
+        // every program, string-free ones included, carried `impl Str for String`'s six
+        // methods and the UTF-8 validator behind `read_to_string`.
+        if decl.file == check::PRELUDE_NAME {
+            return;
+        }
+        if decl.body.is_none() {
+            return;
+        }
+        match self.sig_of(decl) {
+            Option::None => return,
+            Option::Some(sig) => {
+                if !sig.generics.is_empty() {
+                    return;
+                }
+            }
+        }
+        let at = self.instance(decl, no_args(), ast::UNRESOLVED, ast::Span { start: 0, end: 0 });
+        if at >= 0 && decl.name.name == "main" && decl.self_param.is_none()
+            && self.entry < 0 {
+            self.entry = at;
+        }
+    }
+
+    /// Finds or creates the copy of `decl` for one tuple of type arguments, reporting
+    /// where it is filed or -1 when the depth limit rejected it.
+    fn instance(self, decl: ast::FnDecl, args: List[types::Type], from: i64,
+                at: ast::Span) -> i64 {
+        let key = instance_key(decl, args);
+        match self.by_key.get(key) {
+            Option::Some(found) => return found,
+            Option::None => {}
+        }
+
+        let mut depth = 0;
+        if from >= 0 {
+            depth = self.instances.at(from).depth;
+            if !args.is_empty() {
+                depth = depth + 1;
+            }
+        }
+        if depth > MAX_DEPTH {
+            self.report_depth(decl, args, from, at);
+            return ast::UNRESOLVED;
+        }
+
+        let subst = types::new_subst();
+        let params = self.generics_of(decl);
+        let mut i = 0;
+        while i < params.len() && i < args.len() {
+            subst.set(params.at(i), args.at(i));
+            i = i + 1;
+        }
+        let index = self.instances.len();
+        self.instances.push(Instance {
+            decl: decl, args: args, subst: subst, name: instance_name(decl, args),
+            calls: map::new[i64, i64](), iter_calls: map::new[i64, i64](),
+            index: index, depth: depth, parent: from,
+        });
+        self.by_key.insert(key, index);
+        self.queue.push(index);
+        self.trace.push("instance \(index) \(instance_name(decl, args)) \(decl_site(decl))");
+        index
+    }
+
+    /// The generic parameters a function's body may mention, in the one fixed order the
+    /// checker's `FnSig.generics` records.
+    fn generics_of(self, decl: ast::FnDecl) -> List[types::Param] {
+        match self.sig_of(decl) {
+            Option::None => list::new[types::Param](),
+            Option::Some(sig) => sig.generics,
+        }
+    }
+
+    fn sig_of(self, decl: ast::FnDecl) -> Option[check::FnSig] {
+        if decl.info < 0 || decl.info >= self.tys.sigs.len() {
+            return Option::None;
+        }
+        Option::Some(self.tys.sigs.at(decl.info))
+    }
+
+    fn inst_at(self, at: i64) -> Option[check::Inst] {
+        if at < 0 || at >= self.tys.insts.len() {
+            return Option::None;
+        }
+        Option::Some(self.tys.insts.at(at))
+    }
+}
+
+// --- The walk ---------------------------------------------------------------------------
+//
+// A pre-order traversal in source order, which is what `ast.Inspect` gives the Go
+// monomorphizer. Only expressions carry an instantiation, but the walk goes through
+// patterns too: a literal pattern holds an expression, and where it falls decides the
+// order every later call site is discovered in.
+
+impl Walker {
+    fn walk_body(self, at: i64) {
+        match self.instances.at(at).decl.body {
+            Option::None => {}
+            Option::Some(body) => self.walk_expr(at, body),
+        }
+    }
+
+    fn walk_expr(self, at: i64, e: ast::Expr) {
+        // `Insts` before `IterInsts`, the order the Go walk asks the two tables in.
+        self.resolve_call(at, "call", e.inst, e.span);
+        self.resolve_call(at, "iter", e.iter_inst, e.span);
+
+        match e.node {
+            ast::ExprKind::StructLit(p, targs, fields) => {
+                let mut i = 0;
+                while i < fields.len() {
+                    self.walk_expr(at, fields.at(i).value);
+                    i = i + 1;
+                }
+            }
+            ast::ExprKind::Tuple(elems) => self.walk_exprs(at, elems),
+            ast::ExprKind::Lambda(params, ret, body) => {
+                let mut i = 0;
+                while i < params.len() {
+                    self.walk_pat(at, params.at(i).pat);
+                    i = i + 1;
+                }
+                self.walk_expr(at, body);
+            }
+            ast::ExprKind::Block(b) => {
+                let mut i = 0;
+                while i < b.stmts.len() {
+                    self.walk_stmt(at, b.stmts.at(i));
+                    i = i + 1;
+                }
+                match b.tail {
+                    Option::Some(t) => self.walk_expr(at, t),
+                    Option::None => {}
+                }
+            }
+            ast::ExprKind::If(cond, then, els) => {
+                self.walk_expr(at, cond);
+                self.walk_expr(at, then);
+                match els {
+                    Option::Some(x) => self.walk_expr(at, x),
+                    Option::None => {}
+                }
+            }
+            ast::ExprKind::Match(scrut, arms) => {
+                self.walk_expr(at, scrut);
+                let mut i = 0;
+                while i < arms.len() {
+                    let arm = arms.at(i);
+                    self.walk_pat(at, arm.pat);
+                    match arm.guard {
+                        Option::Some(g) => self.walk_expr(at, g),
+                        Option::None => {}
+                    }
+                    self.walk_expr(at, arm.body);
+                    i = i + 1;
+                }
+            }
+            ast::ExprKind::While(cond, body) => {
+                self.walk_expr(at, cond);
+                self.walk_expr(at, body);
+            }
+            ast::ExprKind::For(p, iter, body) => {
+                self.walk_pat(at, p);
+                self.walk_expr(at, iter);
+                self.walk_expr(at, body);
+            }
+            ast::ExprKind::Loop(body) => self.walk_expr(at, body),
+            ast::ExprKind::Break(v) => {
+                match v {
+                    Option::Some(x) => self.walk_expr(at, x),
+                    Option::None => {}
+                }
+            }
+            ast::ExprKind::Return(v) => {
+                match v {
+                    Option::Some(x) => self.walk_expr(at, x),
+                    Option::None => {}
+                }
+            }
+            ast::ExprKind::Unary(op, x) => self.walk_expr(at, x),
+            ast::ExprKind::Binary(op, l, r) => {
+                self.walk_expr(at, l);
+                self.walk_expr(at, r);
+            }
+            ast::ExprKind::Assign(op, place, value) => {
+                self.walk_expr(at, place);
+                self.walk_expr(at, value);
+            }
+            ast::ExprKind::Cast(x, t) => self.walk_expr(at, x),
+            ast::ExprKind::Call(f, args) => {
+                self.walk_expr(at, f);
+                self.walk_exprs(at, args);
+            }
+            ast::ExprKind::Method(name, recv, args) => {
+                self.walk_expr(at, recv);
+                self.walk_exprs(at, args);
+            }
+            ast::ExprKind::Field(name, recv) => self.walk_expr(at, recv),
+            ast::ExprKind::Try(x) => self.walk_expr(at, x),
+            _ => {}
+        }
+    }
+
+    fn walk_exprs(self, at: i64, es: List[ast::Expr]) {
+        let mut i = 0;
+        while i < es.len() {
+            self.walk_expr(at, es.at(i));
+            i = i + 1;
+        }
+    }
+
+    fn walk_stmt(self, at: i64, s: ast::Stmt) {
+        match s {
+            ast::Stmt::Let(mutable, p, ty, value) => {
+                self.walk_pat(at, p);
+                self.walk_expr(at, value);
+            }
+            ast::Stmt::ExprStmt(x, semi) => self.walk_expr(at, x),
+            // A nested item's own body is walked as part of the enclosing one, which is
+            // what `ast.Inspect` does with it. A struct or an enum declared in a body is
+            // rejected later (docs/deferred.md); a nested function has nowhere else to be
+            // walked from.
+            ast::Stmt::ItemStmt(it) => self.walk_item(at, it),
+        }
+    }
+
+    fn walk_item(self, at: i64, it: ast::Item) {
+        match it {
+            ast::Item::Fn(v) => {
+                match v.body {
+                    Option::Some(b) => self.walk_expr(at, b),
+                    Option::None => {}
+                }
+            }
+            ast::Item::Const(v) => self.walk_expr(at, v.value),
+            _ => {}
+        }
+    }
+
+    fn walk_pat(self, at: i64, p: ast::Pat) {
+        match p.node {
+            ast::PatKind::Lit(neg, e) => self.walk_expr(at, e),
+            ast::PatKind::Bind(mutable, name, sub) => {
+                match sub {
+                    Option::Some(s) => self.walk_pat(at, s),
+                    Option::None => {}
+                }
+            }
+            ast::PatKind::PathTuple(path, elems) => {
+                let mut i = 0;
+                while i < elems.len() {
+                    self.walk_pat(at, elems.at(i));
+                    i = i + 1;
+                }
+            }
+            ast::PatKind::PathStruct(path, rest, fields) => {
+                let mut i = 0;
+                while i < fields.len() {
+                    self.walk_pat(at, fields.at(i).pat);
+                    i = i + 1;
+                }
+            }
+            ast::PatKind::Tup(elems) => {
+                let mut i = 0;
+                while i < elems.len() {
+                    self.walk_pat(at, elems.at(i));
+                    i = i + 1;
+                }
+            }
+            ast::PatKind::Or(alts) => {
+                let mut i = 0;
+                while i < alts.len() {
+                    self.walk_pat(at, alts.at(i));
+                    i = i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Files which copy one call site reaches, if any can be named.
+    fn resolve_call(self, at: i64, what: String, site: i64, span: ast::Span) {
+        match self.inst_at(site) {
+            Option::None => {}
+            Option::Some(ci) => {
+                let target = self.resolve(at, ci, span);
+                if target >= 0 {
+                    let mut table = self.instances.at(at).calls;
+                    if what != "call" {
+                        table = self.instances.at(at).iter_calls;
+                    }
+                    table.insert(site, target);
+                    // Read back out of the table rather than reusing `target`, so that the
+                    // trace is a statement about what was filed and not merely about what
+                    // was computed. A table only ever written to is the failure mode this
+                    // phase keeps finding.
+                    self.trace.push("\(what) \(span.start) \(table.get(site).unwrap_or(0 - 1))");
+                }
+            }
+        }
+    }
+
+    /// Finds the copy a call site reaches, substituting the caller's own instantiation
+    /// into the types the checker recorded.
+    fn resolve(self, from: i64, ci: check::Inst, span: ast::Span) -> i64 {
+        let caller = self.instances.at(from);
+        let mut decl = ci.decl;
+        let args = list::new[types::Type]();
+        let mut i = 0;
+        while i < ci.args.len() {
+            args.push(substitute(ci.args.at(i), caller.subst));
+            i = i + 1;
+        }
+
+        // A trait method called on a type parameter was resolved against a symbolic
+        // receiver, so what the checker recorded is the trait's own declaration. Now that
+        // the parameter has a type, the impl that actually runs is known.
+        if ci.has_recv && is_param(types::prune(ci.recv)) {
+            let recv = substitute(ci.recv, caller.subst);
+            let found = self.tys.lookup.resolve_method(recv, ci.method);
+            if !found.has_recv {
+                return ast::UNRESOLVED;
+            }
+            decl = found.decl;
+            args.clear();
+            let mut k = 0;
+            while k < found.args.len() {
+                args.push(found.args.at(k));
+                k = k + 1;
+            }
+        }
+
+        // No body to specialize: the impl is one the compiler provides, and the code
+        // generator lowers the call to a builtin.
+        if decl.info < 0 || decl.body.is_none() {
+            return ast::UNRESOLVED;
+        }
+        self.instance(decl, args, from, span)
+    }
+
+    /// The Go compiler also renders the instantiation chain as a note. Notes are not part
+    /// of what the differential compares and stage1's diagnostics do not carry them at all
+    /// yet (docs/deferred.md), so building the chain here would be building something
+    /// nothing reads.
+    fn report_depth(self, decl: ast::FnDecl, args: List[types::Type], from: i64,
+                    at: ast::Span) {
+        // The call was written in the caller's body, so that is the file it is reported
+        // in -- `self.file` is only where the *rooting* walk got to, and by the time the
+        // queue is being drained it names whichever unit came last.
+        let mut file = self.file;
+        if from >= 0 {
+            file = self.instances.at(from).decl.file;
+        }
+        self.errors.push(MonoError {
+            code: "E0055",
+            message: "instantiating `\(instance_name(decl, args))` exceeds the monomorphization depth limit of \(MAX_DEPTH)",
+            file: file, start: at.start, end: at.end,
+        });
+    }
+}
+
+// --- Naming and identity ------------------------------------------------------------------
+
+fn no_args() -> List[types::Type] { list::new[types::Type]() }
+
+fn is_param(t: types::Type) -> bool {
+    match t {
+        types::Type::ParamT(p) => true,
+        _ => false,
+    }
+}
+
+/// Applies an instantiation to a recorded type, pruning as it goes so that an inference
+/// variable solved during checking is followed to what it was solved to.
+fn substitute(t: types::Type, subst: types::Subst) -> types::Type {
+    if subst.is_empty() {
+        return types::prune(t);
+    }
+    types::substitute(t, subst)
+}
+
+/// What the instance is called in a bytecode dump.
+fn instance_name(decl: ast::FnDecl, args: List[types::Type]) -> String {
+    if args.is_empty() {
+        return decl.name.name;
+    }
+    let mut out = "\(decl.name.name)[";
+    let mut i = 0;
+    while i < args.len() {
+        if i > 0 {
+            out = "\(out), ";
+        }
+        out = "\(out)\(types::show(types::prune(args.at(i))))";
+        i = i + 1;
+    }
+    "\(out)]"
+}
+
+/// Where a declaration was written, which is the identity the traces already use.
+fn decl_site(decl: ast::FnDecl) -> String {
+    "\(decl.file):\(decl.name.start)"
+}
+
+/// Identifies an instance: the declaration it copies, and each type argument by *identity*
+/// rather than by name. Two nominal types in different modules may share a name and must
+/// not share a copy, so a nominal type is keyed by where it was declared and a generic
+/// parameter by the number the checker gave it.
+fn instance_key(decl: ast::FnDecl, args: List[types::Type]) -> String {
+    let mut out = decl_site(decl);
+    let mut i = 0;
+    while i < args.len() {
+        out = "\(out)|\(type_key(args.at(i)))";
+        i = i + 1;
+    }
+    out
+}
+
+fn type_key(t: types::Type) -> String {
+    match types::prune(t) {
+        types::Type::Prim(k) => "\(k)",
+        types::Type::Named(def, targs) => {
+            let mut out = "N\(def.file):\(def.at)";
+            let mut i = 0;
+            while i < targs.len() {
+                out = "\(out)<\(type_key(targs.at(i)))";
+                i = i + 1;
+            }
+            out
+        }
+        types::Type::Tuple(elems) => {
+            let mut out = "T(";
+            let mut i = 0;
+            while i < elems.len() {
+                out = "\(out)\(type_key(elems.at(i))),";
+                i = i + 1;
+            }
+            "\(out))"
+        }
+        types::Type::Func(params, ret) => {
+            let mut out = "F(";
+            let mut i = 0;
+            while i < params.len() {
+                out = "\(out)\(type_key(params.at(i))),";
+                i = i + 1;
+            }
+            "\(out))->\(type_key(ret))"
+        }
+        // A parameter that survives here means the caller was itself generic and this walk
+        // is over a body that will be specialized again; keying on the parameter's own
+        // number keeps those copies apart.
+        types::Type::ParamT(p) => "P\(p.id)",
+        other => types::show(other),
+    }
+}

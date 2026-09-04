@@ -152,11 +152,28 @@ pub struct CheckError {
     pub file: String,
     pub start: i64,
     pub end: i64,
+    /// A warning compiles: the code is suspicious, not wrong. It is recorded here with
+    /// the errors because it is rendered with them and sorted with them, and it is told
+    /// apart by this flag because everything downstream turns on the difference --
+    /// whether the program is rejected, and whether the passes after this one run at all
+    /// (`diag.Bag`'s `HasErrors` counts errors, not diagnostics).
+    pub warning: bool,
 }
 
 pub struct Checked {
     pub trace: List[String],
     pub errors: List[CheckError],
+    /// The instantiations, in the order they were recorded. An expression's `inst` and
+    /// `iter_inst` slots index into this: it is the side table `internal/check` keys by
+    /// node id, turned inside out for a tree that has no node ids.
+    pub insts: List[Inst],
+    /// Every signature, indexed by a declaration's `info` slot, so a later pass can ask
+    /// what generic parameters a function's body may mention without re-deriving them.
+    pub sigs: List[FnSig],
+    /// The checker itself, for the one question monomorphization must ask after checking
+    /// is over: which impl a trait method reaches, once the type parameter it was called
+    /// on has a type. `internal/check` exposes the same thing as `Result.Lookup`.
+    pub lookup: Checker,
 }
 
 // --- The checker --------------------------------------------------------------------------
@@ -204,6 +221,9 @@ pub struct Checker {
     ctx: types::Ctx,
     trace: List[TraceEntry],
     errors: List[CheckError],
+    /// Every instantiation recorded, in order. An expression's `inst`/`iter_inst` slot is
+    /// an index into it.
+    insts: List[Inst],
 
     /// Indexed by a declaration's `info` slot.
     defs: List[types::Def],
@@ -255,12 +275,14 @@ impl Checker {
     fn error(self, code: String, at: ast::Span, message: String) {
         self.errors.push(CheckError {
             code: code, message: message, file: self.file, start: at.start, end: at.end,
+            warning: false,
         });
     }
 
     fn error_in(self, code: String, file: String, at: ast::Span, message: String) {
         self.errors.push(CheckError {
             code: code, message: message, file: file, start: at.start, end: at.end,
+            warning: false,
         });
     }
 
@@ -285,11 +307,13 @@ impl Checker {
     /// Records a call site's instantiation: which declaration, and the type each of its
     /// generic parameters was given here. The arguments are packed into a tuple so that
     /// they render, and are pruned, the way any other type is.
-    fn note_inst(self, what: String, inst: Inst) {
+    fn note_inst(self, what: String, inst: Inst) -> i64 {
         self.trace.push(TraceEntry {
             what: what, text: decl_site(inst.decl), ty: types::Type::Tuple(inst.args),
             has_ty: true,
         });
+        self.insts.push(inst);
+        self.insts.len() - 1
     }
 
     /// What one identifier occurrence resolved to, or a reference to nothing when the
@@ -329,6 +353,59 @@ fn render_trace(entries: List[TraceEntry]) -> List[String] {
     out
 }
 
+// --- The post-check resolver ------------------------------------------------------------
+//
+// The one question a later pass has to ask the checker after checking is over: which impl
+// a trait method reaches, now that the type parameter it was called on has a type. A
+// method call inside a generic body is recorded against the *trait's* declaration, which
+// may have no body at all; only the substituted receiver says which copy actually runs.
+// `internal/check` exposes the same thing as `Result.Lookup`, alongside a `Normalize` the
+// bytecode compiler needs and nothing here does yet.
+
+impl Checker {
+    /// Resolves a method call on a concrete receiver, reporting the declaration to call
+    /// and the generic parameters of the impl that provides it.
+    ///
+    /// `has_recv` is false when there is nothing to name: for a well-typed program that
+    /// means the receiver is a primitive whose impl the compiler provides and which has no
+    /// declaration to call, and the caller falls back to the builtin.
+    pub fn resolve_method(self, recv: types::Type, name: String) -> Inst {
+        let none = Inst {
+            decl: no_fn_decl(), params: list::new[types::Param](),
+            args: list::new[types::Type](), recv: recv, has_recv: false, method: name,
+        };
+        let cand = self.lookup_method(recv, name);
+        if !cand.ok {
+            return none;
+        }
+        let subst = cand.subst.clone();
+        match cand.trait_info {
+            Option::Some(ti) => { subst.set(ti.self_param, recv); }
+            Option::None => {}
+        }
+        let params = list::new[types::Param]();
+        let args = list::new[types::Type]();
+        let mut i = 0;
+        while i < cand.sig.generics.len() {
+            let p = cand.sig.generics.at(i);
+            match subst.get(p) {
+                // A method with generic parameters of its own, called on a type
+                // parameter: nothing here says what they were instantiated at.
+                Option::None => return none,
+                Option::Some(arg) => {
+                    params.push(p);
+                    args.push(types::prune(arg));
+                }
+            }
+            i = i + 1;
+        }
+        Inst {
+            decl: cand.decl, params: params, args: args, recv: recv, has_recv: true,
+            method: name,
+        }
+    }
+}
+
 // --- Program -----------------------------------------------------------------------------
 
 /// One file to check, in the order the resolver saw it.
@@ -350,6 +427,7 @@ pub fn program(res: resolve::Resolved, units: List[Unit]) -> Checked {
         ctx: types::new_ctx(),
         trace: list::new[TraceEntry](),
         errors: list::new[CheckError](),
+        insts: list::new[Inst](),
         defs: list::new[types::Def](),
         fn_sigs: list::new[FnSig](),
         trait_infos: list::new[TraitInfo](),
@@ -384,7 +462,10 @@ pub fn program(res: resolve::Resolved, units: List[Unit]) -> Checked {
     c.check_assoc_bounds();
     c.each(units, 6);  // bodies
 
-    Checked { trace: render_trace(c.trace), errors: c.errors }
+    Checked {
+        trace: render_trace(c.trace), errors: c.errors, insts: c.insts, sigs: c.fn_sigs,
+        lookup: c,
+    }
 }
 
 impl Checker {
@@ -2379,6 +2460,7 @@ impl Checker {
     fn warn(self, code: String, at: ast::Span, message: String) {
         self.errors.push(CheckError {
             code: code, message: message, file: self.file, start: at.start, end: at.end,
+            warning: true,
         });
     }
 
@@ -2700,7 +2782,7 @@ impl Checker {
                     inst_args.push(subst.get(sig.params.at(p)).unwrap_or(types::error_type()));
                     p = p + 1;
                 }
-                self.note_inst("inst", Inst {
+                e.inst = self.note_inst("inst", Inst {
                     decl: fd, params: sig.params, args: inst_args,
                     recv: types::error_type(), has_recv: false, method: "",
                 });
@@ -3514,7 +3596,7 @@ impl Checker {
             Option::Some(ti) => { subst.set(ti.self_param, recv); }
             Option::None => {}
         }
-        self.record_method_inst(name, found, recv, subst);
+        e.inst = self.record_method_inst(name, found, recv, subst);
 
         // The impl's own bounds are obligations of the call as much as the method's are:
         // `impl[T: Show] Show for Box[T]` gives `Box[Opaque]` a `to_str` only if `Opaque`
@@ -3909,15 +3991,18 @@ impl Checker {
     /// monomorphization resolves against: a trait method called on a type parameter names
     /// the trait's own declaration here, and only the substituted receiver says which impl
     /// actually runs.
+    /// Returns where the instantiation was filed, or -1 when the call reaches no copy
+    /// that can be named: a generic parameter the substitution does not bind means the
+    /// callee is still symbolic here, and there is nothing to record.
     fn record_method_inst(self, name: String, cand: Candidate, recv: types::Type,
-                          subst: types::Subst) {
+                          subst: types::Subst) -> i64 {
         let params = list::new[types::Param]();
         let args = list::new[types::Type]();
         let mut i = 0;
         while i < cand.sig.generics.len() {
             let p = cand.sig.generics.at(i);
             match subst.get(p) {
-                Option::None => return,
+                Option::None => return ast::UNRESOLVED,
                 Option::Some(arg) => {
                     params.push(p);
                     args.push(arg);
@@ -3928,7 +4013,7 @@ impl Checker {
         self.note_inst("minst", Inst {
             decl: cand.decl, params: params, args: args, recv: recv, has_recv: true,
             method: name,
-        });
+        })
     }
 }
 
@@ -4451,6 +4536,7 @@ impl Checker {
                     types::Type::Assoc(into_iter.decl, "Item", iter));
 
                 let got = self.record_for_call(iter, "into_iter", iter_expr.span);
+                e.iter_inst = got.inst;
                 if !got.ok {
                     // `iter` does not implement `IntoIterator`: the bound above reports it
                     // once the body finishes.
@@ -4460,7 +4546,7 @@ impl Checker {
                     Option::Some(it) => { self.require_bound(got.ty, it, e.span); }
                     Option::None => {}
                 }
-                self.record_for_call(got.ty, "next", e.span);
+                e.inst = self.record_for_call(got.ty, "next", e.span).inst;
                 elem
             }
         }
@@ -4471,7 +4557,7 @@ impl Checker {
     fn record_for_call(self, recv: types::Type, name: String, at: ast::Span) -> Resolved1 {
         let found = self.lookup_method(recv, name);
         if !found.ok {
-            return Resolved1 { ok: false, ty: types::error_type() };
+            return Resolved1 { ok: false, inst: ast::UNRESOLVED, ty: types::error_type() };
         }
         let subst = found.subst.clone();
         let mut p = 0;
@@ -4483,14 +4569,17 @@ impl Checker {
             Option::Some(ti) => { subst.set(ti.self_param, recv); }
             Option::None => {}
         }
-        self.record_method_inst(name, found, recv, subst);
+        let filed = self.record_method_inst(name, found, recv, subst);
         let mut b = 0;
         while b < found.sig.bounds.len() {
             let bd = found.sig.bounds.at(b);
             self.require_bound(types::substitute(bd.ty, subst), bd.trait_info, at);
             b = b + 1;
         }
-        Resolved1 { ok: true, ty: self.normalize(types::substitute(found.sig.ret, subst)) }
+        Resolved1 {
+            ok: true, inst: filed,
+            ty: self.normalize(types::substitute(found.sig.ret, subst)),
+        }
     }
 
     /// A prelude type applied to arguments, or the error type when the prelude does not
@@ -4735,6 +4824,8 @@ impl Checker {
 /// One resolved implicit call: whether it resolved, and what it returns.
 struct Resolved1 {
     ok: bool,
+    /// Where the instantiation was filed, or -1 when the call reaches no named copy.
+    inst: i64,
     ty: types::Type,
 }
 
