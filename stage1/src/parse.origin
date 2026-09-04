@@ -674,6 +674,7 @@ impl Parser {
     }
 
     fn impl_decl(self) -> ast::ImplDecl {
+        let start = self.pos;
         self.advance();
         let generics = self.generics();
 
@@ -697,7 +698,7 @@ impl Parser {
         if !self.expect(lex::K_LBRACE) {
             self.sync_item();
             return ast::ImplDecl {
-                info: ast::UNRESOLVED, generics: generics, trait_path: trait_path, has_trait: has_trait,
+                span: self.span_from(start), info: ast::UNRESOLVED, generics: generics, trait_path: trait_path, has_trait: has_trait,
                 trait_args: trait_args, where_preds: where_preds, ty: ty, assoc: assoc,
                 methods: methods,
             };
@@ -730,7 +731,7 @@ impl Parser {
         }
         self.expect(lex::K_RBRACE);
         ast::ImplDecl {
-            info: ast::UNRESOLVED, generics: generics, trait_path: trait_path, has_trait: has_trait,
+            span: self.span_from(start), info: ast::UNRESOLVED, generics: generics, trait_path: trait_path, has_trait: has_trait,
             trait_args: trait_args, where_preds: where_preds, ty: ty, assoc: assoc,
             methods: methods,
         }

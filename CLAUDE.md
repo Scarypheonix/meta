@@ -184,50 +184,45 @@ This project outlasts any single context window.
 ## Status
 
 **Phase 9 is in progress.** Its scope is **self-hosting**: a compiler for Origin, written
-in Origin. What exists in `stage1/src/` is the front end through **name resolution** --
-`lex.origin`, `ast.origin`, `parse.origin`, `source.origin`, `resolve.origin` -- and
-`main.origin`, which makes stage1 an actual command-line program
-(`stage1 dump-tokens|dump-ast|parse|resolve <file>...`) shaped like `cmd/originc`'s. Each
-component is held to the Go one it replaces over this repository's own ~400 `.origin`
-files, all in `tests/selfhost`: the token stream against `internal/lex`, the dumped syntax
-tree against `internal/ast`, the position mapping against `internal/source`, the *places*
-syntax errors are reported against `internal/lex` + `internal/parse`, and the whole of
-resolution against `internal/resolve` — 397 packages, 744,896 trace lines, diagnostics and
-their wording included.
+in Origin. What exists in `stage1/src/` is the front end through **type checking** --
+`lex.origin`, `ast.origin`, `parse.origin`, `source.origin`, `resolve.origin`,
+`types.origin`, `check.origin` -- and `main.origin`, which makes stage1 an actual
+command-line program (`stage1 dump-tokens|dump-ast|parse|resolve|check <file>...`) shaped
+like `cmd/originc`'s. That is about 12,600 lines of Origin, and every component is held to
+the Go one it replaces over this repository's own ~400 `.origin` files, all in
+`tests/selfhost`: the token stream against `internal/lex`, the dumped syntax tree against
+`internal/ast`, the position mapping against `internal/source`, the *places* syntax errors
+are reported against `internal/lex` + `internal/parse`, resolution against
+`internal/resolve` (397 packages, 744,896 trace lines), and inference against
+`internal/check` — **399 packages, 1,647,768 trace lines, byte-identical on all three
+engines**, diagnostics and their spans included.
 
 The language grew what a compiler cannot be written without: **the command line and the
 exit status** (`docs/spec/17-process.md`) — `args()` in the prelude over `env::arg_count`
 and `env::arg_at`, and `process::exit`, which ends the *process* and not the thread on all
 three engines. `bootstrap/` is still empty; nothing has self-compiled yet.
 
-**The resolution oracle is the one thing that had to be invented,** and the shape is worth
-reusing for the checker: side tables keyed by node id cannot be compared against a tree with
-no node ids, so both resolvers emit **one line per event, in order**, and the *sequence* is
-what is compared. A line's position identifies the node; what it says identifies what the
-node resolved to, naming a declaration by the `<file>:<offset>` of its own name so that two
-bindings called `x` are the same only if they were declared in the same place.
-`internal/resolve/trace.go` is the Go side.
+**The trace oracle is the one thing that had to be invented,** and it is what every
+remaining component should reuse: side tables keyed by node id cannot be compared against a
+tree with no node ids, so both compilers emit **one line per event, in order**, and the
+*sequence* is what is compared. A line's position identifies the node; what it says
+identifies what the node became, naming a declaration by the `<file>:<offset>` of its own
+name so that two things called `x` are the same only if they were written in the same
+place. `internal/resolve/trace.go` and `internal/check/trace.go` are the Go sides. The
+checker's differs in one way worth knowing before writing another: an entry is rendered at
+the **end** of the run, not when it is made, because a type recorded mid-body is usually an
+unsolved variable that later unification binds and end-of-body defaulting resolves —
+printing at record time compares the checker's intermediate state instead of its answer.
 
-**Next action: type checking.** It is the largest component left — `internal/check` is 4,900
-lines of Go over `internal/types`'s 1,000 — and it is a multi-session piece, so start it with
-the two decisions rather than the code.
-
-*The oracle.* Reuse the resolution trace's shape: **one line per event, in order**, since
-the checker's output is also side tables keyed by node id. One line per expression whose
-type is inferred, in traversal order, giving the type as text; plus a line at each
-generalization, each trait obligation discharged (naming the impl by its `<file>:<offset>`),
-and each monomorphized instance. Rendering a type as text is the only new problem, and it
-has the same answer the trace's declarations do: name a nominal type by where it was
-declared, not by a number.
-
-*The order.* `internal/types` (terms, unification, generalization) comes first and has no
-consumer of its own — so do not land it alone, or it is a field nothing reads, which is the
-failure mode this phase keeps finding. Land it together with enough of `internal/check` to
-type one expression end to end, and put the differential in the same commit.
-
-Two smaller things are done and no longer outstanding: stage1's parser diagnostics now match
-the Go compiler's word for word (as the resolver's already did), and `docs/deferred.md`
-records what that took.
+**Next action: the back half of the compiler**, which is roughly 22,000 lines of Go and
+several sessions' work. Its natural order is `internal/mono` (528 lines) -> `internal/compile`
+(2,377) -> `internal/bytecode` (292) first, since that reaches a *running* stage1-compiled
+program on the VM without touching machine code; then `internal/ir` (1,800) and
+`internal/opt` (1,338); then `internal/x86` (722), `internal/obj` (1,135) and
+`internal/backend` (7,064), with `layout`, `arith`, `dwarf` and `codesign` (1,479 between
+them) pulled in as their consumers need them. The oracle for the first stretch is not a
+trace but the thing itself: `dump-bytecode` already exists on the Go side, and two
+compilers that emit the same bytecode for the same input are comparable directly.
 
 **What Phase 9 has found so far** — the same tell as Phase 8, and worth expecting again:
 every bug came from *running Origin*, not from reading Go.
@@ -245,6 +240,21 @@ every bug came from *running Origin*, not from reading Go.
   flag, never a struct literal's type arguments, never a lambda's return type — and stage1's
   parser had duly thrown every one of them away. **When the oracle has a hole, the thing it
   is checking inherits it.** Both sides now carry them.
+- **Three lookups in the Go checker depended on a Go map's iteration order** — the trait
+  named by a builtin impl, the trait named in a "no method" note, and the prelude's
+  definitions by name. Every one is a scan for a *name*, and every one is deterministic
+  right up until a name is declared twice, which the corpus does exactly once: the entry
+  where the prelude is checked with itself as the prelude. Five runs of that file gave
+  three different outputs. `internal/check` now keeps declarations in declaration order and
+  the first of a duplicated name wins. The degenerate input is the most valuable file in
+  the corpus, and a fourth case of the same thing — `checkBodies` visiting an impl's methods
+  in map order — was found the same way.
+- **A lambda passed as a call argument had no type in `ExprTypes`.** `inferArgs` checks
+  lambdas last, on purpose (ADR-0010: unifying the ordinary arguments first is what gives
+  `m.with(|v| v.get())` a known receiver), and that path called `inferLambdaExpecting`
+  directly instead of `infer` — so it went around the one place that records. Harmless only
+  because nothing downstream asks a lambda node for its own type; `typeOf` was answering
+  `Error` for it.
 - A **collector-era bug four phases old**: `equal_objects` compared a String's trailing
   partial word whole, assuming the bytes above the last meaningful one were zero. True until
   the first collection; false forever after, because every allocation then comes out of a

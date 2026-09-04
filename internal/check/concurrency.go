@@ -26,8 +26,13 @@ import (
 func (c *Checker) preludeDef(name string) *types.Def {
 	if c.preludeDefs == nil {
 		c.preludeDefs = map[string]*types.Def{}
-		for _, def := range c.defs {
-			if def != nil && DeclaredInPrelude(def) {
+		// In declaration order, keeping the first: a prelude that declares a name twice
+		// is a broken prelude, but it must be broken the same way on every run.
+		for _, def := range c.defOrder {
+			if def == nil || !DeclaredInPrelude(def) {
+				continue
+			}
+			if _, seen := c.preludeDefs[def.Name]; !seen {
 				c.preludeDefs[def.Name] = def
 			}
 		}

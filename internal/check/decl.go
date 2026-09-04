@@ -199,6 +199,16 @@ type Checker struct {
 	out *Result
 
 	defs map[ast.Item]*types.Def
+	// defOrder and traitOrder are the same definitions and traits in the order the
+	// files declared them.
+	//
+	// They exist because a Go map's iteration order is random, and every lookup that
+	// scans one of these by *name* has to answer the same way twice: a program may
+	// declare a name twice -- a duplicate is a diagnostic, not a reason to stop
+	// checking -- and which of the two a scan finds decided what `checked_mul` on
+	// `i64` resolved to. Rule 6 is not "deterministic once the program is valid".
+	defOrder   []*types.Def
+	traitOrder []*TraitInfo
 	// preludeDefs indexes defs by name, for the concurrency builtins' signatures.
 	preludeDefs map[string]*types.Def
 	fnSigs      map[*ast.FnDecl]*FnSig
@@ -330,11 +340,13 @@ func (c *Checker) collectShells(f *ast.File) {
 				Kind: types.StructDef, Name: v.Name.Name,
 				Params: c.genericParams(v.Generics), Struct: v,
 			}
+			c.defOrder = append(c.defOrder, c.defs[it])
 		case *ast.EnumDecl:
 			c.defs[it] = &types.Def{
 				Kind: types.EnumDef, Name: v.Name.Name,
 				Params: c.genericParams(v.Generics), Enum: v,
 			}
+			c.defOrder = append(c.defOrder, c.defs[it])
 		}
 	}
 }
@@ -386,6 +398,7 @@ func (c *Checker) collectTraits(f *ast.File) {
 			ti.Methods[m.Name.Name] = m
 		}
 		c.traits[v] = ti
+		c.traitOrder = append(c.traitOrder, ti)
 	}
 }
 

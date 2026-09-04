@@ -23,7 +23,15 @@ func (c *Checker) checkBodies(f *ast.File) {
 			if info == nil {
 				continue
 			}
-			for _, m := range info.Methods {
+			// In declaration order, not the map's. A checker that visits methods in
+			// whatever order a Go map hands them out is a checker whose behaviour
+			// depends on the map seed -- invisible while the diagnostic bag sorts its
+			// output by span, and immediately visible to anything that watches the
+			// order, which is how tests/selfhost found this.
+			for _, m := range v.Methods {
+				if kept, ok := info.Methods[m.Name.Name]; !ok || kept != m {
+					continue // a duplicate: only the first definition is checked
+				}
 				c.checkFn(m, info.Params, info.Self, nil, info.Bounds)
 			}
 
@@ -32,7 +40,10 @@ func (c *Checker) checkBodies(f *ast.File) {
 			if ti == nil {
 				continue
 			}
-			for name, m := range ti.Methods {
+			for _, m := range v.Methods {
+				if kept, ok := ti.Methods[m.Name.Name]; !ok || kept != m {
+					continue
+				}
 				if m.Body == nil {
 					continue // a required method declares a signature only
 				}
@@ -44,7 +55,6 @@ func (c *Checker) checkBodies(f *ast.File) {
 					selfBounds = append(selfBounds, bs...)
 				}
 				c.checkFn(m, append(ti.Params, ti.SelfParam), ti.SelfParam, ti, selfBounds)
-				_ = name
 			}
 		}
 	}

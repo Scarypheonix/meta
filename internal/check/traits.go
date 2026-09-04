@@ -38,8 +38,10 @@ var builtinImpls = map[string][]types.PrimKind{
 
 // traitByName finds a declared trait by name. The prelude declares the ones the
 // compiler itself needs.
+// The first declaration of the name wins, which is also the rule for a duplicate method
+// in one trait and for a method defined twice in one impl.
 func (c *Checker) traitByName(name string) *TraitInfo {
-	for _, ti := range c.traits {
+	for _, ti := range c.traitOrder {
 		if ti.Decl.Name.Name == name {
 			return ti
 		}

@@ -382,9 +382,7 @@ pub fn program(res: resolve::Resolved, units: List[Unit]) -> Checked {
     c.each(units, 5);  // impls
     c.check_coherence();
     c.check_assoc_bounds();
-    // Bodies are pass 6 and are not written; see the comment there. Nothing calls this
-    // function yet for the same reason -- a checker that stops before the bodies would
-    // report a program clean that is not, which is worse than not being wired up at all.
+    c.each(units, 6);  // bodies
 
     Checked { trace: render_trace(c.trace), errors: c.errors }
 }
@@ -610,9 +608,7 @@ impl Checker {
             ast::TypeKind::ErrorType => types::error_type(),
             ast::TypeKind::SelfType => {
                 if !self.env.has_self {
-                    // A bare `Self` in a type position outside a trait or impl. There is
-                    // no span on the node, so it is reported against the whole item by the
-                    // caller; here it is only the error type.
+                    self.error("E0411", t.span, "`Self` is not available here");
                     return types::error_type();
                 }
                 self.env.self_ty
@@ -620,7 +616,7 @@ impl Checker {
             ast::TypeKind::Tuple(elems) => types::Type::Tuple(self.to_types(elems)),
             ast::TypeKind::Func(params, ret) =>
                 types::Type::Func(self.to_types(params), self.to_type(ret)),
-            ast::TypeKind::Path(p, args) => self.path_type(p, args),
+            ast::TypeKind::Path(p, args) => self.path_type(t.span, p, args),
         }
     }
 
@@ -634,13 +630,15 @@ impl Checker {
         out
     }
 
-    fn path_type(self, p: ast::PathRef, arg_nodes: List[ast::Type]) -> types::Type {
+    /// `at` is the whole written type, `Pair[i64]` and not just `Pair`: an arity or
+    /// application mistake is about the application, so the span has to cover the
+    /// arguments that caused it.
+    fn path_type(self, at: ast::Span, p: ast::PathRef, arg_nodes: List[ast::Type]) -> types::Type {
         let r = self.ref_of(p.res);
         if r.kind == resolve::K_UNRESOLVED {
             return types::error_type(); // the resolver already reported it
         }
         let args = self.to_types(arg_nodes);
-        let at = path_span(p);
 
         if r.kind == resolve::K_PRIM {
             // `Array[T]` is the one primitive that is generic (ADR-0028): the compiler
@@ -1173,6 +1171,7 @@ fn showable_kinds() -> List[i64] {
 /// declaration checks that first.
 fn self_less_impl() -> ast::ImplDecl {
     ast::ImplDecl {
+        span: ast::Span { start: 0, end: 0 },
         info: ast::UNRESOLVED, generics: list::new[ast::GenericParam](),
         trait_path: ast::PathRef {
             text: "", start: 0, end: 0, segs: list::new[ast::Ident](),
@@ -1433,8 +1432,12 @@ fn trait_name_of(info: ImplInfo) -> String {
 
 /// Where an impl was written. A builtin impl has no source, and nothing reports against
 /// one: `report_overlap` always names the impl the programmer wrote.
+/// Where an impl-level error is reported: the whole block. A missing method, a
+/// conflicting implementation and an unsatisfied associated-type bound are all about the
+/// impl rather than about the trait's name in its header, and a builtin impl -- which has
+/// no source at all -- is never the one reported against.
 fn impl_span(info: ImplInfo) -> ast::Span {
-    ast::Span { start: info.decl.trait_path.start, end: info.decl.trait_path.end }
+    info.decl.span
 }
 
 fn decl_file(info: ImplInfo) -> String { info.impl_file }
@@ -2170,7 +2173,7 @@ impl Checker {
                             i = i + 1;
                         }
 
-                        let got = self.infer(body);
+                        let got = self.check_block_direct(body);
                         // A body that always diverges satisfies any return type.
                         if !types::is_never(got) {
                             self.unify_at(sig.ret, got, tail_span(fn_decl, body),
@@ -2251,10 +2254,19 @@ fn tail_span(fn_decl: ast::FnDecl, body: ast::Expr) -> ast::Span {
         ast::ExprKind::Block(b) => {
             match b.tail {
                 Option::Some(t) => t.span,
-                Option::None => ident_span(fn_decl.name),
+                Option::None => declared_ret_span(fn_decl),
             }
         }
-        _ => ident_span(fn_decl.name),
+        _ => declared_ret_span(fn_decl),
+    }
+}
+
+/// Where to point when a body produces no value of its own: at the return type the
+/// signature declares, since that is the half of the mismatch the source actually wrote.
+fn declared_ret_span(fn_decl: ast::FnDecl) -> ast::Span {
+    match fn_decl.ret {
+        Option::Some(t) => t.span,
+        Option::None => ident_span(fn_decl.name),
     }
 }
 
@@ -2304,15 +2316,36 @@ impl Checker {
 // --- Blocks and statements -----------------------------------------------------------------
 
 impl Checker {
-    fn check_block(self, b: ast::BlockBody) -> types::Type {
-        let mut i = 0;
-        while i < b.stmts.len() {
-            self.check_stmt(b.stmts.at(i));
-            i = i + 1;
-        }
-        match b.tail {
-            Option::None => types::unit(),
-            Option::Some(t) => self.infer(t),
+    /// Checks a block *without* recording its own type, which is what the Go checker's
+    /// `checkBlock` does: a block with no tail is `()` and records nothing, and a block
+    /// with one records the tail's type against the block as well.
+    ///
+    /// The distinction is not cosmetic. A function body, a `while` body and an `if`'s
+    /// `then` are reached this way, so they never get an entry of their own; a block in
+    /// expression position is reached through `infer`, which records it -- twice, when it
+    /// has a tail, once here and once there. Both sides have to agree on that, or the two
+    /// traces are the same inference described differently.
+    fn check_block_direct(self, e: ast::Expr) -> types::Type {
+        match e.node {
+            ast::ExprKind::Block(b) => {
+                let mut i = 0;
+                while i < b.stmts.len() {
+                    self.check_stmt(b.stmts.at(i));
+                    i = i + 1;
+                }
+                match b.tail {
+                    Option::None => types::unit(),
+                    Option::Some(t) => {
+                        let ty = self.infer(t);
+                        self.note_type("expr", ty);
+                        ty
+                    }
+                }
+            }
+            // `if cond { .. } else if .. ` chains an `if`, not a block; the parser only
+            // ever produces a block where one is required, so this is unreachable in a
+            // well-formed tree and the error type is the honest answer for the rest.
+            _ => self.infer(e),
         }
     }
 
@@ -2468,7 +2501,7 @@ impl Checker {
             ast::ExprKind::Lambda(params, ret, body) =>
                 self.infer_lambda(e, params, ret, body, Option::None),
 
-            ast::ExprKind::Block(b) => self.check_block(b),
+            ast::ExprKind::Block(_) => self.check_block_direct(e),
             ast::ExprKind::If(cond, then, els) => self.infer_if(cond, then, els),
             ast::ExprKind::Match(scrutinee, arms) => self.infer_match(e, scrutinee, arms),
 
@@ -3000,7 +3033,7 @@ impl Checker {
 
     fn infer_if(self, cond: ast::Expr, then: ast::Expr, els: Option[ast::Expr]) -> types::Type {
         self.expect_bool(cond, "an `if` condition");
-        let then_ty = self.infer(then);
+        let then_ty = self.check_block_direct(then);
         match els {
             Option::None => {
                 // spec/04-expressions.md: an `if` without `else` has type `()`.
@@ -3033,7 +3066,7 @@ impl Checker {
     }
 
     fn expect_unit_block(self, body: ast::Expr, what: String) {
-        let got = self.infer(body);
+        let got = self.check_block_direct(body);
         if !types::is_never(got) {
             self.unify_at(types::unit(), got, block_tail_span(body),
                           "\(what) produces no value");
@@ -3074,7 +3107,7 @@ impl Checker {
     fn infer_loop(self, body: ast::Expr) -> types::Type {
         self.loop_values.push(types::error_type());
         self.loop_set.push(false);
-        self.infer(body);
+        self.check_block_direct(body);
         let result = self.loop_values.pop().unwrap_or(types::error_type());
         let was_set = self.loop_set.pop().unwrap_or(false);
         // A `loop` with no `break` never produces a value.

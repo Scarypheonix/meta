@@ -314,6 +314,11 @@ pub struct TraitDecl {
 }
 
 pub struct ImplDecl {
+    /// The whole block, `impl` keyword through closing brace. An impl is the one
+    /// declaration whose errors -- a missing method, a conflicting implementation, an
+    /// unsatisfied bound -- are about the block as a whole rather than about any name
+    /// written inside it.
+    pub span: Span,
     /// Where the checker files what this impl provides; -1 until it has (see `FnDecl`).
     pub mut info: i64,
     pub generics: List[GenericParam],

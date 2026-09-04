@@ -1094,6 +1094,12 @@ func (c *Checker) inferArgs(argExprs []ast.Expr, params []types.Type, kind func(
 		lam := argExprs[i].(*ast.Lambda)
 		want, _ := types.Prune(params[i]).(*types.FnT)
 		args[i] = c.inferLambdaExpecting(lam, want)
+		// Recorded here because this path goes around `infer`, which is what does the
+		// recording everywhere else. Without it a lambda passed as an argument is the
+		// one expression in the language with no entry in ExprTypes, and `typeOf`
+		// answers `Error` for it -- harmless today only because nothing downstream
+		// asks a lambda node for its own type.
+		c.record(lam.NodeID(), args[i])
 		c.unify(params[i], args[i], lam.Span(), kind(i))
 	}
 	return args
@@ -1225,7 +1231,7 @@ func (c *Checker) reportNoMethod(v *ast.MethodCall, recv types.Type, ambiguous [
 	}
 	d := c.bag.Errorf("E0599", v.Span(), "no method `%s` on `%s`", v.Name.Name, recv).
 		Label("method not found")
-	for _, ti := range c.traits {
+	for _, ti := range c.traitOrder {
 		if _, has := ti.Methods[v.Name.Name]; !has {
 			continue
 		}

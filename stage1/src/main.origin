@@ -15,6 +15,7 @@ use lex;
 use ast;
 use parse;
 use resolve;
+use check;
 
 const USAGE: String = "usage: stage1 <command> <file>...
 
@@ -24,6 +25,8 @@ commands:
   parse         parse and report syntax errors only
   resolve       resolve each file after the first as its own package, with the
                 first as the prelude, and print the resolution trace
+  check         resolve and type-check each file after the first the same way,
+                and print the inference trace
 
 exit status:
   0    success
@@ -45,16 +48,17 @@ fn main() {
     }
     let command = argv.at(1);
     if command != "dump-tokens" && command != "dump-ast" && command != "parse"
-        && command != "resolve" {
+        && command != "resolve" && command != "check" {
         io::println("stage1: unknown command `\(command)`");
         io::println(USAGE);
         process::exit(2);
     }
 
-    // `resolve` is a whole-package command: every file is resolved together, because a
-    // module cannot be resolved without the ones it imports (spec/07-modules.md).
-    if command == "resolve" {
-        if !run_resolve(argv) {
+    // `resolve` and `check` are whole-package commands: a module cannot be resolved
+    // without the ones it imports (spec/07-modules.md), and nothing can be checked before
+    // it is resolved.
+    if command == "resolve" || command == "check" {
+        if !run_package(argv, command == "check") {
             process::exit(1);
         }
         return;
@@ -88,9 +92,9 @@ const PRELUDE_NAME: String = "<prelude>";
 /// `originc check <file>` compiles in and the shape the differential compares: two files
 /// that both declare `main` are not a package. The prelude is parsed once and shared,
 /// since resolution does not write into the tree.
-fn run_resolve(argv: List[String]) -> bool {
+fn run_package(argv: List[String], typed: bool) -> bool {
     if argv.len() < 4 {
-        io::println("stage1: `resolve` takes the prelude and at least one file");
+        io::println("stage1: this command takes the prelude and at least one file");
         return false;
     }
     let prelude_path = argv.at(2);
@@ -124,8 +128,20 @@ fn run_resolve(argv: List[String]) -> bool {
                 inputs.push(resolve::Input {
                     file: path, module: "", tree: tree, prelude: false,
                 });
-                if !report_resolution(resolve::program(inputs)) {
+                let resolved = resolve::program(inputs);
+                // The resolution trace is `resolve`'s output; `check`'s is the inference
+                // trace, and printing both would be two answers to one question.
+                if !report_resolution(resolved, !typed) {
                     ok = false;
+                } else {
+                    if typed {
+                        let units = list::new[check::Unit]();
+                        units.push(check::Unit { file: PRELUDE_NAME, tree: prelude_tree });
+                        units.push(check::Unit { file: path, tree: tree });
+                        if !report_check(check::program(resolved, units)) {
+                            ok = false;
+                        }
+                    }
                 }
             }
         }
@@ -134,10 +150,57 @@ fn run_resolve(argv: List[String]) -> bool {
     ok
 }
 
-fn report_resolution(out: resolve::Resolved) -> bool {
+/// Compares two strings the way Go's `<` does: byte by byte, and on a shared prefix
+/// the shorter one first.
+fn str_less(a: String, b: String) -> bool {
+    let mut i = 0;
+    while i < a.len() && i < b.len() {
+        let x = a.byte_at(i);
+        let y = b.byte_at(i);
+        if x != y {
+            return x < y;
+        }
+        i = i + 1;
+    }
+    a.len() < b.len()
+}
+
+/// True when `a` belongs strictly before `b` in `diag.Bag.All`'s order: file name,
+/// then start offset, then end offset. Diagnostics come out of a compiler in whatever
+/// order its passes happened to discover problems in, and rule 6 requires the output
+/// not to depend on that.
+fn before(a_file: String, a_start: i64, a_end: i64, b_file: String, b_start: i64, b_end: i64) -> bool {
+    if a_file != b_file {
+        return str_less(a_file, b_file);
+    }
+    if a_start != b_start {
+        return a_start < b_start;
+    }
+    a_end < b_end
+}
+
+/// A stable insertion sort, which is what `sort.SliceStable` gives the Go driver:
+/// entries that compare equal keep the order the passes emitted them in.
+fn sort_by[T](xs: List[T], less: fn(T, T) -> bool) {
+    let mut i = 1;
+    while i < xs.len() {
+        let cur = xs.at(i);
+        let mut j = i;
+        while j > 0 && less(cur, xs.at(j - 1)) {
+            xs.set(j, xs.at(j - 1));
+            j = j - 1;
+        }
+        xs.set(j, cur);
+        i = i + 1;
+    }
+}
+
+fn report_check(out: check::Checked) -> bool {
+    let errors = out.errors;
+    sort_by(errors, |a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
     let mut e = 0;
-    while e < out.errors.len() {
-        let err = out.errors.at(e);
+    while e < errors.len() {
+        let err = errors.at(e);
         io::println("error \(err.code) \(err.file):\(err.start):\(err.end): \(err.message)");
         e = e + 1;
     }
@@ -145,6 +208,25 @@ fn report_resolution(out: resolve::Resolved) -> bool {
     while t < out.trace.len() {
         io::println(out.trace.at(t));
         t = t + 1;
+    }
+    out.errors.is_empty()
+}
+
+fn report_resolution(out: resolve::Resolved, with_trace: bool) -> bool {
+    let errors = out.errors;
+    sort_by(errors, |a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
+    let mut e = 0;
+    while e < errors.len() {
+        let err = errors.at(e);
+        io::println("error \(err.code) \(err.file):\(err.start):\(err.end): \(err.message)");
+        e = e + 1;
+    }
+    if with_trace {
+        let mut t = 0;
+        while t < out.trace.len() {
+            io::println(out.trace.at(t));
+            t = t + 1;
+        }
     }
     out.errors.is_empty()
 }
