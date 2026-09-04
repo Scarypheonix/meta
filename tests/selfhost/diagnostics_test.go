@@ -20,16 +20,17 @@ import (
 // command line -- and the places it reports a syntax error are held to the places
 // internal/lex and internal/parse report one, over this repository's whole Origin corpus.
 //
-// What is compared is the file, the line, the column and the count, in order. The wording
-// is not: stage1's messages are shorter than the Go compiler's, which name the token they
-// found as well as the one they wanted, and aligning the prose is its own task
-// (docs/deferred.md). Position and count are what say the two parsers agree about the
-// file rather than about how to describe it -- and they are what a wrong answer shows up
-// in: a dropped error is a missing line, a misplaced span a different column.
+// What is compared is the whole line: the file, the line, the column and the message.
+// Position and count say the two parsers agree about the *file*; the wording says they
+// agree about how to describe it, which matters because stage1 is meant to replace the Go
+// compiler for somebody's diagnostics and not merely to fail in the same places.
 //
 // It found a real bug on its first run: stage1's interpolation sub-parser used a
 // diagnostic list of its own and threw it away, so every syntax error inside `\(...)`
 // vanished, and it never checked that the interpolation held only one expression.
+//
+// The `dump-ast` command's own output is what the parse differential compares; this one is
+// about what the parser *rejects*, which no tree can show.
 
 func TestStage1ReportsSyntaxErrorsWhereTheGoParserDoes(t *testing.T) {
 	root := testutil.RepoRoot(t)
@@ -63,7 +64,7 @@ func TestStage1ReportsSyntaxErrorsWhereTheGoParserDoes(t *testing.T) {
 				parse.FileWith(f, bag, ast.NewIDGen())
 				for _, d := range bag.All() {
 					line, col := f.Position(d.Primary.Span.Start)
-					want = append(want, fmt.Sprintf("%s:%d:%d", path, line, col))
+					want = append(want, fmt.Sprintf("%s:%d:%d: %s", path, line, col, d.Msg))
 				}
 			}
 
@@ -94,12 +95,9 @@ func TestStage1ReportsSyntaxErrorsWhereTheGoParserDoes(t *testing.T) {
 
 			var got []string
 			for _, line := range strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n") {
-				if line == "" {
-					continue
+				if line != "" {
+					got = append(got, line)
 				}
-				// `path:line:col: message` -- the message is not compared, see above.
-				parts := strings.SplitN(line, ": ", 2)
-				got = append(got, parts[0])
 			}
 
 			if len(got) != len(want) {
@@ -118,7 +116,7 @@ func TestStage1ReportsSyntaxErrorsWhereTheGoParserDoes(t *testing.T) {
 				t.Errorf("... and %d more differ", bad-8)
 			}
 			if bad == 0 && len(got) == len(want) {
-				t.Logf("%d files, %d syntax errors in the same places", len(files), len(want))
+				t.Logf("%d files, %d syntax errors, same places and same words", len(files), len(want))
 			}
 		})
 	}

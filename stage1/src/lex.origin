@@ -183,6 +183,36 @@ pub fn kind_name(k: i64) -> String {
     "token"
 }
 
+/// How a token is named inside a diagnostic: an identifier by its own text, a literal by
+/// what kind of literal it is, the end of the file by name, and everything else by its
+/// spelling. It is `kind_name`'s counterpart -- that one names the kind a parser *wanted*,
+/// this one names the token it *found*.
+pub fn token_name(t: Token) -> String {
+    if t.kind == K_IDENT { return "`\(t.text)`"; }
+    if t.kind == K_INT || t.kind == K_FLOAT || t.kind == K_STR || t.kind == K_CHAR {
+        return kind_name(t.kind);
+    }
+    if t.kind == K_EOF { return "end of file"; }
+    "`\(kind_name(t.kind))`"
+}
+
+/// A number in uppercase hexadecimal with no prefix, the way a diagnostic about a scalar
+/// value writes one: `0x` and this is `0xD800`.
+pub fn hex_upper(v: i64) -> String {
+    if v == 0 {
+        return "0";
+    }
+    let digits = "0123456789ABCDEF";
+    let mut out = "";
+    let mut n = v;
+    while n > 0 {
+        let d = n - (n / 16) * 16;
+        out = digits.slice(d, d + 1).concat(out);
+        n = n / 16;
+    }
+    out
+}
+
 // --- Tokens ------------------------------------------------------------------------
 
 /// One piece of an interpolated string literal: either literal text, or the tokens of an
@@ -447,7 +477,7 @@ impl Lexer {
             return plain(kw, start, self.pos, text);
         }
         if is_reserved(text) {
-            self.error(start, self.pos, "reserved word");
+            self.error(start, self.pos, "`\(text)` is a reserved word");
         }
         plain(K_IDENT, start, self.pos, text)
     }
@@ -765,7 +795,7 @@ impl Lexer {
         if c == 34 { return char::from_u32(34u32); }
         if c == 120 { return self.lex_hex_escape(start); }
         if c == 117 { return self.lex_unicode_escape(start); }
-        self.error(start, self.pos, "unknown escape sequence");
+        self.error(start, self.pos, "unknown escape sequence `\\\(escape_char(c))`");
         Option::None
     }
 
@@ -791,7 +821,7 @@ impl Lexer {
 
     fn lex_unicode_escape(self, start: i64) -> Option[char] {
         if self.at_end() || self.src.byte_at(self.pos) != 123 {
-            self.error(start, self.pos, "\\u must be followed by `{`");
+            self.error(start, self.pos, "\\u must be followed by \"{\"");
             return Option::None;
         }
         self.pos = self.pos + 1;
@@ -811,24 +841,33 @@ impl Lexer {
         }
         let digits = self.src.slice(digit_start, self.pos);
         if self.at_end() || self.src.byte_at(self.pos) != 125 {
-            self.error(start, self.pos, "unterminated unicode escape; expected `}`");
+            self.error(start, self.pos, "unterminated unicode escape; expected \"}\"");
             return Option::None;
         }
         self.pos = self.pos + 1;
         if digits.is_empty() || digits.len() > 6 {
-            self.error(start, self.pos, "\\u{...} takes 1 to 6 hexadecimal digits");
+            self.error(start, self.pos, "\\u{...} takes 1 to 6 hexadecimal digits, found \(digits.len())");
             return Option::None;
         }
         match parse_digits(digits, 16) {
             Option::None => {
+                // Six hexadecimal digits cannot overflow a u64, so this is unreachable;
+                // the message exists rather than a silent wrong answer (process rule 8).
                 self.error(start, self.pos, "unicode escape is out of range");
                 Option::None
             }
             Option::Some(v) => {
+                let n = v as i64;
+                if n > 1114111 {
+                    self.error(start, self.pos,
+                        "0x\(hex_upper(n)) is above the maximum scalar value 0x10FFFF");
+                    return Option::None;
+                }
                 match char::from_u32(v as u32) {
                     Option::Some(c) => Option::Some(c),
                     Option::None => {
-                        self.error(start, self.pos, "not a Unicode scalar value");
+                        self.error(start, self.pos,
+                            "0x\(hex_upper(n)) is a surrogate, not a Unicode scalar value");
                         Option::None
                     }
                 }
@@ -979,6 +1018,16 @@ fn one_char_kind(s: String) -> i64 {
 
 /// A digit separator may be neither the first nor the last character of a digit run
 /// (spec/01-lexical.md). Returns "" when the run is well formed.
+/// The character an unknown escape names, for the message that reports it. Every escape
+/// Origin recognizes is ASCII, so a byte is a character here.
+fn escape_char(c: i64) -> String {
+    let all = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    if c < 32 || c > 126 {
+        return "?";
+    }
+    all.slice(c - 32, c - 31)
+}
+
 fn underscore_error(digits: String) -> String {
     if digits.is_empty() {
         return "";

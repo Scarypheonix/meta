@@ -109,7 +109,10 @@ impl Parser {
         }
         self.recovering = true;
         let t = self.cur();
-        self.errors.push(ParseError { message: "expected \(what)", start: t.start, end: t.end })
+        self.errors.push(ParseError {
+            message: "expected \(what), found \(lex::token_name(t))",
+            start: t.start, end: t.end,
+        })
     }
 
     fn error_at(self, start: i64, end: i64, message: String) {
