@@ -14,6 +14,7 @@ use source;
 use lex;
 use ast;
 use parse;
+use resolve;
 
 const USAGE: String = "usage: stage1 <command> <file>...
 
@@ -21,6 +22,8 @@ commands:
   dump-tokens   print the token stream
   dump-ast      print the parsed syntax tree
   parse         parse and report syntax errors only
+  resolve       resolve each file after the first as its own package, with the
+                first as the prelude, and print the resolution trace
 
 exit status:
   0    success
@@ -41,10 +44,20 @@ fn main() {
         process::exit(2);
     }
     let command = argv.at(1);
-    if command != "dump-tokens" && command != "dump-ast" && command != "parse" {
+    if command != "dump-tokens" && command != "dump-ast" && command != "parse"
+        && command != "resolve" {
         io::println("stage1: unknown command `\(command)`");
         io::println(USAGE);
         process::exit(2);
+    }
+
+    // `resolve` is a whole-package command: every file is resolved together, because a
+    // module cannot be resolved without the ones it imports (spec/07-modules.md).
+    if command == "resolve" {
+        if !run_resolve(argv) {
+            process::exit(1);
+        }
+        return;
     }
 
     let mut rejected = false;
@@ -58,6 +71,74 @@ fn main() {
     if rejected {
         process::exit(1);
     }
+}
+
+/// Resolves each file named after the first as its own package, with the first as the
+/// prelude, and prints the resolution trace of each under a `== path` header.
+///
+/// One package per file rather than one package of all of them, because that is the shape
+/// `originc check <file>` compiles in and the shape the differential compares: two files
+/// that both declare `main` are not a package. The prelude is parsed once and shared,
+/// since resolution does not write into the tree.
+fn run_resolve(argv: List[String]) -> bool {
+    if argv.len() < 4 {
+        io::println("stage1: `resolve` takes the prelude and at least one file");
+        return false;
+    }
+    let prelude_path = argv.at(2);
+    let mut prelude_tree = ast::File { uses: list::new[ast::Use](), items: list::new[ast::Item]() };
+    match read_to_string(prelude_path) {
+        Result::Err(e) => {
+            io::println("stage1: cannot read \(prelude_path): \(e.to_str())");
+            return false;
+        }
+        Result::Ok(src) => {
+            prelude_tree = parse::parse(lex::lex(src).tokens).file;
+        }
+    }
+
+    let mut ok = true;
+    let mut i = 3;
+    while i < argv.len() {
+        let path = argv.at(i);
+        match read_to_string(path) {
+            Result::Err(e) => {
+                io::println("stage1: cannot read \(path): \(e.to_str())");
+                ok = false;
+            }
+            Result::Ok(src) => {
+                io::println("== \(path)");
+                let tree = parse::parse(lex::lex(src).tokens).file;
+                let inputs = list::new[resolve::Input]();
+                inputs.push(resolve::Input {
+                    file: prelude_path, module: "", tree: prelude_tree, prelude: true,
+                });
+                inputs.push(resolve::Input {
+                    file: path, module: "", tree: tree, prelude: false,
+                });
+                if !report_resolution(resolve::program(inputs)) {
+                    ok = false;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ok
+}
+
+fn report_resolution(out: resolve::Resolved) -> bool {
+    let mut e = 0;
+    while e < out.errors.len() {
+        let err = out.errors.at(e);
+        io::println("error \(err.code) \(err.file):\(err.start):\(err.end): \(err.message)");
+        e = e + 1;
+    }
+    let mut t = 0;
+    while t < out.trace.len() {
+        io::println(out.trace.at(t));
+        t = t + 1;
+    }
+    out.errors.is_empty()
 }
 
 /// Runs one file, reporting whether it was accepted.

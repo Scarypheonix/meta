@@ -129,9 +129,10 @@ pub enum Expr {
     Bool(bool),
     Path(PathRef, List[Type]),
     SelfExpr,
-    StructLit(PathRef, List[FieldInit]),
+    StructLit(PathRef, List[Type], List[FieldInit]),
     Tuple(List[Expr]),
-    Lambda(List[LambdaParam], Expr),
+    /// The parameters, the declared return type if there is one, and the body.
+    Lambda(List[LambdaParam], Option[Type], Expr),
     Block(BlockBody),
     If(Expr, Expr, Option[Expr]),
     Match(Expr, List[Arm]),
@@ -310,6 +311,12 @@ fn mut_mark(m: bool) -> String {
 
 fn mut_prefix(m: bool) -> String {
     if m { "mut " } else { "" }
+}
+
+/// Marks an integer literal too large for any type to hold. The lexer records it rather
+/// than rejecting it, so that the checker can say which type it did not fit.
+fn overflow_mark(overflow: bool) -> String {
+    if overflow { " overflow" } else { "" }
 }
 
 fn suffix_mark(s: String) -> String {
@@ -696,7 +703,8 @@ fn dump_exprs(out: List[String], es: List[Expr], depth: i64) {
 
 fn dump_expr(out: List[String], e: Expr, depth: i64) {
     match e {
-        Expr::Int(v, overflow, suffix) => emit(out, depth, "int \(v)\(suffix_mark(suffix))"),
+        Expr::Int(v, overflow, suffix) =>
+            emit(out, depth, "int \(v)\(overflow_mark(overflow))\(suffix_mark(suffix))"),
         Expr::Float(v, suffix) => emit(out, depth, "float \(float_text(v))\(suffix_mark(suffix))"),
         Expr::Str(v) => emit(out, depth, "str \(quote_str(v))"),
         Expr::Char(v) => emit(out, depth, "char \(quote_char(v))"),
@@ -714,8 +722,17 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
             }
         }
         Expr::SelfExpr => emit(out, depth, "self"),
-        Expr::StructLit(path, fields) => {
-            emit(out, depth, "struct-lit \(path.text)");
+        Expr::StructLit(path, args, fields) => {
+            if args.is_empty() {
+                emit(out, depth, "struct-lit \(path.text)");
+            } else {
+                emit(out, depth, "struct-lit \(path.text)[..]");
+                let mut a = 0;
+                while a < args.len() {
+                    dump_type(out, args.at(a), depth + 1);
+                    a = a + 1;
+                }
+            }
             let mut i = 0;
             while i < fields.len() {
                 emit(out, depth + 1, "field \(fields.at(i).name.name)");
@@ -731,7 +748,7 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
                 dump_exprs(out, elems, depth + 1);
             }
         }
-        Expr::Lambda(params, body) => {
+        Expr::Lambda(params, ret, body) => {
             emit(out, depth, "lambda");
             let mut i = 0;
             while i < params.len() {
@@ -742,6 +759,13 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
                     Option::None => {}
                 }
                 i = i + 1;
+            }
+            match ret {
+                Option::Some(t) => {
+                    emit(out, depth + 1, "returns");
+                    dump_type(out, t, depth + 2);
+                }
+                Option::None => {}
             }
             dump_expr(out, body, depth + 1);
         }

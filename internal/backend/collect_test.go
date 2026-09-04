@@ -614,6 +614,59 @@ fn main() {
 `, "800\nabab\nabab\ntrue")
 }
 
+// Two strings of the same text are equal even when what sits above their last meaningful
+// byte differs.
+//
+// A String's bytes are packed into words, so a length that is not a multiple of eight
+// leaves a partial final word whose high bytes are no part of the value. `equal_objects`
+// compared that word whole, on the stated assumption that those bytes were zero -- true
+// only until the first collection, because the space every allocation after one comes out
+// of is a semispace that has been used before and holds whatever the previous cycle left
+// there.
+//
+// The failure is quiet and specific: only in native code, only after a collection, only
+// for a length not a multiple of eight, and only between strings built separately -- which
+// is why nothing in the corpus caught it and why a Map keyed by String was where it
+// surfaced. `probe` compares the key it finds against the key it was given, so a lookup
+// simply stopped finding entries that were certainly there.
+func TestTwoEqualStringsCompareEqualAfterACollection(t *testing.T) {
+	checkRun(t, `
+use std::io;
+use std::list;
+
+// Built the same way twice, so the two runs of bytes are equal and the words above them
+// are whatever each allocation happened to land on.
+fn names() -> List[String] {
+    "io map str env chan sync array process".split(" ")
+}
+
+fn main() {
+    let mut rounds = 0;
+    let mut unequal = 0;
+    while rounds < 200 {
+        let a = names();
+        // Enough allocation between the two to collect at this heap size.
+        let junk = list::new[String]();
+        let mut j = 0;
+        while j < 40 {
+            junk.push("filler ".concat(j.to_str()).concat("xyzwv").repeat(1 + j - (j / 3) * 3));
+            j = j + 1;
+        }
+        let b = names();
+        let mut i = 0;
+        while i < a.len() {
+            if a.at(i) != b.at(i) {
+                unequal = unequal + 1;
+            }
+            i = i + 1;
+        }
+        rounds = rounds + 1;
+    }
+    io::println(unequal.to_str());
+}
+`, "0")
+}
+
 // The same hazard with a live reference the *caller* holds: `parts` is a list of strings
 // that nothing but the list itself keeps alive, and every `concat` below can collect.
 func TestAListOfStringsSurvivesACollection(t *testing.T) {

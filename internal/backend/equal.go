@@ -177,26 +177,33 @@ func (e *emitter) emitEqualObjects() {
 	a.AddRI(x86.R12, 1)
 	a.Jmp(fixedLoop)
 
-	// ByteArray shape: a String. Its length is payload word 0; equal length and
-	// equal packed-byte words (word 1 onward) is equal content. A partial trailing
-	// word's unused high bytes are zero -- mmap's anonymous pages start zeroed and
-	// nothing here ever overwrites another object's bytes -- so comparing it as a
-	// whole word is exactly byte comparison.
+	// ByteArray shape: a String. Its length is payload word 0; equal length and equal
+	// bytes is equal content.
+	//
+	// The whole words are compared a word at a time and the trailing bytes one at a time,
+	// which is not an optimization but the only correct reading. The bytes above a
+	// partial final word's last meaningful one are NOT part of the value and are NOT
+	// zero: `rt_str_alloc` writes only the bytes it was given, and after the first
+	// collection the space it bump-allocates from is a semispace that has been used
+	// before, so those bytes hold whatever the previous cycle left there. Comparing them
+	// made two strings of the same text unequal -- but only in native code, only after a
+	// collection, and only for a length that is not a multiple of eight.
 	a.Bind(bytesCase)
 	a.MovRM(x86.RAX, x86.At(x86.RBX, objHeaderSize)) // len a
 	a.MovRM(x86.RCX, x86.At(x86.R13, objHeaderSize)) // len b
 	a.CmpRR(x86.RAX, x86.RCX)
 	a.Jcc(x86.NotEqual, isFalse)
-	a.AddRI(x86.RAX, 7)
-	a.ShrI(x86.RAX, 3) // nwords = ceil(len/8)
-	a.MovMR(wordsSlot, x86.RAX)
+	a.MovMR(wordsSlot, x86.RAX) // the length in bytes, for the tail
+	a.ShrI(x86.RAX, 3)          // whole words = len / 8
+	a.MovMR(kindsSlot, x86.RAX) // reused here as the whole-word count
 
 	a.XorRR(x86.R12, x86.R12)
 	bytesLoop := a.NewLabel("eq_bytes_loop")
+	bytesTail := a.NewLabel("eq_bytes_tail")
 	a.Bind(bytesLoop)
-	a.MovRM(x86.RAX, wordsSlot)
+	a.MovRM(x86.RAX, kindsSlot)
 	a.CmpRR(x86.R12, x86.RAX)
-	a.Jcc(x86.GreaterEqual, isTrue)
+	a.Jcc(x86.GreaterEqual, bytesTail)
 
 	a.MovRR(x86.RCX, x86.R12)
 	a.ShlI(x86.RCX, 3)
@@ -211,6 +218,31 @@ func (e *emitter) emitEqualObjects() {
 	a.Jcc(x86.NotEqual, isFalse)
 	a.AddRI(x86.R12, 1)
 	a.Jmp(bytesLoop)
+
+	// The bytes past the last whole word: at most seven, one at a time.
+	a.Bind(bytesTail)
+	a.MovRR(x86.R12, x86.RAX)
+	a.ShlI(x86.R12, 3) // i = whole words * 8, the first byte of the tail
+	tailLoop := a.NewLabel("eq_bytes_tail_loop")
+	a.Bind(tailLoop)
+	a.MovRM(x86.RAX, wordsSlot)
+	a.CmpRR(x86.R12, x86.RAX)
+	a.Jcc(x86.GreaterEqual, isTrue)
+
+	a.MovRR(x86.RCX, x86.R12)
+	a.AddRI(x86.RCX, strBytesOff)
+	a.MovRR(x86.RAX, x86.RCX)
+	a.AddRR(x86.RAX, x86.RBX)
+	a.XorRR(x86.R8, x86.R8)
+	a.MovRM8(x86.R8, x86.At(x86.RAX, 0))
+	a.MovRR(x86.RAX, x86.RCX)
+	a.AddRR(x86.RAX, x86.R13)
+	a.XorRR(x86.R9, x86.R9)
+	a.MovRM8(x86.R9, x86.At(x86.RAX, 0))
+	a.CmpRR(x86.R8, x86.R9)
+	a.Jcc(x86.NotEqual, isFalse)
+	a.AddRI(x86.R12, 1)
+	a.Jmp(tailLoop)
 
 	// An array (ADR-0028): equal lengths and pairwise-equal elements, with the room above
 	// the length no part of the value. One kind for the whole run, from the table's fourth

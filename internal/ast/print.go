@@ -203,7 +203,7 @@ func dump(sb *strings.Builder, n Node, depth int) {
 
 	// Expressions
 	case *IntLit:
-		line(sb, depth, "int %d%s", v.Value, suffixMark(v.Suffix))
+		line(sb, depth, "int %d%s%s", v.Value, overflowMark(v.Overflow), suffixMark(v.Suffix))
 	case *FloatLit:
 		line(sb, depth, "float %s%s", strconv.FormatFloat(v.Value, 'g', -1, 64), suffixMark(v.Suffix))
 	case *StrLit:
@@ -224,7 +224,14 @@ func dump(sb *strings.Builder, n Node, depth int) {
 	case *SelfExpr:
 		line(sb, depth, "self")
 	case *StructLit:
-		line(sb, depth, "struct-lit %s", v.Path)
+		if len(v.Args) == 0 {
+			line(sb, depth, "struct-lit %s", v.Path)
+		} else {
+			line(sb, depth, "struct-lit %s[..]", v.Path)
+			for _, a := range v.Args {
+				dump(sb, a, depth+1)
+			}
+		}
 		for _, f := range v.Fields {
 			line(sb, depth+1, "field %s", f.Name.Name)
 			dump(sb, f.Value, depth+2)
@@ -246,6 +253,10 @@ func dump(sb *strings.Builder, n Node, depth int) {
 			if lp.Type != nil {
 				dump(sb, lp.Type, depth+2)
 			}
+		}
+		if v.Ret != nil {
+			line(sb, depth+1, "returns")
+			dump(sb, v.Ret, depth+2)
 		}
 		dump(sb, v.Body, depth+1)
 	case *Block:
@@ -472,6 +483,15 @@ func dumpTraitRef(sb *strings.Builder, tr *TraitRef, depth int) {
 	for _, a := range tr.Args {
 		dump(sb, a, depth+1)
 	}
+}
+
+// overflowMark marks an integer literal too large for any type to hold. The lexer records
+// it rather than rejecting it, so that the checker can say which type it did not fit.
+func overflowMark(overflow bool) string {
+	if overflow {
+		return " overflow"
+	}
+	return ""
 }
 
 func generics(gs []*GenericParam) string {

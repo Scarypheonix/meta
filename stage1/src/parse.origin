@@ -1402,14 +1402,15 @@ impl Parser {
             self.expect(lex::K_PIPE);
         }
         let mut body = ast::Expr::ErrorExpr;
+        let mut ret = Option::None;
         if self.eat(lex::K_ARROW) {
-            self.type_expr();
+            ret = Option::Some(self.type_expr());
             body = self.block();
         } else {
             body = self.expr();
         }
         self.no_struct = saved;
-        ast::Expr::Lambda(params, body)
+        ast::Expr::Lambda(params, ret, body)
     }
 
     fn path_expr_or_struct_lit(self) -> ast::Expr {
@@ -1417,7 +1418,7 @@ impl Parser {
         let args = self.type_args();
 
         if self.at(lex::K_LBRACE) && !self.no_struct {
-            return self.struct_lit(path);
+            return self.struct_lit(path, args);
         }
         // A struct literal here is what the writer meant, and exactly what §02's first
         // parser restriction forbids. `Ident :` inside the brace is a field initializer and
@@ -1427,12 +1428,12 @@ impl Parser {
             && self.peek_is(1, lex::K_IDENT) && self.peek_is(2, lex::K_COLON) {
             let t = self.cur();
             self.error_at(t.start, t.end, "a struct literal cannot appear here");
-            return self.struct_lit(path);
+            return self.struct_lit(path, args);
         }
         ast::Expr::Path(path, args)
     }
 
-    fn struct_lit(self, path: ast::PathRef) -> ast::Expr {
+    fn struct_lit(self, path: ast::PathRef, args: List[ast::Type]) -> ast::Expr {
         let saved = self.no_struct;
         self.no_struct = false;
         self.advance();
@@ -1464,7 +1465,7 @@ impl Parser {
         }
         self.expect(lex::K_RBRACE);
         self.no_struct = saved;
-        ast::Expr::StructLit(path, fields)
+        ast::Expr::StructLit(path, args, fields)
     }
 }
 

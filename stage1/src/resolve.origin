@@ -1,0 +1,1625 @@
+// Name resolution, in Origin: what every identifier occurrence names.
+//
+// A translation of `internal/resolve`, and held to it (tests/selfhost). The Go resolver's
+// output is side tables keyed by AST node id and this syntax tree deliberately has none
+// (ast.origin's header), so what the two are compared on is a *trace*: one line per
+// resolution event, in the order the resolver produces them. The two walk the same tree in
+// the same order, so a line's position in the trace identifies the node, and what the line
+// says identifies what the node resolved to. A declaration is named by where it was
+// written -- `<file>:<offset>` of its own name -- which is what makes shadowing
+// observable: two bindings called `x` are the same only if they were declared in the same
+// place.
+//
+// Resolution happens in four passes, and the order is what makes module cycles legal
+// (spec/07-modules.md): the module tree is built, then every module's items are declared,
+// then imports are processed, then bodies are resolved.
+
+use std::list;
+use std::map;
+use ast;
+
+// --- Kinds ---------------------------------------------------------------------------
+//
+// Numbers rather than an enum, for the reason lex.origin gives for token kinds: a kind is
+// stored in a field, compared constantly, and printed into the trace.
+
+pub const K_UNRESOLVED: i64 = 0;
+pub const K_LOCAL: i64 = 1;
+pub const K_FN: i64 = 2;
+pub const K_STRUCT: i64 = 3;
+pub const K_ENUM: i64 = 4;
+pub const K_VARIANT: i64 = 5;
+pub const K_CONST: i64 = 6;
+pub const K_BUILTIN: i64 = 7;
+pub const K_TYPEPARAM: i64 = 8;
+pub const K_TRAIT: i64 = 9;
+pub const K_ALIAS: i64 = 10;
+pub const K_PRIM: i64 = 11;
+pub const K_SELFTY: i64 = 12;
+pub const K_MODULE: i64 = 13;
+pub const K_PRIMCONST: i64 = 14;
+pub const K_ASSOC: i64 = 15;
+
+// --- Values --------------------------------------------------------------------------
+
+/// One binding. Identity is the allocation -- `ref_eq` -- so two `Local`s of the same name
+/// in different scopes are different bindings, which is what makes shadowing work.
+pub struct Local {
+    pub name: String,
+    pub mutable: bool,
+    /// Where it was declared: which input file, and the byte offset of its name.
+    pub file: String,
+    pub at: i64,
+    /// The function nesting level it belongs to. A reference from a deeper level is a
+    /// capture.
+    pub fn_depth: i64,
+}
+
+/// What one identifier occurrence resolves to. Which of the payload fields is meaningful
+/// follows from `kind`, exactly as it does for a token's payload.
+pub struct Ref {
+    pub kind: i64,
+    pub name: String,
+    /// The declaration's own name span, for the kinds that have a declaration.
+    pub file: String,
+    pub at: i64,
+    /// The full name of a compiler-provided operation, such as `io::println`.
+    pub builtin: String,
+    /// The projected member, for `K_PRIMCONST` and `K_ASSOC`.
+    pub member: String,
+    /// What an associated-type projection is based on: `K_SELFTY` or `K_TYPEPARAM`.
+    pub base_kind: i64,
+    pub local: Option[Local],
+    /// The declaration, for `K_ENUM`, so that `Enum::Variant` can be looked up.
+    pub enum_decl: Option[ast::EnumDecl],
+    pub module: Option[Module],
+}
+
+fn no_local() -> Option[Local] { Option::None }
+fn no_enum() -> Option[ast::EnumDecl] { Option::None }
+fn no_module() -> Option[Module] { Option::None }
+
+/// A reference to nothing: the name was not found and a diagnostic was already reported.
+pub fn unresolved() -> Ref {
+    Ref {
+        kind: K_UNRESOLVED, name: "", file: "", at: 0, builtin: "", member: "",
+        base_kind: 0, local: no_local(), enum_decl: no_enum(), module: no_module(),
+    }
+}
+
+fn ref_decl(kind: i64, name: String, file: String, at: i64) -> Ref {
+    let r = unresolved();
+    Ref {
+        kind: kind, name: name, file: file, at: at, builtin: "", member: "",
+        base_kind: 0, local: no_local(), enum_decl: no_enum(), module: no_module(),
+    }
+}
+
+fn ref_named(kind: i64, name: String) -> Ref {
+    ref_decl(kind, name, "", 0)
+}
+
+fn ref_builtin(full: String, name: String) -> Ref {
+    Ref {
+        kind: K_BUILTIN, name: name, file: "", at: 0, builtin: full, member: "",
+        base_kind: 0, local: no_local(), enum_decl: no_enum(), module: no_module(),
+    }
+}
+
+fn ref_local(l: Local) -> Ref {
+    Ref {
+        kind: K_LOCAL, name: l.name, file: l.file, at: l.at, builtin: "", member: "",
+        base_kind: 0, local: Option::Some(l), enum_decl: no_enum(), module: no_module(),
+    }
+}
+
+fn ref_enum(d: ast::EnumDecl, file: String) -> Ref {
+    Ref {
+        kind: K_ENUM, name: d.name.name, file: file, at: d.name.start, builtin: "",
+        member: "", base_kind: 0, local: no_local(), enum_decl: Option::Some(d),
+        module: no_module(),
+    }
+}
+
+fn ref_module(m: Module) -> Ref {
+    Ref {
+        kind: K_MODULE, name: m.name, file: "", at: 0, builtin: "", member: "",
+        base_kind: 0, local: no_local(), enum_decl: no_enum(), module: Option::Some(m),
+    }
+}
+
+/// Whether two references name the same thing.
+///
+/// Written out rather than `==`, which would compare structurally and walk into a module's
+/// parent pointer -- a cycle. What identifies a reference is its kind and either the
+/// declaration it points at or the name it carries.
+fn same_ref(a: Ref, b: Ref) -> bool {
+    a.kind == b.kind && a.name == b.name && a.file == b.file && a.at == b.at
+        && a.builtin == b.builtin && a.member == b.member
+}
+
+// --- Scopes --------------------------------------------------------------------------
+
+pub struct Scope {
+    names: Map[String, Ref],
+    parent: Option[Scope],
+}
+
+fn new_scope(parent: Option[Scope]) -> Scope {
+    Scope { names: map::new[String, Ref](), parent: parent }
+}
+
+impl Scope {
+    fn lookup(self, name: String) -> Option[Ref] {
+        match self.names.get(name) {
+            Option::Some(r) => Option::Some(r),
+            Option::None => {
+                match self.parent {
+                    Option::Some(p) => p.lookup(name),
+                    Option::None => Option::None,
+                }
+            }
+        }
+    }
+}
+
+// --- Modules -------------------------------------------------------------------------
+
+/// One node of the package's module tree. The filesystem is the module tree
+/// (spec/07-modules.md): a file's path under the source root, with separators replaced by
+/// `::`, is its module path.
+pub struct Module {
+    pub name: String,
+    parent: Option[Module],
+    children: Map[String, Module],
+    items: Map[String, Ref],
+    pubs: Map[String, bool],
+    mut scope: Option[Scope],
+    mut is_prelude: bool,
+}
+
+fn new_module(name: String, parent: Option[Module]) -> Module {
+    Module {
+        name: name, parent: parent, children: map::new[String, Module](),
+        items: map::new[String, Ref](), pubs: map::new[String, bool](),
+        scope: Option::None, is_prelude: false,
+    }
+}
+
+impl Module {
+    /// The `::`-separated path from the root, which is empty for the root itself.
+    pub fn path(self) -> String {
+        match self.parent {
+            Option::None => self.name,
+            Option::Some(p) => {
+                let above = p.path();
+                if above.is_empty() { self.name } else { "\(above)::\(self.name)" }
+            }
+        }
+    }
+
+    /// How the module is named in a diagnostic.
+    fn describe(self) -> String {
+        let p = self.path();
+        if p.is_empty() { "the root module" } else { "`\(p)`" }
+    }
+
+    fn is_public(self, name: String) -> bool {
+        self.pubs.get(name).unwrap_or(false)
+    }
+}
+
+// --- Errors and results ---------------------------------------------------------------
+
+pub struct ResolveError {
+    pub code: String,
+    pub message: String,
+    pub file: String,
+    pub start: i64,
+    pub end: i64,
+}
+
+/// One file to resolve, with the module path it lives at and whether it is the prelude.
+pub struct Input {
+    pub file: String,
+    pub module: String,
+    pub tree: ast::File,
+    pub prelude: bool,
+}
+
+pub struct Resolved {
+    pub trace: List[String],
+    pub errors: List[ResolveError],
+}
+
+// --- The resolver ---------------------------------------------------------------------
+
+struct LambdaCtx {
+    depth: i64,
+    captured: List[Local],
+}
+
+pub struct Resolver {
+    trace: List[String],
+    errors: List[ResolveError],
+    root: Module,
+    std_root: Module,
+    globals: Scope,
+    prelude_scope: Scope,
+    mut current: Module,
+    mut scope: Scope,
+    mut fn_depth: i64,
+    mut loop_depth: i64,
+    lambdas: List[LambdaCtx],
+    /// The file whose body is being resolved, for spans in its diagnostics.
+    mut file: String,
+}
+
+/// The primitive type names, in scope everywhere. They are not declarations, so they
+/// cannot be shadowed by one.
+fn primitive_names() -> List[String] {
+    let out = list::new[String]();
+    out.push("i8"); out.push("i16"); out.push("i32"); out.push("i64");
+    out.push("u8"); out.push("u16"); out.push("u32"); out.push("u64");
+    out.push("f32"); out.push("f64");
+    out.push("bool"); out.push("char"); out.push("String");
+    // `Array` is generic, unlike every other name here, and is a primitive for the same
+    // reason `String` is: the compiler provides it and no source declares it (ADR-0028).
+    out.push("Array");
+    out
+}
+
+/// The associated constants every integer type carries. They exist so that the most
+/// negative value of a signed type can be written at all (spec/01-lexical.md).
+fn is_prim_const(name: String) -> bool {
+    name == "MIN" || name == "MAX" || name == "BITS"
+}
+
+/// The compiler-provided modules of the standard library, as `path` then its item names.
+/// They exist so that `use std::io;` goes through ordinary module resolution rather than
+/// a special case.
+fn std_modules() -> List[List[String]] {
+    let out = list::new[List[String]]();
+    out.push(mod_entry("std::io", "print println"));
+    out.push(mod_entry("std::array", "new len cap at set push truncate"));
+    out.push(mod_entry("std::list", "new"));
+    out.push(mod_entry("std::map", "new"));
+    out.push(mod_entry("std::hash", "of"));
+    out.push(mod_entry("std::str", "len byte_at slice concat char_at char_width"));
+    out.push(mod_entry("std::env", "arg_count arg_at"));
+    out.push(mod_entry("std::process", "exit"));
+    out.push(mod_entry("std::float", "bits from_bits"));
+    out.push(mod_entry("std::fs", "read_file taken_text write_file file_exists"));
+    out.push(mod_entry("std::thread", "spawn join_thread"));
+    out.push(mod_entry("std::chan", "channel send_value await_value taken_value close_sender"));
+    out.push(mod_entry("std::sync", "mutex with_lock"));
+    out
+}
+
+fn mod_entry(path: String, names: String) -> List[String] {
+    let out = list::new[String]();
+    out.push(path);
+    let parts = names.split(" ");
+    let mut i = 0;
+    while i < parts.len() {
+        out.push(parts.at(i));
+        i = i + 1;
+    }
+    out
+}
+
+/// Splits a `::`-separated module path into its segments.
+fn split_path(p: String) -> List[String] {
+    let out = list::new[String]();
+    if p.is_empty() {
+        return out;
+    }
+    let parts = p.split("::");
+    let mut i = 0;
+    while i < parts.len() {
+        out.push(parts.at(i));
+        i = i + 1;
+    }
+    out
+}
+
+/// Resolves a whole package: the prelude, the root module, and every submodule.
+pub fn program(inputs: List[Input]) -> Resolved {
+    let root = new_module("", Option::None);
+    let globals = new_scope(Option::None);
+    let r = Resolver {
+        trace: list::new[String](),
+        errors: list::new[ResolveError](),
+        root: root,
+        std_root: new_module("std", Option::None),
+        globals: globals,
+        // The prelude's items go into the global scope, which is what makes them visible
+        // everywhere without a `use`. Its *imports* must not: `use std::thread` inside the
+        // prelude is how its own method bodies reach the runtime's operations, and leaking
+        // `thread` into every user module would make `use std::thread;` a no-op there.
+        prelude_scope: new_scope(Option::Some(globals)),
+        current: root,
+        scope: globals,
+        fn_depth: 0,
+        loop_depth: 0,
+        lambdas: list::new[LambdaCtx](),
+        file: "",
+    };
+
+    let prims = primitive_names();
+    let mut i = 0;
+    while i < prims.len() {
+        let n = prims.at(i);
+        r.globals.names.insert(n, ref_named(K_PRIM, n));
+        i = i + 1;
+    }
+    // The two compiler-provided functions in scope everywhere, with no `use`.
+    r.globals.names.insert("panic", ref_builtin("panic", "panic"));
+    r.globals.names.insert("ref_eq", ref_builtin("ref_eq", "ref_eq"));
+    r.register_std();
+
+    // Pass 1: place every file in the module tree.
+    let mods = list::new[Module]();
+    let mut a = 0;
+    while a < inputs.len() {
+        let unit = inputs.at(a);
+        let m = r.module_at(unit.module);
+        if unit.prelude {
+            m.is_prelude = true;
+        }
+        mods.push(m);
+        a = a + 1;
+    }
+
+    // Pass 2: declare each module's items. Prelude items go into the global scope instead.
+    let mut b = 0;
+    while b < inputs.len() {
+        let unit = inputs.at(b);
+        r.current = mods.at(b);
+        r.file = unit.file;
+        if unit.prelude {
+            r.scope = r.globals;
+        } else {
+            r.scope = r.module_scope(mods.at(b));
+        }
+        let items = unit.tree.items;
+        let mut j = 0;
+        while j < items.len() {
+            r.declare_item(items.at(j));
+            if !unit.prelude {
+                r.declare_visibility(items.at(j));
+            }
+            j = j + 1;
+        }
+        b = b + 1;
+    }
+
+    // Pass 3: process imports, now that every module's items exist.
+    let mut c = 0;
+    while c < inputs.len() {
+        let unit = inputs.at(c);
+        r.current = mods.at(c);
+        r.file = unit.file;
+        if unit.prelude {
+            r.scope = r.prelude_scope;
+        } else {
+            r.scope = r.module_scope(mods.at(c));
+        }
+        let uses = unit.tree.uses;
+        let mut j = 0;
+        while j < uses.len() {
+            r.resolve_use(uses.at(j));
+            j = j + 1;
+        }
+        c = c + 1;
+    }
+
+    // Pass 4: resolve bodies.
+    let mut d = 0;
+    while d < inputs.len() {
+        let unit = inputs.at(d);
+        r.current = mods.at(d);
+        r.file = unit.file;
+        if unit.prelude {
+            r.scope = r.prelude_scope;
+        } else {
+            r.scope = r.module_scope(mods.at(d));
+        }
+        let items = unit.tree.items;
+        let mut j = 0;
+        while j < items.len() {
+            r.resolve_item(items.at(j));
+            j = j + 1;
+        }
+        d = d + 1;
+    }
+
+    Resolved { trace: r.trace, errors: r.errors }
+}
+
+impl Resolver {
+    fn register_std(self) {
+        let mods = std_modules();
+        let mut i = 0;
+        while i < mods.len() {
+            let entry = mods.at(i);
+            let path = entry.at(0);
+            let segs = split_path(path);
+            let mut m = self.std_root;
+            let mut s = 1;
+            while s < segs.len() {
+                m = self.child_of(m, segs.at(s));
+                s = s + 1;
+            }
+            let prefix = path.slice(5, path.len()); // past "std::"
+            let mut n = 1;
+            while n < entry.len() {
+                let name = entry.at(n);
+                m.items.insert(name, ref_builtin("\(prefix)::\(name)", name));
+                m.pubs.insert(name, true);
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    fn child_of(self, m: Module, name: String) -> Module {
+        match m.children.get(name) {
+            Option::Some(c) => c,
+            Option::None => {
+                let c = new_module(name, Option::Some(m));
+                m.children.insert(name, c);
+                c
+            }
+        }
+    }
+
+    /// The module at a `::`-separated path, creating it if needed.
+    fn module_at(self, path: String) -> Module {
+        let segs = split_path(path);
+        let mut m = self.root;
+        let mut i = 0;
+        while i < segs.len() {
+            m = self.child_of(m, segs.at(i));
+            i = i + 1;
+        }
+        self.module_scope(m);
+        m
+    }
+
+    /// The scope names resolve in inside a module, made on first use.
+    fn module_scope(self, m: Module) -> Scope {
+        match m.scope {
+            Option::Some(s) => s,
+            Option::None => {
+                let s = new_scope(Option::Some(self.globals));
+                m.scope = Option::Some(s);
+                s
+            }
+        }
+    }
+
+    fn error(self, code: String, at: ast::Span, message: String) {
+        self.errors.push(ResolveError {
+            code: code, message: message, file: self.file, start: at.start, end: at.end,
+        });
+    }
+
+    fn error_at(self, code: String, id: ast::Ident, message: String) {
+        self.error(code, ast::Span { start: id.start, end: id.end }, message);
+    }
+}
+
+// --- The trace --------------------------------------------------------------------------
+
+impl Resolver {
+    fn note(self, r: Ref) {
+        self.trace.push("ref \(describe_ref(r))");
+    }
+
+    fn note_binding(self, l: Local) {
+        self.trace.push("bind \(l.name) \(l.mutable) \(l.file):\(l.at)");
+    }
+
+    fn note_captures(self, order: List[Local]) {
+        let mut line = "lambda \(order.len())";
+        let mut i = 0;
+        while i < order.len() {
+            let l = order.at(i);
+            line = line.concat(" \(l.name)@\(l.file):\(l.at)");
+            i = i + 1;
+        }
+        self.trace.push(line);
+    }
+}
+
+fn describe_ref(r: Ref) -> String {
+    if r.kind == K_LOCAL { return "local \(r.name) \(r.file):\(r.at)"; }
+    if r.kind == K_FN { return "fn \(r.name) \(r.file):\(r.at)"; }
+    if r.kind == K_STRUCT { return "struct \(r.name) \(r.file):\(r.at)"; }
+    if r.kind == K_ENUM { return "enum \(r.name) \(r.file):\(r.at)"; }
+    if r.kind == K_VARIANT { return "variant \(r.name) \(r.file):\(r.at)"; }
+    if r.kind == K_CONST { return "const \(r.name) \(r.file):\(r.at)"; }
+    if r.kind == K_TRAIT { return "trait \(r.name) \(r.file):\(r.at)"; }
+    if r.kind == K_ALIAS { return "alias \(r.name) \(r.file):\(r.at)"; }
+    if r.kind == K_BUILTIN { return "builtin \(r.builtin)"; }
+    if r.kind == K_PRIM { return "prim \(r.name)"; }
+    if r.kind == K_PRIMCONST { return "primconst \(r.name)::\(r.member)"; }
+    if r.kind == K_SELFTY { return "selfty"; }
+    if r.kind == K_TYPEPARAM { return "typeparam \(r.name)"; }
+    if r.kind == K_MODULE {
+        match r.module {
+            Option::Some(m) => return "module \(m.path())",
+            Option::None => return "module ?",
+        }
+    }
+    if r.kind == K_ASSOC { return "assoc \(kind_word(r.base_kind)) \(r.name)::\(r.member)"; }
+    "unresolved"
+}
+
+fn kind_word(k: i64) -> String {
+    if k == K_SELFTY { return "selfty"; }
+    if k == K_TYPEPARAM { return "typeparam"; }
+    "?"
+}
+
+// --- Declaring items ---------------------------------------------------------------
+
+impl Resolver {
+    fn declare_item(self, item: ast::Item) {
+        match item {
+            ast::Item::Fn(d) => self.declare(d.name, ref_decl(K_FN, d.name.name, self.file, d.name.start)),
+            ast::Item::Struct(d) => self.declare(d.name, ref_decl(K_STRUCT, d.name.name, self.file, d.name.start)),
+            ast::Item::Enum(d) => self.declare(d.name, ref_enum(d, self.file)),
+            ast::Item::Const(d) => self.declare(d.name, ref_decl(K_CONST, d.name.name, self.file, d.name.start)),
+            ast::Item::Trait(d) => self.declare(d.name, ref_decl(K_TRAIT, d.name.name, self.file, d.name.start)),
+            ast::Item::Alias(d) => self.declare(d.name, ref_decl(K_ALIAS, d.name.name, self.file, d.name.start)),
+            // An impl declares no top-level name at all: its methods are reached through
+            // the receiver's type, which is the checker's question rather than this one's.
+            ast::Item::Impl(_) => {}
+            ast::Item::ErrorItem => {}
+        }
+    }
+
+    fn declare(self, name: ast::Ident, r: Ref) {
+        if name.name.is_empty() {
+            return; // the parser already reported a missing name
+        }
+        match self.scope.names.get(name.name) {
+            Option::Some(prev) => {
+                if prev.kind != K_LOCAL {
+                    self.error_at("E0433", name,
+                        "`\(name.name)` is declared more than once in this module");
+                    return;
+                }
+            }
+            Option::None => {}
+        }
+        self.scope.names.insert(name.name, r);
+        self.current.items.insert(name.name, r);
+    }
+
+    fn declare_visibility(self, item: ast::Item) {
+        match item {
+            ast::Item::Fn(d) => self.set_pub(d.name, d.public),
+            ast::Item::Struct(d) => self.set_pub(d.name, d.public),
+            ast::Item::Enum(d) => self.set_pub(d.name, d.public),
+            ast::Item::Trait(d) => self.set_pub(d.name, d.public),
+            ast::Item::Const(d) => self.set_pub(d.name, d.public),
+            ast::Item::Alias(d) => self.set_pub(d.name, d.public),
+            ast::Item::Impl(_) => {}
+            ast::Item::ErrorItem => {}
+        }
+    }
+
+    fn set_pub(self, name: ast::Ident, public: bool) {
+        if name.name.is_empty() {
+            return;
+        }
+        self.current.pubs.insert(name.name, public);
+    }
+}
+
+// --- Imports -------------------------------------------------------------------------
+
+impl Resolver {
+    /// `use` imports names from another module (spec/07-modules.md). Origin 0.1 has no
+    /// glob imports and no renaming, so a `use` names either one item or a braced list of
+    /// items from one module.
+    fn resolve_use(self, u: ast::Use) {
+        let segs = u.path.segs;
+        if segs.is_empty() {
+            return;
+        }
+        let whole = ast::Span { start: u.path.start, end: u.path.end };
+
+        if !u.names.is_empty() {
+            match self.module_by_path(segs, whole, u.path.text) {
+                Option::None => {}
+                Option::Some(m) => {
+                    let mut i = 0;
+                    while i < u.names.len() {
+                        self.import_name(m, u.names.at(i));
+                        i = i + 1;
+                    }
+                }
+            }
+            return;
+        }
+
+        // A single path: the last segment is either an item in the module named by the
+        // prefix, or a module itself.
+        if segs.len() >= 2 {
+            match self.lookup_module(prefix_of(segs)) {
+                Option::Some(m) => {
+                    let last = segs.at(segs.len() - 1);
+                    match m.children.get(last.name) {
+                        Option::Some(child) => {
+                            self.scope.names.insert(last.name, ref_module(child));
+                        }
+                        Option::None => self.import_name(m, last),
+                    }
+                    return;
+                }
+                Option::None => {}
+            }
+        }
+        match self.lookup_module(segs) {
+            Option::Some(m) => {
+                let last = segs.at(segs.len() - 1);
+                self.scope.names.insert(last.name, ref_module(m));
+            }
+            Option::None => {
+                self.error("E0432", whole, "cannot resolve import `\(u.path.text)`");
+            }
+        }
+    }
+
+    /// Brings one name from a module into the current scope, checking visibility.
+    fn import_name(self, m: Module, name: ast::Ident) {
+        match m.items.get(name.name) {
+            Option::None => {
+                match m.children.get(name.name) {
+                    Option::Some(child) => {
+                        self.scope.names.insert(name.name, ref_module(child));
+                    }
+                    Option::None => {
+                        self.error_at("E0432", name,
+                            "\(m.describe()) has no item `\(name.name)`");
+                        self.poison(name.name);
+                    }
+                }
+            }
+            Option::Some(r) => {
+                if !m.is_public(name.name) {
+                    self.error_at("E0603", name, "`\(name.name)` is private");
+                    self.poison(name.name);
+                    return;
+                }
+                match self.scope.names.get(name.name) {
+                    Option::Some(prev) => {
+                        if !same_ref(prev, r) && prev.kind != K_LOCAL {
+                            self.error_at("E0432", name,
+                                "`\(name.name)` is imported more than once");
+                            return;
+                        }
+                    }
+                    Option::None => {}
+                }
+                self.scope.names.insert(name.name, r);
+            }
+        }
+    }
+
+    /// Binds a name that failed to import, so every later use of it resolves to the
+    /// already-reported marker instead of producing a second diagnostic.
+    fn poison(self, name: String) {
+        if name.is_empty() {
+            return;
+        }
+        self.scope.names.insert(name, unresolved());
+    }
+
+    /// Resolves a module path: a name already in scope, then a sibling of the current
+    /// module, then a child of the root, then `std`.
+    fn lookup_module(self, segs: List[ast::Ident]) -> Option[Module] {
+        if segs.is_empty() {
+            return Option::None;
+        }
+        let first = segs.at(0).name;
+        let mut start = no_module();
+        if first == "std" {
+            start = Option::Some(self.std_root);
+        } else {
+            match self.scope.lookup(first) {
+                Option::Some(r) => {
+                    if r.kind == K_MODULE {
+                        start = r.module;
+                    }
+                }
+                Option::None => {}
+            }
+            match start {
+                Option::Some(_) => {}
+                Option::None => {
+                    match self.current.parent {
+                        Option::Some(p) => { start = p.children.get(first); }
+                        Option::None => {}
+                    }
+                }
+            }
+            match start {
+                Option::Some(_) => {}
+                Option::None => { start = self.root.children.get(first); }
+            }
+        }
+        match start {
+            Option::None => Option::None,
+            Option::Some(top) => {
+                let mut m = top;
+                let mut i = 1;
+                while i < segs.len() {
+                    match m.children.get(segs.at(i).name) {
+                        Option::None => return Option::None,
+                        Option::Some(c) => { m = c; }
+                    }
+                    i = i + 1;
+                }
+                Option::Some(m)
+            }
+        }
+    }
+
+    fn module_by_path(self, segs: List[ast::Ident], at: ast::Span, text: String) -> Option[Module] {
+        let m = self.lookup_module(segs);
+        match m {
+            Option::None => {
+                self.error("E0432", at, "cannot resolve module `\(path_text(segs))`");
+            }
+            Option::Some(_) => {}
+        }
+        m
+    }
+}
+
+/// Everything but the last segment, which is the prefix a qualified path names a module by.
+fn prefix_of(segs: List[ast::Ident]) -> List[ast::Ident] {
+    let out = list::new[ast::Ident]();
+    let mut i = 0;
+    while i + 1 < segs.len() {
+        out.push(segs.at(i));
+        i = i + 1;
+    }
+    out
+}
+
+/// Everything but the last two, for `mod::Enum::Variant`.
+fn prefix2_of(segs: List[ast::Ident]) -> List[ast::Ident] {
+    let out = list::new[ast::Ident]();
+    let mut i = 0;
+    while i + 2 < segs.len() {
+        out.push(segs.at(i));
+        i = i + 1;
+    }
+    out
+}
+
+fn path_text(segs: List[ast::Ident]) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < segs.len() {
+        if i > 0 {
+            out = out.concat("::");
+        }
+        out = out.concat(segs.at(i).name);
+        i = i + 1;
+    }
+    out
+}
+
+// --- Items ---------------------------------------------------------------------------
+
+impl Resolver {
+    fn resolve_item(self, item: ast::Item) {
+        match item {
+            ast::Item::Fn(d) => self.resolve_fn(d),
+
+            ast::Item::Const(d) => {
+                self.resolve_type(d.ty);
+                self.resolve_expr(d.value);
+            }
+
+            ast::Item::Struct(d) => {
+                let saved = self.enter_generics(d.generics, false);
+                self.resolve_where(d.where_preds);
+                let mut i = 0;
+                while i < d.fields.len() {
+                    self.resolve_type(d.fields.at(i).ty);
+                    i = i + 1;
+                }
+                self.scope = saved;
+            }
+
+            ast::Item::Enum(d) => {
+                let saved = self.enter_generics(d.generics, false);
+                self.resolve_where(d.where_preds);
+                let mut i = 0;
+                while i < d.variants.len() {
+                    let v = d.variants.at(i);
+                    let mut j = 0;
+                    while j < v.types.len() {
+                        self.resolve_type(v.types.at(j));
+                        j = j + 1;
+                    }
+                    let mut k = 0;
+                    while k < v.fields.len() {
+                        self.resolve_type(v.fields.at(k).ty);
+                        k = k + 1;
+                    }
+                    i = i + 1;
+                }
+                self.scope = saved;
+            }
+
+            ast::Item::Alias(d) => {
+                let saved = self.enter_generics(d.generics, false);
+                self.resolve_type(d.ty);
+                self.scope = saved;
+            }
+
+            ast::Item::Trait(d) => {
+                let saved = self.enter_generics(d.generics, true);
+                let mut s = 0;
+                while s < d.supertraits.len() {
+                    self.resolve_trait_ref(d.supertraits.at(s));
+                    s = s + 1;
+                }
+                self.resolve_where(d.where_preds);
+                let mut i = 0;
+                while i < d.assoc.len() {
+                    let a = d.assoc.at(i);
+                    let mut b = 0;
+                    while b < a.bounds.len() {
+                        self.resolve_trait_ref(a.bounds.at(b));
+                        b = b + 1;
+                    }
+                    i = i + 1;
+                }
+                let mut m = 0;
+                while m < d.methods.len() {
+                    self.resolve_fn(d.methods.at(m));
+                    m = m + 1;
+                }
+                self.scope = saved;
+            }
+
+            ast::Item::Impl(d) => {
+                let saved = self.enter_generics(d.generics, true);
+                if d.has_trait {
+                    self.resolve_path(d.trait_path, false);
+                    let mut a = 0;
+                    while a < d.trait_args.len() {
+                        self.resolve_type(d.trait_args.at(a));
+                        a = a + 1;
+                    }
+                }
+                self.resolve_type(d.ty);
+                self.resolve_where(d.where_preds);
+                let mut i = 0;
+                while i < d.assoc.len() {
+                    match d.assoc.at(i).ty {
+                        Option::Some(t) => self.resolve_type(t),
+                        Option::None => {}
+                    }
+                    i = i + 1;
+                }
+                let mut m = 0;
+                while m < d.methods.len() {
+                    self.resolve_fn(d.methods.at(m));
+                    m = m + 1;
+                }
+                self.scope = saved;
+            }
+
+            ast::Item::ErrorItem => {}
+        }
+    }
+
+    /// Opens a scope holding the given type parameters, and optionally `Self`, returning
+    /// the scope to restore afterwards.
+    fn enter_generics(self, gs: List[ast::GenericParam], with_self: bool) -> Scope {
+        let saved = self.scope;
+        self.scope = new_scope(Option::Some(saved));
+        if with_self {
+            self.scope.names.insert("Self", ref_named(K_SELFTY, "Self"));
+        }
+        self.declare_generics(gs);
+        saved
+    }
+
+    fn declare_generics(self, gs: List[ast::GenericParam]) {
+        let mut i = 0;
+        while i < gs.len() {
+            let g = gs.at(i);
+            self.scope.names.insert(g.name.name, ref_named(K_TYPEPARAM, g.name.name));
+            let mut b = 0;
+            while b < g.bounds.len() {
+                self.resolve_trait_ref(g.bounds.at(b));
+                b = b + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    fn resolve_where(self, preds: List[ast::WherePred]) {
+        let mut i = 0;
+        while i < preds.len() {
+            let w = preds.at(i);
+            self.resolve_type(w.ty);
+            let mut b = 0;
+            while b < w.bounds.len() {
+                self.resolve_trait_ref(w.bounds.at(b));
+                b = b + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    fn resolve_trait_ref(self, tr: ast::TraitRef) {
+        self.resolve_path(tr.path, false);
+        let mut i = 0;
+        while i < tr.args.len() {
+            self.resolve_type(tr.args.at(i));
+            i = i + 1;
+        }
+    }
+
+    /// The names inside a syntactic type. The checker reads the result and never consults
+    /// a scope itself (spec/07-modules.md).
+    fn resolve_type(self, t: ast::Type) {
+        match t {
+            ast::Type::Path(p, args) => {
+                self.resolve_path(p, false);
+                let mut i = 0;
+                while i < args.len() {
+                    self.resolve_type(args.at(i));
+                    i = i + 1;
+                }
+            }
+            ast::Type::Tuple(elems) => {
+                let mut i = 0;
+                while i < elems.len() {
+                    self.resolve_type(elems.at(i));
+                    i = i + 1;
+                }
+            }
+            ast::Type::Func(params, ret) => {
+                let mut i = 0;
+                while i < params.len() {
+                    self.resolve_type(params.at(i));
+                    i = i + 1;
+                }
+                self.resolve_type(ret);
+            }
+            ast::Type::Unit => {}
+            ast::Type::SelfType => {}
+            ast::Type::ErrorType => {}
+        }
+    }
+
+    fn resolve_fn(self, d: ast::FnDecl) {
+        // A trait's required method has no body, but its signature still needs resolving.
+        let saved = self.scope;
+        let saved_depth = self.fn_depth;
+        let saved_loop = self.loop_depth;
+        self.scope = new_scope(Option::Some(saved));
+        self.fn_depth = self.fn_depth + 1;
+        self.loop_depth = 0;
+
+        self.declare_generics(d.generics);
+        self.resolve_where(d.where_preds);
+        let mut i = 0;
+        while i < d.params.len() {
+            let p = d.params.at(i);
+            self.resolve_type(p.ty);
+            self.bind_pattern(p.pat, p.mutable);
+            i = i + 1;
+        }
+        match d.ret {
+            Option::Some(t) => self.resolve_type(t),
+            Option::None => {}
+        }
+        match d.body {
+            Option::Some(b) => self.resolve_expr(b),
+            Option::None => {}
+        }
+
+        self.scope = saved;
+        self.fn_depth = saved_depth;
+        self.loop_depth = saved_loop;
+    }
+}
+
+// --- Patterns ------------------------------------------------------------------------
+
+impl Resolver {
+    /// Introduces the bindings a pattern declares. A bare name that resolves to a unit
+    /// variant or a constant matches that value instead of binding (spec/02-grammar.md);
+    /// that decision is made here, not in the parser.
+    fn bind_pattern(self, p: ast::Pat, mutable: bool) {
+        match p {
+            ast::Pat::Wild => {}
+            ast::Pat::ErrorPat => {}
+            ast::Pat::Lit(_, _) => {}
+
+            ast::Pat::Bind(pat_mut, name, sub) => {
+                if !pat_mut && !mutable {
+                    match self.scope.lookup(name.name) {
+                        Option::Some(r) => {
+                            if r.kind == K_VARIANT || r.kind == K_CONST {
+                                self.note(r);
+                                match sub {
+                                    Option::Some(s) => self.bind_pattern(s, false),
+                                    Option::None => {}
+                                }
+                                return;
+                            }
+                        }
+                        Option::None => {}
+                    }
+                }
+                let l = Local {
+                    name: name.name, mutable: pat_mut || mutable, file: self.file,
+                    at: name.start, fn_depth: self.fn_depth,
+                };
+                self.scope.names.insert(name.name, ref_local(l));
+                self.note_binding(l);
+                match sub {
+                    Option::Some(s) => self.bind_pattern(s, mutable),
+                    Option::None => {}
+                }
+            }
+
+            ast::Pat::PathUnit(path) => { self.resolve_path(path, true); }
+
+            ast::Pat::PathTuple(path, elems) => {
+                self.resolve_path(path, true);
+                let mut i = 0;
+                while i < elems.len() {
+                    self.bind_pattern(elems.at(i), mutable);
+                    i = i + 1;
+                }
+            }
+
+            ast::Pat::PathStruct(path, _, fields) => {
+                self.resolve_path(path, true);
+                let mut i = 0;
+                while i < fields.len() {
+                    self.bind_pattern(fields.at(i).pat, mutable);
+                    i = i + 1;
+                }
+            }
+
+            ast::Pat::Tup(elems) => {
+                let mut i = 0;
+                while i < elems.len() {
+                    self.bind_pattern(elems.at(i), mutable);
+                    i = i + 1;
+                }
+            }
+
+            // Every alternative must bind the same names; that check belongs to the
+            // checker (spec/05-patterns.md). Here each alternative is simply resolved.
+            ast::Pat::Or(alts) => {
+                let mut i = 0;
+                while i < alts.len() {
+                    self.bind_pattern(alts.at(i), mutable);
+                    i = i + 1;
+                }
+            }
+        }
+    }
+}
+
+// --- Paths ---------------------------------------------------------------------------
+
+impl Resolver {
+    /// Resolves a path and records what it named.
+    ///
+    /// It is a wrapper for the reason the Go resolver's is: `path_into` returns from a
+    /// dozen branches, and reading the answer back once is both simpler and harder to get
+    /// wrong than emitting a trace line at each exit.
+    fn resolve_path(self, p: ast::PathRef, in_pattern: bool) -> Ref {
+        let r = self.path_into(p, in_pattern);
+        self.note(r);
+        r
+    }
+
+    fn path_into(self, p: ast::PathRef, in_pattern: bool) -> Ref {
+        let segs = p.segs;
+        if segs.is_empty() {
+            return unresolved();
+        }
+        let first = segs.at(0);
+        let found = self.scope.lookup(first.name);
+
+        match found {
+            Option::Some(base) => {
+                if segs.len() == 1 {
+                    if base.kind == K_LOCAL {
+                        match base.local {
+                            Option::Some(l) => self.note_capture(l),
+                            Option::None => {}
+                        }
+                    }
+                    return base;
+                }
+                if segs.len() == 2 {
+                    // `Self::Item` and `T::Item` are associated-type projections; which
+                    // trait supplies the member depends on bounds, so the checker
+                    // finishes the job.
+                    if base.kind == K_SELFTY || base.kind == K_TYPEPARAM {
+                        let a = unresolved();
+                        return Ref {
+                            kind: K_ASSOC, name: first.name, file: "", at: 0, builtin: "",
+                            member: segs.at(1).name, base_kind: base.kind,
+                            local: no_local(), enum_decl: no_enum(), module: no_module(),
+                        };
+                    }
+                    if base.kind == K_ENUM {
+                        return self.variant_of(base, segs.at(1));
+                    }
+                    if base.kind == K_PRIM {
+                        return self.prim_member(base.name, segs.at(1));
+                    }
+                }
+            }
+            Option::None => {}
+        }
+
+        // Otherwise the prefix must name a module.
+        if segs.len() >= 2 {
+            match self.lookup_module(prefix_of(segs)) {
+                Option::Some(m) => {
+                    let last = segs.at(segs.len() - 1);
+                    match m.items.get(last.name) {
+                        Option::Some(r) => {
+                            // An item is visible inside its own module even without `pub`.
+                            if !m.is_public(last.name) && !ref_eq(m, self.current) {
+                                self.error_at("E0603", last, "`\(last.name)` is private");
+                                return unresolved();
+                            }
+                            return r;
+                        }
+                        Option::None => {
+                            self.error_at("E0433", last,
+                                "\(m.describe()) has no item `\(last.name)`");
+                            return unresolved();
+                        }
+                    }
+                }
+                Option::None => {}
+            }
+        }
+
+        // `mod::Enum::Variant`, with as many module segments in front as there are.
+        //
+        // This has to be its own step rather than a fallback inside the one above, because
+        // in `shapes::Shape::Circle` the prefix `shapes::Shape` is not a module and never
+        // will be -- so the branch that requires it to be one is never entered.
+        if segs.len() >= 3 {
+            match self.lookup_module(prefix2_of(segs)) {
+                Option::Some(outer) => {
+                    let owner = segs.at(segs.len() - 2);
+                    match outer.items.get(owner.name) {
+                        Option::Some(er) => {
+                            if er.kind != K_ENUM {
+                                self.error_at("E0433", owner, "`\(owner.name)` is not an enum");
+                                return unresolved();
+                            }
+                            if !outer.is_public(owner.name) && !ref_eq(outer, self.current) {
+                                self.error_at("E0603", owner, "`\(owner.name)` is private");
+                                return unresolved();
+                            }
+                            return self.variant_of(er, segs.at(segs.len() - 1));
+                        }
+                        Option::None => {
+                            self.error_at("E0433", owner,
+                                "\(outer.describe()) has no item `\(owner.name)`");
+                            return unresolved();
+                        }
+                    }
+                }
+                Option::None => {}
+            }
+        }
+
+        match found {
+            Option::None => {
+                self.error_at("E0433", first, "cannot find `\(first.name)` in this scope");
+                unresolved()
+            }
+            Option::Some(_) => {
+                self.error("E0433", ast::Span { start: p.start, end: p.end },
+                    "cannot resolve `\(p.text)`");
+                unresolved()
+            }
+        }
+    }
+
+    /// `T::member` where T is a primitive type: an associated constant on an integer, or
+    /// `char::from_u32`.
+    ///
+    /// These are members of the *type*, so they need no `use` -- and must not, since a
+    /// module named `char` would shadow the primitive `char` in type position.
+    fn prim_member(self, prim: String, member: ast::Ident) -> Ref {
+        if prim == "char" {
+            if member.name != "from_u32" {
+                self.error_at("E0433", member,
+                    "`char` has no associated item `\(member.name)`");
+                return unresolved();
+            }
+            return ref_builtin("char::from_u32", "from_u32");
+        }
+        if !is_prim_const(member.name) {
+            self.error_at("E0433", member,
+                "`\(prim)` has no associated constant `\(member.name)`");
+            return unresolved();
+        }
+        Ref {
+            kind: K_PRIMCONST, name: prim, file: "", at: 0, builtin: "",
+            member: member.name, base_kind: 0, local: no_local(), enum_decl: no_enum(),
+            module: no_module(),
+        }
+    }
+
+    /// A reference to one variant of an enum.
+    fn variant_of(self, enum_ref: Ref, want: ast::Ident) -> Ref {
+        match enum_ref.enum_decl {
+            Option::None => unresolved(),
+            Option::Some(d) => {
+                let mut i = 0;
+                while i < d.variants.len() {
+                    let v = d.variants.at(i);
+                    if v.name.name == want.name {
+                        return ref_decl(K_VARIANT, "\(d.name.name)::\(v.name.name)",
+                            enum_ref.file, v.name.start);
+                    }
+                    i = i + 1;
+                }
+                self.error_at("E0433", want,
+                    "enum `\(d.name.name)` has no variant `\(want.name)`");
+                unresolved()
+            }
+        }
+    }
+
+    /// Records that the lambdas between a binding's frame and the current one capture it
+    /// by value (spec/04-expressions.md).
+    fn note_capture(self, l: Local) {
+        if l.fn_depth >= self.fn_depth {
+            return; // same frame: an ordinary local reference
+        }
+        let mut i = 0;
+        while i < self.lambdas.len() {
+            let lc = self.lambdas.at(i);
+            // Only the lambdas *between* the binding's frame and this reference capture
+            // it. A lambda whose own frame declares the binding reads it as a local.
+            if lc.depth > l.fn_depth && !holds_local(lc.captured, l) {
+                lc.captured.push(l);
+            }
+            i = i + 1;
+        }
+    }
+}
+
+/// Whether a capture list already holds this binding. Identity is the allocation, so
+/// `ref_eq` and not a comparison of names: two bindings of the same name in different
+/// scopes are different bindings.
+fn holds_local(seen: List[Local], l: Local) -> bool {
+    let mut i = 0;
+    while i < seen.len() {
+        if ref_eq(seen.at(i), l) {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// --- Expressions and statements --------------------------------------------------------
+
+impl Resolver {
+    fn resolve_block(self, b: ast::BlockBody) {
+        let saved = self.scope;
+        self.scope = new_scope(Option::Some(saved));
+
+        // Items declared in a block are visible throughout it, like items in a module.
+        let mut i = 0;
+        while i < b.stmts.len() {
+            match b.stmts.at(i) {
+                ast::Stmt::ItemStmt(it) => self.declare_item(it),
+                _ => {}
+            }
+            i = i + 1;
+        }
+        let mut j = 0;
+        while j < b.stmts.len() {
+            self.resolve_stmt(b.stmts.at(j));
+            j = j + 1;
+        }
+        match b.tail {
+            Option::Some(t) => self.resolve_expr(t),
+            Option::None => {}
+        }
+        self.scope = saved;
+    }
+
+    fn resolve_stmt(self, s: ast::Stmt) {
+        match s {
+            ast::Stmt::Let(mutable, pat, ty, value) => {
+                match ty {
+                    Option::Some(t) => self.resolve_type(t),
+                    Option::None => {}
+                }
+                // The initializer is resolved before the pattern binds, so `let x = x;`
+                // refers to the outer `x`.
+                self.resolve_expr(value);
+                self.bind_pattern(pat, mutable);
+            }
+            ast::Stmt::ExprStmt(e, _) => self.resolve_expr(e),
+            ast::Stmt::ItemStmt(it) => self.resolve_item(it),
+        }
+    }
+
+    fn resolve_expr(self, e: ast::Expr) {
+        match e {
+            ast::Expr::Int(_, _, _) => {}
+            ast::Expr::Float(_, _) => {}
+            ast::Expr::Str(_) => {}
+            ast::Expr::Char(_) => {}
+            ast::Expr::Bool(_) => {}
+            ast::Expr::SelfExpr => {}
+            ast::Expr::ErrorExpr => {}
+            ast::Expr::Continue(at) => {
+                if self.loop_depth == 0 {
+                    self.error("E0433", at, "`continue` outside of a loop");
+                }
+            }
+
+            ast::Expr::Path(p, args) => {
+                self.resolve_path(p, false);
+                let mut i = 0;
+                while i < args.len() {
+                    self.resolve_type(args.at(i));
+                    i = i + 1;
+                }
+            }
+
+            ast::Expr::StructLit(p, args, fields) => {
+                self.resolve_path(p, false);
+                let mut a = 0;
+                while a < args.len() {
+                    self.resolve_type(args.at(a));
+                    a = a + 1;
+                }
+                let mut i = 0;
+                while i < fields.len() {
+                    self.resolve_expr(fields.at(i).value);
+                    i = i + 1;
+                }
+            }
+
+            ast::Expr::Tuple(elems) => {
+                let mut i = 0;
+                while i < elems.len() {
+                    self.resolve_expr(elems.at(i));
+                    i = i + 1;
+                }
+            }
+
+            ast::Expr::Lambda(params, ret, body) => self.resolve_lambda(params, ret, body),
+
+            ast::Expr::Block(b) => self.resolve_block(b),
+
+            ast::Expr::If(cond, then, els) => {
+                self.resolve_expr(cond);
+                self.resolve_expr(then);
+                match els {
+                    Option::Some(x) => self.resolve_expr(x),
+                    Option::None => {}
+                }
+            }
+
+            ast::Expr::Match(scrutinee, arms) => {
+                self.resolve_expr(scrutinee);
+                let mut i = 0;
+                while i < arms.len() {
+                    let arm = arms.at(i);
+                    let saved = self.scope;
+                    self.scope = new_scope(Option::Some(saved));
+                    self.bind_pattern(arm.pat, false);
+                    match arm.guard {
+                        Option::Some(g) => self.resolve_expr(g),
+                        Option::None => {}
+                    }
+                    self.resolve_expr(arm.body);
+                    self.scope = saved;
+                    i = i + 1;
+                }
+            }
+
+            ast::Expr::While(cond, body) => {
+                self.resolve_expr(cond);
+                self.loop_depth = self.loop_depth + 1;
+                self.resolve_expr(body);
+                self.loop_depth = self.loop_depth - 1;
+            }
+
+            ast::Expr::For(pat, iter, body) => {
+                self.resolve_expr(iter);
+                let saved = self.scope;
+                self.scope = new_scope(Option::Some(saved));
+                self.bind_pattern(pat, false);
+                self.loop_depth = self.loop_depth + 1;
+                self.resolve_expr(body);
+                self.loop_depth = self.loop_depth - 1;
+                self.scope = saved;
+            }
+
+            ast::Expr::Loop(body) => {
+                self.loop_depth = self.loop_depth + 1;
+                self.resolve_expr(body);
+                self.loop_depth = self.loop_depth - 1;
+            }
+
+            ast::Expr::Break(at, value) => {
+                if self.loop_depth == 0 {
+                    self.error("E0433", at, "`break` outside of a loop");
+                }
+                match value {
+                    Option::Some(x) => self.resolve_expr(x),
+                    Option::None => {}
+                }
+            }
+
+            ast::Expr::Return(value) => {
+                match value {
+                    Option::Some(x) => self.resolve_expr(x),
+                    Option::None => {}
+                }
+            }
+
+            ast::Expr::Unary(_, x) => self.resolve_expr(x),
+
+            ast::Expr::Binary(_, l, r) => {
+                self.resolve_expr(l);
+                self.resolve_expr(r);
+            }
+
+            ast::Expr::Assign(_, at, place, value) => {
+                self.resolve_expr(place);
+                self.resolve_expr(value);
+                self.check_assignable(at, place);
+            }
+
+            ast::Expr::Cast(x, ty) => {
+                self.resolve_expr(x);
+                self.resolve_type(ty);
+            }
+
+            ast::Expr::Call(f, args) => {
+                self.resolve_expr(f);
+                let mut i = 0;
+                while i < args.len() {
+                    self.resolve_expr(args.at(i));
+                    i = i + 1;
+                }
+            }
+
+            ast::Expr::Method(_, recv, args) => {
+                self.resolve_expr(recv);
+                let mut i = 0;
+                while i < args.len() {
+                    self.resolve_expr(args.at(i));
+                    i = i + 1;
+                }
+            }
+
+            ast::Expr::Field(_, recv) => self.resolve_expr(recv),
+
+            ast::Expr::Try(x) => self.resolve_expr(x),
+        }
+    }
+
+    /// The part of the place rule that is decidable without types: a local binding must be
+    /// declared `mut`. Field mutability needs the receiver's type and belongs to a later
+    /// pass.
+    fn check_assignable(self, at: ast::Span, place: ast::Expr) {
+        match place {
+            ast::Expr::Path(p, _) => {
+                // Resolved a moment ago by resolve_expr, so this cannot report twice.
+                match self.lookup_place(p) {
+                    Option::None => {} // already reported
+                    Option::Some(r) => {
+                        if r.kind != K_LOCAL {
+                            self.error("E0594", at, "cannot assign to `\(p.text)`");
+                            return;
+                        }
+                        match r.local {
+                            Option::None => {}
+                            Option::Some(l) => {
+                                if !l.mutable {
+                                    self.error("E0594", at,
+                                        "cannot assign to `\(l.name)`, which is not declared `mut`");
+                                    return;
+                                }
+                                // A capture is a copy, so there is no outer binding here to
+                                // assign to (spec/04-expressions.md). Saying so is the
+                                // point: the alternative is a program that means different
+                                // things on different engines.
+                                if l.fn_depth < self.fn_depth {
+                                    self.error("E0595", at,
+                                        "cannot assign to `\(l.name)`, which this lambda captured");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Checked once field types exist.
+            ast::Expr::Field(_, _) => {}
+            _ => {
+                self.error("E0594", at, "cannot assign to this expression");
+            }
+        }
+    }
+
+    /// What the place named, without reporting anything: the diagnostic for a name that
+    /// does not resolve was already produced when the place was resolved as an expression.
+    fn lookup_place(self, p: ast::PathRef) -> Option[Ref] {
+        if p.segs.len() != 1 {
+            return Option::None;
+        }
+        match self.scope.lookup(p.segs.at(0).name) {
+            Option::None => Option::None,
+            Option::Some(r) => {
+                if r.kind == K_UNRESOLVED { Option::None } else { Option::Some(r) }
+            }
+        }
+    }
+
+    fn resolve_lambda(self, params: List[ast::LambdaParam], ret: Option[ast::Type], body: ast::Expr) {
+        let saved = self.scope;
+        let saved_depth = self.fn_depth;
+        let saved_loop = self.loop_depth;
+        self.scope = new_scope(Option::Some(saved));
+        self.fn_depth = self.fn_depth + 1;
+
+        let lc = LambdaCtx { depth: self.fn_depth, captured: list::new[Local]() };
+        self.lambdas.push(lc);
+        self.loop_depth = 0;
+
+        let mut i = 0;
+        while i < params.len() {
+            let p = params.at(i);
+            match p.ty {
+                Option::Some(t) => self.resolve_type(t),
+                Option::None => {}
+            }
+            self.bind_pattern(p.pat, false);
+            i = i + 1;
+        }
+        match ret {
+            Option::Some(t) => self.resolve_type(t),
+            Option::None => {}
+        }
+        self.resolve_expr(body);
+
+        self.scope = saved;
+        self.fn_depth = saved_depth;
+        self.loop_depth = saved_loop;
+        self.lambdas.pop();
+        self.note_captures(lc.captured);
+    }
+}

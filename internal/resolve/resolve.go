@@ -173,6 +173,11 @@ type resolver struct {
 	lambdas      []*lambdaCtx
 	// loopDepth guards `break` and `continue`.
 	loopDepth int
+	// trace, when not nil, collects one line per resolution event, in the order they
+	// happen. It is the oracle stage1's own resolver is held to (tests/selfhost): the
+	// two walk the same tree in the same order, so a line's position in the trace is
+	// the node's identity and neither side needs the node ids stage1 does not have.
+	trace *[]string
 }
 
 // Input is one file to resolve, with the module path it lives at. The root module has
@@ -200,6 +205,18 @@ func Files(bag *diag.Bag, files ...*ast.File) *Result {
 // declared, then imports are processed, then bodies are resolved. Nothing looks at a
 // body until every name in the package exists.
 func Program(bag *diag.Bag, inputs ...Input) *Result {
+	res, _ := program(bag, false, inputs...)
+	return res
+}
+
+// Trace resolves like Program and additionally returns one line per resolution event, in
+// the order the resolver produced them. See the resolver's `trace` field.
+func Trace(bag *diag.Bag, inputs ...Input) (*Result, []string) {
+	return program(bag, true, inputs...)
+}
+
+func program(bag *diag.Bag, traced bool, inputs ...Input) (*Result, []string) {
+	var lines []string
 	r := &resolver{
 		bag: bag,
 		out: &Result{
@@ -212,6 +229,9 @@ func Program(bag *diag.Bag, inputs ...Input) *Result {
 		},
 	}
 
+	if traced {
+		r.trace = &lines
+	}
 	r.root = newModule("", nil)
 	r.out.Root = r.root
 	r.globals = newScope(nil)
@@ -283,7 +303,7 @@ func Program(bag *diag.Bag, inputs ...Input) *Result {
 			r.resolveItem(it)
 		}
 	}
-	return r.out
+	return r.out, lines
 }
 
 // globalBuiltins are compiler-provided functions in scope everywhere, with no `use`.
@@ -802,6 +822,7 @@ func (r *resolver) bindPattern(p ast.Pattern, mut bool) {
 		if !v.Mut && !mut {
 			if ref, ok := r.scope.lookup(v.Name.Name); ok && isConstructorLike(ref) {
 				r.out.Refs[v.NodeID()] = ref
+				r.note(ref)
 				if v.Sub != nil {
 					r.bindPattern(v.Sub, false)
 				}
@@ -812,6 +833,7 @@ func (r *resolver) bindPattern(p ast.Pattern, mut bool) {
 		r.scope.names[v.Name.Name] = Ref{Kind: LocalVar, Local: local, Name: local.Name}
 		r.out.Bindings[v.NodeID()] = local
 		r.out.Refs[v.NodeID()] = Ref{Kind: LocalVar, Local: local, Name: local.Name}
+		r.noteBinding(local)
 		if v.Sub != nil {
 			r.bindPattern(v.Sub, mut)
 		}
@@ -850,7 +872,16 @@ func isConstructorLike(ref Ref) bool {
 // resolvePathIn resolves a path and records the result against nodeID. inPattern
 // changes the wording of the diagnostic, because a bare name in a pattern would
 // otherwise have bound rather than failed.
+//
+// It is a wrapper so that the trace has exactly one place to watch: resolvePathInto
+// returns from a dozen branches and every one of them writes the node's Ref, so reading
+// it back here is both simpler and harder to get wrong than emitting at each exit.
 func (r *resolver) resolvePathIn(path *ast.Path, nodeID ast.NodeID, inPattern bool) {
+	r.resolvePathInto(path, nodeID, inPattern)
+	r.note(r.out.Refs[nodeID])
+}
+
+func (r *resolver) resolvePathInto(path *ast.Path, nodeID ast.NodeID, inPattern bool) {
 	if path == nil || len(path.Segments) == 0 {
 		r.out.Refs[nodeID] = Ref{Kind: Unresolved}
 		return
@@ -1284,4 +1315,5 @@ func (r *resolver) resolveLambda(l *ast.Lambda) {
 	r.scope, r.fnDepth, r.loopDepth = saved, savedDepth, savedLoop
 	r.lambdas = r.lambdas[:len(r.lambdas)-1]
 	r.out.Captures[l.NodeID()] = lc.order
+	r.noteCaptures(lc.order)
 }
