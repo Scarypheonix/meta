@@ -1,0 +1,3 @@
+#!/usr/bin/env ori
+# A file you can mark executable and run directly: chmod +x this file, then ./06_hello_script.ori
+print("Origin is running.")

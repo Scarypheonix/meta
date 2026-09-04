@@ -1,0 +1,34 @@
+let score = 87
+
+if score >= 90 {
+    print("A")
+} else if score >= 80 {
+    print("B")
+} else {
+    print("C or lower")
+}
+
+# 'and', 'or' and 'not' are words, not symbols.
+if score > 0 and not (score > 100) {
+    print("score is in range")
+}
+
+# while loops
+let n = 5
+let factorial = 1
+while n > 1 {
+    factorial = factorial * n
+    n = n - 1
+}
+print("5! =", factorial)
+
+# for-in loops over a list, a string, or the keys of a map
+for i in range(1, 6) {
+    if i == 3 {
+        continue
+    }
+    if i == 5 {
+        break
+    }
+    print("i =", i)
+}

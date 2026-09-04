@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Run an Origin program:  ./ori program.ori   (or with no argument, the REPL)
+exec python3 "$(dirname "$(readlink -f "$0")")/origin.py" "$@"

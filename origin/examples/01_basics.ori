@@ -1,0 +1,20 @@
+# Everything after a '#' is a comment.
+
+let name = "world"
+let year = 2026
+let pi = 3.14
+let ready = true
+let nothing = nil
+
+print("hello, " + name)
+print("year:", year, "pi:", pi)
+
+# Variables are declared with 'let' and reassigned with plain '='.
+let count = 0
+count = count + 1
+print("count is", count)
+
+# str() turns anything into text, num() parses text into a number.
+print("next year: " + str(year + 1))
+print(num("42") + 8)
+print(type(name), type(year), type(ready), type(nothing))

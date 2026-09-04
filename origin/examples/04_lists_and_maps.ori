@@ -1,0 +1,26 @@
+let langs = ["origin", "python", "rust"]
+print(langs[0], langs[len(langs) - 1])
+
+push(langs, "go")
+print(langs, "has", len(langs), "items")
+print("popped:", pop(langs))
+
+langs[1] = "javascript"
+for lang in langs {
+    print("-", lang)
+}
+
+# Maps use string or number keys.
+let user = {"name": "ada", "age": 36, "tags": ["math", "code"]}
+print(user["name"], user.age)          # both forms read a key
+user.age = 37                          # and both forms write one
+user["city"] = "london"
+print(keys(user))
+print(has(user, "city"), has(user, "email"))
+
+for key in user {
+    print(key, "=>", str(user[key]))
+}
+
+print(join(["a", "b", "c"], "-"))
+print(split("1,2,3", ","))

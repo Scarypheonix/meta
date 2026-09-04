@@ -1,0 +1,22 @@
+# A slightly bigger program: count word frequencies.
+
+fn word_counts(text) {
+    let counts = {}
+    for word in split(text, " ") {
+        if has(counts, word) {
+            counts[word] = counts[word] + 1
+        } else {
+            counts[word] = 1
+        }
+    }
+    return counts
+}
+
+let text = "the quick brown fox jumps over the lazy dog the fox"
+let counts = word_counts(text)
+
+for word in counts {
+    if counts[word] > 1 {
+        print(word, "appears", counts[word], "times")
+    }
+}

@@ -1,0 +1,40 @@
+fn greet(who) {
+    return "hello, " + who
+}
+
+print(greet("Origin"))
+
+# No return statement means the function gives back nil.
+fn shout(text) {
+    print(text + "!")
+}
+shout("loud")
+
+# Functions are values: store them, pass them, return them.
+let double = fn(x) { return x * 2 }
+print(double(21))
+
+fn apply_twice(f, x) {
+    return f(f(x))
+}
+print(apply_twice(double, 5))
+
+# Closures capture the environment they were made in.
+fn counter() {
+    let n = 0
+    return fn() {
+        n = n + 1
+        return n
+    }
+}
+let next = counter()
+print(next(), next(), next())
+
+# Recursion works as you would expect.
+fn fib(n) {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+print("fib(15) =", fib(15))
