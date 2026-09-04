@@ -1,0 +1,866 @@
+// The shared representation of Origin's semantic types, in Origin.
+//
+// A translation of `internal/types`, and the same contract: it owns type terms,
+// substitution, unification and printing, and nothing else. It does not own declarations,
+// inference strategy or diagnostics -- those belong to `check.origin`, which is the only
+// place allowed to decide what a type error means (process rule 5).
+//
+// Printing is part of the contract rather than a convenience: spec/09-errors.md requires a
+// type in a message to be written in source syntax, so `show` is specified behaviour, and
+// it is what `tests/selfhost`'s inference differential compares.
+
+use std::list;
+use ast;
+
+// --- Primitive kinds -------------------------------------------------------------------
+
+pub const P_I8: i64 = 0;
+pub const P_I16: i64 = 1;
+pub const P_I32: i64 = 2;
+pub const P_I64: i64 = 3;
+pub const P_U8: i64 = 4;
+pub const P_U16: i64 = 5;
+pub const P_U32: i64 = 6;
+pub const P_U64: i64 = 7;
+pub const P_F32: i64 = 8;
+pub const P_F64: i64 = 9;
+pub const P_BOOL: i64 = 10;
+pub const P_CHAR: i64 = 11;
+pub const P_STRING: i64 = 12;
+pub const P_UNIT: i64 = 13;
+/// The type of a diverging expression. It unifies with anything and is not writable in
+/// source in 0.1.
+pub const P_NEVER: i64 = 14;
+
+pub fn prim_name(k: i64) -> String {
+    if k == P_I8 { return "i8"; }
+    if k == P_I16 { return "i16"; }
+    if k == P_I32 { return "i32"; }
+    if k == P_I64 { return "i64"; }
+    if k == P_U8 { return "u8"; }
+    if k == P_U16 { return "u16"; }
+    if k == P_U32 { return "u32"; }
+    if k == P_U64 { return "u64"; }
+    if k == P_F32 { return "f32"; }
+    if k == P_F64 { return "f64"; }
+    if k == P_BOOL { return "bool"; }
+    if k == P_CHAR { return "char"; }
+    if k == P_STRING { return "String"; }
+    if k == P_UNIT { return "()"; }
+    if k == P_NEVER { return "!"; }
+    "prim(\(k))"
+}
+
+pub fn prim_of_name(name: String) -> i64 {
+    let mut k = 0;
+    while k <= P_NEVER {
+        if prim_name(k) == name {
+            return k;
+        }
+        k = k + 1;
+    }
+    0 - 1
+}
+
+pub fn is_integer(k: i64) -> bool { k >= P_I8 && k <= P_U64 }
+pub fn is_signed(k: i64) -> bool { k >= P_I8 && k <= P_I64 }
+pub fn is_float(k: i64) -> bool { k == P_F32 || k == P_F64 }
+pub fn is_numeric(k: i64) -> bool { is_integer(k) || is_float(k) }
+
+/// Whether `<` and friends apply directly (spec/04-expressions.md: integers, floats, char
+/// and String; everything else goes through `Ord`).
+pub fn is_ordered(k: i64) -> bool { is_numeric(k) || k == P_CHAR || k == P_STRING }
+
+pub fn prim_bits(k: i64) -> i64 {
+    if k == P_I8 || k == P_U8 { return 8; }
+    if k == P_I16 || k == P_U16 { return 16; }
+    if k == P_I32 || k == P_U32 { return 32; }
+    if k == P_I64 || k == P_U64 { return 64; }
+    0
+}
+
+// --- Declarations ----------------------------------------------------------------------
+
+pub const DEF_STRUCT: i64 = 0;
+pub const DEF_ENUM: i64 = 1;
+/// A nominal type the compiler provides rather than any source declares: `Array[T]`
+/// (ADR-0028). It has parameters and a name like any other nominal type and no declaration
+/// behind it -- which is what makes `Array[i64] { }` the same error `String { }` already
+/// is, with nothing new to write for it.
+pub const DEF_BUILTIN: i64 = 2;
+
+/// A generic parameter: a rigid type variable that unifies only with itself.
+///
+/// `id` is what makes two same-named parameters from different declarations distinct;
+/// identity is the allocation, so `ref_eq` decides it and the id is for reading.
+pub struct Param {
+    pub name: String,
+    pub id: i64,
+}
+
+/// A nominal type declaration: a struct or an enum, with its generic parameters.
+///
+/// The field and variant types are filled in a pass after every shell exists, so that a
+/// type can refer to any other; they are `mut` for that reason and no other.
+pub struct Def {
+    pub kind: i64,
+    pub name: String,
+    pub params: List[Param],
+    pub struct_decl: Option[ast::StructDecl],
+    pub enum_decl: Option[ast::EnumDecl],
+    /// Where the declaration was written, which is how the trace names it and how
+    /// "declared in the prelude?" is answered.
+    pub file: String,
+    pub at: i64,
+    pub mut field_types: List[Type],
+    pub mut variant_types: List[List[Type]],
+}
+
+/// What an unsolved inference variable becomes at the end of a body (spec/03-types.md).
+pub const D_NONE: i64 = 0;
+pub const D_INT: i64 = 1;
+pub const D_FLOAT: i64 = 2;
+
+/// An inference variable. Binding is by mutation with path compression, which is why every
+/// read goes through `prune`.
+///
+/// `level` implements Remy's ranked generalization: a variable created inside a `let`
+/// right-hand side has a higher level than the binding around it, and only variables whose
+/// level exceeds the current one may be generalized. Without it, `let` would generalize
+/// variables the enclosing scope still constrains.
+pub struct Var {
+    pub id: i64,
+    pub mut bound: Option[Type],
+    pub mut fallback: i64,
+    pub mut level: i64,
+}
+
+/// A semantic type.
+pub enum Type {
+    Prim(i64),
+    /// A nominal type applied to arguments: `Vec[i64]`, `Point`.
+    Named(Def, List[Type]),
+    Tuple(List[Type]),
+    Func(List[Type], Type),
+    ParamT(Param),
+    VarT(Var),
+    /// An associated-type projection, `T::Item`, not yet reduced to a concrete type. The
+    /// checker normalizes it by finding the impl that defines the member; it survives as a
+    /// type only while the self type is still a rigid parameter.
+    Assoc(ast::TraitDecl, String, Type),
+    /// Stands in for a type that could not be determined. A diagnostic was already
+    /// reported, so unifying with it always succeeds and never reports again
+    /// (spec/09-errors.md rule 4).
+    ErrorT,
+}
+
+pub fn unit() -> Type { Type::Prim(P_UNIT) }
+pub fn never() -> Type { Type::Prim(P_NEVER) }
+pub fn error_type() -> Type { Type::ErrorT }
+
+// --- Pruning ---------------------------------------------------------------------------
+
+/// Follows bound inference variables to the type they stand for, compressing the path as
+/// it goes. Every function that inspects a type must call it first.
+pub fn prune(t: Type) -> Type {
+    match t {
+        Type::VarT(v) => {
+            match v.bound {
+                Option::None => t,
+                Option::Some(inner) => {
+                    let r = prune(inner);
+                    v.bound = Option::Some(r);
+                    r
+                }
+            }
+        }
+        _ => t,
+    }
+}
+
+pub fn is_error(t: Type) -> bool {
+    match prune(t) {
+        Type::ErrorT => true,
+        _ => false,
+    }
+}
+
+pub fn is_never(t: Type) -> bool {
+    match prune(t) {
+        Type::Prim(k) => k == P_NEVER,
+        _ => false,
+    }
+}
+
+/// The primitive kind of a type, or -1 when it is not one.
+pub fn as_prim(t: Type) -> i64 {
+    match prune(t) {
+        Type::Prim(k) => k,
+        _ => 0 - 1,
+    }
+}
+
+pub fn as_named(t: Type) -> Option[Def] {
+    match prune(t) {
+        Type::Named(d, _) => Option::Some(d),
+        _ => Option::None,
+    }
+}
+
+pub fn named_args(t: Type) -> List[Type] {
+    match prune(t) {
+        Type::Named(_, args) => args,
+        _ => list::new[Type](),
+    }
+}
+
+pub fn as_var(t: Type) -> Option[Var] {
+    match prune(t) {
+        Type::VarT(v) => Option::Some(v),
+        _ => Option::None,
+    }
+}
+
+// --- Printing --------------------------------------------------------------------------
+
+/// The type in Origin source syntax (spec/09-errors.md rule 3).
+pub fn show(t: Type) -> String {
+    match prune(t) {
+        Type::Prim(k) => prim_name(k),
+        Type::Named(d, args) => {
+            if args.is_empty() {
+                return d.name;
+            }
+            "\(d.name)[\(show_list(args))]"
+        }
+        Type::Tuple(elems) => {
+            if elems.len() == 1 {
+                return "(\(show(elems.at(0))),)";
+            }
+            "(\(show_list(elems)))"
+        }
+        Type::Func(params, ret) => "fn(\(show_list(params))) -> \(show(ret))",
+        Type::ParamT(p) => p.name,
+        // spec/09-errors.md rule 2: a diagnostic must never show an internal identifier,
+        // so an unsolved variable prints as an underscore and never as its number.
+        Type::VarT(_) => "_",
+        Type::Assoc(_, member, self_ty) => "\(show(self_ty))::\(member)",
+        Type::ErrorT => "{unknown}",
+    }
+}
+
+fn show_list(ts: List[Type]) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < ts.len() {
+        if i > 0 {
+            out = out.concat(", ");
+        }
+        out = out.concat(show(ts.at(i)));
+        i = i + 1;
+    }
+    out
+}
+
+// --- The inference context ---------------------------------------------------------------
+
+/// Allocates inference variables and performs unification. One context serves one function
+/// body, matching ADR-0009: inference never crosses a function boundary.
+pub struct Ctx {
+    mut next_var: i64,
+    mut next_param: i64,
+    mut level: i64,
+}
+
+pub fn new_ctx() -> Ctx {
+    Ctx { next_var: 0, next_param: 0, level: 0 }
+}
+
+impl Ctx {
+    /// A new unbound inference variable at the current level.
+    pub fn fresh(self) -> Type {
+        self.next_var = self.next_var + 1;
+        let none: Option[Type] = Option::None;
+        Type::VarT(Var { id: self.next_var, bound: none, fallback: D_NONE, level: self.level })
+    }
+
+    /// A new inference variable that falls back to a concrete type if nothing else
+    /// determines it (spec/03-types.md: integer literals default to `i64`, float literals
+    /// to `f64`).
+    pub fn fresh_defaulting(self, d: i64) -> Type {
+        let t = self.fresh();
+        match as_var(t) {
+            Option::Some(v) => { v.fallback = d; }
+            Option::None => {}
+        }
+        t
+    }
+
+    /// A fresh rigid type parameter.
+    pub fn new_param(self, name: String) -> Param {
+        self.next_param = self.next_param + 1;
+        Param { name: name, id: self.next_param }
+    }
+
+    /// `enter_level` and `exit_level` bracket a `let` right-hand side. Variables created
+    /// inside are candidates for generalization when the level is left.
+    pub fn enter_level(self) { self.level = self.level + 1; }
+    pub fn exit_level(self) { self.level = self.level - 1; }
+    pub fn current_level(self) -> i64 { self.level }
+}
+
+// --- Unification -------------------------------------------------------------------------
+
+/// Why two types could not be unified. The checker turns it into a diagnostic; nothing here
+/// renders one, so that every message about types is phrased in one place.
+pub struct UnifyError {
+    pub want: Type,
+    pub got: Type,
+    /// A more specific cause when there is one, such as an arity mismatch. Empty otherwise.
+    pub detail: String,
+    /// A suggested fix, set when the cause implies one.
+    pub help: String,
+    /// Whether the failure was the occurs check.
+    pub infinite: bool,
+}
+
+fn mismatch(want: Type, got: Type) -> Option[UnifyError] {
+    Option::Some(UnifyError { want: want, got: got, detail: "", help: "", infinite: false })
+}
+
+fn detailed(want: Type, got: Type, detail: String) -> Option[UnifyError] {
+    Option::Some(UnifyError { want: want, got: got, detail: detail, help: "", infinite: false })
+}
+
+fn no_error() -> Option[UnifyError] { Option::None }
+
+impl UnifyError {
+    pub fn message(self) -> String {
+        if self.infinite {
+            return "infinite type: `\(show(self.got))` would contain itself";
+        }
+        if !self.detail.is_empty() {
+            return self.detail;
+        }
+        "expected `\(show(self.want))`, found `\(show(self.got))`"
+    }
+}
+
+/// Makes `want` and `got` equal, binding inference variables as needed.
+///
+/// The error type unifies with everything, so one reported mistake never produces a second
+/// diagnostic. The never type unifies with everything for the same structural reason: a
+/// diverging expression has no value to disagree about.
+pub fn unify(want_in: Type, got_in: Type) -> Option[UnifyError] {
+    let want = prune(want_in);
+    let got = prune(got_in);
+
+    if same_type(want, got) {
+        return no_error();
+    }
+    if is_error(want) || is_error(got) {
+        return no_error();
+    }
+    if is_never(want) || is_never(got) {
+        return no_error();
+    }
+
+    match want {
+        Type::VarT(v) => {
+            match literal_constraint(v, got, true) {
+                Option::Some(e) => return Option::Some(e),
+                Option::None => {}
+            }
+            return bind(v, got);
+        }
+        _ => {}
+    }
+    match got {
+        Type::VarT(v) => {
+            match literal_constraint(v, want, false) {
+                Option::Some(e) => return Option::Some(e),
+                Option::None => {}
+            }
+            return bind(v, want);
+        }
+        _ => {}
+    }
+
+    match want {
+        Type::Prim(wk) => {
+            if as_prim(got) != wk {
+                return mismatch(want, got);
+            }
+            no_error()
+        }
+
+        Type::ParamT(wp) => {
+            match got {
+                Type::ParamT(gp) => {
+                    if !ref_eq(wp, gp) {
+                        return mismatch(want, got);
+                    }
+                    no_error()
+                }
+                _ => mismatch(want, got),
+            }
+        }
+
+        Type::Named(wd, wargs) => {
+            match got {
+                Type::Named(gd, gargs) => {
+                    if !ref_eq(wd, gd) {
+                        return mismatch(want, got);
+                    }
+                    if wargs.len() != gargs.len() {
+                        return detailed(want, got,
+                            "`\(wd.name)` takes \(wargs.len()) type argument(s) but \(gargs.len()) were supplied");
+                    }
+                    unify_all(wargs, gargs)
+                }
+                _ => mismatch(want, got),
+            }
+        }
+
+        Type::Tuple(welems) => {
+            match got {
+                Type::Tuple(gelems) => {
+                    if welems.len() != gelems.len() {
+                        return detailed(want, got,
+                            "expected a \(welems.len())-element tuple, found \(gelems.len()) elements");
+                    }
+                    unify_all(welems, gelems)
+                }
+                _ => mismatch(want, got),
+            }
+        }
+
+        Type::Assoc(wtr, wmem, wself) => {
+            match got {
+                Type::Assoc(gtr, gmem, gself) => {
+                    if !ref_eq(wtr, gtr) || wmem != gmem {
+                        return mismatch(want, got);
+                    }
+                    unify(wself, gself)
+                }
+                _ => mismatch(want, got),
+            }
+        }
+
+        Type::Func(wparams, wret) => {
+            match got {
+                Type::Func(gparams, gret) => {
+                    if wparams.len() != gparams.len() {
+                        return detailed(want, got,
+                            "expected a function taking \(wparams.len()) argument(s), found one taking \(gparams.len())");
+                    }
+                    match unify_all(wparams, gparams) {
+                        Option::Some(e) => return Option::Some(e),
+                        Option::None => {}
+                    }
+                    unify(wret, gret)
+                }
+                _ => mismatch(want, got),
+            }
+        }
+
+        _ => mismatch(want, got),
+    }
+}
+
+fn unify_all(a: List[Type], b: List[Type]) -> Option[UnifyError] {
+    let mut i = 0;
+    while i < a.len() {
+        match unify(a.at(i), b.at(i)) {
+            Option::Some(e) => return Option::Some(e),
+            Option::None => {}
+        }
+        i = i + 1;
+    }
+    no_error()
+}
+
+/// Whether two pruned types are the *same* term, which is what the Go resolver's pointer
+/// comparison decides. Two references to one variable, parameter or declaration are the
+/// same; everything else is settled structurally by `unify` itself.
+fn same_type(a: Type, b: Type) -> bool {
+    match a {
+        Type::VarT(av) => {
+            match b {
+                Type::VarT(bv) => ref_eq(av, bv),
+                _ => false,
+            }
+        }
+        Type::ParamT(ap) => {
+            match b {
+                Type::ParamT(bp) => ref_eq(ap, bp),
+                _ => false,
+            }
+        }
+        Type::Prim(ak) => ak == as_prim(b),
+        _ => false,
+    }
+}
+
+/// Stops a numeric literal's inference variable from taking a type it could never have had.
+///
+/// Without it, `let x: f64 = 1;` binds the integer literal's variable straight to `f64` and
+/// Origin silently grows the implicit int-to-float conversion ADR-0012 rules out.
+/// `want_side` says which side of the mismatch the variable was on, so the message reads in
+/// the direction the programmer wrote.
+fn literal_constraint(v: Var, other: Type, want_side: bool) -> Option[UnifyError] {
+    if v.fallback == D_NONE {
+        return no_error();
+    }
+    let k = as_prim(other);
+    if k < 0 {
+        match as_var(other) {
+            // Two variables: the constraint carries across in `bind`.
+            Option::Some(_) => return no_error(),
+            Option::None => return literal_error(v, other, want_side),
+        }
+    }
+    if v.fallback == D_INT && is_integer(k) {
+        return no_error();
+    }
+    if v.fallback == D_FLOAT && is_float(k) {
+        return no_error();
+    }
+    literal_error(v, other, want_side)
+}
+
+fn literal_error(v: Var, other: Type, want_side: bool) -> Option[UnifyError] {
+    let mut kind = "an integer literal";
+    let mut alt = "a float";
+    if v.fallback == D_FLOAT {
+        kind = "a float literal";
+        alt = "an integer";
+    }
+    let none: Option[Type] = Option::None;
+    let mut detail = "expected `\(show(other))`, found \(kind)";
+    if want_side {
+        detail = "expected \(kind), found `\(show(other))`";
+    }
+    let mut help = "";
+    let k = as_prim(other);
+    if k >= 0 && is_numeric(k) {
+        help = "write the literal as \(alt), or convert with `as \(prim_name(k))`";
+    }
+    Option::Some(UnifyError {
+        want: Type::VarT(v), got: other, detail: detail, help: help, infinite: false,
+    })
+}
+
+/// Points an unbound variable at a type, after the occurs check.
+fn bind(v: Var, t: Type) -> Option[UnifyError] {
+    match t {
+        Type::VarT(other) => {
+            if ref_eq(v, other) {
+                return no_error();
+            }
+        }
+        _ => {}
+    }
+    if occurs(v, t) {
+        return Option::Some(UnifyError {
+            want: Type::VarT(v), got: t, detail: "", help: "", infinite: true,
+        });
+    }
+    // A variable escaping into an outer scope must not stay generalizable there, so lower
+    // every level inside t to v's.
+    lower_levels(t, v.level);
+    // Binding a defaulting variable to another variable carries the default across, so
+    // `let x = 1; let y = x;` still defaults once, at the end.
+    match as_var(t) {
+        Option::Some(other) => {
+            if other.fallback == D_NONE {
+                other.fallback = v.fallback;
+            }
+        }
+        Option::None => {}
+    }
+    v.bound = Option::Some(t);
+    no_error()
+}
+
+/// Caps the level of every free variable in t at `limit`.
+fn lower_levels(t: Type, limit: i64) {
+    match prune(t) {
+        Type::VarT(v) => {
+            if v.level > limit {
+                v.level = limit;
+            }
+        }
+        Type::Named(_, args) => lower_levels_all(args, limit),
+        Type::Tuple(elems) => lower_levels_all(elems, limit),
+        Type::Func(params, ret) => {
+            lower_levels_all(params, limit);
+            lower_levels(ret, limit);
+        }
+        Type::Assoc(_, _, self_ty) => lower_levels(self_ty, limit),
+        _ => {}
+    }
+}
+
+fn lower_levels_all(ts: List[Type], limit: i64) {
+    let mut i = 0;
+    while i < ts.len() {
+        lower_levels(ts.at(i), limit);
+        i = i + 1;
+    }
+}
+
+/// Whether v appears inside t, which would make the type infinite.
+fn occurs(v: Var, t: Type) -> bool {
+    match prune(t) {
+        Type::VarT(other) => ref_eq(v, other),
+        Type::Named(_, args) => occurs_any(v, args),
+        Type::Tuple(elems) => occurs_any(v, elems),
+        Type::Func(params, ret) => occurs_any(v, params) || occurs(v, ret),
+        _ => false,
+    }
+}
+
+fn occurs_any(v: Var, ts: List[Type]) -> bool {
+    let mut i = 0;
+    while i < ts.len() {
+        if occurs(v, ts.at(i)) {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// --- Substitutions ------------------------------------------------------------------------
+
+/// A map from rigid parameters to the types they are instantiated at.
+///
+/// Parallel lists rather than a `Map`, because the key is a *parameter's identity* and not
+/// its name: two same-named parameters from different declarations are different keys, and
+/// `ref_eq` is what tells them apart.
+pub struct Subst {
+    keys: List[Param],
+    vals: List[Type],
+}
+
+pub fn new_subst() -> Subst {
+    Subst { keys: list::new[Param](), vals: list::new[Type]() }
+}
+
+impl Subst {
+    pub fn len(self) -> i64 { self.keys.len() }
+    pub fn is_empty(self) -> bool { self.keys.is_empty() }
+
+    pub fn set(self, p: Param, t: Type) {
+        let mut i = 0;
+        while i < self.keys.len() {
+            if ref_eq(self.keys.at(i), p) {
+                self.vals.set(i, t);
+                return;
+            }
+            i = i + 1;
+        }
+        self.keys.push(p);
+        self.vals.push(t);
+    }
+
+    pub fn get(self, p: Param) -> Option[Type] {
+        let mut i = 0;
+        while i < self.keys.len() {
+            if ref_eq(self.keys.at(i), p) {
+                return Option::Some(self.vals.at(i));
+            }
+            i = i + 1;
+        }
+        Option::None
+    }
+
+    pub fn param_at(self, i: i64) -> Param { self.keys.at(i) }
+    pub fn type_at(self, i: i64) -> Type { self.vals.at(i) }
+
+    /// A copy, so that a caller can extend one without disturbing the one it came from.
+    pub fn clone(self) -> Subst {
+        let out = new_subst();
+        let mut i = 0;
+        while i < self.keys.len() {
+            out.keys.push(self.keys.at(i));
+            out.vals.push(self.vals.at(i));
+            i = i + 1;
+        }
+        out
+    }
+}
+
+/// Replaces generic parameters with the types they are instantiated at.
+pub fn substitute(t: Type, s: Subst) -> Type {
+    if s.is_empty() {
+        return t;
+    }
+    match prune(t) {
+        Type::ParamT(p) => {
+            match s.get(p) {
+                Option::Some(r) => r,
+                Option::None => Type::ParamT(p),
+            }
+        }
+        Type::Named(d, args) => {
+            if args.is_empty() {
+                return Type::Named(d, args);
+            }
+            Type::Named(d, substitute_all(args, s))
+        }
+        Type::Tuple(elems) => Type::Tuple(substitute_all(elems, s)),
+        Type::Func(params, ret) => Type::Func(substitute_all(params, s), substitute(ret, s)),
+        Type::Assoc(tr, member, self_ty) => Type::Assoc(tr, member, substitute(self_ty, s)),
+        _ => prune(t),
+    }
+}
+
+fn substitute_all(ts: List[Type], s: Subst) -> List[Type] {
+    let out = list::new[Type]();
+    let mut i = 0;
+    while i < ts.len() {
+        out.push(substitute(ts.at(i), s));
+        i = i + 1;
+    }
+    out
+}
+
+// --- Schemes ------------------------------------------------------------------------------
+
+/// A possibly-polymorphic type: the variables it quantifies over, and its body. A
+/// monomorphic type is a scheme with no variables.
+pub struct Scheme {
+    pub vars: List[Var],
+    pub ty: Type,
+}
+
+pub fn mono(t: Type) -> Scheme {
+    Scheme { vars: list::new[Var](), ty: t }
+}
+
+impl Ctx {
+    /// Quantifies over the variables in t whose level exceeds the context's, which are
+    /// exactly the ones no enclosing binding constrains.
+    pub fn generalize(self, t: Type) -> Scheme {
+        let vars = list::new[Var]();
+        let free = free_vars(t, list::new[Var]());
+        let mut i = 0;
+        while i < free.len() {
+            let v = free.at(i);
+            if v.level > self.level {
+                vars.push(v);
+            }
+            i = i + 1;
+        }
+        Scheme { vars: vars, ty: t }
+    }
+
+    /// A copy of the scheme's type with fresh variables in place of the quantified ones.
+    pub fn instantiate(self, s: Scheme) -> Type {
+        if s.vars.is_empty() {
+            return s.ty;
+        }
+        let fresh = list::new[Type]();
+        let mut i = 0;
+        while i < s.vars.len() {
+            let f = self.fresh();
+            match as_var(f) {
+                Option::Some(fv) => { fv.fallback = s.vars.at(i).fallback; }
+                Option::None => {}
+            }
+            fresh.push(f);
+            i = i + 1;
+        }
+        replace_vars(s.ty, s.vars, fresh)
+    }
+}
+
+fn replace_vars(t: Type, from: List[Var], to: List[Type]) -> Type {
+    match prune(t) {
+        Type::VarT(v) => {
+            let mut i = 0;
+            while i < from.len() {
+                if ref_eq(from.at(i), v) {
+                    return to.at(i);
+                }
+                i = i + 1;
+            }
+            Type::VarT(v)
+        }
+        Type::Named(d, args) => {
+            if args.is_empty() {
+                return Type::Named(d, args);
+            }
+            Type::Named(d, replace_vars_all(args, from, to))
+        }
+        Type::Tuple(elems) => Type::Tuple(replace_vars_all(elems, from, to)),
+        Type::Func(params, ret) =>
+            Type::Func(replace_vars_all(params, from, to), replace_vars(ret, from, to)),
+        Type::Assoc(tr, member, self_ty) =>
+            Type::Assoc(tr, member, replace_vars(self_ty, from, to)),
+        _ => prune(t),
+    }
+}
+
+fn replace_vars_all(ts: List[Type], from: List[Var], to: List[Type]) -> List[Type] {
+    let out = list::new[Type]();
+    let mut i = 0;
+    while i < ts.len() {
+        out.push(replace_vars(ts.at(i), from, to));
+        i = i + 1;
+    }
+    out
+}
+
+/// Appends the unbound inference variables in t to `out`, in first-seen order.
+pub fn free_vars(t: Type, out: List[Var]) -> List[Var] {
+    match prune(t) {
+        Type::VarT(v) => {
+            let mut i = 0;
+            while i < out.len() {
+                if ref_eq(out.at(i), v) {
+                    return out;
+                }
+                i = i + 1;
+            }
+            out.push(v);
+            out
+        }
+        Type::Named(_, args) => free_vars_all(args, out),
+        Type::Tuple(elems) => free_vars_all(elems, out),
+        Type::Func(params, ret) => free_vars(ret, free_vars_all(params, out)),
+        Type::Assoc(_, _, self_ty) => free_vars(self_ty, out),
+        _ => out,
+    }
+}
+
+fn free_vars_all(ts: List[Type], out: List[Var]) -> List[Var] {
+    let mut acc = out;
+    let mut i = 0;
+    while i < ts.len() {
+        acc = free_vars(ts.at(i), acc);
+        i = i + 1;
+    }
+    acc
+}
+
+/// Resolves an unsolved variable to its fallback, reporting whether it now has one.
+/// Defaulting happens once, after all constraints in a body are solved (spec/03-types.md).
+pub fn apply_defaults(t: Type) -> bool {
+    match as_var(t) {
+        Option::None => true,
+        Option::Some(v) => {
+            if v.fallback == D_INT {
+                v.bound = Option::Some(Type::Prim(P_I64));
+                return true;
+            }
+            if v.fallback == D_FLOAT {
+                v.bound = Option::Some(Type::Prim(P_F64));
+                return true;
+            }
+            false
+        }
+    }
+}

@@ -230,6 +230,10 @@ pub struct Input {
 pub struct Resolved {
     pub trace: List[String],
     pub errors: List[ResolveError],
+    /// Every reference the resolver made, in the order it made them. An `ast::PathRef`'s
+    /// or `ast::Ident`'s `res` is an index into this: the side table later passes read,
+    /// with the key kept in the node rather than beside it.
+    pub refs: List[Ref],
 }
 
 // --- The resolver ---------------------------------------------------------------------
@@ -241,6 +245,7 @@ struct LambdaCtx {
 
 pub struct Resolver {
     trace: List[String],
+    refs: List[Ref],
     errors: List[ResolveError],
     root: Module,
     std_root: Module,
@@ -329,6 +334,7 @@ pub fn program(inputs: List[Input]) -> Resolved {
     let globals = new_scope(Option::None);
     let r = Resolver {
         trace: list::new[String](),
+        refs: list::new[Ref](),
         errors: list::new[ResolveError](),
         root: root,
         std_root: new_module("std", Option::None),
@@ -434,7 +440,7 @@ pub fn program(inputs: List[Input]) -> Resolved {
         d = d + 1;
     }
 
-    Resolved { trace: r.trace, errors: r.errors }
+    Resolved { trace: r.trace, errors: r.errors, refs: r.refs }
 }
 
 impl Resolver {
@@ -513,8 +519,18 @@ impl Resolver {
 // --- The trace --------------------------------------------------------------------------
 
 impl Resolver {
-    fn note(self, r: Ref) {
+    /// Files one resolution and returns where, which is what the node keeps.
+    fn file_ref(self, r: Ref) -> i64 {
+        self.refs.push(r);
+        self.refs.len() - 1
+    }
+
+    /// Files a resolution and puts it in the trace. A binding introduced by a pattern is
+    /// filed but not traced -- it has a `bind` line of its own, and the Go resolver's
+    /// trace does the same, so a second line here would be a difference about nothing.
+    fn note(self, r: Ref) -> i64 {
         self.trace.push("ref \(describe_ref(r))");
+        self.file_ref(r)
     }
 
     fn note_binding(self, l: Local) {
@@ -1057,7 +1073,7 @@ impl Resolver {
                     match self.scope.lookup(name.name) {
                         Option::Some(r) => {
                             if r.kind == K_VARIANT || r.kind == K_CONST {
-                                self.note(r);
+                                name.res = self.note(r);
                                 match sub {
                                     Option::Some(s) => self.bind_pattern(s, false),
                                     Option::None => {}
@@ -1072,7 +1088,9 @@ impl Resolver {
                     name: name.name, mutable: pat_mut || mutable, file: self.file,
                     at: name.start, fn_depth: self.fn_depth,
                 };
-                self.scope.names.insert(name.name, ref_local(l));
+                let local_ref = ref_local(l);
+                self.scope.names.insert(name.name, local_ref);
+                name.res = self.file_ref(local_ref);
                 self.note_binding(l);
                 match sub {
                     Option::Some(s) => self.bind_pattern(s, mutable),
@@ -1131,7 +1149,7 @@ impl Resolver {
     /// wrong than emitting a trace line at each exit.
     fn resolve_path(self, p: ast::PathRef, in_pattern: bool) -> Ref {
         let r = self.path_into(p, in_pattern);
-        self.note(r);
+        p.res = self.note(r);
         r
     }
 

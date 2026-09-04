@@ -27,10 +27,17 @@ pub struct Span {
 }
 
 /// One identifier occurrence: its text and where it was written.
+///
+/// `res` is where name resolution files its answer: an index into the resolver's own list
+/// of references, or -1 for an identifier that names nothing (a declaration's own name, a
+/// field's). It is the node id this tree does not otherwise have, kept on the two node
+/// kinds that need one rather than on every node -- the checker has to *ask* what a name
+/// meant, and walking two passes in lockstep and hoping they stay in step is not asking.
 pub struct Ident {
     pub name: String,
     pub start: i64,
     pub end: i64,
+    pub mut res: i64,
 }
 
 /// A `::`-separated path. `text` is what the dumper prints; `segs` is what a resolver
@@ -41,7 +48,12 @@ pub struct PathRef {
     pub start: i64,
     pub end: i64,
     pub segs: List[Ident],
+    /// Where name resolution files what the path named; -1 until it has (see `Ident`).
+    pub mut res: i64,
 }
+
+/// A path or identifier that has not been resolved yet.
+pub const UNRESOLVED: i64 = 0 - 1;
 
 // --- Types ---------------------------------------------------------------------------
 

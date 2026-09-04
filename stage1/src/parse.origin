@@ -261,7 +261,7 @@ impl Parser {
     fn ident(self) -> Option[ast::Ident] {
         if self.at(lex::K_IDENT) {
             let t = self.advance();
-            return Option::Some(ast::Ident { name: t.text, start: t.start, end: t.end });
+            return Option::Some(ast::Ident { name: t.text, start: t.start, end: t.end, res: ast::UNRESOLVED });
         }
         self.error_expected("an identifier");
         Option::None
@@ -274,7 +274,7 @@ impl Parser {
             Option::Some(id) => id,
             Option::None => {
                 let t = self.cur();
-                ast::Ident { name: "", start: t.start, end: t.end }
+                ast::Ident { name: "", start: t.start, end: t.end, res: ast::UNRESOLVED }
             }
         }
     }
@@ -296,12 +296,12 @@ impl Parser {
                     text = text.concat("::");
                 }
                 text = text.concat(name);
-                segs.push(ast::Ident { name: name, start: t.start, end: t.end });
+                segs.push(ast::Ident { name: name, start: t.start, end: t.end, res: ast::UNRESOLVED });
                 end = t.end;
             } else {
                 if segs.is_empty() {
                     self.error_expected("a path");
-                    return ast::PathRef { text: text, start: start, end: start, segs: segs };
+                    return ast::PathRef { text: text, start: start, end: start, segs: segs, res: ast::UNRESOLVED };
                 }
             }
             // A `::` before `{` belongs to a braced `use` list, not to the path.
@@ -311,7 +311,7 @@ impl Parser {
                 going = false;
             }
         }
-        ast::PathRef { text: text, start: start, end: end, segs: segs }
+        ast::PathRef { text: text, start: start, end: end, segs: segs, res: ast::UNRESOLVED }
     }
 
     fn item(self) -> ast::Item {
@@ -654,7 +654,7 @@ impl Parser {
         // `impl Trait for Type` and `impl Type` are told apart by the `for` that follows
         // the first type, so a type is parsed and reinterpreted when one appears.
         let first = self.type_expr();
-        let mut trait_path = ast::PathRef { text: "", start: 0, end: 0, segs: list::new[ast::Ident]() };
+        let mut trait_path = ast::PathRef { text: "", start: 0, end: 0, segs: list::new[ast::Ident](), res: ast::UNRESOLVED };
         let mut has_trait = false;
         let mut trait_args = list::new[ast::Type]();
         let mut ty = first;
@@ -754,7 +754,7 @@ fn one_ident(id: ast::Ident) -> List[ast::Ident] {
 fn type_as_trait_path(t: ast::Type) -> ast::PathRef {
     match t {
         ast::Type::Path(path, _) => path,
-        _ => ast::PathRef { text: "", start: 0, end: 0, segs: list::new[ast::Ident]() },
+        _ => ast::PathRef { text: "", start: 0, end: 0, segs: list::new[ast::Ident](), res: ast::UNRESOLVED },
     }
 }
 
@@ -1452,7 +1452,7 @@ impl Parser {
                 Option::Some(name) => {
                     let shorthand = ast::PathRef {
                         text: name.name, start: name.start, end: name.end,
-                        segs: one_ident(name),
+                        segs: one_ident(name), res: ast::UNRESOLVED,
                     };
                     let mut value = ast::Expr::Path(shorthand, list::new[ast::Type]());
                     if self.eat(lex::K_COLON) {
