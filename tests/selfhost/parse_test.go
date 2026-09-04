@@ -107,12 +107,10 @@ func TestStage1ParserMatchesTheGoParser(t *testing.T) {
 		want = append(want, lines...)
 	}
 
-	// Every engine: the parser is Origin, and by a wide margin the largest Origin program
-	// in the project, so where the three engines disagree it will show here first.
-	// Every engine: the parser is Origin, and by a wide margin the largest Origin program
-	// in the project, so where the three engines disagree it will show here first. Native
-	// code takes the whole corpus; the two hosted engines take a sample of it spread across
-	// the whole, since what they are for here is agreement rather than coverage.
+	// Every engine: the parser is Origin, so where the three engines disagree it will show
+	// here. Native code takes the whole corpus; the two hosted engines take a sample of it
+	// spread across the whole, since what they are for here is agreement rather than
+	// coverage.
 	engines := []struct {
 		name   string
 		engine driver.Engine
@@ -145,7 +143,7 @@ func TestStage1ParserMatchesTheGoParser(t *testing.T) {
 				writeParsePackage(t, pkg, files)
 			}
 			var stdout, stderr bytes.Buffer
-			if code := driver.RunAt(pkg, e.engine, e.level, &stdout, &stderr); code != 0 {
+			if code := runStage1(t, pkg, e.engine, e.level, &stdout, &stderr); code != 0 {
 				t.Fatalf("exit %d\n%s", code, stderr.String())
 			}
 			got := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")

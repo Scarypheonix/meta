@@ -109,7 +109,7 @@ func TestStage1MonomorphizerMatchesTheGoOne(t *testing.T) {
 
 			args := append([]string{"mono", preludePath}, files...)
 			var stdout, stderr bytes.Buffer
-			code := driver.RunAt("stage1/src", e.engine, e.level, &stdout, &stderr, args...)
+			code := runStage1(t, stage1Root, e.engine, e.level, &stdout, &stderr, args...)
 			if stderr.Len() > 0 {
 				t.Fatalf("stage1 wrote to stderr:\n%s", stderr.String())
 			}
@@ -206,7 +206,7 @@ func TestStage1MonomorphizesItsOwnSource(t *testing.T) {
 			}
 
 			var stdout, stderr bytes.Buffer
-			if code := driver.RunAt(srcRoot, e.engine, e.level, &stdout, &stderr, args...); code != 0 {
+			if code := runStage1(t, srcRoot, e.engine, e.level, &stdout, &stderr, args...); code != 0 {
 				t.Fatalf("stage1 exited %d, want 0\nstderr:\n%s\nstdout:\n%s",
 					code, stderr.String(), truncate(stdout.String()))
 			}

@@ -79,7 +79,7 @@ func TestStage1ReportsSyntaxErrorsWhereTheGoParserDoes(t *testing.T) {
 
 			var stdout, stderr bytes.Buffer
 			args := append([]string{"parse"}, files...)
-			code := driver.RunAt("stage1/src", e.engine, e.level, &stdout, &stderr, args...)
+			code := runStage1(t, stage1Root, e.engine, e.level, &stdout, &stderr, args...)
 			if stderr.Len() > 0 {
 				t.Fatalf("stage1 wrote to stderr:\n%s", stderr.String())
 			}

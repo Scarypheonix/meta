@@ -281,22 +281,43 @@ func TestStage1LexerMatchesTheGoLexer(t *testing.T) {
 		want = append(want, dumpGo(source.NewFile(path, string(data)))...)
 	}
 
-	// Every engine, because the lexer is Origin: it has to lex the same on all three, and
-	// this is the largest Origin program in the project by a wide margin.
+	// Every engine, because the lexer is Origin and has to lex the same on all three.
+	// Native code takes the whole corpus; the two hosted engines take a sample spread
+	// across it, since what they are for here is agreement rather than coverage -- and a
+	// token dump is the largest output in this package, so lexing all four hundred files
+	// on the virtual machine was a third of the suite's whole five-minute budget on its
+	// own.
 	engines := []struct {
 		name   string
 		engine driver.Engine
 		level  opt.Level
+		stride int
 	}{
-		{"native-O2", driver.Native, opt.O2},
-		{"native-O0", driver.Native, opt.O0},
-		{"vm-O2", driver.VM, opt.O2},
-		{"interpreter", driver.Interpreter, opt.O0},
+		{"native-O2", driver.Native, opt.O2, 1},
+		{"native-O0", driver.Native, opt.O0, 1},
+		{"vm-O2", driver.VM, opt.O2, 12},
+		{"interpreter", driver.Interpreter, opt.O0, 12},
 	}
 	for _, e := range engines {
 		t.Run(e.name, func(t *testing.T) {
+			files, want := files, want
+			pkg := dir
+			if e.stride > 1 {
+				files = stride(files, e.stride)
+				want = nil
+				for _, path := range files {
+					want = append(want, "== "+path)
+					data, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					want = append(want, dumpGo(source.NewFile(path, string(data)))...)
+				}
+				pkg = filepath.Join(dir, e.name)
+				writePackage(t, pkg, files)
+			}
 			var stdout, stderr bytes.Buffer
-			if code := driver.RunAt(dir, e.engine, e.level, &stdout, &stderr); code != 0 {
+			if code := runStage1(t, pkg, e.engine, e.level, &stdout, &stderr); code != 0 {
 				t.Fatalf("exit %d\n%s", code, stderr.String())
 			}
 			got := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")

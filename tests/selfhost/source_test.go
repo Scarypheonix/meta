@@ -171,7 +171,7 @@ func TestStage1PositionsMatchTheGoSource(t *testing.T) {
 			want := wantPositions(t, files)
 
 			var stdout, stderr bytes.Buffer
-			if code := driver.RunAt(dir, e.engine, e.level, &stdout, &stderr, files...); code != 0 {
+			if code := runStage1(t, dir, e.engine, e.level, &stdout, &stderr, files...); code != 0 {
 				t.Fatalf("exit %d\n%s", code, stderr.String())
 			}
 			got := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")

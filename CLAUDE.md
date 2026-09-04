@@ -274,6 +274,17 @@ every bug came from *running Origin*, not from reading Go.
   the first of a duplicated name wins. The degenerate input is the most valuable file in
   the corpus, and a fourth case of the same thing — `checkBodies` visiting an impl's methods
   in map order — was found the same way.
+- **The self-hosting suite was 92% of the five-minute budget**, and almost none of it was
+  work that needed doing twice. `driver.RunAt` compiles from source on every call, so
+  running stage1 twenty times across the differentials compiled 13,500 lines of Origin
+  twenty times — parsing, resolution, checking, monomorphization, the bytecode compiler,
+  the optimizer and the whole native backend — for a program whose source had not changed
+  between calls. And the lexer differential ran all four hundred corpus files on *every*
+  engine with no stride, on the strength of a comment saying the lexer was the largest
+  Origin program in the project, which had stopped being true three components earlier;
+  that one subtest was a third of the suite. `tests/selfhost/stage1_test.go` now compiles
+  each package once per engine and level; the hosted engines take a stride there like
+  everywhere else. 265s to 146s, with the same coverage.
 - **stage1 treated a warning as an error.** `check.origin` filed W0001 in the same list as
   the errors with nothing to tell them apart, so `stage1 check` rejected a program
   `originc check` accepts and the passes after checking never ran. Invisible to the check
