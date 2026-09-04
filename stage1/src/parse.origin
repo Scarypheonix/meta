@@ -61,6 +61,15 @@ impl Parser {
         self.toks.at(self.pos).kind == lex::K_EOF
     }
 
+    /// Where the token before the cursor ended, which is where the construct just parsed
+    /// ends. At the very start there is nothing behind, so the cursor's own start serves.
+    fn prev_end(self) -> i64 {
+        if self.pos == 0 {
+            return self.toks.at(0).start;
+        }
+        self.toks.at(self.pos - 1).end
+    }
+
     fn peek_is(self, n: i64, k: i64) -> bool {
         if self.pos + n >= self.toks.len() {
             return false;
@@ -227,7 +236,7 @@ impl Parser {
     fn use_decl(self) -> ast::Use {
         self.advance();
         let path = self.path();
-        let names = list::new[String]();
+        let names = list::new[ast::Ident]();
         if self.at(lex::K_COLONCOLON) && self.peek_is(1, lex::K_LBRACE) {
             self.advance();
             self.advance();
@@ -246,39 +255,50 @@ impl Parser {
         ast::Use { path: path, names: names }
     }
 
-    fn ident(self) -> Option[String] {
+    fn ident(self) -> Option[ast::Ident] {
         if self.at(lex::K_IDENT) {
-            return Option::Some(self.advance().text);
+            let t = self.advance();
+            return Option::Some(ast::Ident { name: t.text, start: t.start, end: t.end });
         }
         self.error_expected("an identifier");
         Option::None
     }
 
-    /// A `::`-separated path, rendered as the text the dumper prints.
-    fn path(self) -> String {
-        let mut out = "";
-        let mut n = 0;
+    /// The identifier a declaration is named by, or an empty one at the current token so
+    /// that a span is always available to report against.
+    fn decl_name(self) -> ast::Ident {
+        match self.ident() {
+            Option::Some(id) => id,
+            Option::None => {
+                let t = self.cur();
+                ast::Ident { name: "", start: t.start, end: t.end }
+            }
+        }
+    }
+
+    /// A `::`-separated path: the text the dumper prints, the span of the whole, and the
+    /// span of each segment, because a diagnostic about `std::io::nope` underlines the
+    /// last segment and not the path.
+    fn path(self) -> ast::PathRef {
+        let segs = list::new[ast::Ident]();
+        let start = self.cur().start;
+        let mut end = start;
+        let mut text = "";
         let mut going = true;
         while going {
-            if self.at(lex::K_IDENT) {
-                if n > 0 {
-                    out = out.concat("::");
+            if self.at(lex::K_IDENT) || self.at(lex::K_SELF_TYPE) {
+                let t = self.advance();
+                let name = if t.kind == lex::K_SELF_TYPE { "Self" } else { t.text };
+                if !segs.is_empty() {
+                    text = text.concat("::");
                 }
-                out = out.concat(self.advance().text);
-                n = n + 1;
+                text = text.concat(name);
+                segs.push(ast::Ident { name: name, start: t.start, end: t.end });
+                end = t.end;
             } else {
-                if self.at(lex::K_SELF_TYPE) {
-                    self.advance();
-                    if n > 0 {
-                        out = out.concat("::");
-                    }
-                    out = out.concat("Self");
-                    n = n + 1;
-                } else {
-                    if n == 0 {
-                        self.error_expected("a path");
-                        return out;
-                    }
+                if segs.is_empty() {
+                    self.error_expected("a path");
+                    return ast::PathRef { text: text, start: start, end: start, segs: segs };
                 }
             }
             // A `::` before `{` belongs to a braced `use` list, not to the path.
@@ -288,7 +308,7 @@ impl Parser {
                 going = false;
             }
         }
-        out
+        ast::PathRef { text: text, start: start, end: end, segs: segs }
     }
 
     fn item(self) -> ast::Item {
@@ -402,7 +422,7 @@ impl Parser {
 
     fn fn_decl(self, public: bool) -> ast::FnDecl {
         self.advance();
-        let name = self.ident().unwrap_or("");
+        let name = self.decl_name();
         let generics = self.generics();
         let params = list::new[ast::Param]();
         let mut self_param = Option::None;
@@ -466,7 +486,7 @@ impl Parser {
 
     fn struct_decl(self, public: bool) -> ast::StructDecl {
         self.advance();
-        let name = self.ident().unwrap_or("");
+        let name = self.decl_name();
         let generics = self.generics();
         let where_preds = self.where_clause();
         let mut fields = list::new[ast::Field]();
@@ -513,7 +533,7 @@ impl Parser {
 
     fn enum_decl(self, public: bool) -> ast::EnumDecl {
         self.advance();
-        let name = self.ident().unwrap_or("");
+        let name = self.decl_name();
         let generics = self.generics();
         let where_preds = self.where_clause();
         let variants = list::new[ast::Variant]();
@@ -567,7 +587,7 @@ impl Parser {
         self.finish_enum(public, name, generics, where_preds, variants)
     }
 
-    fn finish_enum(self, public: bool, name: String, generics: List[ast::GenericParam],
+    fn finish_enum(self, public: bool, name: ast::Ident, generics: List[ast::GenericParam],
                    where_preds: List[ast::WherePred], variants: List[ast::Variant]) -> ast::EnumDecl {
         self.expect(lex::K_RBRACE);
         ast::EnumDecl {
@@ -578,7 +598,7 @@ impl Parser {
 
     fn trait_decl(self, public: bool) -> ast::TraitDecl {
         self.advance();
-        let name = self.ident().unwrap_or("");
+        let name = self.decl_name();
         let generics = self.generics();
         let mut supertraits = list::new[ast::TraitRef]();
         if self.eat(lex::K_COLON) {
@@ -598,7 +618,7 @@ impl Parser {
             let before = self.pos;
             if self.at(lex::K_TYPE) {
                 self.advance();
-                let aname = self.ident().unwrap_or("");
+                let aname = self.decl_name();
                 let mut bounds = list::new[ast::TraitRef]();
                 if self.eat(lex::K_COLON) {
                     bounds = self.trait_bounds();
@@ -631,7 +651,7 @@ impl Parser {
         // `impl Trait for Type` and `impl Type` are told apart by the `for` that follows
         // the first type, so a type is parsed and reinterpreted when one appears.
         let first = self.type_expr();
-        let mut trait_path = "";
+        let mut trait_path = ast::PathRef { text: "", start: 0, end: 0, segs: list::new[ast::Ident]() };
         let mut has_trait = false;
         let mut trait_args = list::new[ast::Type]();
         let mut ty = first;
@@ -658,7 +678,7 @@ impl Parser {
             let public = self.eat(lex::K_PUB);
             if self.at(lex::K_TYPE) {
                 self.advance();
-                let aname = self.ident().unwrap_or("");
+                let aname = self.decl_name();
                 let mut aty = ast::Type::ErrorType;
                 if self.expect(lex::K_ASSIGN) {
                     aty = self.type_expr();
@@ -689,7 +709,7 @@ impl Parser {
 
     fn alias_decl(self, public: bool) -> ast::AliasDecl {
         self.advance();
-        let name = self.ident().unwrap_or("");
+        let name = self.decl_name();
         let generics = self.generics();
         let mut ty = ast::Type::ErrorType;
         if self.expect(lex::K_ASSIGN) {
@@ -703,7 +723,7 @@ impl Parser {
 
     fn const_decl(self, public: bool) -> ast::ConstDecl {
         self.advance();
-        let name = self.ident().unwrap_or("");
+        let name = self.decl_name();
         let mut ty = ast::Type::ErrorType;
         if self.expect(lex::K_COLON) {
             ty = self.type_expr();
@@ -719,11 +739,19 @@ impl Parser {
     }
 }
 
+/// A one-segment path's segment list, for the shorthand `Point { x, y }`, where the
+/// field's own identifier stands in for the expression `x`.
+fn one_ident(id: ast::Ident) -> List[ast::Ident] {
+    let out = list::new[ast::Ident]();
+    out.push(id);
+    out
+}
+
 /// A parsed type reinterpreted as a trait's path, which only a path type can be.
-fn type_as_trait_path(t: ast::Type) -> String {
+fn type_as_trait_path(t: ast::Type) -> ast::PathRef {
     match t {
         ast::Type::Path(path, _) => path,
-        _ => "",
+        _ => ast::PathRef { text: "", start: 0, end: 0, segs: list::new[ast::Ident]() },
     }
 }
 
@@ -954,14 +982,18 @@ impl Parser {
     }
 
     fn assign_expr(self) -> ast::Expr {
+        let start = self.cur().start;
         let lhs = self.or_expr();
         let op = assign_op(self.cur().kind);
         if op.is_empty() {
             return lhs;
         }
+        // The place's span, taken before and after parsing it: the resolver reports
+        // "cannot assign to this expression" against exactly this range.
+        let place = ast::Span { start: start, end: self.prev_end() };
         self.advance();
         let rhs = self.assign_expr(); // right-associative
-        ast::Expr::Assign(op, lhs, rhs)
+        ast::Expr::Assign(op, place, lhs, rhs)
     }
 
     fn or_expr(self) -> ast::Expr {
@@ -1124,9 +1156,9 @@ impl Parser {
                     }
                     Option::Some(name) => {
                         if self.at(lex::K_LPAREN) {
-                            e = ast::Expr::Method(name, e, self.call_args());
+                            e = ast::Expr::Method(name.name, e, self.call_args());
                         } else {
-                            e = ast::Expr::Field(name, e);
+                            e = ast::Expr::Field(name.name, e);
                         }
                     }
                 }
@@ -1234,15 +1266,17 @@ impl Parser {
             return ast::Expr::Loop(self.block());
         }
         if k == lex::K_BREAK {
-            self.advance();
+            let t = self.advance();
+            let at = ast::Span { start: t.start, end: t.end };
             if self.can_start_expr() {
-                return ast::Expr::Break(Option::Some(self.expr()));
+                return ast::Expr::Break(at, Option::Some(self.expr()));
             }
-            return ast::Expr::Break(Option::None);
+            let none: Option[ast::Expr] = Option::None;
+            return ast::Expr::Break(at, none);
         }
         if k == lex::K_CONTINUE {
-            self.advance();
-            return ast::Expr::Continue;
+            let t = self.advance();
+            return ast::Expr::Continue(ast::Span { start: t.start, end: t.end });
         }
         if k == lex::K_RETURN {
             self.advance();
@@ -1398,7 +1432,7 @@ impl Parser {
         ast::Expr::Path(path, args)
     }
 
-    fn struct_lit(self, path: String) -> ast::Expr {
+    fn struct_lit(self, path: ast::PathRef) -> ast::Expr {
         let saved = self.no_struct;
         self.no_struct = false;
         self.advance();
@@ -1412,7 +1446,11 @@ impl Parser {
                     }
                 }
                 Option::Some(name) => {
-                    let mut value = ast::Expr::Path(name, list::new[ast::Type]());
+                    let shorthand = ast::PathRef {
+                        text: name.name, start: name.start, end: name.end,
+                        segs: one_ident(name),
+                    };
+                    let mut value = ast::Expr::Path(shorthand, list::new[ast::Type]());
                     if self.eat(lex::K_COLON) {
                         value = self.expr();
                     }
@@ -1563,7 +1601,7 @@ impl Parser {
                 if self.eat(lex::K_AT) {
                     sub = Option::Some(self.pattern_no_or());
                 }
-                return ast::Pat::Bind(false, path, sub);
+                return ast::Pat::Bind(false, path.segs.at(0), sub);
             }
             return ast::Pat::PathUnit(path);
         }
@@ -1614,7 +1652,7 @@ impl Parser {
         ast::Pat::Tup(elems)
     }
 
-    fn tuple_variant_pattern(self, path: String) -> ast::Pat {
+    fn tuple_variant_pattern(self, path: ast::PathRef) -> ast::Pat {
         self.advance();
         let elems = list::new[ast::Pat]();
         while !self.at(lex::K_RPAREN) && !self.at_eof() {
@@ -1631,7 +1669,7 @@ impl Parser {
         ast::Pat::PathTuple(path, elems)
     }
 
-    fn struct_pattern(self, path: String) -> ast::Pat {
+    fn struct_pattern(self, path: ast::PathRef) -> ast::Pat {
         self.advance();
         let fields = list::new[ast::FieldPat]();
         let mut rest = false;

@@ -13,11 +13,41 @@
 use std::list;
 use std::str;
 
+// --- Spans and names -----------------------------------------------------------------
+//
+// Byte offsets into the file, `[start, end)`, on exactly the nodes a later pass reports a
+// diagnostic at: an identifier, a path and each of its segments, the place of an
+// assignment, a `break` or a `continue`. Nothing else carries one, for the reason the
+// header gives -- a field nothing reads is the failure mode Phase 8 kept finding -- and
+// what reads these is `resolve.origin`.
+
+pub struct Span {
+    pub start: i64,
+    pub end: i64,
+}
+
+/// One identifier occurrence: its text and where it was written.
+pub struct Ident {
+    pub name: String,
+    pub start: i64,
+    pub end: i64,
+}
+
+/// A `::`-separated path. `text` is what the dumper prints; `segs` is what a resolver
+/// walks, because a diagnostic about `std::io::nope` underlines `nope` and not the whole
+/// path.
+pub struct PathRef {
+    pub text: String,
+    pub start: i64,
+    pub end: i64,
+    pub segs: List[Ident],
+}
+
 // --- Types ---------------------------------------------------------------------------
 
 pub enum Type {
     /// A path with its type arguments: `Map[String, i64]`.
-    Path(String, List[Type]),
+    Path(PathRef, List[Type]),
     Tuple(List[Type]),
     Unit,
     /// `fn(A, B) -> C`.
@@ -30,13 +60,13 @@ pub enum Type {
 
 /// A trait named in a bound, with its type arguments: `Iterator[Item]`.
 pub struct TraitRef {
-    pub path: String,
+    pub path: PathRef,
     pub args: List[Type],
 }
 
 /// One generic parameter and the bounds written inline on it.
 pub struct GenericParam {
-    pub name: String,
+    pub name: Ident,
     pub bounds: List[TraitRef],
 }
 
@@ -49,7 +79,7 @@ pub struct WherePred {
 // --- Patterns ------------------------------------------------------------------------
 
 pub struct FieldPat {
-    pub name: String,
+    pub name: Ident,
     pub pat: Pat,
 }
 
@@ -58,11 +88,11 @@ pub enum Pat {
     /// A literal, with the `-` a numeric one may carry.
     Lit(bool, Expr),
     /// `mut x`, `x @ sub`.
-    Bind(bool, String, Option[Pat]),
-    PathUnit(String),
-    PathTuple(String, List[Pat]),
+    Bind(bool, Ident, Option[Pat]),
+    PathUnit(PathRef),
+    PathTuple(PathRef, List[Pat]),
     /// The `bool` is a trailing `..`.
-    PathStruct(String, bool, List[FieldPat]),
+    PathStruct(PathRef, bool, List[FieldPat]),
     Tup(List[Pat]),
     Or(List[Pat]),
     ErrorPat,
@@ -71,7 +101,7 @@ pub enum Pat {
 // --- Expressions ---------------------------------------------------------------------
 
 pub struct FieldInit {
-    pub name: String,
+    pub name: Ident,
     pub value: Expr,
 }
 
@@ -97,9 +127,9 @@ pub enum Expr {
     Str(String),
     Char(i64),
     Bool(bool),
-    Path(String, List[Type]),
+    Path(PathRef, List[Type]),
     SelfExpr,
-    StructLit(String, List[FieldInit]),
+    StructLit(PathRef, List[FieldInit]),
     Tuple(List[Expr]),
     Lambda(List[LambdaParam], Expr),
     Block(BlockBody),
@@ -108,12 +138,13 @@ pub enum Expr {
     While(Expr, Expr),
     For(Pat, Expr, Expr),
     Loop(Expr),
-    Break(Option[Expr]),
-    Continue,
+    Break(Span, Option[Expr]),
+    Continue(Span),
     Return(Option[Expr]),
     Unary(String, Expr),
     Binary(String, Expr, Expr),
-    Assign(String, Expr, Expr),
+    /// The operator, the span of the place being assigned, the place, and the value.
+    Assign(String, Span, Expr, Expr),
     Cast(Expr, Type),
     Call(Expr, List[Expr]),
     Method(String, Expr, List[Expr]),
@@ -142,7 +173,7 @@ pub struct Param {
 
 pub struct FnDecl {
     pub public: bool,
-    pub name: String,
+    pub name: Ident,
     pub generics: List[GenericParam],
     pub where_preds: List[WherePred],
     /// One element when the function takes `self`, holding whether it is `mut`.
@@ -155,13 +186,13 @@ pub struct FnDecl {
 pub struct Field {
     pub public: bool,
     pub mutable: bool,
-    pub name: String,
+    pub name: Ident,
     pub ty: Type,
 }
 
 pub struct StructDecl {
     pub public: bool,
-    pub name: String,
+    pub name: Ident,
     pub generics: List[GenericParam],
     pub where_preds: List[WherePred],
     pub fields: List[Field],
@@ -172,7 +203,7 @@ pub const VARIANT_TUPLE: i64 = 1;
 pub const VARIANT_STRUCT: i64 = 2;
 
 pub struct Variant {
-    pub name: String,
+    pub name: Ident,
     pub kind: i64,
     pub types: List[Type],
     pub fields: List[Field],
@@ -180,21 +211,21 @@ pub struct Variant {
 
 pub struct EnumDecl {
     pub public: bool,
-    pub name: String,
+    pub name: Ident,
     pub generics: List[GenericParam],
     pub where_preds: List[WherePred],
     pub variants: List[Variant],
 }
 
 pub struct AssocType {
-    pub name: String,
+    pub name: Ident,
     pub bounds: List[TraitRef],
     pub ty: Option[Type],
 }
 
 pub struct TraitDecl {
     pub public: bool,
-    pub name: String,
+    pub name: Ident,
     pub generics: List[GenericParam],
     pub supertraits: List[TraitRef],
     pub where_preds: List[WherePred],
@@ -204,8 +235,8 @@ pub struct TraitDecl {
 
 pub struct ImplDecl {
     pub generics: List[GenericParam],
-    /// The trait's path, empty for an inherent impl.
-    pub trait_path: String,
+    /// The trait's path; meaningful only when `has_trait`.
+    pub trait_path: PathRef,
     pub has_trait: bool,
     pub trait_args: List[Type],
     pub where_preds: List[WherePred],
@@ -216,14 +247,14 @@ pub struct ImplDecl {
 
 pub struct AliasDecl {
     pub public: bool,
-    pub name: String,
+    pub name: Ident,
     pub generics: List[GenericParam],
     pub ty: Type,
 }
 
 pub struct ConstDecl {
     pub public: bool,
-    pub name: String,
+    pub name: Ident,
     pub ty: Type,
     pub value: Expr,
 }
@@ -240,8 +271,8 @@ pub enum Item {
 }
 
 pub struct Use {
-    pub path: String,
-    pub names: List[String],
+    pub path: PathRef,
+    pub names: List[Ident],
 }
 
 pub struct File {
@@ -295,7 +326,7 @@ fn generics_mark(gs: List[GenericParam]) -> String {
         if i > 0 {
             out = out.concat(", ");
         }
-        out = out.concat(gs.at(i).name);
+        out = out.concat(gs.at(i).name.name);
         i = i + 1;
     }
     out.concat("]")
@@ -308,7 +339,7 @@ fn dump_bounds(out: List[String], gs: List[GenericParam], depth: i64) {
     while i < gs.len() {
         let g = gs.at(i);
         if !g.bounds.is_empty() {
-            emit(out, depth, "bound \(g.name)");
+            emit(out, depth, "bound \(g.name.name)");
             dump_trait_refs(out, g.bounds, depth + 1);
         }
         i = i + 1;
@@ -338,10 +369,10 @@ fn dump_trait_refs(out: List[String], refs: List[TraitRef], depth: i64) {
 /// dumps the way a nested type does.
 fn dump_trait_ref(out: List[String], tr: TraitRef, depth: i64) {
     if tr.args.is_empty() {
-        emit(out, depth, "trait \(tr.path)");
+        emit(out, depth, "trait \(tr.path.text)");
         return;
     }
-    emit(out, depth, "trait \(tr.path)[..]");
+    emit(out, depth, "trait \(tr.path.text)[..]");
     let mut i = 0;
     while i < tr.args.len() {
         dump_type(out, tr.args.at(i), depth + 1);
@@ -433,12 +464,12 @@ pub fn dump(f: File) -> List[String] {
                 if j > 0 {
                     names = names.concat(", ");
                 }
-                names = names.concat(u.names.at(j));
+                names = names.concat(u.names.at(j).name);
                 j = j + 1;
             }
             names = names.concat("}");
         }
-        emit(out, 1, "use \(u.path)\(names)");
+        emit(out, 1, "use \(u.path.text)\(names)");
         i = i + 1;
     }
     let mut k = 0;
@@ -453,30 +484,30 @@ fn dump_item(out: List[String], item: Item, depth: i64) {
     match item {
         Item::Fn(d) => dump_fn(out, d, depth),
         Item::Struct(d) => {
-            emit(out, depth, "struct \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics))");
+            emit(out, depth, "struct \(pub_mark(d.public))\(d.name.name)\(generics_mark(d.generics))");
             dump_bounds(out, d.generics, depth + 1);
             dump_where(out, d.where_preds, depth + 1);
             dump_fields(out, d.fields, depth + 1, true);
         }
         Item::Enum(d) => {
-            emit(out, depth, "enum \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics))");
+            emit(out, depth, "enum \(pub_mark(d.public))\(d.name.name)\(generics_mark(d.generics))");
             dump_bounds(out, d.generics, depth + 1);
             dump_where(out, d.where_preds, depth + 1);
             let mut i = 0;
             while i < d.variants.len() {
                 let v = d.variants.at(i);
                 if v.kind == VARIANT_UNIT {
-                    emit(out, depth + 1, "variant \(v.name)");
+                    emit(out, depth + 1, "variant \(v.name.name)");
                 } else {
                     if v.kind == VARIANT_TUPLE {
-                        emit(out, depth + 1, "variant \(v.name)(..)");
+                        emit(out, depth + 1, "variant \(v.name.name)(..)");
                         let mut j = 0;
                         while j < v.types.len() {
                             dump_type(out, v.types.at(j), depth + 2);
                             j = j + 1;
                         }
                     } else {
-                        emit(out, depth + 1, "variant \(v.name){..}");
+                        emit(out, depth + 1, "variant \(v.name.name){..}");
                         dump_fields(out, v.fields, depth + 2, false);
                     }
                 }
@@ -484,7 +515,7 @@ fn dump_item(out: List[String], item: Item, depth: i64) {
             }
         }
         Item::Trait(d) => {
-            emit(out, depth, "trait \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics))");
+            emit(out, depth, "trait \(pub_mark(d.public))\(d.name.name)\(generics_mark(d.generics))");
             dump_bounds(out, d.generics, depth + 1);
             let mut s = 0;
             while s < d.supertraits.len() {
@@ -496,7 +527,7 @@ fn dump_item(out: List[String], item: Item, depth: i64) {
             let mut i = 0;
             while i < d.assoc.len() {
                 let a = d.assoc.at(i);
-                emit(out, depth + 1, "assoc-type \(a.name)");
+                emit(out, depth + 1, "assoc-type \(a.name.name)");
                 dump_trait_refs(out, a.bounds, depth + 2);
                 i = i + 1;
             }
@@ -508,7 +539,7 @@ fn dump_item(out: List[String], item: Item, depth: i64) {
         }
         Item::Impl(d) => {
             if d.has_trait {
-                emit(out, depth, "impl\(generics_mark(d.generics)) \(d.trait_path) for");
+                emit(out, depth, "impl\(generics_mark(d.generics)) \(d.trait_path.text) for");
                 let mut a = 0;
                 while a < d.trait_args.len() {
                     emit(out, depth + 1, "trait-arg");
@@ -524,7 +555,7 @@ fn dump_item(out: List[String], item: Item, depth: i64) {
             let mut i = 0;
             while i < d.assoc.len() {
                 let a = d.assoc.at(i);
-                emit(out, depth + 1, "assoc-type \(a.name) =");
+                emit(out, depth + 1, "assoc-type \(a.name.name) =");
                 match a.ty {
                     Option::Some(t) => dump_type(out, t, depth + 2),
                     Option::None => {}
@@ -538,12 +569,12 @@ fn dump_item(out: List[String], item: Item, depth: i64) {
             }
         }
         Item::Alias(d) => {
-            emit(out, depth, "type \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics)) =");
+            emit(out, depth, "type \(pub_mark(d.public))\(d.name.name)\(generics_mark(d.generics)) =");
             dump_bounds(out, d.generics, depth + 1);
             dump_type(out, d.ty, depth + 1);
         }
         Item::Const(d) => {
-            emit(out, depth, "const \(pub_mark(d.public))\(d.name)");
+            emit(out, depth, "const \(pub_mark(d.public))\(d.name.name)");
             dump_type(out, d.ty, depth + 1);
             dump_expr(out, d.value, depth + 1);
         }
@@ -556,9 +587,9 @@ fn dump_fields(out: List[String], fields: List[Field], depth: i64, with_pub: boo
     while i < fields.len() {
         let f = fields.at(i);
         if with_pub {
-            emit(out, depth, "field \(pub_mark(f.public))\(mut_prefix(f.mutable))\(f.name)");
+            emit(out, depth, "field \(pub_mark(f.public))\(mut_prefix(f.mutable))\(f.name.name)");
         } else {
-            emit(out, depth, "field \(mut_prefix(f.mutable))\(f.name)");
+            emit(out, depth, "field \(mut_prefix(f.mutable))\(f.name.name)");
         }
         dump_type(out, f.ty, depth + 1);
         i = i + 1;
@@ -566,7 +597,7 @@ fn dump_fields(out: List[String], fields: List[Field], depth: i64, with_pub: boo
 }
 
 fn dump_fn(out: List[String], d: FnDecl, depth: i64) {
-    emit(out, depth, "fn \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics))");
+    emit(out, depth, "fn \(pub_mark(d.public))\(d.name.name)\(generics_mark(d.generics))");
     dump_bounds(out, d.generics, depth + 1);
     dump_where(out, d.where_preds, depth + 1);
     match d.self_param {
@@ -598,9 +629,9 @@ fn dump_type(out: List[String], t: Type, depth: i64) {
     match t {
         Type::Path(path, args) => {
             if args.is_empty() {
-                emit(out, depth, "type \(path)");
+                emit(out, depth, "type \(path.text)");
             } else {
-                emit(out, depth, "type \(path)[..]");
+                emit(out, depth, "type \(path.text)[..]");
                 let mut i = 0;
                 while i < args.len() {
                     dump_type(out, args.at(i), depth + 1);
@@ -672,9 +703,9 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
         Expr::Bool(v) => emit(out, depth, "bool \(v)"),
         Expr::Path(path, args) => {
             if args.is_empty() {
-                emit(out, depth, "path \(path)");
+                emit(out, depth, "path \(path.text)");
             } else {
-                emit(out, depth, "path \(path)[..]");
+                emit(out, depth, "path \(path.text)[..]");
                 let mut i = 0;
                 while i < args.len() {
                     dump_type(out, args.at(i), depth + 1);
@@ -684,10 +715,10 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
         }
         Expr::SelfExpr => emit(out, depth, "self"),
         Expr::StructLit(path, fields) => {
-            emit(out, depth, "struct-lit \(path)");
+            emit(out, depth, "struct-lit \(path.text)");
             let mut i = 0;
             while i < fields.len() {
-                emit(out, depth + 1, "field \(fields.at(i).name)");
+                emit(out, depth + 1, "field \(fields.at(i).name.name)");
                 dump_expr(out, fields.at(i).value, depth + 2);
                 i = i + 1;
             }
@@ -775,14 +806,14 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
             emit(out, depth, "loop");
             dump_expr(out, body, depth + 1);
         }
-        Expr::Break(v) => {
+        Expr::Break(_, v) => {
             emit(out, depth, "break");
             match v {
                 Option::Some(x) => dump_expr(out, x, depth + 1),
                 Option::None => {}
             }
         }
-        Expr::Continue => emit(out, depth, "continue"),
+        Expr::Continue(_) => emit(out, depth, "continue"),
         Expr::Return(v) => {
             emit(out, depth, "return");
             match v {
@@ -799,7 +830,7 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
             dump_expr(out, l, depth + 1);
             dump_expr(out, r, depth + 1);
         }
-        Expr::Assign(op, place, value) => {
+        Expr::Assign(op, _, place, value) => {
             emit(out, depth, "assign \(op)");
             dump_expr(out, place, depth + 1);
             dump_expr(out, value, depth + 1);
@@ -840,15 +871,15 @@ fn dump_pat(out: List[String], p: Pat, depth: i64) {
             dump_expr(out, lit, depth + 1);
         }
         Pat::Bind(mutable, name, sub) => {
-            emit(out, depth, "pat bind\(mut_mark(mutable)) \(name)");
+            emit(out, depth, "pat bind\(mut_mark(mutable)) \(name.name)");
             match sub {
                 Option::Some(s) => dump_pat(out, s, depth + 1),
                 Option::None => {}
             }
         }
-        Pat::PathUnit(path) => emit(out, depth, "pat path \(path)"),
+        Pat::PathUnit(path) => emit(out, depth, "pat path \(path.text)"),
         Pat::PathTuple(path, elems) => {
-            emit(out, depth, "pat path \(path)(..)");
+            emit(out, depth, "pat path \(path.text)(..)");
             let mut i = 0;
             while i < elems.len() {
                 dump_pat(out, elems.at(i), depth + 1);
@@ -857,10 +888,10 @@ fn dump_pat(out: List[String], p: Pat, depth: i64) {
         }
         Pat::PathStruct(path, rest, fields) => {
             let mark = if rest { " .." } else { "" };
-            emit(out, depth, "pat path \(path){..}\(mark)");
+            emit(out, depth, "pat path \(path.text){..}\(mark)");
             let mut i = 0;
             while i < fields.len() {
-                emit(out, depth + 1, "field \(fields.at(i).name)");
+                emit(out, depth + 1, "field \(fields.at(i).name.name)");
                 dump_pat(out, fields.at(i).pat, depth + 2);
                 i = i + 1;
             }
