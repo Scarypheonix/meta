@@ -26,6 +26,26 @@ pub enum Type {
     ErrorType,
 }
 
+// --- Bounds --------------------------------------------------------------------------
+
+/// A trait named in a bound, with its type arguments: `Iterator[Item]`.
+pub struct TraitRef {
+    pub path: String,
+    pub args: List[Type],
+}
+
+/// One generic parameter and the bounds written inline on it.
+pub struct GenericParam {
+    pub name: String,
+    pub bounds: List[TraitRef],
+}
+
+/// One `where` predicate: a type and the bounds it must satisfy.
+pub struct WherePred {
+    pub ty: Type,
+    pub bounds: List[TraitRef],
+}
+
 // --- Patterns ------------------------------------------------------------------------
 
 pub struct FieldPat {
@@ -123,7 +143,8 @@ pub struct Param {
 pub struct FnDecl {
     pub public: bool,
     pub name: String,
-    pub generics: List[String],
+    pub generics: List[GenericParam],
+    pub where_preds: List[WherePred],
     /// One element when the function takes `self`, holding whether it is `mut`.
     pub self_param: Option[bool],
     pub params: List[Param],
@@ -141,7 +162,8 @@ pub struct Field {
 pub struct StructDecl {
     pub public: bool,
     pub name: String,
-    pub generics: List[String],
+    pub generics: List[GenericParam],
+    pub where_preds: List[WherePred],
     pub fields: List[Field],
 }
 
@@ -159,27 +181,34 @@ pub struct Variant {
 pub struct EnumDecl {
     pub public: bool,
     pub name: String,
-    pub generics: List[String],
+    pub generics: List[GenericParam],
+    pub where_preds: List[WherePred],
     pub variants: List[Variant],
 }
 
 pub struct AssocType {
     pub name: String,
+    pub bounds: List[TraitRef],
     pub ty: Option[Type],
 }
 
 pub struct TraitDecl {
     pub public: bool,
     pub name: String,
-    pub generics: List[String],
+    pub generics: List[GenericParam],
+    pub supertraits: List[TraitRef],
+    pub where_preds: List[WherePred],
     pub assoc: List[AssocType],
     pub methods: List[FnDecl],
 }
 
 pub struct ImplDecl {
+    pub generics: List[GenericParam],
     /// The trait's path, empty for an inherent impl.
     pub trait_path: String,
     pub has_trait: bool,
+    pub trait_args: List[Type],
+    pub where_preds: List[WherePred],
     pub ty: Type,
     pub assoc: List[AssocType],
     pub methods: List[FnDecl],
@@ -188,7 +217,7 @@ pub struct ImplDecl {
 pub struct AliasDecl {
     pub public: bool,
     pub name: String,
-    pub generics: List[String],
+    pub generics: List[GenericParam],
     pub ty: Type,
 }
 
@@ -256,7 +285,7 @@ fn suffix_mark(s: String) -> String {
     if s.is_empty() { "" } else { " ".concat(s) }
 }
 
-fn generics_mark(gs: List[String]) -> String {
+fn generics_mark(gs: List[GenericParam]) -> String {
     if gs.is_empty() {
         return "";
     }
@@ -266,10 +295,58 @@ fn generics_mark(gs: List[String]) -> String {
         if i > 0 {
             out = out.concat(", ");
         }
-        out = out.concat(gs.at(i));
+        out = out.concat(gs.at(i).name);
         i = i + 1;
     }
     out.concat("]")
+}
+
+/// The bounds a generic parameter list carries. The names are already inline in
+/// `generics_mark`; this is the part that has type arguments and so cannot be.
+fn dump_bounds(out: List[String], gs: List[GenericParam], depth: i64) {
+    let mut i = 0;
+    while i < gs.len() {
+        let g = gs.at(i);
+        if !g.bounds.is_empty() {
+            emit(out, depth, "bound \(g.name)");
+            dump_trait_refs(out, g.bounds, depth + 1);
+        }
+        i = i + 1;
+    }
+}
+
+fn dump_where(out: List[String], preds: List[WherePred], depth: i64) {
+    let mut i = 0;
+    while i < preds.len() {
+        let w = preds.at(i);
+        emit(out, depth, "where");
+        dump_type(out, w.ty, depth + 1);
+        dump_trait_refs(out, w.bounds, depth + 1);
+        i = i + 1;
+    }
+}
+
+fn dump_trait_refs(out: List[String], refs: List[TraitRef], depth: i64) {
+    let mut i = 0;
+    while i < refs.len() {
+        dump_trait_ref(out, refs.at(i), depth);
+        i = i + 1;
+    }
+}
+
+/// One trait reference, with its type arguments as children so that a nested application
+/// dumps the way a nested type does.
+fn dump_trait_ref(out: List[String], tr: TraitRef, depth: i64) {
+    if tr.args.is_empty() {
+        emit(out, depth, "trait \(tr.path)");
+        return;
+    }
+    emit(out, depth, "trait \(tr.path)[..]");
+    let mut i = 0;
+    while i < tr.args.len() {
+        dump_type(out, tr.args.at(i), depth + 1);
+        i = i + 1;
+    }
 }
 
 /// A float as Go's `%g` with the shortest round-tripping digits renders it.
@@ -377,10 +454,14 @@ fn dump_item(out: List[String], item: Item, depth: i64) {
         Item::Fn(d) => dump_fn(out, d, depth),
         Item::Struct(d) => {
             emit(out, depth, "struct \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics))");
+            dump_bounds(out, d.generics, depth + 1);
+            dump_where(out, d.where_preds, depth + 1);
             dump_fields(out, d.fields, depth + 1, true);
         }
         Item::Enum(d) => {
             emit(out, depth, "enum \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics))");
+            dump_bounds(out, d.generics, depth + 1);
+            dump_where(out, d.where_preds, depth + 1);
             let mut i = 0;
             while i < d.variants.len() {
                 let v = d.variants.at(i);
@@ -404,9 +485,19 @@ fn dump_item(out: List[String], item: Item, depth: i64) {
         }
         Item::Trait(d) => {
             emit(out, depth, "trait \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics))");
+            dump_bounds(out, d.generics, depth + 1);
+            let mut s = 0;
+            while s < d.supertraits.len() {
+                emit(out, depth + 1, "super");
+                dump_trait_ref(out, d.supertraits.at(s), depth + 2);
+                s = s + 1;
+            }
+            dump_where(out, d.where_preds, depth + 1);
             let mut i = 0;
             while i < d.assoc.len() {
-                emit(out, depth + 1, "assoc-type \(d.assoc.at(i).name)");
+                let a = d.assoc.at(i);
+                emit(out, depth + 1, "assoc-type \(a.name)");
+                dump_trait_refs(out, a.bounds, depth + 2);
                 i = i + 1;
             }
             let mut j = 0;
@@ -417,10 +508,18 @@ fn dump_item(out: List[String], item: Item, depth: i64) {
         }
         Item::Impl(d) => {
             if d.has_trait {
-                emit(out, depth, "impl \(d.trait_path) for");
+                emit(out, depth, "impl\(generics_mark(d.generics)) \(d.trait_path) for");
+                let mut a = 0;
+                while a < d.trait_args.len() {
+                    emit(out, depth + 1, "trait-arg");
+                    dump_type(out, d.trait_args.at(a), depth + 2);
+                    a = a + 1;
+                }
             } else {
-                emit(out, depth, "impl");
+                emit(out, depth, "impl\(generics_mark(d.generics))");
             }
+            dump_bounds(out, d.generics, depth + 1);
+            dump_where(out, d.where_preds, depth + 1);
             dump_type(out, d.ty, depth + 1);
             let mut i = 0;
             while i < d.assoc.len() {
@@ -440,6 +539,7 @@ fn dump_item(out: List[String], item: Item, depth: i64) {
         }
         Item::Alias(d) => {
             emit(out, depth, "type \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics)) =");
+            dump_bounds(out, d.generics, depth + 1);
             dump_type(out, d.ty, depth + 1);
         }
         Item::Const(d) => {
@@ -467,6 +567,8 @@ fn dump_fields(out: List[String], fields: List[Field], depth: i64, with_pub: boo
 
 fn dump_fn(out: List[String], d: FnDecl, depth: i64) {
     emit(out, depth, "fn \(pub_mark(d.public))\(d.name)\(generics_mark(d.generics))");
+    dump_bounds(out, d.generics, depth + 1);
+    dump_where(out, d.where_preds, depth + 1);
     match d.self_param {
         Option::Some(m) => emit(out, depth + 1, "self\(mut_mark(m))"),
         Option::None => {}

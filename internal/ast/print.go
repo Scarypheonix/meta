@@ -10,6 +10,13 @@ import (
 // `originc check --dump-ast`; it is not a formatter and makes no promise of being
 // re-parseable. Snapshot tests compare its output, so its shape is stable: changing it
 // means updating goldens deliberately.
+//
+// It is a *complete* description of the tree, and that is load-bearing rather than
+// decorative: tests/selfhost holds stage1's parser to this one by requiring the two dumps
+// to agree, so anything Dump leaves out is syntax the second parser may discard with
+// nothing to notice. Bounds, `where` predicates, supertraits, an impl's generics and a
+// trait reference's type arguments were all omitted here until Phase 9, and stage1's
+// parser had duly thrown every one of them away.
 func Dump(n Node) string {
 	var sb strings.Builder
 	dump(&sb, n, 0)
@@ -49,6 +56,8 @@ func dump(sb *strings.Builder, n Node, depth int) {
 
 	case *FnDecl:
 		line(sb, depth, "fn %s%s%s", pubMark(v.Pub), v.Name.Name, generics(v.Generics))
+		dumpBounds(sb, v.Generics, depth+1)
+		dumpWhere(sb, v.Where, depth+1)
 		if v.Self != nil {
 			line(sb, depth+1, "self%s", mutMark(v.Self.Mut))
 		}
@@ -67,6 +76,8 @@ func dump(sb *strings.Builder, n Node, depth int) {
 
 	case *StructDecl:
 		line(sb, depth, "struct %s%s%s", pubMark(v.Pub), v.Name.Name, generics(v.Generics))
+		dumpBounds(sb, v.Generics, depth+1)
+		dumpWhere(sb, v.Where, depth+1)
 		for _, f := range v.Fields {
 			line(sb, depth+1, "field %s%s%s", pubMark(f.Pub), mutPrefix(f.Mut), f.Name.Name)
 			dump(sb, f.Type, depth+2)
@@ -74,6 +85,8 @@ func dump(sb *strings.Builder, n Node, depth int) {
 
 	case *EnumDecl:
 		line(sb, depth, "enum %s%s%s", pubMark(v.Pub), v.Name.Name, generics(v.Generics))
+		dumpBounds(sb, v.Generics, depth+1)
+		dumpWhere(sb, v.Where, depth+1)
 		for _, va := range v.Variants {
 			switch va.Kind {
 			case UnitVariant:
@@ -94,8 +107,17 @@ func dump(sb *strings.Builder, n Node, depth int) {
 
 	case *TraitDecl:
 		line(sb, depth, "trait %s%s%s", pubMark(v.Pub), v.Name.Name, generics(v.Generics))
+		dumpBounds(sb, v.Generics, depth+1)
+		for _, st := range v.Supertraits {
+			line(sb, depth+1, "super")
+			dumpTraitRef(sb, st, depth+2)
+		}
+		dumpWhere(sb, v.Where, depth+1)
 		for _, at := range v.AssocTypes {
 			line(sb, depth+1, "assoc-type %s", at.Name.Name)
+			for _, b := range at.Bounds {
+				dumpTraitRef(sb, b, depth+2)
+			}
 		}
 		for _, m := range v.Methods {
 			dump(sb, m, depth+1)
@@ -103,10 +125,16 @@ func dump(sb *strings.Builder, n Node, depth int) {
 
 	case *ImplDecl:
 		if v.Trait != nil {
-			line(sb, depth, "impl %s for", v.Trait.Path)
+			line(sb, depth, "impl%s %s for", generics(v.Generics), v.Trait.Path)
+			for _, a := range v.Trait.Args {
+				line(sb, depth+1, "trait-arg")
+				dump(sb, a, depth+2)
+			}
 		} else {
-			line(sb, depth, "impl")
+			line(sb, depth, "impl%s", generics(v.Generics))
 		}
+		dumpBounds(sb, v.Generics, depth+1)
+		dumpWhere(sb, v.Where, depth+1)
 		dump(sb, v.Type, depth+1)
 		for _, at := range v.AssocTypes {
 			line(sb, depth+1, "assoc-type %s =", at.Name.Name)
@@ -118,6 +146,7 @@ func dump(sb *strings.Builder, n Node, depth int) {
 
 	case *TypeAliasDecl:
 		line(sb, depth, "type %s%s%s =", pubMark(v.Pub), v.Name.Name, generics(v.Generics))
+		dumpBounds(sb, v.Generics, depth+1)
 		dump(sb, v.Type, depth+1)
 
 	case *ConstDecl:
@@ -400,6 +429,49 @@ func suffixMark(s string) string {
 		return ""
 	}
 	return " " + s
+}
+
+// dumpBounds renders the bounds a generic parameter list carries. The names themselves
+// are already inline in `generics`; this is the part that has type arguments and so
+// cannot be.
+func dumpBounds(sb *strings.Builder, gs []*GenericParam, depth int) {
+	for _, g := range gs {
+		if len(g.Bounds) == 0 {
+			continue
+		}
+		line(sb, depth, "bound %s", g.Name.Name)
+		for _, b := range g.Bounds {
+			dumpTraitRef(sb, b, depth+1)
+		}
+	}
+}
+
+// dumpWhere renders the `where` predicates, each as a type and the bounds on it.
+func dumpWhere(sb *strings.Builder, preds []*WherePred, depth int) {
+	for _, w := range preds {
+		line(sb, depth, "where")
+		dump(sb, w.Type, depth+1)
+		for _, b := range w.Bounds {
+			dumpTraitRef(sb, b, depth+1)
+		}
+	}
+}
+
+// dumpTraitRef renders one trait reference, with its type arguments as children so that
+// a nested application dumps the same way a nested type does.
+func dumpTraitRef(sb *strings.Builder, tr *TraitRef, depth int) {
+	if tr == nil {
+		line(sb, depth, "<nil>")
+		return
+	}
+	if len(tr.Args) == 0 {
+		line(sb, depth, "trait %s", tr.Path)
+		return
+	}
+	line(sb, depth, "trait %s[..]", tr.Path)
+	for _, a := range tr.Args {
+		dump(sb, a, depth+1)
+	}
 }
 
 func generics(gs []*GenericParam) string {

@@ -313,8 +313,8 @@ impl Parser {
         ast::Item::ErrorItem
     }
 
-    fn generics(self) -> List[String] {
-        let out = list::new[String]();
+    fn generics(self) -> List[ast::GenericParam] {
+        let out = list::new[ast::GenericParam]();
         if !self.at(lex::K_LBRACKET) {
             return out;
         }
@@ -328,10 +328,11 @@ impl Parser {
                     }
                 }
                 Option::Some(name) => {
-                    out.push(name);
+                    let mut bounds = list::new[ast::TraitRef]();
                     if self.eat(lex::K_COLON) {
-                        self.trait_bounds();
+                        bounds = self.trait_bounds();
                     }
+                    out.push(ast::GenericParam { name: name, bounds: bounds });
                     if !self.eat(lex::K_COMMA) {
                         return self.finish_generics(out);
                     }
@@ -341,20 +342,22 @@ impl Parser {
         self.finish_generics(out)
     }
 
-    fn finish_generics(self, out: List[String]) -> List[String] {
+    fn finish_generics(self, out: List[ast::GenericParam]) -> List[ast::GenericParam] {
         self.expect(lex::K_RBRACKET);
         out
     }
 
-    /// Bounds are parsed and dropped: the dumper never shows them, and nothing after the
-    /// parser exists yet to read them.
-    fn trait_bounds(self) {
+    /// One or more trait references joined by `+`.
+    fn trait_bounds(self) -> List[ast::TraitRef] {
+        let out = list::new[ast::TraitRef]();
         let mut going = true;
         while going {
-            self.path();
-            self.type_args();
+            let path = self.path();
+            let args = self.type_args();
+            out.push(ast::TraitRef { path: path, args: args });
             going = self.eat(lex::K_PLUS);
         }
+        out
     }
 
     fn type_args(self) -> List[ast::Type] {
@@ -373,16 +376,19 @@ impl Parser {
         out
     }
 
-    fn where_clause(self) {
+    fn where_clause(self) -> List[ast::WherePred] {
+        let out = list::new[ast::WherePred]();
         if !self.eat(lex::K_WHERE) {
-            return;
+            return out;
         }
         let mut going = true;
         while going {
-            self.type_expr();
+            let ty = self.type_expr();
+            let mut bounds = list::new[ast::TraitRef]();
             if self.expect(lex::K_COLON) {
-                self.trait_bounds();
+                bounds = self.trait_bounds();
             }
+            out.push(ast::WherePred { ty: ty, bounds: bounds });
             if !self.eat(lex::K_COMMA) {
                 going = false;
             } else {
@@ -391,6 +397,7 @@ impl Parser {
                 }
             }
         }
+        out
     }
 
     fn fn_decl(self, public: bool) -> ast::FnDecl {
@@ -406,12 +413,12 @@ impl Parser {
         if self.eat(lex::K_ARROW) {
             ret = Option::Some(self.type_expr());
         }
-        self.where_clause();
+        let where_preds = self.where_clause();
 
         if self.eat(lex::K_SEMI) {
             return ast::FnDecl {
-                public: public, name: name, generics: generics, self_param: self_param,
-                params: params, ret: ret, body: Option::None,
+                public: public, name: name, generics: generics, where_preds: where_preds,
+                self_param: self_param, params: params, ret: ret, body: Option::None,
             };
         }
         let mut body = Option::None;
@@ -422,8 +429,8 @@ impl Parser {
             self.sync_item();
         }
         ast::FnDecl {
-            public: public, name: name, generics: generics, self_param: self_param,
-            params: params, ret: ret, body: body,
+            public: public, name: name, generics: generics, where_preds: where_preds,
+            self_param: self_param, params: params, ret: ret, body: body,
         }
     }
 
@@ -461,7 +468,7 @@ impl Parser {
         self.advance();
         let name = self.ident().unwrap_or("");
         let generics = self.generics();
-        self.where_clause();
+        let where_preds = self.where_clause();
         let mut fields = list::new[ast::Field]();
         if self.expect(lex::K_LBRACE) {
             fields = self.field_list();
@@ -469,7 +476,10 @@ impl Parser {
         } else {
             self.sync_item();
         }
-        ast::StructDecl { public: public, name: name, generics: generics, fields: fields }
+        ast::StructDecl {
+            public: public, name: name, generics: generics, where_preds: where_preds,
+            fields: fields,
+        }
     }
 
     fn field_list(self) -> List[ast::Field] {
@@ -505,18 +515,21 @@ impl Parser {
         self.advance();
         let name = self.ident().unwrap_or("");
         let generics = self.generics();
-        self.where_clause();
+        let where_preds = self.where_clause();
         let variants = list::new[ast::Variant]();
         if !self.expect(lex::K_LBRACE) {
             self.sync_item();
-            return ast::EnumDecl { public: public, name: name, generics: generics, variants: variants };
+            return ast::EnumDecl {
+                public: public, name: name, generics: generics, where_preds: where_preds,
+                variants: variants,
+            };
         }
         while !self.at(lex::K_RBRACE) && !self.at_eof() {
             match self.ident() {
                 Option::None => {
                     self.sync_list(lex::K_RBRACE);
                     if !self.eat(lex::K_COMMA) {
-                        return self.finish_enum(public, name, generics, variants);
+                        return self.finish_enum(public, name, generics, where_preds, variants);
                     }
                 }
                 Option::Some(vname) => {
@@ -546,43 +559,52 @@ impl Parser {
                     }
                     variants.push(ast::Variant { name: vname, kind: kind, types: types, fields: fields });
                     if !self.eat(lex::K_COMMA) {
-                        return self.finish_enum(public, name, generics, variants);
+                        return self.finish_enum(public, name, generics, where_preds, variants);
                     }
                 }
             }
         }
-        self.finish_enum(public, name, generics, variants)
+        self.finish_enum(public, name, generics, where_preds, variants)
     }
 
-    fn finish_enum(self, public: bool, name: String, generics: List[String], variants: List[ast::Variant]) -> ast::EnumDecl {
+    fn finish_enum(self, public: bool, name: String, generics: List[ast::GenericParam],
+                   where_preds: List[ast::WherePred], variants: List[ast::Variant]) -> ast::EnumDecl {
         self.expect(lex::K_RBRACE);
-        ast::EnumDecl { public: public, name: name, generics: generics, variants: variants }
+        ast::EnumDecl {
+            public: public, name: name, generics: generics, where_preds: where_preds,
+            variants: variants,
+        }
     }
 
     fn trait_decl(self, public: bool) -> ast::TraitDecl {
         self.advance();
         let name = self.ident().unwrap_or("");
         let generics = self.generics();
+        let mut supertraits = list::new[ast::TraitRef]();
         if self.eat(lex::K_COLON) {
-            self.trait_bounds();
+            supertraits = self.trait_bounds();
         }
-        self.where_clause();
+        let where_preds = self.where_clause();
         let assoc = list::new[ast::AssocType]();
         let methods = list::new[ast::FnDecl]();
         if !self.expect(lex::K_LBRACE) {
             self.sync_item();
-            return ast::TraitDecl { public: public, name: name, generics: generics, assoc: assoc, methods: methods };
+            return ast::TraitDecl {
+                public: public, name: name, generics: generics, supertraits: supertraits,
+                where_preds: where_preds, assoc: assoc, methods: methods,
+            };
         }
         while !self.at(lex::K_RBRACE) && !self.at_eof() {
             let before = self.pos;
             if self.at(lex::K_TYPE) {
                 self.advance();
                 let aname = self.ident().unwrap_or("");
+                let mut bounds = list::new[ast::TraitRef]();
                 if self.eat(lex::K_COLON) {
-                    self.trait_bounds();
+                    bounds = self.trait_bounds();
                 }
                 self.expect(lex::K_SEMI);
-                assoc.push(ast::AssocType { name: aname, ty: Option::None });
+                assoc.push(ast::AssocType { name: aname, bounds: bounds, ty: Option::None });
             } else {
                 if self.at(lex::K_FN) {
                     methods.push(self.fn_decl(false));
@@ -596,31 +618,40 @@ impl Parser {
             }
         }
         self.expect(lex::K_RBRACE);
-        ast::TraitDecl { public: public, name: name, generics: generics, assoc: assoc, methods: methods }
+        ast::TraitDecl {
+            public: public, name: name, generics: generics, supertraits: supertraits,
+            where_preds: where_preds, assoc: assoc, methods: methods,
+        }
     }
 
     fn impl_decl(self) -> ast::ImplDecl {
         self.advance();
-        self.generics();
+        let generics = self.generics();
 
         // `impl Trait for Type` and `impl Type` are told apart by the `for` that follows
         // the first type, so a type is parsed and reinterpreted when one appears.
         let first = self.type_expr();
         let mut trait_path = "";
         let mut has_trait = false;
+        let mut trait_args = list::new[ast::Type]();
         let mut ty = first;
         if self.eat(lex::K_FOR) {
             has_trait = true;
             trait_path = type_as_trait_path(first);
+            trait_args = type_as_trait_args(first);
             ty = self.type_expr();
         }
-        self.where_clause();
+        let where_preds = self.where_clause();
 
         let assoc = list::new[ast::AssocType]();
         let methods = list::new[ast::FnDecl]();
         if !self.expect(lex::K_LBRACE) {
             self.sync_item();
-            return ast::ImplDecl { trait_path: trait_path, has_trait: has_trait, ty: ty, assoc: assoc, methods: methods };
+            return ast::ImplDecl {
+                generics: generics, trait_path: trait_path, has_trait: has_trait,
+                trait_args: trait_args, where_preds: where_preds, ty: ty, assoc: assoc,
+                methods: methods,
+            };
         }
         while !self.at(lex::K_RBRACE) && !self.at_eof() {
             let before = self.pos;
@@ -633,7 +664,9 @@ impl Parser {
                     aty = self.type_expr();
                 }
                 self.expect(lex::K_SEMI);
-                assoc.push(ast::AssocType { name: aname, ty: Option::Some(aty) });
+                assoc.push(ast::AssocType {
+                    name: aname, bounds: list::new[ast::TraitRef](), ty: Option::Some(aty),
+                });
             } else {
                 if self.at(lex::K_FN) {
                     methods.push(self.fn_decl(public));
@@ -647,7 +680,11 @@ impl Parser {
             }
         }
         self.expect(lex::K_RBRACE);
-        ast::ImplDecl { trait_path: trait_path, has_trait: has_trait, ty: ty, assoc: assoc, methods: methods }
+        ast::ImplDecl {
+            generics: generics, trait_path: trait_path, has_trait: has_trait,
+            trait_args: trait_args, where_preds: where_preds, ty: ty, assoc: assoc,
+            methods: methods,
+        }
     }
 
     fn alias_decl(self, public: bool) -> ast::AliasDecl {
@@ -687,6 +724,14 @@ fn type_as_trait_path(t: ast::Type) -> String {
     match t {
         ast::Type::Path(path, _) => path,
         _ => "",
+    }
+}
+
+/// The same type's arguments, which are the trait's: `impl Iterator[i64] for Counter`.
+fn type_as_trait_args(t: ast::Type) -> List[ast::Type] {
+    match t {
+        ast::Type::Path(_, args) => args,
+        _ => list::new[ast::Type](),
     }
 }
 
