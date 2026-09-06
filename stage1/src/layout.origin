@@ -1,0 +1,207 @@
+// Object layout: what the garbage collector and the code generator must agree on.
+//
+// A translation of `internal/layout`, and of the part of it a compiler needs: the
+// descriptor of an object shape, and the registry that hands each shape an id. The
+// collector's half -- headers, forwarding pointers, stack maps -- belongs to whichever
+// runtime is doing the collecting, and stage1 does not have one yet.
+//
+// Process rule 5 puts this agreement in exactly one module for a reason worth repeating
+// here: a heap where the collector and the code generator disagree about which word is a
+// pointer is a heap that corrupts silently. The format is `docs/spec/08-memory-model.md`.
+
+use std::list;
+use std::map;
+use std::str;
+
+/// Identifies an object's descriptor. Zero is reserved, so a zeroed word is never a valid
+/// one.
+pub const INVALID_TYPE: i64 = 0;
+
+// --- Shape ---------------------------------------------------------------------------
+//
+// How a descriptor describes an object's payload.
+
+/// A struct-like object: a fixed number of payload words, with `kinds` saying which of
+/// them hold references.
+pub const FIXED: i64 = 0;
+/// A length-prefixed run of references: payload word 0 is the count, every word after it
+/// is a reference.
+pub const REF_ARRAY: i64 = 1;
+/// A length-prefixed run of raw bytes: payload word 0 is the length in bytes, the bytes
+/// follow. It holds no references, which is what makes a `String` cheap to skip.
+pub const BYTE_ARRAY: i64 = 2;
+/// A length-prefixed run of words that are not references: an `Array[i64]` or an
+/// `Array[f64]` (spec/13-collections.md, ADR-0028). Which of it and `REF_ARRAY` an array
+/// instantiation gets is decided while compiling, from the element type, so the collector
+/// never has to guess whether a word is a pointer.
+pub const RAW_ARRAY: i64 = 3;
+
+// --- ObjKind -------------------------------------------------------------------------
+//
+// What an object is, for structural equality and for rendering. The collector ignores it;
+// the virtual machine cannot, because `Point { x: 1 }` and a two-element tuple have the
+// same shape and must not print or compare the same way.
+
+pub const OBJ_STRUCT: i64 = 0;
+/// One variant of an enum. Each variant has its own descriptor, so a variant test is a
+/// type-id comparison and needs no tag slot.
+pub const OBJ_ENUM: i64 = 1;
+pub const OBJ_TUPLE: i64 = 2;
+/// A function value: slot 0 is the function index, the rest are its captures.
+pub const OBJ_CLOSURE: i64 = 3;
+/// A `String`.
+pub const OBJ_BYTES: i64 = 4;
+/// An `Array[T]` (spec/13-collections.md).
+pub const OBJ_ARRAY: i64 = 5;
+
+// --- WordKind ------------------------------------------------------------------------
+//
+// How one payload word is to be read.
+//
+// The collector only needs to know which words are references. The virtual machine needs
+// more: it compares aggregates structurally (spec/04-expressions.md), and a float compares
+// by IEEE rules rather than by bits, so `NaN != NaN` and `0.0 == -0.0` hold inside a struct
+// exactly as they do outside one. Both readings come from this one table, so the two
+// cannot drift apart.
+
+/// An opaque raw word, compared by bits.
+pub const WORD_RAW: i64 = 0;
+/// A reference the collector must trace and rewrite.
+pub const WORD_REF: i64 = 1;
+/// IEEE bits, compared as a float.
+pub const WORD_FLOAT: i64 = 2;
+/// A signed or unsigned integer, compared by bits.
+pub const WORD_INT: i64 = 3;
+/// 0 or 1.
+pub const WORD_BOOL: i64 = 4;
+/// A Unicode scalar value.
+pub const WORD_CHAR: i64 = 5;
+/// The unit value; its word is unused.
+pub const WORD_UNIT: i64 = 6;
+
+/// One object shape.
+pub struct Descriptor {
+    /// Used in diagnostics and heap dumps, and -- because a name identifies a shape --
+    /// as the registry's key.
+    pub name: String,
+    pub shape: i64,
+    /// The payload size for a `FIXED` shape, in words.
+    pub words: i64,
+    /// The kind of each payload word for a `FIXED` shape.
+    pub kinds: List[i64],
+    /// The kind of every element for a `REF_ARRAY` or a `RAW_ARRAY`, which have one kind
+    /// for the whole run rather than one per word (ADR-0028).
+    pub elem: i64,
+    pub mut kind: i64,
+    /// A struct's or a struct variant's slot names, in declaration order. Empty for a
+    /// tuple variant, a tuple or a closure.
+    pub field_names: List[String],
+    /// The enum's or struct's declared name; `variant_name` is the variant's, for an
+    /// `OBJ_ENUM` descriptor.
+    pub mut type_name: String,
+    pub mut variant_name: String,
+}
+
+/// A `FIXED` descriptor from the kind of each field, in declaration order.
+pub fn fixed(name: String, kinds: List[i64]) -> Descriptor {
+    Descriptor {
+        name: name, shape: FIXED, words: kinds.len(), kinds: kinds, elem: WORD_RAW,
+        kind: OBJ_STRUCT, field_names: list::new[String](), type_name: "",
+        variant_name: "",
+    }
+}
+
+/// The descriptor for one array instantiation: a length-prefixed run whose shape says,
+/// once and for all, whether its elements are references (ADR-0028).
+///
+/// The count in payload word 0 is the array's *length*, not its capacity: the object is as
+/// large as its header says, and everything above the length is room a push has not used
+/// yet. The collector traces exactly the length, which is what makes those spare slots cost
+/// nothing and hold nothing.
+pub fn array(name: String, elem: i64) -> Descriptor {
+    let mut shape = RAW_ARRAY;
+    if elem == WORD_REF {
+        shape = REF_ARRAY;
+    }
+    Descriptor {
+        name: name, shape: shape, words: 0, kinds: list::new[i64](), elem: elem,
+        kind: OBJ_ARRAY, field_names: list::new[String](), type_name: "",
+        variant_name: "",
+    }
+}
+
+/// Maps type ids to descriptors. One registry serves one program: descriptors are created
+/// while lowering and read by the collector, and neither side may invent one the other has
+/// not seen.
+pub struct Registry {
+    descs: List[Descriptor],
+    by_name: Map[String, i64],
+}
+
+/// An empty registry. Type id 0 is reserved.
+pub fn new_registry() -> Registry {
+    let descs = list::new[Descriptor]();
+    descs.push(fixed("<invalid>", list::new[i64]()));
+    Registry { descs: descs, by_name: map::new[String, i64]() }
+}
+
+impl Registry {
+    /// Registers a descriptor and returns its id. Registering the same name twice returns
+    /// the existing id, so lowering may declare a type wherever it first needs it.
+    ///
+    /// A name identifies a shape, so two descriptors sharing a name must be the same
+    /// shape. Returning the existing id for a *different* one silently aliases two
+    /// layouts, and every read through the loser's id then interprets the wrong words --
+    /// an object's field read as a reference because some other type of the same name had
+    /// a reference there. That is what this check was added for in the Go original:
+    /// closure descriptors were named by their capture count alone, so a closure capturing
+    /// an `i64` and one capturing a reference collapsed into whichever was registered
+    /// first.
+    pub fn add(self, d: Descriptor) -> i64 {
+        match self.by_name.get(d.name) {
+            Option::Some(id) => {
+                if !same_shape(self.descs.at(id), d) {
+                    panic("two different layouts registered as `\(d.name)`: a descriptor's name must identify its shape");
+                }
+                id
+            }
+            Option::None => {
+                let id = self.descs.len();
+                self.descs.push(d);
+                self.by_name.insert(d.name, id);
+                id
+            }
+        }
+    }
+
+    /// A descriptor by id. An unknown id is a bug in whichever side wrote it, so this
+    /// stops rather than returning a plausible shape and corrupting the heap.
+    pub fn get(self, t: i64) -> Descriptor {
+        if t <= 0 || t >= self.descs.len() {
+            panic("unknown type id \(t): the heap and the descriptor table disagree");
+        }
+        self.descs.at(t)
+    }
+
+    pub fn lookup(self, name: String) -> Option[i64] { self.by_name.get(name) }
+
+    /// How many descriptors are registered, including the reserved zero.
+    pub fn len(self) -> i64 { self.descs.len() }
+}
+
+/// Whether two descriptors lay memory out identically. Names, field names and the rest are
+/// documentation; the kinds and the word count are the contract the collector and the code
+/// generator both read.
+fn same_shape(a: Descriptor, b: Descriptor) -> bool {
+    if a.words != b.words || a.kind != b.kind || a.kinds.len() != b.kinds.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.kinds.len() {
+        if a.kinds.at(i) != b.kinds.at(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}

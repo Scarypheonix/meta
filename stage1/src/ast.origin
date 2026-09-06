@@ -124,6 +124,9 @@ pub struct FieldPat {
 pub struct Pat {
     pub span: Span,
     pub node: PatKind,
+    /// Where the checker files the type this pattern matches against; -1 until it has.
+    /// `Expr`'s own `ty` says why it is here.
+    pub mut ty: i64,
 }
 
 pub enum PatKind {
@@ -141,7 +144,9 @@ pub enum PatKind {
     ErrorPat,
 }
 
-pub fn pat(span: Span, node: PatKind) -> Pat { Pat { span: span, node: node } }
+pub fn pat(span: Span, node: PatKind) -> Pat {
+    Pat { span: span, node: node, ty: UNRESOLVED }
+}
 
 // --- Expressions ---------------------------------------------------------------------
 
@@ -186,6 +191,11 @@ pub struct Expr {
     /// implicit call needs `iter_inst`, because both hang off the one node.
     pub mut inst: i64,
     pub mut iter_inst: i64,
+    /// Where the checker files this expression's type; -1 until it has. It is what
+    /// `internal/check` keeps in `ExprTypes`, a map keyed by node id, and it is here for
+    /// the reason the two slots above are: code generation has to ask what type a value
+    /// has, and there is no node id to key a table by.
+    pub mut ty: i64,
 }
 
 pub enum ExprKind {
@@ -221,7 +231,10 @@ pub enum ExprKind {
 }
 
 pub fn expr(span: Span, node: ExprKind) -> Expr {
-    Expr { span: span, node: node, captures: UNRESOLVED, inst: UNRESOLVED, iter_inst: UNRESOLVED }
+    Expr {
+        span: span, node: node, captures: UNRESOLVED, inst: UNRESOLVED,
+        iter_inst: UNRESOLVED, ty: UNRESOLVED,
+    }
 }
 
 // --- Statements ----------------------------------------------------------------------

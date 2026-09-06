@@ -18,6 +18,7 @@ use parse;
 use resolve;
 use check;
 use mono;
+use compile;
 
 const USAGE: String = "usage: stage1 <command> <file>...
 
@@ -32,8 +33,10 @@ commands:
   mono          check each file after the first the same way and print the
                 monomorphization trace: which copy of each generic function the
                 program needs, and which copy every call site reaches
+  dump-bytecode compile each file after the first the same way and print the
+                bytecode, in `originc dump-bytecode`'s own format
 
-`resolve`, `check` and `mono` also take
+`resolve`, `check`, `mono` and `dump-bytecode` also take
 
   <prelude> --package <root> <file>...
 
@@ -61,16 +64,18 @@ fn main() {
     }
     let command = argv.at(1);
     if command != "dump-tokens" && command != "dump-ast" && command != "parse"
-        && command != "resolve" && command != "check" && command != "mono" {
+        && command != "resolve" && command != "check" && command != "mono"
+        && command != "dump-bytecode" {
         io::println("stage1: unknown command `\(command)`");
         io::println(USAGE);
         process::exit(2);
     }
 
-    // `resolve`, `check` and `mono` are whole-package commands: a module cannot be
-    // resolved without the ones it imports (spec/07-modules.md), nothing can be checked
-    // before it is resolved, and nothing can be monomorphized before it is checked.
-    if command == "resolve" || command == "check" || command == "mono" {
+    // These are whole-package commands: a module cannot be resolved without the ones it
+    // imports (spec/07-modules.md), nothing can be checked before it is resolved, nothing
+    // can be monomorphized before it is checked, and nothing can be lowered before that.
+    if command == "resolve" || command == "check" || command == "mono"
+        || command == "dump-bytecode" {
         if !run_package(argv, command) {
             process::exit(1);
         }
@@ -106,7 +111,7 @@ const PRELUDE_NAME: String = "<prelude>";
 /// that both declare `main` are not a package. The prelude is parsed once and shared,
 /// since resolution does not write into the tree.
 fn run_package(argv: List[String], command: String) -> bool {
-    let typed = command == "check" || command == "mono";
+    let typed = typed_command(command);
     if argv.len() < 4 {
         io::println("stage1: this command takes the prelude and at least one file");
         return false;
@@ -141,7 +146,21 @@ fn run_package(argv: List[String], command: String) -> bool {
             }
             Result::Ok(src) => {
                 io::println("== \(path)");
-                let tree = parse::parse(lex::lex(src).tokens).file;
+                let lexed = lex::lex(src);
+                let parsed = parse::parse(lexed.tokens);
+                let tree = parsed.file;
+                // A file whose syntax is wrong has error nodes in its tree, and there is
+                // no code to generate from one. The passes before code generation are
+                // deliberately run over the recovered tree -- that is what makes their
+                // differentials demanding -- but lowering it would only ask both compilers
+                // to refuse, which is what `originc` does by stopping here
+                // (spec/09-errors.md). Both halves of syntax count: a bad escape is the
+                // lexer's diagnostic, and it leaves a tree just as unusable.
+                if command == "dump-bytecode"
+                    && (!lexed.errors.is_empty() || !parsed.errors.is_empty()) {
+                    i = i + 1;
+                    continue;
+                }
                 let inputs = list::new[resolve::Input]();
                 inputs.push(resolve::Input {
                     file: PRELUDE_NAME, module: "", tree: prelude_tree, prelude: true,
@@ -160,10 +179,10 @@ fn run_package(argv: List[String], command: String) -> bool {
                         units.push(check::Unit { file: PRELUDE_NAME, tree: prelude_tree });
                         units.push(check::Unit { file: path, tree: tree });
                         let checked = check::program(resolved, units);
-                        if !report_check(checked, command == "check") {
+                        if !report_check(checked, command) {
                             ok = false;
                         } else {
-                            if command == "mono" {
+                            if mono_command(command) {
                                 // Monomorphization runs as part of deciding a program's
                                 // legality (ADR-0010): a polymorphic-recursion chain past
                                 // the depth limit is E0055, and `check` must reach the same
@@ -173,8 +192,21 @@ fn run_package(argv: List[String], command: String) -> bool {
                                     file: PRELUDE_NAME, tree: prelude_tree,
                                 });
                                 munits.push(mono::Unit { file: path, tree: tree });
-                                if !report_mono(mono::program(checked, munits)) {
+                                let mo = mono::program(checked, munits);
+                                if !report_mono(mo, command == "mono") {
                                     ok = false;
+                                } else {
+                                    if command == "dump-bytecode" {
+                                        let cunits = list::new[compile::Unit]();
+                                        cunits.push(compile::Unit {
+                                            file: PRELUDE_NAME, tree: prelude_tree,
+                                        });
+                                        cunits.push(compile::Unit { file: path, tree: tree });
+                                        if !report_bytecode(
+                                                compile::program(resolved, checked, mo, cunits)) {
+                                            ok = false;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -234,7 +266,14 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String) ->
                 return false;
             }
             Result::Ok(src) => {
-                let tree = parse::parse(lex::lex(src).tokens).file;
+                let lexed = lex::lex(src);
+                let parsed = parse::parse(lexed.tokens);
+                if command == "dump-bytecode"
+                    && (!lexed.errors.is_empty() || !parsed.errors.is_empty()) {
+                    io::println("stage1: \(paths.at(u)) does not parse");
+                    return false;
+                }
+                let tree = parsed.file;
                 trees.push(tree);
                 inputs.push(resolve::Input {
                     file: paths.at(u), module: modules.at(u), tree: tree, prelude: false,
@@ -259,10 +298,10 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String) ->
         k = k + 1;
     }
     let checked = check::program(resolved, units);
-    if !report_check(checked, command == "check") {
+    if !report_check(checked, command) {
         return false;
     }
-    if command != "mono" {
+    if !mono_command(command) {
         return true;
     }
     let munits = list::new[mono::Unit]();
@@ -272,10 +311,31 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String) ->
         munits.push(mono::Unit { file: paths.at(m), tree: trees.at(m) });
         m = m + 1;
     }
-    report_mono(mono::program(checked, munits))
+    let mo = mono::program(checked, munits);
+    if !report_mono(mo, command == "mono") {
+        return false;
+    }
+    if command != "dump-bytecode" {
+        return true;
+    }
+    let cunits = list::new[compile::Unit]();
+    cunits.push(compile::Unit { file: PRELUDE_NAME, tree: prelude_tree });
+    let mut b = 0;
+    while b < trees.len() {
+        cunits.push(compile::Unit { file: paths.at(b), tree: trees.at(b) });
+        b = b + 1;
+    }
+    report_bytecode(compile::program(resolved, checked, mo, cunits))
 }
 
-fn typed_command(command: String) -> bool { command == "check" || command == "mono" }
+fn typed_command(command: String) -> bool {
+    command == "check" || command == "mono" || command == "dump-bytecode"
+}
+
+/// Whether a command needs the instantiation set.
+fn mono_command(command: String) -> bool {
+    command == "mono" || command == "dump-bytecode"
+}
 
 /// A path under the source root becomes a module path: `resolve.origin` is `resolve`,
 /// `a/b.origin` is `a::b`, and `main.origin` or `lib.origin` at the root is the root
@@ -383,13 +443,21 @@ fn sort_by[T](xs: List[T], less: fn(T, T) -> bool) {
     }
 }
 
-fn report_check(out: check::Checked, with_trace: bool) -> bool {
+fn report_check(out: check::Checked, command: String) -> bool {
+    // Everything but `dump-bytecode` writes diagnostics and nothing else, so a warning
+    // belongs in the output. `dump-bytecode`'s output is the artefact, and a warning is
+    // not part of it: `originc` makes the same split by writing every diagnostic to
+    // stderr and the bytecode to stdout, and stage1 has only one stream to write to.
+    let artefact = command == "dump-bytecode";
+    let with_trace = command == "check";
     let errors = out.errors;
     sort_by(errors, |a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
     let mut e = 0;
     while e < errors.len() {
         let err = errors.at(e);
-        io::println("error \(err.code) \(err.file):\(err.start):\(err.end): \(err.message)");
+        if !artefact || !err.warning {
+            io::println("error \(err.code) \(err.file):\(err.start):\(err.end): \(err.message)");
+        }
         e = e + 1;
     }
     if with_trace {
@@ -417,7 +485,7 @@ fn any_error(errors: List[check::CheckError]) -> bool {
     false
 }
 
-fn report_mono(out: mono::Result) -> bool {
+fn report_mono(out: mono::Result, with_trace: bool) -> bool {
     let errors = out.errors;
     sort_by(errors, |a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
     let mut e = 0;
@@ -426,12 +494,41 @@ fn report_mono(out: mono::Result) -> bool {
         io::println("error \(err.code) \(err.file):\(err.start):\(err.end): \(err.message)");
         e = e + 1;
     }
-    let mut t = 0;
-    while t < out.trace.len() {
-        io::println(out.trace.at(t));
-        t = t + 1;
+    if with_trace {
+        let mut t = 0;
+        while t < out.trace.len() {
+            io::println(out.trace.at(t));
+            t = t + 1;
+        }
     }
     out.errors.is_empty()
+}
+
+/// Prints the disassembled bytecode, in `originc dump-bytecode`'s own format, so that the
+/// two compilers' output is comparable directly rather than through a trace invented for
+/// the purpose.
+fn report_bytecode(out: compile::Lowered) -> bool {
+    if !out.errors.is_empty() {
+        let mut e = 0;
+        while e < out.errors.len() {
+            let err = out.errors.at(e);
+            io::println("stage1: \(err.message) at \(err.file):\(err.start):\(err.end)");
+            e = e + 1;
+        }
+        return false;
+    }
+    // A package with no `main` is a library: nothing was lowered and nothing is wrong.
+    // `originc dump-bytecode` puts nothing on stdout for one either.
+    if !out.has_entry {
+        return true;
+    }
+    let parts = out.prog.disassemble();
+    let mut i = 0;
+    while i < parts.len() {
+        io::print(parts.at(i));
+        i = i + 1;
+    }
+    true
 }
 
 fn report_resolution(out: resolve::Resolved, with_trace: bool) -> bool {

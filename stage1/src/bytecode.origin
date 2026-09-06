@@ -1,0 +1,605 @@
+// Origin's stack bytecode: the instruction set, the program that holds it, and the
+// disassembler.
+//
+// A translation of `internal/bytecode`. A stack machine was chosen for one reason, and it
+// is the reason ADR-0016 gives: the IR builder lowers this to SSA anyway, so the register
+// allocation problem is solved there, on a representation designed for it, rather than
+// twice.
+//
+// Every instruction that can trap carries the source span it would trap at, so a trap
+// message names a line and column without the runtime keeping a shadow stack of positions.
+
+use std::list;
+use std::str;
+
+use ast;
+use layout;
+
+// --- Opcodes -------------------------------------------------------------------------
+//
+// Operands are in the instruction's `a` and `b` fields; the stack supplies everything
+// else. They are constants rather than an enum because they are compared, indexed and
+// printed far more often than they are matched on.
+
+/// Does nothing. It exists so that a jump target can be patched safely.
+pub const OP_NOP: i64 = 0;
+
+// constants and locals
+/// Pushes constant `a`.
+pub const OP_CONST: i64 = 1;
+/// Pushes the unit value.
+pub const OP_UNIT: i64 = 2;
+pub const OP_TRUE: i64 = 3;
+pub const OP_FALSE: i64 = 4;
+/// Pushes local slot `a`.
+pub const OP_LOAD: i64 = 5;
+/// Pops into local slot `a`.
+pub const OP_STORE: i64 = 6;
+/// Pushes capture slot `a` of the running closure.
+pub const OP_LOAD_CAPTURE: i64 = 7;
+/// Discards the top of the stack.
+pub const OP_POP: i64 = 8;
+
+// arithmetic, all trapping per ADR-0005
+pub const OP_ADD: i64 = 9;
+pub const OP_SUB: i64 = 10;
+pub const OP_MUL: i64 = 11;
+pub const OP_DIV: i64 = 12;
+pub const OP_REM: i64 = 13;
+pub const OP_NEG: i64 = 14;
+// the float forms, which never trap
+pub const OP_ADDF: i64 = 15;
+pub const OP_SUBF: i64 = 16;
+pub const OP_MULF: i64 = 17;
+pub const OP_DIVF: i64 = 18;
+pub const OP_REMF: i64 = 19;
+pub const OP_NEGF: i64 = 20;
+// the explicit non-trapping integer forms
+pub const OP_WRAP_ADD: i64 = 21;
+pub const OP_WRAP_SUB: i64 = 22;
+pub const OP_WRAP_MUL: i64 = 23;
+
+// bitwise and shifts
+pub const OP_AND: i64 = 24;
+pub const OP_OR: i64 = 25;
+pub const OP_XOR: i64 = 26;
+pub const OP_SHL: i64 = 27;
+pub const OP_SHR: i64 = 28;
+
+// comparison
+/// Compares structurally (spec/04-expressions.md).
+pub const OP_EQ: i64 = 29;
+pub const OP_NE: i64 = 30;
+pub const OP_LT: i64 = 31;
+pub const OP_LE: i64 = 32;
+pub const OP_GT: i64 = 33;
+pub const OP_GE: i64 = 34;
+pub const OP_NOT: i64 = 35;
+
+// control flow
+/// Jumps to `a`.
+pub const OP_JUMP: i64 = 36;
+/// Pops a bool and jumps to `a` when it is false.
+pub const OP_JUMP_IF_FALSE: i64 = 37;
+/// Pops a bool and jumps to `a` when it is true.
+pub const OP_JUMP_IF_TRUE: i64 = 38;
+/// Returns the top of the stack from the current function.
+pub const OP_RETURN: i64 = 39;
+
+// calls
+/// Calls the callee beneath `a` arguments.
+pub const OP_CALL: i64 = 40;
+/// Calls builtin `a` with `b` arguments.
+pub const OP_CALL_BUILTIN: i64 = 41;
+/// Builds closure-creation site `a`, capturing `b` values from the stack.
+pub const OP_CLOSURE: i64 = 42;
+/// Pushes the top-level function `a` as a value.
+pub const OP_FUNC: i64 = 43;
+
+// aggregates
+/// Builds struct instantiation `a` from `b` values on the stack.
+pub const OP_STRUCT: i64 = 44;
+/// Builds tuple-shape descriptor `a` from `b` values on the stack.
+pub const OP_TUPLE: i64 = 45;
+/// Builds enum variant `a` from `b` payload values.
+pub const OP_VARIANT: i64 = 46;
+/// Pushes field `a` of the object on top.
+pub const OP_GET_FIELD: i64 = 47;
+/// Pops a value and stores it into field `a` of the object beneath it.
+pub const OP_SET_FIELD: i64 = 48;
+/// Pushes whether the object on top is variant `a` of its enum.
+pub const OP_IS_VARIANT: i64 = 49;
+/// Pushes payload word `a` of the variant on top.
+pub const OP_GET_PAYLOAD: i64 = 50;
+/// Pushes element `a` of the tuple on top.
+pub const OP_GET_TUPLE_ELEM: i64 = 51;
+
+// primitive conversions
+/// Converts the top of the stack, with `a` naming the conversion.
+pub const OP_CAST: i64 = 52;
+/// Renders the top of the stack as a `String`.
+pub const OP_TO_STR: i64 = 53;
+
+/// Stops with the message in constant `a`. It is how `panic` and an unreachable match arm
+/// are emitted.
+pub const OP_TRAP: i64 = 54;
+/// Ends the program.
+pub const OP_HALT: i64 = 55;
+
+pub const NUM_OPS: i64 = 56;
+
+/// One opcode's name, as the disassembler prints it.
+pub fn op_name(o: i64) -> String {
+    if o == OP_NOP { return "nop"; }
+    if o == OP_CONST { return "const"; }
+    if o == OP_UNIT { return "unit"; }
+    if o == OP_TRUE { return "true"; }
+    if o == OP_FALSE { return "false"; }
+    if o == OP_LOAD { return "load"; }
+    if o == OP_STORE { return "store"; }
+    if o == OP_LOAD_CAPTURE { return "load_capture"; }
+    if o == OP_POP { return "pop"; }
+    if o == OP_ADD { return "add"; }
+    if o == OP_SUB { return "sub"; }
+    if o == OP_MUL { return "mul"; }
+    if o == OP_DIV { return "div"; }
+    if o == OP_REM { return "rem"; }
+    if o == OP_NEG { return "neg"; }
+    if o == OP_ADDF { return "addf"; }
+    if o == OP_SUBF { return "subf"; }
+    if o == OP_MULF { return "mulf"; }
+    if o == OP_DIVF { return "divf"; }
+    if o == OP_REMF { return "remf"; }
+    if o == OP_NEGF { return "negf"; }
+    if o == OP_WRAP_ADD { return "wrap_add"; }
+    if o == OP_WRAP_SUB { return "wrap_sub"; }
+    if o == OP_WRAP_MUL { return "wrap_mul"; }
+    if o == OP_AND { return "and"; }
+    if o == OP_OR { return "or"; }
+    if o == OP_XOR { return "xor"; }
+    if o == OP_SHL { return "shl"; }
+    if o == OP_SHR { return "shr"; }
+    if o == OP_EQ { return "eq"; }
+    if o == OP_NE { return "ne"; }
+    if o == OP_LT { return "lt"; }
+    if o == OP_LE { return "le"; }
+    if o == OP_GT { return "gt"; }
+    if o == OP_GE { return "ge"; }
+    if o == OP_NOT { return "not"; }
+    if o == OP_JUMP { return "jump"; }
+    if o == OP_JUMP_IF_FALSE { return "jump_if_false"; }
+    if o == OP_JUMP_IF_TRUE { return "jump_if_true"; }
+    if o == OP_RETURN { return "return"; }
+    if o == OP_CALL { return "call"; }
+    if o == OP_CALL_BUILTIN { return "call_builtin"; }
+    if o == OP_CLOSURE { return "closure"; }
+    if o == OP_FUNC { return "func"; }
+    if o == OP_STRUCT { return "struct"; }
+    if o == OP_TUPLE { return "tuple"; }
+    if o == OP_VARIANT { return "variant"; }
+    if o == OP_GET_FIELD { return "get_field"; }
+    if o == OP_SET_FIELD { return "set_field"; }
+    if o == OP_IS_VARIANT { return "is_variant"; }
+    if o == OP_GET_PAYLOAD { return "get_payload"; }
+    if o == OP_GET_TUPLE_ELEM { return "get_tuple_elem"; }
+    if o == OP_CAST { return "cast"; }
+    if o == OP_TO_STR { return "to_str"; }
+    if o == OP_TRAP { return "trap"; }
+    if o == OP_HALT { return "halt"; }
+    "op(\(o))"
+}
+
+// --- Kinds ---------------------------------------------------------------------------
+//
+// The static type of an operand or a result, for the handful of opcodes whose behaviour --
+// or whose value's own shape -- the native backend cannot recover any other way.
+//
+// The virtual machine does not need this: every value it holds carries a tag, so `to_str`
+// and `==` can look at what they were given, and a collection can look at an object's own
+// header. Native code has no tags -- a register holds sixty-four bits and nothing says
+// what they mean -- so the static type has to travel with the instruction, both for the
+// operations whose lowering depends on it and, since ADR-0021, for the ones a stack map
+// needs to know are references at all.
+//
+// An integer says its *width* as well as its signedness, because that is what "what do
+// these sixty-four bits mean" actually asks: `255u8 + 1` has to trap and `255u32 + 1` has
+// to be 256, and nothing in the register distinguishes them.
+
+pub const KIND_UNKNOWN: i64 = 0;
+pub const KIND_I8: i64 = 1;
+pub const KIND_I16: i64 = 2;
+pub const KIND_I32: i64 = 3;
+pub const KIND_I64: i64 = 4;
+pub const KIND_U8: i64 = 5;
+pub const KIND_U16: i64 = 6;
+pub const KIND_U32: i64 = 7;
+pub const KIND_U64: i64 = 8;
+pub const KIND_FLOAT: i64 = 9;
+pub const KIND_BOOL: i64 = 10;
+pub const KIND_CHAR: i64 = 11;
+pub const KIND_STRING: i64 = 12;
+pub const KIND_UNIT: i64 = 13;
+/// An aggregate: a struct, an enum, a tuple or a closure. Its object header names its
+/// type, so the runtime can work structurally from there.
+pub const KIND_REF: i64 = 14;
+
+pub fn kind_is_integer(k: i64) -> bool { k >= KIND_I8 && k <= KIND_U64 }
+
+/// Whether `k` is a signed integer. False for everything that is not an integer at all, so
+/// a caller must ask `kind_is_integer` first when that matters.
+pub fn kind_is_signed(k: i64) -> bool { k >= KIND_I8 && k <= KIND_I64 }
+
+/// An integer kind's width. 64 for anything else, which is the width of the machine word
+/// every other value occupies.
+pub fn kind_bits(k: i64) -> i64 {
+    if k == KIND_I8 || k == KIND_U8 { return 8; }
+    if k == KIND_I16 || k == KIND_U16 { return 16; }
+    if k == KIND_I32 || k == KIND_U32 { return 32; }
+    64
+}
+
+/// The integer kind a primitive type's source name denotes, or `KIND_UNKNOWN`.
+///
+/// It is here rather than in the compiler because `u64::MAX` has to mean the same number
+/// in every engine, and the number is the maximum of this kind.
+pub fn int_kind_named(name: String) -> i64 {
+    if name == "i8" { return KIND_I8; }
+    if name == "i16" { return KIND_I16; }
+    if name == "i32" { return KIND_I32; }
+    if name == "i64" { return KIND_I64; }
+    if name == "u8" { return KIND_U8; }
+    if name == "u16" { return KIND_U16; }
+    if name == "u32" { return KIND_U32; }
+    if name == "u64" { return KIND_U64; }
+    KIND_UNKNOWN
+}
+
+pub fn kind_name(k: i64) -> String {
+    if k == KIND_I8 { return "i8"; }
+    if k == KIND_I16 { return "i16"; }
+    if k == KIND_I32 { return "i32"; }
+    if k == KIND_I64 { return "i64"; }
+    if k == KIND_U8 { return "u8"; }
+    if k == KIND_U16 { return "u16"; }
+    if k == KIND_U32 { return "u32"; }
+    if k == KIND_U64 { return "u64"; }
+    if k == KIND_FLOAT { return "float"; }
+    if k == KIND_BOOL { return "bool"; }
+    if k == KIND_CHAR { return "char"; }
+    if k == KIND_STRING { return "string"; }
+    if k == KIND_UNIT { return "unit"; }
+    if k == KIND_REF { return "ref"; }
+    "unknown"
+}
+
+// --- Instructions and constants --------------------------------------------------------
+
+/// One instruction. It is a struct rather than packed bytes because the virtual machine is
+/// stage0: the packed encoding belongs to the native backend, and an explicit struct keeps
+/// the disassembler honest and the compiler readable.
+pub struct Instr {
+    pub op: i64,
+    pub a: i64,
+    pub b: i64,
+    /// The static type of the value this instruction produces, for the handful of opcodes
+    /// whose result the native backend cannot otherwise recover: a field, payload or
+    /// tuple-element read, and a call's result. `KIND_UNKNOWN` is every other
+    /// instruction's value.
+    pub kind: i64,
+    /// Where this instruction came from, so a trap names a source location.
+    pub span: ast::Span,
+    /// Which file that span is an offset into.
+    pub file: String,
+}
+
+/// What a constant holds.
+pub const CONST_INT: i64 = 0;
+/// A float, stored as its IEEE bits.
+pub const CONST_FLOAT: i64 = 1;
+/// A Unicode scalar value.
+pub const CONST_CHAR: i64 = 2;
+/// Text, interned into the heap on first use.
+pub const CONST_STRING: i64 = 3;
+
+/// A constant-pool entry.
+pub struct Const {
+    pub kind: i64,
+    pub bits: u64,
+    pub text: String,
+}
+
+/// A primitive conversion, resolved at compile time from the `as` matrix in
+/// spec/04-expressions.md.
+///
+/// Truncates an integer to a narrower width; it never traps.
+pub const CAST_INT_TRUNC: i64 = 0;
+pub const CAST_INT_TO_FLOAT: i64 = 1;
+/// Truncates toward zero and traps when out of range or NaN.
+pub const CAST_FLOAT_TO_INT: i64 = 2;
+/// Rounds f64 to f32.
+pub const CAST_FLOAT_NARROW: i64 = 3;
+/// Exact.
+pub const CAST_FLOAT_WIDEN: i64 = 4;
+pub const CAST_BOOL_TO_INT: i64 = 5;
+/// Yields the scalar value.
+pub const CAST_CHAR_TO_INT: i64 = 6;
+
+// --- Functions and programs -------------------------------------------------------------
+
+/// A compiled function.
+pub struct Fn {
+    pub mut name: String,
+    /// How many arguments the function takes.
+    pub mut params: i64,
+    /// How many local slots the frame needs, including parameters.
+    pub mut locals: i64,
+    /// How many captured values a closure over this function holds.
+    pub mut captures: i64,
+    pub code: List[Instr],
+    /// Each parameter's and each capture's static kind, parallel to `params` and
+    /// `captures`. A parameter or a capture is an entry value with no producing
+    /// instruction of its own for a kind to travel with any other way (ADR-0021).
+    pub mut param_kinds: List[i64],
+    pub mut capture_kinds: List[i64],
+    /// The declaration's span, used when a trap has no better location.
+    pub mut span: ast::Span,
+    pub mut file: String,
+}
+
+pub fn new_fn(name: String) -> Fn {
+    Fn {
+        name: name, params: 0, locals: 0, captures: 0, code: list::new[Instr](),
+        param_kinds: list::new[i64](), capture_kinds: list::new[i64](),
+        span: ast::Span { start: 0, end: 0 }, file: "",
+    }
+}
+
+/// One enum variant, as the runtime sees it.
+pub struct VariantInfo {
+    pub ty: i64,
+    /// The variant's index within its enum.
+    pub tag: i64,
+    /// How many payload values the variant carries.
+    pub payload: i64,
+    /// Used in diagnostics and disassembly.
+    pub name: String,
+}
+
+/// One closure-creation site.
+pub struct ClosureInfo {
+    /// The closure's body, an index into `Program.fns`.
+    pub fn_index: i64,
+    /// The exact layout of the closure object: slot 0 is always the function index, and
+    /// the rest are the captures, in capture order (ADR-0019).
+    pub ty: i64,
+}
+
+/// The prelude variants the runtime constructs directly: `Option` for the checked
+/// arithmetic, `Ordering` for `cmp`. They are resolved at compile time so no engine ever
+/// looks anything up by name.
+pub struct PreludeVariants {
+    pub mut option_some: i64,
+    pub mut option_none: i64,
+    pub mut less: i64,
+    pub mut equal: i64,
+    pub mut greater: i64,
+    /// Whether the prelude supplied all of them.
+    pub mut found: bool,
+}
+
+pub fn no_prelude_variants() -> PreludeVariants {
+    PreludeVariants {
+        option_some: 0, option_none: 0, less: 0, equal: 0, greater: 0, found: false,
+    }
+}
+
+/// A whole compiled program.
+pub struct Program {
+    pub fns: List[Fn],
+    pub consts: List[Const],
+    /// The layout registry the heap and this program share.
+    pub types: layout::Registry,
+    /// The index of `main`.
+    pub mut entry: i64,
+    /// Each variant constant index's enum type id and tag.
+    pub variants: List[VariantInfo],
+    /// Each struct constant index's type id.
+    pub structs: List[i64],
+    /// The descriptor id for `String`.
+    pub mut string_type: i64,
+    /// Each closure-creation site, indexed by `OP_CLOSURE`'s `a` operand.
+    pub closures: List[ClosureInfo],
+    /// The descriptor for a captureless closure that wraps a bare top-level function
+    /// reference. A path naming a function evaluates to a function *index*, not a heap
+    /// object, but a struct field or tuple slot of function type has one word that must
+    /// always hold the same kind of value, so a function index is boxed into one of these
+    /// before being written there (ADR-0019).
+    pub mut fn_box_type: i64,
+    pub mut prelude: PreludeVariants,
+}
+
+pub fn new_program() -> Program {
+    Program {
+        fns: list::new[Fn](), consts: list::new[Const](), types: layout::new_registry(),
+        entry: 0, variants: list::new[VariantInfo](), structs: list::new[i64](),
+        string_type: 0, closures: list::new[ClosureInfo](), fn_box_type: 0,
+        prelude: no_prelude_variants(),
+    }
+}
+
+// --- Disassembly -----------------------------------------------------------------------
+//
+// Snapshot tests compare this output, which is the "snapshot test of the generated IR"
+// process rule 2 requires -- and, from Phase 9, it is what holds a second bytecode
+// compiler to this one. That is a better oracle than the traces the front end needed: the
+// artefact itself is comparable, with no format invented in between.
+
+impl Program {
+    /// The disassembly, in pieces.
+    ///
+    /// Pieces rather than one string because a program's bytecode runs to megabytes, and
+    /// joining a list of them one at a time copies the whole accumulated text on every
+    /// step -- quadratic in the output's own length, which is minutes rather than seconds
+    /// on stage1's own source. The caller writes them in order; nothing needs them joined.
+    pub fn disassemble(self) -> List[String] {
+        let out = list::new[String]();
+        let mut i = 0;
+        while i < self.fns.len() {
+            let f = self.fns.at(i);
+            out.push("fn \(i) \(f.name)(params=\(f.params) locals=\(f.locals) captures=\(f.captures))\n");
+            let mut pc = 0;
+            while pc < f.code.len() {
+                out.push("  \(pad_left("\(pc)", 4))  \(op_name(f.code.at(pc).op))");
+                out.push(self.operands(f.code.at(pc)));
+                out.push("\n");
+                pc = pc + 1;
+            }
+            out.push("\n");
+            i = i + 1;
+        }
+        out
+    }
+
+    /// What follows an opcode's name on its line: the operands it uses, and the comment
+    /// that says what an index means.
+    fn operands(self, x: Instr) -> String {
+        if x.op == OP_CONST {
+            return " \(x.a)  ; \(self.const_text(x.a))";
+        }
+        if x.op == OP_VARIANT {
+            if x.a < self.variants.len() {
+                return " \(x.a) \(x.b)  ; \(self.variants.at(x.a).name)";
+            }
+            return "";
+        }
+        if x.op == OP_IS_VARIANT {
+            if x.a < self.variants.len() {
+                return " \(x.a)  ; \(self.variants.at(x.a).name)";
+            }
+            return "";
+        }
+        if x.op == OP_CALL {
+            return " \(x.a)  ; kind=\(kind_name(x.kind))";
+        }
+        if x.op == OP_STRUCT || x.op == OP_TUPLE || x.op == OP_CALL_BUILTIN
+            || x.op == OP_CLOSURE {
+            return " \(x.a) \(x.b)";
+        }
+        if x.op == OP_GET_FIELD || x.op == OP_SET_FIELD || x.op == OP_GET_PAYLOAD
+            || x.op == OP_GET_TUPLE_ELEM {
+            return " \(x.a)  ; kind=\(kind_name(x.kind))";
+        }
+        if x.op == OP_LOAD || x.op == OP_STORE || x.op == OP_LOAD_CAPTURE
+            || x.op == OP_JUMP || x.op == OP_JUMP_IF_FALSE || x.op == OP_JUMP_IF_TRUE
+            || x.op == OP_FUNC || x.op == OP_CAST || x.op == OP_TRAP {
+            return " \(x.a)";
+        }
+        ""
+    }
+
+    fn const_text(self, i: i64) -> String {
+        if i < 0 || i >= self.consts.len() {
+            return "?";
+        }
+        let c = self.consts.at(i);
+        if c.kind == CONST_STRING {
+            return quote_string(c.text);
+        }
+        if c.kind == CONST_FLOAT {
+            return "float";
+        }
+        if c.kind == CONST_CHAR {
+            return quote_char(c.bits as i64);
+        }
+        "\(c.bits as i64)"
+    }
+}
+
+fn pad_left(s: String, width: i64) -> String {
+    let mut out = s;
+    while out.len() < width {
+        out = " \(out)";
+    }
+    out
+}
+
+// --- Quoting ---------------------------------------------------------------------------
+//
+// A string or character constant is rendered the way Go's `%q` renders it, because that is
+// what `internal/bytecode`'s disassembler does and the two outputs are compared byte for
+// byte.
+//
+// One case is approximated: every scalar value at or above U+0080 is taken to be
+// printable and emitted as itself. Go asks Unicode, and for anything a program is likely
+// to contain the answer is the same; where it is not -- an unassigned code point, a
+// combining mark alone in a literal -- Go writes `\uXXXX` and this writes the character.
+// Narrowing it needs the same table stage1's lexer wants for identifiers, and that is a
+// data problem rather than a code one (docs/deferred.md).
+
+/// A string as a double-quoted Go literal.
+pub fn quote_string(s: String) -> String {
+    let mut out = "\"";
+    let cs = s.chars();
+    let mut i = 0;
+    while i < cs.len() {
+        out = "\(out)\(escape_scalar(cs.at(i), 34))";
+        i = i + 1;
+    }
+    "\(out)\""
+}
+
+/// A scalar value as a single-quoted Go rune literal. An invalid one becomes U+FFFD,
+/// which is what Go substitutes before quoting.
+pub fn quote_char(scalar: i64) -> String {
+    if scalar < 0 || scalar > 1114111 || (scalar >= 55296 && scalar <= 57343) {
+        return "'\\ufffd'";
+    }
+    match char::from_u32(scalar as u32) {
+        Option::Some(c) => "'\(escape_scalar(c, 39))'",
+        Option::None => "'\\ufffd'",
+    }
+}
+
+/// One character, escaped for a literal delimited by `quote`.
+fn escape_scalar(c: char, quote: i64) -> String {
+    let r = c as i64;
+    if r == quote || r == 92 {
+        return "\\\(c)";
+    }
+    if r >= 32 && r <= 126 {
+        return "\(c)";
+    }
+    // The seven Go spells with a letter. Origin's own literals have no `\a`, `\b`, `\f`
+    // or `\v`, so those four are written as the two characters they are.
+    if r == 7 { return "\\a"; }
+    if r == 8 { return "\\b"; }
+    if r == 12 { return "\\f"; }
+    if r == 10 { return "\\n"; }
+    if r == 13 { return "\\r"; }
+    if r == 9 { return "\\t"; }
+    if r == 11 { return "\\v"; }
+    if r < 32 || r == 127 {
+        return "\\x\(hex_lower(r, 2))";
+    }
+    "\(c)"
+}
+
+/// `n` as lowercase hex, at least `width` digits. Go's `%q` uses lowercase, unlike the
+/// uppercase form the lexer's diagnostics want.
+fn hex_lower(n: i64, width: i64) -> String {
+    let digits = "0123456789abcdef";
+    let mut out = "";
+    let mut v = n;
+    while v > 0 {
+        let d = v % 16;
+        out = "\(digits.slice(d, d + 1))\(out)";
+        v = v / 16;
+    }
+    while out.len() < width {
+        out = "0\(out)";
+    }
+    if out == "" {
+        return "0";
+    }
+    out
+}

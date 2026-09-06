@@ -603,7 +603,13 @@ func (c *Compiler) tupleInst(t types.Type, span diag.Span) (layout.TypeID, error
 	if id, ok := c.tupleCache[key]; ok {
 		return id, nil
 	}
-	d := layout.FixedDescriptor(fmt.Sprintf("(tuple/%d)", len(kinds)), kinds)
+	// The name has to identify the shape, not merely the arity, for the reason
+	// closureInst spells out: Registry.Add treats a name as a shape's identity, so
+	// `(tuple/2)` holding an integer and a bool and `(tuple/2)` holding a bool and a
+	// reference would be the same type and one of them would be read wrong. It was the
+	// arity alone until a second compiler ran over the whole corpus and reached
+	// `let pair: (i64, bool)` and `let nested: (i64, (bool, String))` in one function.
+	d := layout.FixedDescriptor(fmt.Sprintf("(tuple/%d/%s)", len(kinds), kindsName(kinds)), kinds)
 	d.Kind = layout.ObjTuple
 	id := c.prog.Types.Add(d)
 	c.tupleCache[key] = id

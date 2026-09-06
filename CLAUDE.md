@@ -77,7 +77,8 @@ docs/phases/          N-complete.md, written at each phase gate
 docs/deferred.md      everything deliberately left out, each tagged with a phase
 stage1/src/           from Phase 9: the compiler for Origin, written in Origin --
                       lex.origin, ast.origin, parse.origin, source.origin,
-                      resolve.origin, types.origin, check.origin, mono.origin and
+                      resolve.origin, types.origin, check.origin, mono.origin,
+                      layout.origin, bytecode.origin, compile.origin and
                       main.origin (its own command line) so far
 bootstrap/            from Phase 9: the last known-good stage1 binary
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
@@ -185,25 +186,26 @@ This project outlasts any single context window.
 ## Status
 
 **Phase 9 is in progress.** Its scope is **self-hosting**: a compiler for Origin, written
-in Origin. What exists in `stage1/src/` is the front end through **monomorphization** --
+in Origin. What exists in `stage1/src/` is everything through **bytecode** --
 `lex.origin`, `ast.origin`, `parse.origin`, `source.origin`, `resolve.origin`,
-`types.origin`, `check.origin`, `mono.origin` -- and `main.origin`, which makes stage1 an
-actual command-line program (`stage1 dump-tokens|dump-ast|parse|resolve|check|mono
-<file>...`, plus `--package <root>` for a whole package) shaped like `cmd/originc`'s. That
-is about 13,200 lines of Origin, and every component is held to the Go one it replaces over
-this repository's own ~400 `.origin` files, all in `tests/selfhost`: the token stream
-against `internal/lex`, the dumped syntax tree against `internal/ast`, the position mapping
-against `internal/source`, the *places* syntax errors are reported against `internal/lex` +
+`types.origin`, `check.origin`, `mono.origin`, `layout.origin`, `bytecode.origin`,
+`compile.origin` -- and `main.origin`, which makes stage1 an actual command-line program
+(`stage1 dump-tokens|dump-ast|parse|resolve|check|mono|dump-bytecode <file>...`, plus
+`--package <root>` for a whole package) shaped like `cmd/originc`'s. That is about 18,000
+lines of Origin, and every component is held to the Go one it replaces over this
+repository's own ~400 `.origin` files, all in `tests/selfhost`: the token stream against
+`internal/lex`, the dumped syntax tree against `internal/ast`, the position mapping against
+`internal/source`, the *places* syntax errors are reported against `internal/lex` +
 `internal/parse`, resolution against `internal/resolve` (397 packages, 744,896 trace
-lines), inference against `internal/check` — **399 packages, 1,647,768 trace lines,
-byte-identical on all three engines** — and the instantiation set against `internal/mono`.
+lines), inference against `internal/check` (399 packages, 1,647,768 trace lines), the
+instantiation set against `internal/mono`, and the bytecode against `internal/compile`.
 
-**stage1 now monomorphizes its own source.** `stage1/src` compiled as one package, with the
-prelude, gives 7,225 trace lines identical to the Go compiler's, which is the closest the
-project has come to self-compilation: the corpus files are each compiled alone, so a module
-that imports its siblings never gets past name resolution there, and most of stage1 is such
-a module. Compiling them as one package is what exercises the generic machinery stage1 is
-actually built out of.
+**stage1 compiles its own source to bytecode, byte for byte.** `stage1/src` as one package,
+with the prelude, gives **91,609 lines of bytecode identical to the Go compiler's** —
+every instruction, every operand, the constant pool and its order, every exact object
+layout (ADR-0019) and the static kind each instruction carries (ADR-0021). That bytecode
+runs on the virtual machine today; what stands between it and a self-hosted compiler is
+only the back half of code generation.
 
 The language grew what a compiler cannot be written without: **the command line and the
 exit status** (`docs/spec/17-process.md`) — `args()` in the prelude over `env::arg_count`
@@ -217,7 +219,8 @@ tree with no node ids, so both compilers emit **one line per event, in order**, 
 identifies what the node became, naming a declaration by the `<file>:<offset>` of its own
 name so that two things called `x` are the same only if they were written in the same
 place. `internal/resolve/trace.go`, `internal/check/trace.go` and `internal/mono/trace.go`
-are the Go sides. Two of them differ from the first in a way worth knowing before writing
+are the Go sides. It stops being needed at the bytecode: a compiled program is not a side
+table, so from `dump-bytecode` on, the artefact itself is the oracle. Two of them differ from the first in a way worth knowing before writing
 another. The checker's entries are rendered at the **end** of the run, not when they are
 made, because a type recorded mid-body is usually an unsolved variable that later
 unification binds and end-of-body defaulting resolves — printing at record time compares the
@@ -231,23 +234,19 @@ which is where stage1 keeps what `internal/check` keeps in a map keyed by `ast.N
 rule `ast.origin` states — a slot arrives when a reader does — is why they landed in the
 same commit as the reader.
 
-**Next action: `internal/compile` (2,377 lines) and `internal/bytecode` (292)**, which
-together reach a *running* stage1-compiled program on the VM without touching machine code.
-Everything they read is now in place: `mono.origin` says which copy of each function to emit
-and which copy each call site reaches, and `check.origin` says what type every expression
-has. After that come `internal/ir` (1,800) and `internal/opt` (1,338), then `internal/x86`
-(722), `internal/obj` (1,135) and `internal/backend` (7,064), with `layout`, `arith`,
-`dwarf` and `codesign` (1,479 between them) pulled in as their consumers need them —
-roughly 20,000 lines of Go still to translate.
+**Next action: `internal/ir` (1,800 lines) and `internal/opt` (1,338)**, then
+`internal/x86` (722), `internal/obj` (1,135) and `internal/backend` (7,064), with `arith`,
+`dwarf` and `codesign` (1,087 between them) pulled in as their consumers need them —
+roughly 13,000 lines of Go still to translate. `originc dump-ir` is the oracle for the
+first stretch, exactly as `dump-bytecode` was for the last: the artefact itself, compared
+directly.
 
-The oracle changes here, and for the better: it stops being a trace and becomes the artefact.
-`originc dump-bytecode` already exists, and two compilers that emit the same bytecode for the
-same input are comparable directly, with no invented format in between. One hazard is visible
-from here: the disassembler renders a string constant with Go's `%q`, so every string literal
-in the program goes through `strconv.Quote`. stage1 needs the same quoting or the dump format
-needs to stop depending on it — the parser differential already has one unreachable
-divergence of exactly that shape (`docs/deferred.md`), and here it would be reachable on the
-first program with a tab in a literal.
+**The alternative worth weighing first**: a stage1 that ends at bytecode is already a
+compiler, if something runs the bytecode. Writing the *virtual machine* in Origin
+(`internal/vm`, plus what `internal/gc` it needs) reaches a self-hosted `run` sooner than
+the native backend does, and `bootstrap/` wants a binary rather than an interpreter. Which
+comes first is a real choice, not an oversight — the phase's exit criterion is a compiler
+that compiles itself, and the native backend is what makes that a *binary*.
 
 **What Phase 9 has found so far** — the same tell as Phase 8, and worth expecting again:
 every bug came from *running Origin*, not from reading Go.
@@ -274,6 +273,19 @@ every bug came from *running Origin*, not from reading Go.
   the first of a duplicated name wins. The degenerate input is the most valuable file in
   the corpus, and a fourth case of the same thing — `checkBodies` visiting an impl's methods
   in map order — was found the same way.
+- **Two tuples of the same arity could not coexist in one compiled program.** A
+  descriptor's *name* is its identity in the layout registry, and a tuple's was its arity
+  alone, so `(i64, bool)` and `(bool, String)` were the same type: the second registration
+  lost, and every read through it interpreted the wrong words — a reference read as an
+  integer, or the reverse, which is a heap the collector corrupts silently. The Go
+  compiler's own closure descriptors had been fixed for exactly this in Phase 5, with a
+  comment explaining why; tuples were never given the same treatment. It survived because
+  nothing executed it: `tests/conformance` compiles a tuple case only as far as the
+  checker's verdict, `originc run` defaults to the interpreter, which never builds a
+  descriptor at all, and no end-to-end program happened to build two same-arity tuples of
+  different shapes. Running a second compiler over the whole corpus found it on the third
+  file. `tests/e2e/cases/tuples_of_one_arity_differ_by_shape.origin` is the case that
+  fails on the code it replaced.
 - **The self-hosting suite was 92% of the five-minute budget**, and almost none of it was
   work that needed doing twice. `driver.RunAt` compiles from source on every call, so
   running stage1 twenty times across the differentials compiled 13,500 lines of Origin

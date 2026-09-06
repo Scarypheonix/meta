@@ -1,0 +1,30 @@
+// Two tuples of the same arity whose words are laid out differently.
+//
+// Every distinct shape gets its own descriptor (ADR-0019), and a descriptor's *name* is
+// its identity in the layout registry. Naming a tuple by its arity alone made
+// `(i64, bool)` and `(bool, String)` the same type: the second registration lost, and
+// every read through it interpreted the wrong words -- a reference read as an integer, or
+// the reverse, which is a heap the collector corrupts silently.
+//
+// It survived until Phase 9 because nothing executed it. `tests/conformance` compiles a
+// tuple case only as far as the checker's verdict, and no end-to-end program had happened
+// to build two same-arity tuples of different shapes in one compilation.
+
+use std::io;
+
+fn main() {
+    let ints: (i64, bool) = (1, true);
+    let refs: (bool, String) = (false, "two");
+    let mixed: (String, i64) = ("three", 4);
+    let nested: (i64, (bool, String)) = (5, (true, "six"));
+
+    let (a, b) = ints;
+    io::println("\(a) \(b)");
+    let (c, d) = refs;
+    io::println("\(c) \(d)");
+    let (e, f) = mixed;
+    io::println("\(e) \(f)");
+    let (g, h) = nested;
+    let (i, j) = h;
+    io::println("\(g) \(i) \(j)");
+}

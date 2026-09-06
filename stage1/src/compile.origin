@@ -1,0 +1,3532 @@
+// Lowering the checked syntax tree to the stack bytecode of `bytecode.origin`.
+//
+// A translation of `internal/compile`. It runs after the checker, so it may assume the
+// program is well typed: a match is exhaustive, a field exists, an argument count is
+// right. Where it still emits a check, that check is one the type system does not make --
+// an arithmetic overflow, a division by zero -- and it is emitted as a trap with the
+// source span the specification requires.
+//
+// A struct, tuple, enum variant or closure gets one exact layout per distinct tuple of
+// concrete field types actually constructed, keyed the way `mono.origin` keys a function
+// instance (ADR-0019). Every construction site is compiled inside some instance's body,
+// and that instance's own substitution is what turns a field's declared type -- possibly
+// still in terms of the struct's or the instance's own generic parameters -- into
+// something concrete.
+
+use std::list;
+use std::map;
+use std::float;
+use std::str;
+
+use ast;
+use bytecode;
+use check;
+use layout;
+use mono;
+use resolve;
+use types;
+
+// --- Builtin indices ---------------------------------------------------------------------
+//
+// Shared with every engine. They are small and fixed rather than looked up by name at run
+// time, and `internal/compile` owns them (process rule 5).
+
+pub const BUILTIN_PRINT: i64 = 0;
+pub const BUILTIN_PRINTLN: i64 = 1;
+pub const BUILTIN_PANIC: i64 = 2;
+pub const BUILTIN_REF_EQ: i64 = 3;
+/// One builtin per receiver kind rather than one `cmp` shared by all of them: the virtual
+/// machine dispatches on its own value's runtime tag regardless and treats all four
+/// identically, but native code cannot ask a register what it holds, and `OP_CALL_BUILTIN`
+/// carries no operand-kind operand the way `OP_TO_STR` does. Picking the builtin index
+/// itself by kind, at compile time, answers the same question through the one channel that
+/// already exists.
+pub const BUILTIN_CMP_INT: i64 = 4;
+pub const BUILTIN_CMP_UINT: i64 = 5;
+pub const BUILTIN_CMP_FLOAT: i64 = 6;
+pub const BUILTIN_CMP_STRING: i64 = 7;
+/// `does a op b fit in this type`, as a bool. `checked_add` and its siblings are built out
+/// of one of these plus the corresponding wrapping operation, here, rather than returning
+/// an `Option` from the runtime: an `Option[u8]` and an `Option[i64]` are different types
+/// with different layouts (ADR-0019), and a runtime that built one from a single recorded
+/// variant index handed `checked_add` on a `u8` an `Option[i64]` -- whose variant tags the
+/// caller's own `match` matched none of.
+pub const BUILTIN_FITS_ADD: i64 = 8;
+pub const BUILTIN_FITS_SUB: i64 = 9;
+pub const BUILTIN_FITS_MUL: i64 = 10;
+pub const BUILTIN_SATURATING_ADD: i64 = 11;
+pub const BUILTIN_SATURATING_SUB: i64 = 12;
+pub const BUILTIN_SATURATING_MUL: i64 = 13;
+// The concurrency operations (spec/12-concurrency.md). The prelude's own methods call
+// these, so a program reaches them through `spawn`, `send`, `with` and the rest.
+pub const BUILTIN_SPAWN: i64 = 14;
+pub const BUILTIN_JOIN: i64 = 15;
+pub const BUILTIN_CHANNEL: i64 = 16;
+pub const BUILTIN_SEND: i64 = 17;
+pub const BUILTIN_AWAIT: i64 = 18;
+pub const BUILTIN_TAKEN: i64 = 19;
+pub const BUILTIN_CLOSE_CHAN: i64 = 20;
+pub const BUILTIN_MUTEX: i64 = 21;
+pub const BUILTIN_WITH_LOCK: i64 = 22;
+// The array operations (spec/13-collections.md). `List` and `Map` are Origin source in the
+// prelude written in terms of these.
+pub const BUILTIN_NEW_ARRAY: i64 = 23;
+pub const BUILTIN_ARRAY_LEN: i64 = 24;
+pub const BUILTIN_ARRAY_CAP: i64 = 25;
+pub const BUILTIN_ARRAY_AT: i64 = 26;
+pub const BUILTIN_ARRAY_SET: i64 = 27;
+pub const BUILTIN_ARRAY_PUSH: i64 = 28;
+pub const BUILTIN_ARRAY_TRUNCATE: i64 = 29;
+/// No runtime behind it at all: an empty array and the prelude's own struct around it are
+/// written out here. It is a builtin because `List::new` needs somewhere to live in a
+/// language with no associated functions, not because any engine implements it.
+pub const BUILTIN_LIST_NEW: i64 = 30;
+/// `list::new`'s twin: an empty map is an empty list of entries and an empty index array.
+pub const BUILTIN_MAP_NEW: i64 = 31;
+/// spec/13-collections.md's `hash::of`: 64-bit FNV-1a over a specified encoding, which is
+/// what makes it the same number on all three engines.
+pub const BUILTIN_HASH: i64 = 32;
+// The string operations (spec/14-strings.md). The prelude's `Str` trait is written in
+// terms of these six.
+pub const BUILTIN_STR_LEN: i64 = 33;
+pub const BUILTIN_STR_BYTE_AT: i64 = 34;
+pub const BUILTIN_STR_SLICE: i64 = 35;
+pub const BUILTIN_STR_CONCAT: i64 = 36;
+pub const BUILTIN_STR_CHAR_AT: i64 = 37;
+pub const BUILTIN_STR_CHAR_WIDTH: i64 = 38;
+// The process's arguments and its exit status (spec/17-process.md).
+pub const BUILTIN_ARG_COUNT: i64 = 39;
+pub const BUILTIN_ARG_AT: i64 = 40;
+pub const BUILTIN_EXIT: i64 = 41;
+/// `is this u32 a Unicode scalar value`. A predicate rather than the conversion itself for
+/// the reason `BUILTIN_FITS_ADD` is one: a runtime that returned the `Option` would have to
+/// know what the prelude's `Option` is, and the native backend cannot construct a prelude
+/// type (ADR-0025).
+pub const BUILTIN_CHAR_VALID: i64 = 42;
+/// Reinterpret sixty-four bits (spec/16-floats.md). Neither computes anything: on every
+/// engine the bits are already where they need to be, and what changes is only the static
+/// type that says how to read them.
+pub const BUILTIN_FLOAT_BITS: i64 = 43;
+pub const BUILTIN_FLOAT_FROM_BITS: i64 = 44;
+// The file operations (spec/15-files.md).
+pub const BUILTIN_READ_FILE: i64 = 45;
+pub const BUILTIN_TAKEN_TEXT: i64 = 46;
+pub const BUILTIN_WRITE_FILE: i64 = 47;
+pub const BUILTIN_FILE_EXISTS: i64 = 48;
+
+/// The file-operation statuses (spec/15-files.md), which `fs::read_file` and
+/// `fs::write_file` return and the prelude's `io_error_of` turns into an `IoError`.
+///
+/// They live here rather than in any one engine because all three have to agree on them
+/// and the prelude reads them as plain numbers.
+pub const IO_OK: i64 = 0;
+pub const IO_NOT_FOUND: i64 = 1;
+pub const IO_PERMISSION: i64 = 2;
+pub const IO_OTHER: i64 = 3;
+
+/// What went wrong, when lowering cannot continue. It is a compiler bug rather than a
+/// program the language rejects, so it names what was not handled (process rule 8).
+pub struct CompileError {
+    pub message: String,
+    pub file: String,
+    pub start: i64,
+    pub end: i64,
+}
+
+// --- The compiler's state ---------------------------------------------------------------
+
+/// One enclosing loop's unfinished jumps.
+struct LoopCtx {
+    /// Jump positions to patch once the loop's extent is known.
+    breaks: List[i64],
+    continues: List[i64],
+    /// Marks a `loop`, whose breaks carry a value.
+    is_value_loop: bool,
+}
+
+pub struct Compiler {
+    res: resolve::Resolved,
+    tys: check::Checked,
+    mo: mono::Result,
+    prog: bytecode::Program,
+
+    /// Each instance's bytecode function, by the instance's own number. A non-generic
+    /// function has exactly one instance; a generic one gets one bytecode function per
+    /// distinct tuple of type arguments actually used (spec/06-traits-generics.md).
+    inst_index: List[i64],
+    /// A declaration with no generic parameters of its own mapped to its single instance,
+    /// for a reference monomorphization did not resolve because the call itself is not
+    /// generic (an ordinary function value or a plain call). Keyed by the declaration's
+    /// `info` slot.
+    root_index: Map[i64, i64],
+    const_idx: Map[String, i64],
+
+    /// Exact layouts memoized by a key built from the concrete type-argument tuple, so
+    /// that two construction sites that end up at the same concrete shape share one
+    /// descriptor (ADR-0019).
+    struct_cache: Map[String, i64],
+    variant_cache: Map[String, i64],
+    tuple_cache: Map[String, i64],
+    array_cache: Map[String, i64],
+    closure_cache: Map[String, i64],
+    prelude_defs: Map[String, types::Def],
+
+    // Per-function state.
+    mut f: bytecode::Fn,
+    mut inst: i64,
+    mut slot_keys: List[resolve::Local],
+    mut slot_values: List[i64],
+    mut next_slot: i64,
+    mut capture_keys: List[resolve::Local],
+    mut capture_values: List[i64],
+    mut loops: List[LoopCtx],
+
+    /// The prelude's `Option` enum and its `Some` variant, found once alongside the forced
+    /// prelude variants. A `for` loop reuses them to test the `Option[Item]` its desugared
+    /// `next()` returns, at whatever concrete `Item` the loop's pattern needs -- which
+    /// cannot be precomputed the way `Option[i64]` is, because every instantiation gets its
+    /// own exact layout (ADR-0019).
+    mut option_def: Option[types::Def],
+    mut option_some: Option[ast::Variant],
+
+    errors: List[CompileError],
+    /// The file whose declarations are being lowered, for a diagnostic's own span.
+    mut file: String,
+}
+
+/// One file to lower, in the order the checker saw it.
+pub struct Unit {
+    pub file: String,
+    pub tree: ast::File,
+}
+
+/// The result of lowering: the program, and what stopped if anything did.
+pub struct Lowered {
+    pub prog: bytecode::Program,
+    pub errors: List[CompileError],
+    /// Whether the program has a `main` to start at. A package without one is a library:
+    /// there is nothing to lower and nothing wrong, which is a different answer from a
+    /// lowering that failed.
+    pub mut has_entry: bool,
+}
+
+/// Lowers a checked program.
+///
+/// `mo` is the instantiation set: which specialized copy of each generic function exists,
+/// and which copy every call site reaches. A non-generic program has exactly one instance
+/// per declaration, and this behaves as it would have before ADR-0010.
+pub fn program(res: resolve::Resolved, tys: check::Checked, mo: mono::Result,
+               units: List[Unit]) -> Lowered {
+    let c = Compiler {
+        res: res, tys: tys, mo: mo, prog: bytecode::new_program(),
+        inst_index: list::new[i64](),
+        root_index: map::new[i64, i64](),
+        const_idx: map::new[String, i64](),
+        struct_cache: map::new[String, i64](),
+        variant_cache: map::new[String, i64](),
+        tuple_cache: map::new[String, i64](),
+        array_cache: map::new[String, i64](),
+        closure_cache: map::new[String, i64](),
+        prelude_defs: map::new[String, types::Def](),
+        f: bytecode::new_fn(""),
+        inst: 0 - 1,
+        slot_keys: list::new[resolve::Local](),
+        slot_values: list::new[i64](),
+        next_slot: 0,
+        capture_keys: list::new[resolve::Local](),
+        capture_values: list::new[i64](),
+        loops: list::new[LoopCtx](),
+        option_def: Option::None,
+        option_some: Option::None,
+        errors: list::new[CompileError](),
+        file: "",
+    };
+    c.prog.entry = 0 - 1;
+
+    c.prog.string_type = c.prog.types.add(layout::Descriptor {
+        name: "String", shape: layout::BYTE_ARRAY, words: 0, kinds: list::new[i64](),
+        elem: layout::WORD_RAW, kind: layout::OBJ_BYTES,
+        field_names: list::new[String](), type_name: "String", variant_name: "",
+    });
+    // The canonical captureless-closure shape: slot 0 only, the function index. Every
+    // zero-capture lambda shares it, and it is also what a bare top-level function
+    // reference is boxed into when it is written into a reference-shaped field (ADR-0019)
+    // -- guaranteed to exist even if the program never writes one there.
+    let fn_box_kinds = list::new[i64]();
+    fn_box_kinds.push(layout::WORD_INT);
+    let fn_box = layout::fixed("(fn)", fn_box_kinds);
+    fn_box.kind = layout::OBJ_CLOSURE;
+    c.prog.fn_box_type = c.prog.types.add(fn_box);
+    c.closure_cache.insert(kinds_key(fn_box_kinds), c.prog.fn_box_type);
+
+    // Every instance monomorphization found gets a bytecode function, indexed in
+    // instantiation order so the result is deterministic. The index is filled first, in
+    // full, so that a call from one instance to another lowered later still resolves.
+    let mut i = 0;
+    while i < c.mo.instances.len() {
+        let inst = c.mo.instances.at(i);
+        let mut params = inst.decl.params.len();
+        if inst.decl.self_param.is_some() {
+            params = params + 1;
+        }
+        let bf = bytecode::new_fn(inst.name);
+        bf.params = params;
+        bf.span = decl_span(inst.decl);
+        bf.file = inst.decl.file;
+        c.prog.fns.push(bf);
+        c.inst_index.push(c.prog.fns.len() - 1);
+        if inst.args.is_empty() {
+            c.root_index.insert(inst.decl.info, i);
+        }
+        i = i + 1;
+    }
+    if c.mo.entry < 0 {
+        // A library rather than a program. Nothing is lowered, because every instance is
+        // reached from a root and there is no root here.
+        return Lowered { prog: c.prog, errors: c.errors, has_entry: false };
+    }
+    c.prog.entry = c.inst_index.at(c.mo.entry);
+
+    if !units.is_empty() {
+        c.force_prelude_variants(units.at(0).tree);
+    }
+    let mut k = 0;
+    while k < c.mo.instances.len() {
+        c.file = c.mo.instances.at(k).decl.file;
+        c.compile_instance(k);
+        if !c.errors.is_empty() {
+            return Lowered { prog: c.prog, errors: c.errors, has_entry: true };
+        }
+        k = k + 1;
+    }
+    Lowered { prog: c.prog, errors: c.errors, has_entry: true }
+}
+
+/// A function declaration's own span: its name through the end of its body, which is the
+/// location a trap with nowhere better to point falls back to.
+fn decl_span(decl: ast::FnDecl) -> ast::Span {
+    match decl.body {
+        Option::Some(b) => ast::Span { start: decl.name.start, end: b.span.end },
+        Option::None => ast::Span { start: decl.name.start, end: decl.name.end },
+    }
+}
+
+impl Compiler {
+    /// Records that lowering could not continue. It is a compiler bug rather than a
+    /// program the language rejects, so it says what was not handled (process rule 8).
+    fn unsupported(self, what: String, at: ast::Span) {
+        self.errors.push(CompileError {
+            message: "unimplemented: \(what)", file: self.file, start: at.start,
+            end: at.end,
+        });
+    }
+
+    fn failed(self) -> bool { !self.errors.is_empty() }
+}
+
+// --- Exact layouts ------------------------------------------------------------------------
+
+/// Translates a backend operand kind into the kind an exact-layout word is recorded with.
+/// It is total over every kind a field can concretely have; `KIND_UNKNOWN` means the
+/// checker left something unresolved, which is a compiler bug by the time a construction
+/// site is lowered.
+fn word_kind_of(k: i64) -> i64 {
+    if k == bytecode::KIND_FLOAT { return layout::WORD_FLOAT; }
+    if k == bytecode::KIND_BOOL { return layout::WORD_BOOL; }
+    if k == bytecode::KIND_CHAR { return layout::WORD_CHAR; }
+    if k == bytecode::KIND_UNIT { return layout::WORD_UNIT; }
+    if k == bytecode::KIND_STRING || k == bytecode::KIND_REF { return layout::WORD_REF; }
+    if bytecode::kind_is_integer(k) {
+        // Every integer occupies a whole word whatever its declared width: the layout
+        // question is "is this a reference", and a narrow integer is stored in range and
+        // sign- or zero-extended to sixty-four bits (spec/04-expressions.md).
+        return layout::WORD_INT;
+    }
+    layout::WORD_RAW
+}
+
+fn word_kind_known(k: i64) -> bool { word_kind_of(k) != layout::WORD_RAW }
+
+/// A field's exact word kind from its concrete type, falling back to `WORD_INT` for a type
+/// that is still an unresolved inference variable.
+///
+/// `concrete_type` only ever leaves one of those behind when the checker's own
+/// value-restriction analysis already proved the value can never be observably read, so any
+/// kind is sound there and `WORD_INT` is simply the cheapest one that keeps the collector
+/// from tracing it.
+fn word_kind_for(t: types::Type) -> i64 {
+    match types::as_var(t) {
+        Option::Some(v) => return layout::WORD_INT,
+        Option::None => {}
+    }
+    word_kind_of(kind_of_type(t))
+}
+
+fn word_kind_for_known(t: types::Type) -> bool {
+    match types::as_var(t) {
+        Option::Some(v) => return true,
+        Option::None => {}
+    }
+    word_kind_known(kind_of_type(t))
+}
+
+/// Renders a kind vector for a descriptor's name, so that two shapes never share one.
+fn kinds_name(kinds: List[i64]) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < kinds.len() {
+        if i > 0 {
+            out = "\(out),";
+        }
+        out = "\(out)\(kinds.at(i))";
+        i = i + 1;
+    }
+    out
+}
+
+fn kinds_key(kinds: List[i64]) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < kinds.len() {
+        out = "\(out)\(kinds.at(i)).";
+        i = i + 1;
+    }
+    out
+}
+
+impl Compiler {
+    /// Substitutes the instance currently lowering into `t`, then applies the same
+    /// end-of-body defaulting the checker itself would have.
+    ///
+    /// A checked type inside a generic function's body may still name that function's own
+    /// parameters (or, for a trait method, the enclosing impl's, or `Self`); the instance's
+    /// substitution is what monomorphization resolved them to for this specialization,
+    /// which is what object layout needs a field's *actual* type to be (ADR-0019).
+    ///
+    /// Defaulting here catches what the checker's own end-of-body sweep provably could not:
+    /// a value the value restriction generalized and that is never instantiated again is
+    /// left with a free variable on purpose, because nothing observable depends on what its
+    /// type would have been. Something still has to be emitted for that dead construction
+    /// before a later pass deletes it, and a fixed-shape word needs a concrete kind to be
+    /// written with the right one.
+    fn concrete_type(self, t_in: types::Type) -> types::Type {
+        let mut t = t_in;
+        if self.inst >= 0 {
+            let subst = self.mo.instances.at(self.inst).subst;
+            if !subst.is_empty() {
+                t = types::substitute(t, subst);
+            }
+        }
+        // Substituting `Self` inside a trait's default body leaves `Self::Tag` as a
+        // projection through a now-concrete type, which is not itself concrete: it has no
+        // layout, no width and no kind. Reducing it is the checker's job and the checker's
+        // tables, so it is the checker that is asked (ADR-0029: one answer for three
+        // engines).
+        t = self.tys.lookup.resolve_type(t);
+        types::apply_defaults(t);
+        types::prune(t)
+    }
+
+    /// An expression's own concrete type.
+    fn concrete_type_of(self, e: ast::Expr) -> types::Type {
+        self.concrete_type(self.type_of(e))
+    }
+
+    /// The concrete type a pattern matches against.
+    fn pat_type_of(self, p: ast::Pat) -> types::Type {
+        if p.ty < 0 || p.ty >= self.tys.types.len() {
+            return types::error_type();
+        }
+        self.concrete_type(self.tys.types.at(p.ty))
+    }
+
+    /// An expression's checked type.
+    fn type_of(self, e: ast::Expr) -> types::Type {
+        if e.ty < 0 || e.ty >= self.tys.types.len() {
+            return types::error_type();
+        }
+        types::prune(self.tys.types.at(e.ty))
+    }
+
+    /// Whether an expression's type is a float, which selects the non-trapping arithmetic
+    /// opcodes.
+    fn is_float(self, e: ast::Expr) -> bool {
+        types::is_float(types::as_prim(self.type_of(e)))
+    }
+
+    /// Rejects a type that still contains an inference variable.
+    ///
+    /// Under ADR-0010 every instantiation has its own descriptor (ADR-0019), so a type with
+    /// a free variable names no single runtime shape. Building an object at one anyway is
+    /// not a near-miss: it silently produces a distinct descriptor, and a later `match`
+    /// compares against the real one and finds nothing.
+    fn require_concrete(self, t: types::Type, what: String, at: ast::Span) -> bool {
+        if has_free_var(t) {
+            self.unsupported(
+                "\(what) at the unresolved type \(types::show(t)); every instantiation needs a concrete layout (ADR-0019)",
+                at);
+            return false;
+        }
+        true
+    }
+
+    /// The exact per-word kind of a struct's or a variant's payload, substituting the
+    /// definition's own generic parameters with the concrete arguments this instantiation
+    /// supplies, then the instance currently lowering on top of that (a field's declared
+    /// type can itself mention the instance's parameters).
+    fn field_kinds(self, declared: List[types::Type], params: List[types::Param],
+                   args: List[types::Type], at: ast::Span) -> List[i64] {
+        let subst = types::new_subst();
+        let mut i = 0;
+        while i < params.len() && i < args.len() {
+            subst.set(params.at(i), args.at(i));
+            i = i + 1;
+        }
+        let kinds = list::new[i64]();
+        let mut k = 0;
+        while k < declared.len() {
+            let concrete = self.concrete_type(types::substitute(declared.at(k), subst));
+            if !word_kind_for_known(concrete) {
+                self.unsupported(
+                    "a field of type \(types::show(concrete)) has no object layout yet", at);
+                return kinds;
+            }
+            kinds.push(word_kind_for(concrete));
+            k = k + 1;
+        }
+        kinds
+    }
+}
+
+/// Whether a type still contains an inference variable.
+fn has_free_var(t: types::Type) -> bool {
+    match types::prune(t) {
+        types::Type::VarT(v) => true,
+        types::Type::Named(def, args) => {
+            let mut i = 0;
+            while i < args.len() {
+                if has_free_var(args.at(i)) {
+                    return true;
+                }
+                i = i + 1;
+            }
+            false
+        }
+        types::Type::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                if has_free_var(elems.at(i)) {
+                    return true;
+                }
+                i = i + 1;
+            }
+            false
+        }
+        types::Type::Func(params, ret) => {
+            let mut i = 0;
+            while i < params.len() {
+                if has_free_var(params.at(i)) {
+                    return true;
+                }
+                i = i + 1;
+            }
+            has_free_var(ret)
+        }
+        _ => false,
+    }
+}
+
+// --- Kinds -------------------------------------------------------------------------------
+
+/// The static type of a checked type, as the backend needs to see it.
+///
+/// Deliberately total: a type the checker left as an error, or one of a shape with no
+/// distinct lowering, reports `KIND_UNKNOWN`, and the backend refuses to guess rather than
+/// emitting something plausible.
+fn kind_of_type(t: types::Type) -> i64 {
+    let p = types::as_prim(t);
+    if p >= 0 {
+        if p == types::P_BOOL { return bytecode::KIND_BOOL; }
+        if p == types::P_CHAR { return bytecode::KIND_CHAR; }
+        if p == types::P_STRING { return bytecode::KIND_STRING; }
+        if p == types::P_UNIT { return bytecode::KIND_UNIT; }
+        if types::is_float(p) { return bytecode::KIND_FLOAT; }
+        if types::is_integer(p) { return int_kind_of(p); }
+        return bytecode::KIND_UNKNOWN;
+    }
+    match types::prune(t) {
+        types::Type::Named(def, args) => bytecode::KIND_REF,
+        types::Type::Tuple(elems) => bytecode::KIND_REF,
+        types::Type::Func(params, ret) => bytecode::KIND_REF,
+        _ => bytecode::KIND_UNKNOWN,
+    }
+}
+
+/// Maps a primitive integer type to the bytecode kind that names its width and signedness
+/// together. Every instruction whose behaviour depends on either carries it.
+fn int_kind_of(k: i64) -> i64 {
+    if k == types::P_I8 { return bytecode::KIND_I8; }
+    if k == types::P_I16 { return bytecode::KIND_I16; }
+    if k == types::P_I32 { return bytecode::KIND_I32; }
+    if k == types::P_I64 { return bytecode::KIND_I64; }
+    if k == types::P_U8 { return bytecode::KIND_U8; }
+    if k == types::P_U16 { return bytecode::KIND_U16; }
+    if k == types::P_U32 { return bytecode::KIND_U32; }
+    if k == types::P_U64 { return bytecode::KIND_U64; }
+    bytecode::KIND_UNKNOWN
+}
+
+impl Compiler {
+    /// An expression's kind.
+    ///
+    /// `concrete_type_of`, not `type_of`: inside a generic instance's body the checker's
+    /// own recorded type can still name that instance's own type parameter, and the
+    /// concrete type this particular instantiation gives it is exactly what a static kind
+    /// needs to mean here -- the same substitution ADR-0019's object-layout code applies.
+    fn kind_of(self, e: ast::Expr) -> i64 {
+        kind_of_type(self.concrete_type_of(e))
+    }
+
+    /// A method declaration's receiver kind, substituted for the instance currently
+    /// lowering (ADR-0021). `KIND_UNKNOWN` for a plain function, which has no receiver.
+    fn self_kind(self, decl: ast::FnDecl) -> i64 {
+        match self.sig_of(decl) {
+            Option::None => bytecode::KIND_UNKNOWN,
+            Option::Some(sig) => {
+                if !sig.has_self {
+                    return bytecode::KIND_UNKNOWN;
+                }
+                kind_of_type(self.concrete_type(sig.self_ty))
+            }
+        }
+    }
+
+    fn sig_of(self, decl: ast::FnDecl) -> Option[check::FnSig] {
+        if decl.info < 0 || decl.info >= self.tys.sigs.len() {
+            return Option::None;
+        }
+        Option::Some(self.tys.sigs.at(decl.info))
+    }
+}
+
+// --- Type keys --------------------------------------------------------------------------
+//
+// A nominal type's concrete instantiation, for the layout caches. Built from where the
+// definition was written rather than from its name, like `mono.origin`'s own instance key,
+// so that two types sharing a name in different modules never collide.
+
+fn inst_key(def: types::Def, args: List[types::Type]) -> String {
+    let mut out = "\(def.file):\(def.at)";
+    let mut i = 0;
+    while i < args.len() {
+        out = "\(out)|\(type_key(args.at(i)))";
+        i = i + 1;
+    }
+    out
+}
+
+fn type_key(t: types::Type) -> String {
+    match types::prune(t) {
+        types::Type::Prim(k) => types::prim_name(k),
+        types::Type::Named(def, args) => "N\(inst_key(def, args))",
+        types::Type::Tuple(elems) => {
+            let mut out = "T(";
+            let mut i = 0;
+            while i < elems.len() {
+                out = "\(out)\(type_key(elems.at(i))),";
+                i = i + 1;
+            }
+            "\(out))"
+        }
+        types::Type::Func(params, ret) => {
+            let mut out = "F(";
+            let mut i = 0;
+            while i < params.len() {
+                out = "\(out)\(type_key(params.at(i))),";
+                i = i + 1;
+            }
+            "\(out))->\(type_key(ret))"
+        }
+        other => types::show(other),
+    }
+}
+
+// --- The layout builders ------------------------------------------------------------------
+
+impl Compiler {
+    /// The bytecode struct index for one concrete instantiation, building its exact layout
+    /// on first use and reusing it for every later construction at the same field types.
+    fn struct_inst(self, t: types::Type, at: ast::Span) -> i64 {
+        let concrete = self.concrete_type(t);
+        match types::as_named(concrete) {
+            Option::None => {
+                self.unsupported(
+                    "constructing \(types::show(t)), which is not a concrete struct type", at);
+                0
+            }
+            Option::Some(def) => {
+                if def.struct_decl.is_none() {
+                    self.unsupported(
+                        "constructing \(types::show(t)), which is not a concrete struct type", at);
+                    return 0;
+                }
+                let args = types::named_args(concrete);
+                if !self.require_concrete(concrete, "constructing \(def.name)", at) {
+                    return 0;
+                }
+                let key = "struct:\(inst_key(def, args))";
+                match self.struct_cache.get(key) {
+                    Option::Some(idx) => return idx,
+                    Option::None => {}
+                }
+                let kinds = self.field_kinds(def.field_types, def.params, args, at);
+                if self.failed() {
+                    return 0;
+                }
+                let d = layout::fixed(key, kinds);
+                d.kind = layout::OBJ_STRUCT;
+                d.type_name = def.name;
+                match def.struct_decl {
+                    Option::Some(sd) => {
+                        let mut i = 0;
+                        while i < sd.fields.len() {
+                            d.field_names.push(sd.fields.at(i).name.name);
+                            i = i + 1;
+                        }
+                    }
+                    Option::None => {}
+                }
+                let id = self.prog.types.add(d);
+                let idx = self.prog.structs.len();
+                self.prog.structs.push(id);
+                self.struct_cache.insert(key, idx);
+                idx
+            }
+        }
+    }
+
+    /// The bytecode variant index for one concrete instantiation of a variant, building its
+    /// exact layout on first use.
+    fn variant_inst(self, variant: ast::Variant, enum_t: types::Type) -> i64 {
+        let at = ident_span(variant.name);
+        let concrete = self.concrete_type(enum_t);
+        match types::as_named(concrete) {
+            Option::None => {
+                self.unsupported(
+                    "matching or building \(types::show(enum_t)), which is not a concrete enum type", at);
+                0
+            }
+            Option::Some(def) => {
+                match def.enum_decl {
+                    Option::None => {
+                        self.unsupported(
+                            "matching or building \(types::show(enum_t)), which is not a concrete enum type", at);
+                        0
+                    }
+                    Option::Some(ed) => {
+                        let mut pos = 0 - 1;
+                        let mut i = 0;
+                        while i < ed.variants.len() {
+                            if ref_eq(ed.variants.at(i), variant) {
+                                pos = i;
+                                i = ed.variants.len();
+                            } else {
+                                i = i + 1;
+                            }
+                        }
+                        if pos < 0 || pos >= def.variant_types.len() {
+                            self.unsupported("an unknown variant", at);
+                            return 0;
+                        }
+                        let args = types::named_args(concrete);
+                        if !self.require_concrete(
+                                concrete, "building \(def.name)::\(variant.name.name)", at) {
+                            return 0;
+                        }
+                        let key = "variant:\(inst_key(def, args))::\(variant.name.name)";
+                        match self.variant_cache.get(key) {
+                            Option::Some(idx) => return idx,
+                            Option::None => {}
+                        }
+                        let kinds = self.field_kinds(
+                            def.variant_types.at(pos), def.params, args, at);
+                        if self.failed() {
+                            return 0;
+                        }
+                        let d = layout::fixed(key, kinds);
+                        d.kind = layout::OBJ_ENUM;
+                        d.type_name = def.name;
+                        d.variant_name = variant.name.name;
+                        let mut k = 0;
+                        while k < variant.fields.len() {
+                            d.field_names.push(variant.fields.at(k).name.name);
+                            k = k + 1;
+                        }
+                        let id = self.prog.types.add(d);
+                        let idx = self.prog.variants.len();
+                        self.prog.variants.push(bytecode::VariantInfo {
+                            ty: id, tag: idx, payload: kinds.len(),
+                            name: "\(def.name)::\(variant.name.name)",
+                        });
+                        self.variant_cache.insert(key, idx);
+                        idx
+                    }
+                }
+            }
+        }
+    }
+
+    /// The descriptor for one concrete tuple shape, built on first use. A tuple's element
+    /// types are already concrete at every construction site -- they come straight from
+    /// inference, not from a declaration's own parameters -- so only the instance
+    /// substitution applies.
+    fn tuple_inst(self, t: types::Type, at: ast::Span) -> i64 {
+        match self.concrete_type(t) {
+            types::Type::Tuple(elems) => {
+                let kinds = list::new[i64]();
+                let mut i = 0;
+                while i < elems.len() {
+                    let e = self.concrete_type(elems.at(i));
+                    if !word_kind_for_known(e) {
+                        self.unsupported(
+                            "a tuple element of type \(types::show(e)) has no object layout yet", at);
+                        return 0;
+                    }
+                    kinds.push(word_kind_for(e));
+                    i = i + 1;
+                }
+                let key = "tuple:\(kinds_key(kinds))";
+                match self.tuple_cache.get(key) {
+                    Option::Some(id) => return id,
+                    Option::None => {}
+                }
+                // The name has to identify the shape, not merely the arity, for the
+                // reason `closure_inst` spells out: the registry treats a name as a
+                // shape's identity, so `(tuple/2)` holding an integer and a bool and
+                // `(tuple/2)` holding a bool and a reference would be the same type and
+                // one of them would be read wrong.
+                let d = layout::fixed(
+                    "(tuple/\(kinds.len())/\(kinds_name(kinds)))", kinds);
+                d.kind = layout::OBJ_TUPLE;
+                let id = self.prog.types.add(d);
+                self.tuple_cache.insert(key, id);
+                id
+            }
+            _ => {
+                self.unsupported(
+                    "constructing \(types::show(t)), which is not a concrete tuple type", at);
+                0
+            }
+        }
+    }
+
+    /// The layout of one array instantiation, built on first use.
+    ///
+    /// An array's shape is decided here and nowhere else (ADR-0028): a run of references
+    /// when its elements are references, a run of raw words when they are not. The
+    /// collector reads that shape rather than inferring anything from a value, which is the
+    /// whole reason the answer has to be settled while compiling.
+    fn array_inst(self, t: types::Type, at: ast::Span) -> i64 {
+        let concrete = self.concrete_type(t);
+        let args = types::named_args(concrete);
+        match types::as_named(concrete) {
+            Option::None => {
+                self.unsupported(
+                    "an array of type \(types::show(t)), which is not a concrete Array[T]", at);
+                0
+            }
+            Option::Some(def) => {
+                if def.kind != types::DEF_BUILTIN || def.name != "Array" || args.len() != 1 {
+                    self.unsupported(
+                        "an array of type \(types::show(t)), which is not a concrete Array[T]", at);
+                    return 0;
+                }
+                let elem = self.concrete_type(args.at(0));
+                match types::as_var(types::prune(elem)) {
+                    // `word_kind_for` would answer "int" for a type variable, and an array
+                    // of references the collector believes is raw is a heap it silently
+                    // corrupts. Monomorphization gives every instance concrete arguments,
+                    // so reaching this is a compiler bug rather than a rejected program.
+                    Option::Some(v) => {
+                        self.unsupported("an array whose element type is not known here", at);
+                        return 0;
+                    }
+                    Option::None => {}
+                }
+                if !word_kind_known(kind_of_type(elem)) {
+                    self.unsupported(
+                        "an array of \(types::show(elem)), which has no object layout yet", at);
+                    return 0;
+                }
+                let key = "array:\(type_key(elem))";
+                match self.array_cache.get(key) {
+                    Option::Some(id) => return id,
+                    Option::None => {}
+                }
+                let d = layout::array(key, word_kind_for(elem));
+                d.type_name = "Array";
+                let id = self.prog.types.add(d);
+                self.array_cache.insert(key, id);
+                id
+            }
+        }
+    }
+
+    /// The descriptor for a closure over exactly these captures, in order. Slot 0 is always
+    /// the function index; two closures that capture the same types, even from different
+    /// lambda literals, share one descriptor.
+    fn closure_inst(self, caps: List[resolve::Local], at: ast::Span) -> i64 {
+        let kinds = list::new[i64]();
+        kinds.push(layout::WORD_INT);
+        let mut i = 0;
+        while i < caps.len() {
+            let t = self.concrete_type(self.local_type(caps.at(i)));
+            if !word_kind_for_known(t) {
+                self.unsupported("a capture whose type has no object layout yet", at);
+                return 0;
+            }
+            kinds.push(word_kind_for(t));
+            i = i + 1;
+        }
+        let key = kinds_key(kinds);
+        match self.closure_cache.get(key) {
+            Option::Some(id) => return id,
+            Option::None => {}
+        }
+        // The name has to identify the shape, not merely the arity: the registry treats a
+        // name as a shape's identity, so `(closure/1)` capturing an `i64` and `(closure/1)`
+        // capturing a reference would be the same type and one of them would be read wrong.
+        let d = layout::fixed("(closure/\(caps.len())/\(kinds_name(kinds)))", kinds);
+        d.kind = layout::OBJ_CLOSURE;
+        let id = self.prog.types.add(d);
+        self.closure_cache.insert(key, id);
+        id
+    }
+
+    fn local_type(self, l: resolve::Local) -> types::Type {
+        self.tys.lookup.resolve_local(l).unwrap_or(types::error_type())
+    }
+}
+
+fn ident_span(id: ast::Ident) -> ast::Span {
+    ast::Span { start: id.start, end: id.end }
+}
+
+// --- Constants and emitting ----------------------------------------------------------------
+
+impl Compiler {
+    fn constant(self, k: i64, bits: u64, text: String) -> i64 {
+        let key = "\(k)/\(bits)/\(text)";
+        match self.const_idx.get(key) {
+            Option::Some(i) => return i,
+            Option::None => {}
+        }
+        let i = self.prog.consts.len();
+        self.prog.consts.push(bytecode::Const { kind: k, bits: bits, text: text });
+        self.const_idx.insert(key, i);
+        i
+    }
+
+    fn int_const(self, v: i64) -> i64 {
+        self.constant(bytecode::CONST_INT, v as u64, "")
+    }
+
+    fn str_const(self, s: String) -> i64 {
+        self.constant(bytecode::CONST_STRING, 0u64, s)
+    }
+
+    fn emit(self, op: i64, at: ast::Span) -> i64 {
+        self.emit_full(op, 0, 0, bytecode::KIND_UNKNOWN, at)
+    }
+
+    fn emit_a(self, op: i64, a: i64, at: ast::Span) -> i64 {
+        self.emit_full(op, a, 0, bytecode::KIND_UNKNOWN, at)
+    }
+
+    fn emit_ab(self, op: i64, a: i64, b: i64, at: ast::Span) -> i64 {
+        self.emit_full(op, a, b, bytecode::KIND_UNKNOWN, at)
+    }
+
+    /// `emit_a` plus the value's static kind (ADR-0021): a field, payload or tuple-element
+    /// read, or a call -- the instructions whose result the native backend cannot otherwise
+    /// tell is a reference at all.
+    fn emit_ak(self, op: i64, a: i64, kind: i64, at: ast::Span) -> i64 {
+        self.emit_full(op, a, 0, kind, at)
+    }
+
+    /// `emit_ab` plus the value's static kind, for a builtin whose result kind is the
+    /// program's own `T` rather than fixed by which builtin it is: `join` yields the
+    /// thread's result, `with` whatever its closure returned.
+    fn emit_abk(self, op: i64, a: i64, b: i64, kind: i64, at: ast::Span) -> i64 {
+        self.emit_full(op, a, b, kind, at)
+    }
+
+    fn emit_full(self, op: i64, a: i64, b: i64, kind: i64, at: ast::Span) -> i64 {
+        self.f.code.push(bytecode::Instr {
+            op: op, a: a, b: b, kind: kind, span: at, file: self.file,
+        });
+        self.f.code.len() - 1
+    }
+
+    /// Points a previously emitted jump at the current end of the code.
+    fn patch(self, at: i64) {
+        let target = self.f.code.len();
+        let old = self.f.code.at(at);
+        self.f.code.set(at, bytecode::Instr {
+            op: old.op, a: target, b: old.b, kind: old.kind, span: old.span, file: old.file,
+        });
+    }
+
+    fn here(self) -> i64 { self.f.code.len() }
+
+    /// The frame slot for a binding, allocating one on first use.
+    fn slot_of(self, l: resolve::Local) -> i64 {
+        let mut i = 0;
+        while i < self.slot_keys.len() {
+            if ref_eq(self.slot_keys.at(i), l) {
+                return self.slot_values.at(i);
+            }
+            i = i + 1;
+        }
+        let s = self.next_slot;
+        self.next_slot = self.next_slot + 1;
+        self.slot_keys.push(l);
+        self.slot_values.push(s);
+        if self.next_slot > self.f.locals {
+            self.f.locals = self.next_slot;
+        }
+        s
+    }
+
+    /// Where a binding is held when it is one of the running closure's captures, or -1.
+    fn capture_of(self, l: resolve::Local) -> i64 {
+        let mut i = 0;
+        while i < self.capture_keys.len() {
+            if ref_eq(self.capture_keys.at(i), l) {
+                return self.capture_values.at(i);
+            }
+            i = i + 1;
+        }
+        0 - 1
+    }
+
+    /// An anonymous frame slot, for a match scrutinee or an extracted payload.
+    fn temp(self) -> i64 {
+        let s = self.next_slot;
+        self.next_slot = self.next_slot + 1;
+        if self.next_slot > self.f.locals {
+            self.f.locals = self.next_slot;
+        }
+        s
+    }
+}
+
+// --- The forced prelude variants ------------------------------------------------------------
+
+impl Compiler {
+    /// Builds the specific instantiations the runtime constructs directly, with no compiled
+    /// call site to attach a concrete type to: `Option::Some[i64]` and `Option::None` for
+    /// the checked-arithmetic builtins, `Ordering`'s three variants for `cmp`. Their
+    /// indices must be known before any user code runs.
+    fn force_prelude_variants(self, prelude: ast::File) {
+        let option = find_enum(prelude, "Option");
+        let ordering = find_enum(prelude, "Ordering");
+        match option {
+            Option::None => return,
+            Option::Some(o) => {
+                match ordering {
+                    Option::None => return,
+                    Option::Some(ord) => self.force_variants_of(o, ord),
+                }
+            }
+        }
+    }
+
+    fn force_variants_of(self, option: ast::EnumDecl, ordering: ast::EnumDecl) {
+        let option_def = self.def_at(option.info);
+        let ordering_def = self.def_at(ordering.info);
+        match option_def {
+            Option::None => return,
+            Option::Some(od) => {
+                match ordering_def {
+                    Option::None => return,
+                    Option::Some(rd) => {
+                        let i64_args = list::new[types::Type]();
+                        i64_args.push(types::Type::Prim(types::P_I64));
+                        let option_i64 = types::Type::Named(od, i64_args);
+                        let ordering_t =
+                            types::Type::Named(rd, list::new[types::Type]());
+
+                        let some = find_variant(option, "Some");
+                        let none = find_variant(option, "None");
+                        let less = find_variant(ordering, "Less");
+                        let equal = find_variant(ordering, "Equal");
+                        let greater = find_variant(ordering, "Greater");
+                        if some.is_none() || none.is_none() || less.is_none()
+                            || equal.is_none() || greater.is_none() {
+                            return;
+                        }
+                        self.option_def = Option::Some(od);
+                        self.option_some = some;
+
+                        let p = bytecode::no_prelude_variants();
+                        p.option_some = self.variant_inst(some.expect("some"), option_i64);
+                        p.option_none = self.variant_inst(none.expect("none"), option_i64);
+                        p.less = self.variant_inst(less.expect("less"), ordering_t);
+                        p.equal = self.variant_inst(equal.expect("equal"), ordering_t);
+                        p.greater = self.variant_inst(greater.expect("greater"), ordering_t);
+                        if self.failed() {
+                            return;
+                        }
+                        p.found = true;
+                        self.prog.prelude = p;
+                    }
+                }
+            }
+        }
+    }
+
+    fn def_at(self, info: i64) -> Option[types::Def] {
+        if info < 0 || info >= self.tys.defs.len() {
+            return Option::None;
+        }
+        Option::Some(self.tys.defs.at(info))
+    }
+}
+
+fn find_enum(f: ast::File, name: String) -> Option[ast::EnumDecl] {
+    let mut i = 0;
+    while i < f.items.len() {
+        match f.items.at(i) {
+            ast::Item::Enum(e) => {
+                if e.name.name == name {
+                    return Option::Some(e);
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    Option::None
+}
+
+fn find_variant(e: ast::EnumDecl, name: String) -> Option[ast::Variant] {
+    let mut i = 0;
+    while i < e.variants.len() {
+        if e.variants.at(i).name.name == name {
+            return Option::Some(e.variants.at(i));
+        }
+        i = i + 1;
+    }
+    Option::None
+}
+
+// --- One instance's body ---------------------------------------------------------------
+
+impl Compiler {
+    fn ref_of(self, at: i64) -> resolve::Ref {
+        if at < 0 || at >= self.res.refs.len() {
+            return resolve::unresolved();
+        }
+        self.res.refs.at(at)
+    }
+
+    fn captures_of(self, e: ast::Expr) -> List[resolve::Local] {
+        if e.captures < 0 || e.captures >= self.res.captures.len() {
+            return list::new[resolve::Local]();
+        }
+        self.res.captures.at(e.captures)
+    }
+
+    /// The copy a call or method-call expression reaches from the instance currently
+    /// lowering, or -1 when it has no concrete target: a call to a compiler-provided impl
+    /// with no Origin body, which the caller lowers to a builtin.
+    fn call_target(self, e: ast::Expr) -> i64 {
+        if self.inst < 0 {
+            return 0 - 1;
+        }
+        self.mo.instances.at(self.inst).calls.get(e.inst).unwrap_or(0 - 1)
+    }
+
+    /// The copy a `for` loop's `into_iter` reaches. Its `next` is `call_target`'s, from the
+    /// same expression: the loop's two implicit calls hang off one node.
+    fn iter_target(self, e: ast::Expr) -> i64 {
+        if self.inst < 0 {
+            return 0 - 1;
+        }
+        self.mo.instances.at(self.inst).iter_calls.get(e.iter_inst).unwrap_or(0 - 1)
+    }
+
+    /// Lowers one monomorphized instance's body.
+    ///
+    /// A non-generic function has exactly one instance, and this is exactly what
+    /// per-declaration compilation would be. A generic one is lowered once per
+    /// instantiation, because the calls inside its body can differ: `a.cmp(b)` inside
+    /// `max2[T: Ord]` is `Money::cmp` in one instance and the builtin integer comparison in
+    /// another (ADR-0010), and only the concrete instance knows which.
+    fn compile_instance(self, at: i64) {
+        let inst = self.mo.instances.at(at);
+        let decl = inst.decl;
+        match decl.body {
+            Option::None => return,
+            Option::Some(body) => {
+                let saved_fn = self.f;
+                let saved_inst = self.inst;
+                let saved_slot_keys = self.slot_keys;
+                let saved_slot_values = self.slot_values;
+                let saved_next = self.next_slot;
+                let saved_cap_keys = self.capture_keys;
+                let saved_cap_values = self.capture_values;
+                let saved_loops = self.loops;
+
+                self.f = self.prog.fns.at(self.inst_index.at(at));
+                self.inst = at;
+                self.slot_keys = list::new[resolve::Local]();
+                self.slot_values = list::new[i64]();
+                self.capture_keys = list::new[resolve::Local]();
+                self.capture_values = list::new[i64]();
+                self.next_slot = 0;
+                self.loops = list::new[LoopCtx]();
+
+                // Slot 0 is the receiver for a method, then the declared parameters in
+                // order. The parameter kinds are built in the same order (ADR-0021): a
+                // stack map needs a parameter's kind at least once as live across a call,
+                // and there is no producing instruction for a parameter's own value to
+                // carry it on.
+                if decl.self_param.is_some() {
+                    self.next_slot = self.next_slot + 1;
+                    self.f.locals = self.next_slot;
+                    self.f.param_kinds.push(self.self_kind(decl));
+                }
+                let mut i = 0;
+                while i < decl.params.len() {
+                    let p = decl.params.at(i);
+                    self.f.param_kinds.push(kind_of_type(self.pat_type_of(p.pat)));
+                    self.bind_param(p.pat);
+                    i = i + 1;
+                }
+
+                self.block_expr(body);
+                self.emit(bytecode::OP_RETURN, self.f.span);
+
+                self.f = saved_fn;
+                self.inst = saved_inst;
+                self.slot_keys = saved_slot_keys;
+                self.slot_values = saved_slot_values;
+                self.next_slot = saved_next;
+                self.capture_keys = saved_cap_keys;
+                self.capture_values = saved_cap_values;
+                self.loops = saved_loops;
+            }
+        }
+    }
+
+    /// Gives a parameter its slot. Parameters are irrefutable (spec/05-patterns.md), so a
+    /// destructuring parameter is bound by unpacking after the frame is set up.
+    fn bind_param(self, p: ast::Pat) {
+        match p.node {
+            ast::PatKind::Bind(_, name, sub) => {
+                match self.ref_of(name.res).local {
+                    Option::Some(l) => {
+                        self.slot_of(l);
+                        return;
+                    }
+                    Option::None => {}
+                }
+            }
+            _ => {}
+        }
+        // A wildcard or a destructuring pattern still occupies an argument slot.
+        self.temp();
+    }
+
+    // --- statements ---
+
+    fn block_expr(self, e: ast::Expr) {
+        match e.node {
+            ast::ExprKind::Block(b) => {
+                let mut i = 0;
+                while i < b.stmts.len() {
+                    self.stmt(b.stmts.at(i));
+                    if self.failed() {
+                        return;
+                    }
+                    i = i + 1;
+                }
+                match b.tail {
+                    Option::None => { self.emit(bytecode::OP_UNIT, e.span); }
+                    Option::Some(t) => self.expr(t),
+                }
+            }
+            _ => self.expr(e),
+        }
+    }
+
+    fn stmt(self, s: ast::Stmt) {
+        match s {
+            ast::Stmt::Let(_, p, _, value) => {
+                self.expr(value);
+                if self.failed() {
+                    return;
+                }
+                self.bind_irrefutable(p, p.span);
+            }
+            ast::Stmt::ExprStmt(x, _) => {
+                self.expr(x);
+                if self.failed() {
+                    return;
+                }
+                self.emit(bytecode::OP_POP, x.span);
+            }
+            // Items are compiled where they are declared.
+            ast::Stmt::ItemStmt(_) => {}
+        }
+    }
+
+    /// Stores the value on top of the stack into a pattern's bindings.
+    fn bind_irrefutable(self, p: ast::Pat, at: ast::Span) {
+        match p.node {
+            ast::PatKind::Wild => { self.emit(bytecode::OP_POP, at); }
+            ast::PatKind::ErrorPat => { self.emit(bytecode::OP_POP, at); }
+            ast::PatKind::Bind(_, name, sub) => {
+                match self.ref_of(name.res).local {
+                    Option::Some(l) => { self.emit_a(bytecode::OP_STORE, self.slot_of(l), at); }
+                    Option::None => { self.emit(bytecode::OP_POP, at); }
+                }
+            }
+            ast::PatKind::Tup(elems) => {
+                let slot = self.temp();
+                self.emit_a(bytecode::OP_STORE, slot, at);
+                let mut i = 0;
+                while i < elems.len() {
+                    self.emit_a(bytecode::OP_LOAD, slot, at);
+                    self.emit_ak(bytecode::OP_GET_TUPLE_ELEM, i,
+                                 kind_of_type(self.pat_type_of(elems.at(i))), at);
+                    self.bind_irrefutable(elems.at(i), at);
+                    if self.failed() {
+                        return;
+                    }
+                    i = i + 1;
+                }
+            }
+            ast::PatKind::PathUnit(path) => {
+                let slot = self.temp();
+                self.emit_a(bytecode::OP_STORE, slot, at);
+                self.bind_path_payload(p, path, slot, at);
+            }
+            ast::PatKind::PathTuple(path, _) => {
+                let slot = self.temp();
+                self.emit_a(bytecode::OP_STORE, slot, at);
+                self.bind_path_payload(p, path, slot, at);
+            }
+            ast::PatKind::PathStruct(path, _, _) => {
+                let slot = self.temp();
+                self.emit_a(bytecode::OP_STORE, slot, at);
+                self.bind_path_payload(p, path, slot, at);
+            }
+            _ => self.unsupported("this pattern in a binding position", at),
+        }
+    }
+
+    /// Unpacks a struct or single-variant enum pattern that is known to match.
+    fn bind_path_payload(self, p: ast::Pat, path: ast::PathRef, slot: i64, at: ast::Span) {
+        let elems = path_pat_elems(p);
+        let fields = path_pat_fields(p);
+        let r = self.ref_of(path.res);
+        if r.kind == resolve::K_VARIANT {
+            let mut i = 0;
+            while i < elems.len() {
+                self.emit_a(bytecode::OP_LOAD, slot, at);
+                self.emit_ak(bytecode::OP_GET_PAYLOAD, i,
+                             kind_of_type(self.pat_type_of(elems.at(i))), at);
+                self.bind_irrefutable(elems.at(i), at);
+                if self.failed() {
+                    return;
+                }
+                i = i + 1;
+            }
+            match r.variant {
+                Option::None => {}
+                Option::Some(variant) => {
+                    let mut k = 0;
+                    while k < fields.len() {
+                        let idx = field_index_of_variant(variant, fields.at(k).name.name);
+                        if idx < 0 {
+                            self.unsupported("an unknown field in a pattern", at);
+                            return;
+                        }
+                        self.emit_a(bytecode::OP_LOAD, slot, at);
+                        self.emit_ak(bytecode::OP_GET_PAYLOAD, idx,
+                                     kind_of_type(self.pat_type_of(fields.at(k).pat)), at);
+                        self.bind_irrefutable(fields.at(k).pat, at);
+                        if self.failed() {
+                            return;
+                        }
+                        k = k + 1;
+                    }
+                }
+            }
+            return;
+        }
+        if r.kind == resolve::K_STRUCT {
+            match r.struct_decl {
+                Option::None => {}
+                Option::Some(sd) => {
+                    let mut k = 0;
+                    while k < fields.len() {
+                        let idx = field_index_of_struct(sd, fields.at(k).name.name);
+                        if idx < 0 {
+                            self.unsupported("an unknown field in a pattern", at);
+                            return;
+                        }
+                        self.emit_a(bytecode::OP_LOAD, slot, at);
+                        self.emit_ak(bytecode::OP_GET_FIELD, idx,
+                                     kind_of_type(self.pat_type_of(fields.at(k).pat)), at);
+                        self.bind_irrefutable(fields.at(k).pat, at);
+                        if self.failed() {
+                            return;
+                        }
+                        k = k + 1;
+                    }
+                    return;
+                }
+            }
+        }
+        self.unsupported("this pattern in a binding position", at);
+    }
+}
+
+fn field_index_of_variant(v: ast::Variant, name: String) -> i64 {
+    let mut i = 0;
+    while i < v.fields.len() {
+        if v.fields.at(i).name.name == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+fn field_index_of_struct(s: ast::StructDecl, name: String) -> i64 {
+    let mut i = 0;
+    while i < s.fields.len() {
+        if s.fields.at(i).name.name == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+// --- Expressions ---------------------------------------------------------------------------
+
+impl Compiler {
+    fn expr(self, e: ast::Expr) {
+        if self.failed() {
+            return;
+        }
+        match e.node {
+            ast::ExprKind::Int(v, _, _) => {
+                self.emit_a(bytecode::OP_CONST, self.int_const(v as i64), e.span);
+            }
+            ast::ExprKind::Float(v, _) => {
+                let bits = self.constant(bytecode::CONST_FLOAT, float_bits(v), "");
+                self.emit_a(bytecode::OP_CONST, bits, e.span);
+            }
+            ast::ExprKind::Str(v) => {
+                self.emit_a(bytecode::OP_CONST, self.str_const(v), e.span);
+            }
+            ast::ExprKind::Char(v) => {
+                let k = self.constant(bytecode::CONST_CHAR, v as u64, "");
+                self.emit_a(bytecode::OP_CONST, k, e.span);
+            }
+            ast::ExprKind::Bool(v) => {
+                if v {
+                    self.emit(bytecode::OP_TRUE, e.span);
+                } else {
+                    self.emit(bytecode::OP_FALSE, e.span);
+                }
+            }
+            ast::ExprKind::SelfExpr => { self.emit_a(bytecode::OP_LOAD, 0, e.span); }
+            ast::ExprKind::Path(path, _) => self.path_expr(e, path),
+            ast::ExprKind::StructLit(path, _, fields) => self.struct_lit(e, path, fields),
+            ast::ExprKind::Tuple(elems) => {
+                if elems.is_empty() {
+                    self.emit(bytecode::OP_UNIT, e.span);
+                    return;
+                }
+                let mut i = 0;
+                while i < elems.len() {
+                    self.expr(elems.at(i));
+                    if self.failed() {
+                        return;
+                    }
+                    i = i + 1;
+                }
+                let tt = self.tuple_inst(self.type_of(e), e.span);
+                if self.failed() {
+                    return;
+                }
+                self.emit_ab(bytecode::OP_TUPLE, tt, elems.len(), e.span);
+            }
+            ast::ExprKind::Lambda(params, _, body) => self.lambda(e, params, body),
+            ast::ExprKind::Block(b) => self.block_expr(e),
+            ast::ExprKind::If(cond, then, els) => self.if_expr(e, cond, then, els),
+            ast::ExprKind::Match(scrut, arms) => self.match_expr(e, scrut, arms),
+            ast::ExprKind::While(cond, body) => self.while_expr(e, cond, body),
+            ast::ExprKind::Loop(body) => self.loop_expr(e, body),
+            ast::ExprKind::For(p, iter, body) => self.for_expr(e, p, iter, body),
+            ast::ExprKind::Break(v) => self.break_expr(e, v),
+            ast::ExprKind::Continue => {
+                if self.loops.is_empty() {
+                    self.unsupported("`continue` outside a loop", e.span);
+                    return;
+                }
+                let top = self.loops.at(self.loops.len() - 1);
+                top.continues.push(self.emit_a(bytecode::OP_JUMP, 0, e.span));
+                self.emit(bytecode::OP_UNIT, e.span);
+            }
+            ast::ExprKind::Return(v) => {
+                match v {
+                    Option::None => { self.emit(bytecode::OP_UNIT, e.span); }
+                    Option::Some(x) => self.expr(x),
+                }
+                if self.failed() {
+                    return;
+                }
+                self.emit(bytecode::OP_RETURN, e.span);
+                self.emit(bytecode::OP_UNIT, e.span);  // keep the stack shape consistent
+            }
+            ast::ExprKind::Unary(op, x) => self.unary(e, op, x),
+            ast::ExprKind::Binary(op, l, r) => self.binary(e, op, l, r),
+            ast::ExprKind::Assign(op, place, value) => self.assign(e, op, place, value),
+            ast::ExprKind::Cast(x, _) => self.cast(e, x),
+            ast::ExprKind::Call(f, args) => self.call(e, f, args),
+            ast::ExprKind::Method(name, recv, args) => self.method_call(e, name, recv, args),
+            ast::ExprKind::Field(name, recv) => self.field_access(e, name, recv),
+            ast::ExprKind::Try(x) => self.try_expr(e, x),
+            ast::ExprKind::ErrorExpr => {
+                self.unsupported("an expression the checker rejected", e.span);
+            }
+        }
+    }
+
+    fn path_expr(self, e: ast::Expr, path: ast::PathRef) {
+        let r = self.ref_of(path.res);
+        if r.kind == resolve::K_UNRESOLVED {
+            self.unsupported("an unresolved name", e.span);
+            return;
+        }
+        if r.kind == resolve::K_LOCAL {
+            match r.local {
+                Option::None => self.unsupported("a binding with no slot", e.span),
+                Option::Some(l) => {
+                    let cap = self.capture_of(l);
+                    if cap >= 0 {
+                        self.emit_a(bytecode::OP_LOAD_CAPTURE, cap, e.span);
+                    } else {
+                        self.emit_a(bytecode::OP_LOAD, self.slot_of(l), e.span);
+                    }
+                }
+            }
+            return;
+        }
+        if r.kind == resolve::K_FN {
+            let mut target = self.call_target(e);
+            if target < 0 {
+                match r.fn_decl {
+                    Option::Some(fd) => {
+                        target = self.root_index.get(fd.info).unwrap_or(0 - 1);
+                    }
+                    Option::None => {}
+                }
+            }
+            if target < 0 {
+                self.unsupported("a call to a function with no body", e.span);
+                return;
+            }
+            self.emit_a(bytecode::OP_FUNC, self.inst_index.at(target), e.span);
+            return;
+        }
+        if r.kind == resolve::K_CONST {
+            match r.const_decl {
+                Option::Some(cd) => self.expr(cd.value),
+                Option::None => self.unsupported("a constant with no value", e.span),
+            }
+            return;
+        }
+        if r.kind == resolve::K_PRIMCONST {
+            let v = prim_const_value(r.name, r.member);
+            if v.ok {
+                self.emit_a(bytecode::OP_CONST, self.int_const(v.value), e.span);
+            } else {
+                self.unsupported(v.message, e.span);
+            }
+            return;
+        }
+        if r.kind == resolve::K_VARIANT {
+            match r.variant {
+                Option::None => self.unsupported("this name as a value", e.span),
+                Option::Some(variant) => {
+                    if !is_unit_variant(variant) {
+                        self.unsupported("a variant constructor used as a value", e.span);
+                        return;
+                    }
+                    let vi = self.variant_inst(variant, self.type_of(e));
+                    if self.failed() {
+                        return;
+                    }
+                    self.emit_ab(bytecode::OP_VARIANT, vi, 0, e.span);
+                }
+            }
+            return;
+        }
+        if r.kind == resolve::K_BUILTIN {
+            self.unsupported("a builtin used as a value", e.span);
+            return;
+        }
+        self.unsupported("this name as a value", e.span);
+    }
+
+    fn struct_lit(self, e: ast::Expr, path: ast::PathRef, fields: List[ast::FieldInit]) {
+        let r = self.ref_of(path.res);
+        if r.kind == resolve::K_STRUCT {
+            match r.struct_decl {
+                Option::None => { self.unsupported("this struct literal", e.span); }
+                Option::Some(sd) => {
+                    let idx = self.struct_inst(self.type_of(e), e.span);
+                    if self.failed() {
+                        return;
+                    }
+                    self.place_initializers(fields, sd.fields.len(),
+                                            |n| field_index_of_struct(sd, n), e.span);
+                    if self.failed() {
+                        return;
+                    }
+                    self.emit_ab(bytecode::OP_STRUCT, idx, sd.fields.len(), e.span);
+                }
+            }
+            return;
+        }
+        if r.kind == resolve::K_VARIANT {
+            match r.variant {
+                Option::None => { self.unsupported("this struct literal", e.span); }
+                Option::Some(variant) => {
+                    let vi = self.variant_inst(variant, self.type_of(e));
+                    if self.failed() {
+                        return;
+                    }
+                    self.place_initializers(fields, variant.fields.len(),
+                                            |n| field_index_of_variant(variant, n), e.span);
+                    if self.failed() {
+                        return;
+                    }
+                    self.emit_ab(bytecode::OP_VARIANT, vi, variant.fields.len(), e.span);
+                }
+            }
+            return;
+        }
+        self.unsupported("this struct literal", e.span);
+    }
+
+    /// Field initializers run in source order (spec/04-expressions.md), then the values are
+    /// placed in declaration order, so the two are reconciled through temporaries rather
+    /// than by reordering the evaluation.
+    fn place_initializers(self, fields: List[ast::FieldInit], count: i64,
+                          index_of: fn(String) -> i64, at: ast::Span) {
+        let slots = list::new[i64]();
+        let mut i = 0;
+        while i < count {
+            slots.push(0 - 1);
+            i = i + 1;
+        }
+        let mut k = 0;
+        while k < fields.len() {
+            let init = fields.at(k);
+            self.expr(init.value);
+            if self.failed() {
+                return;
+            }
+            let t = self.temp();
+            self.emit_a(bytecode::OP_STORE, t, init.value.span);
+            let fi = index_of(init.name.name);
+            if fi >= 0 {
+                slots.set(fi, t);
+            }
+            k = k + 1;
+        }
+        let mut s = 0;
+        while s < slots.len() {
+            if slots.at(s) < 0 {
+                self.unsupported("a literal missing a field", at);
+                return;
+            }
+            self.emit_a(bytecode::OP_LOAD, slots.at(s), at);
+            s = s + 1;
+        }
+    }
+
+    fn lambda(self, e: ast::Expr, params: List[ast::LambdaParam], body: ast::Expr) {
+        // The captured values are pushed in the order the resolver recorded, and the
+        // closure object takes them off the stack.
+        let caps = self.captures_of(e);
+        let mut i = 0;
+        while i < caps.len() {
+            let cap = self.capture_of(caps.at(i));
+            if cap >= 0 {
+                self.emit_a(bytecode::OP_LOAD_CAPTURE, cap, e.span);
+            } else {
+                self.emit_a(bytecode::OP_LOAD, self.slot_of(caps.at(i)), e.span);
+            }
+            i = i + 1;
+        }
+
+        // The captures' types are read in the enclosing instance's context, before it is
+        // swapped out for the lambda body's own -- the same reason the parameter and
+        // capture kinds (ADR-0021) are built here rather than after the swap.
+        let ct = self.closure_inst(caps, e.span);
+        if self.failed() {
+            return;
+        }
+        let cap_kinds = list::new[i64]();
+        let mut k = 0;
+        while k < caps.len() {
+            cap_kinds.push(kind_of_type(self.concrete_type(self.local_type(caps.at(k)))));
+            k = k + 1;
+        }
+        let param_kinds = list::new[i64]();
+        let mut p = 0;
+        while p < params.len() {
+            param_kinds.push(kind_of_type(self.pat_type_of(params.at(p).pat)));
+            p = p + 1;
+        }
+
+        // The lambda's body becomes an ordinary function whose captures are addressed
+        // separately from its locals.
+        let idx = self.prog.fns.len();
+        let lfn = bytecode::new_fn("<lambda>");
+        lfn.params = params.len();
+        lfn.captures = caps.len();
+        lfn.span = e.span;
+        lfn.file = self.file;
+        lfn.param_kinds = param_kinds;
+        lfn.capture_kinds = cap_kinds;
+        self.prog.fns.push(lfn);
+
+        let saved_fn = self.f;
+        let saved_slot_keys = self.slot_keys;
+        let saved_slot_values = self.slot_values;
+        let saved_next = self.next_slot;
+        let saved_cap_keys = self.capture_keys;
+        let saved_cap_values = self.capture_values;
+        let saved_loops = self.loops;
+
+        self.f = lfn;
+        self.slot_keys = list::new[resolve::Local]();
+        self.slot_values = list::new[i64]();
+        self.capture_keys = list::new[resolve::Local]();
+        self.capture_values = list::new[i64]();
+        self.next_slot = 0;
+        self.loops = list::new[LoopCtx]();
+        let mut ci = 0;
+        while ci < caps.len() {
+            self.capture_keys.push(caps.at(ci));
+            self.capture_values.push(ci);
+            ci = ci + 1;
+        }
+        let mut bp = 0;
+        while bp < params.len() {
+            self.bind_param(params.at(bp).pat);
+            bp = bp + 1;
+        }
+        self.expr(body);
+        if !self.failed() {
+            self.emit(bytecode::OP_RETURN, e.span);
+        }
+
+        self.f = saved_fn;
+        self.slot_keys = saved_slot_keys;
+        self.slot_values = saved_slot_values;
+        self.next_slot = saved_next;
+        self.capture_keys = saved_cap_keys;
+        self.capture_values = saved_cap_values;
+        self.loops = saved_loops;
+        if self.failed() {
+            return;
+        }
+
+        let site = self.prog.closures.len();
+        self.prog.closures.push(bytecode::ClosureInfo { fn_index: idx, ty: ct });
+        self.emit_ab(bytecode::OP_CLOSURE, site, caps.len(), e.span);
+    }
+
+    fn if_expr(self, e: ast::Expr, cond: ast::Expr, then: ast::Expr, els: Option[ast::Expr]) {
+        self.expr(cond);
+        if self.failed() {
+            return;
+        }
+        let to_else = self.emit_a(bytecode::OP_JUMP_IF_FALSE, 0, cond.span);
+        self.block_expr(then);
+        if self.failed() {
+            return;
+        }
+        let to_end = self.emit_a(bytecode::OP_JUMP, 0, e.span);
+        self.patch(to_else);
+        match els {
+            Option::Some(x) => self.expr(x),
+            Option::None => { self.emit(bytecode::OP_UNIT, e.span); }
+        }
+        if self.failed() {
+            return;
+        }
+        self.patch(to_end);
+    }
+
+    fn while_expr(self, e: ast::Expr, cond: ast::Expr, body: ast::Expr) {
+        let top = self.here();
+        self.loops.push(new_loop(false));
+        self.expr(cond);
+        if self.failed() {
+            return;
+        }
+        let exit = self.emit_a(bytecode::OP_JUMP_IF_FALSE, 0, cond.span);
+        self.block_expr(body);
+        if self.failed() {
+            return;
+        }
+        self.emit(bytecode::OP_POP, e.span);  // a `while` body's value is discarded
+        let cont_target = self.here();
+        self.emit_a(bytecode::OP_JUMP, top, e.span);
+        self.patch(exit);
+        self.close_loop(cont_target);
+        self.emit(bytecode::OP_UNIT, e.span);
+    }
+
+    fn loop_expr(self, e: ast::Expr, body: ast::Expr) {
+        let top = self.here();
+        self.loops.push(new_loop(true));
+        self.block_expr(body);
+        if self.failed() {
+            return;
+        }
+        self.emit(bytecode::OP_POP, e.span);
+        self.emit_a(bytecode::OP_JUMP, top, e.span);
+        self.close_loop(top);
+        // A `loop` leaves its break value on the stack; a loop with no break never gets
+        // here, and the checker gives it type `()`.
+    }
+
+    /// Pops the innermost loop and points its unfinished jumps at where they belong: a
+    /// `break` at the code after the loop, a `continue` at `cont_target`.
+    fn close_loop(self, cont_target: i64) {
+        let ctx = self.loops.at(self.loops.len() - 1);
+        self.loops.pop();
+        let mut i = 0;
+        while i < ctx.breaks.len() {
+            self.patch(ctx.breaks.at(i));
+            i = i + 1;
+        }
+        let mut k = 0;
+        while k < ctx.continues.len() {
+            let at = ctx.continues.at(k);
+            let old = self.f.code.at(at);
+            self.f.code.set(at, bytecode::Instr {
+                op: old.op, a: cont_target, b: old.b, kind: old.kind, span: old.span,
+                file: old.file,
+            });
+            k = k + 1;
+        }
+    }
+
+    fn break_expr(self, e: ast::Expr, value: Option[ast::Expr]) {
+        if self.loops.is_empty() {
+            self.unsupported("`break` outside a loop", e.span);
+            return;
+        }
+        let top = self.loops.at(self.loops.len() - 1);
+        if top.is_value_loop {
+            match value {
+                Option::None => { self.emit(bytecode::OP_UNIT, e.span); }
+                Option::Some(x) => self.expr(x),
+            }
+            if self.failed() {
+                return;
+            }
+        }
+        top.breaks.push(self.emit_a(bytecode::OP_JUMP, 0, e.span));
+        if !top.is_value_loop {
+            self.emit(bytecode::OP_UNIT, e.span);
+        }
+    }
+
+    fn field_access(self, e: ast::Expr, name: String, recv: ast::Expr) {
+        self.expr(recv);
+        if self.failed() {
+            return;
+        }
+        match types::as_named(self.type_of(recv)) {
+            Option::None => self.unsupported("a field read on a non-struct", e.span),
+            Option::Some(def) => {
+                match def.struct_decl {
+                    Option::None => self.unsupported("a field read on a non-struct", e.span),
+                    Option::Some(sd) => {
+                        let idx = field_index_of_struct(sd, name);
+                        if idx < 0 {
+                            self.unsupported("an unknown field", e.span);
+                            return;
+                        }
+                        self.emit_ak(bytecode::OP_GET_FIELD, idx, self.kind_of(e), e.span);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn new_loop(is_value_loop: bool) -> LoopCtx {
+    LoopCtx {
+        breaks: list::new[i64](), continues: list::new[i64](),
+        is_value_loop: is_value_loop,
+    }
+}
+
+fn no_variant() -> Option[ast::Variant] { Option::None }
+
+/// The sub-patterns a tuple-variant pattern holds, or none.
+fn path_pat_elems(p: ast::Pat) -> List[ast::Pat] {
+    match p.node {
+        ast::PatKind::PathTuple(_, elems) => elems,
+        _ => list::new[ast::Pat](),
+    }
+}
+
+/// The named sub-patterns a struct pattern holds, or none.
+fn path_pat_fields(p: ast::Pat) -> List[ast::FieldPat] {
+    match p.node {
+        ast::PatKind::PathStruct(_, _, fields) => fields,
+        _ => list::new[ast::FieldPat](),
+    }
+}
+
+fn is_unit_variant(v: ast::Variant) -> bool { v.kind == ast::VARIANT_UNIT }
+
+/// A float's IEEE bits, which is what the constant pool holds. `float::bits` is the one
+/// operation in the language that says a `f64` and a `u64` are the same sixty-four bits
+/// (spec/16-floats.md).
+fn float_bits(v: f64) -> u64 { float::bits(v) }
+
+/// The answer `i64::MAX` and its siblings evaluate to at compile time, or why there is
+/// none.
+struct PrimConst {
+    ok: bool,
+    value: i64,
+    message: String,
+}
+
+/// Evaluates `i64::MAX` and friends.
+///
+/// A constant slot holds sixty-four bits; `u64::MAX` is the pattern with every bit set,
+/// which read as an `i64` is -1 and read as the `u64` the static type names is the number
+/// the specification says.
+fn prim_const_value(prim: String, member: String) -> PrimConst {
+    let k = bytecode::int_kind_named(prim);
+    if k == bytecode::KIND_UNKNOWN {
+        return PrimConst {
+            ok: false, value: 0, message: "`\(prim)` has no associated constants",
+        };
+    }
+    if member == "BITS" {
+        return PrimConst { ok: true, value: bytecode::kind_bits(k), message: "" };
+    }
+    if member == "MIN" {
+        return PrimConst { ok: true, value: int_min(k) as i64, message: "" };
+    }
+    if member == "MAX" {
+        return PrimConst { ok: true, value: int_max(k) as i64, message: "" };
+    }
+    PrimConst {
+        ok: false, value: 0,
+        message: "`\(prim)` has no associated constant `\(member)`",
+    }
+}
+
+/// The largest value of an integer kind, as its own bit pattern.
+fn int_max(k: i64) -> u64 {
+    let w = bytecode::kind_bits(k);
+    if bytecode::kind_is_signed(k) {
+        return (1u64 << ((w - 1) as u64)) - 1u64;
+    }
+    if w == 64 {
+        return u64::MAX;
+    }
+    (1u64 << (w as u64)) - 1u64
+}
+
+/// The smallest value of an integer kind, as its own bit pattern: sign-extended for a
+/// signed kind, and zero for every unsigned one.
+fn int_min(k: i64) -> u64 {
+    if !bytecode::kind_is_signed(k) {
+        return 0u64;
+    }
+    wrap_to(k, 1u64 << ((bytecode::kind_bits(k) - 1) as u64))
+}
+
+/// Reduces a bit pattern to what an integer kind can hold, sign-extending a signed one so
+/// that the whole word reads as the value the narrow type names.
+fn wrap_to(k: i64, v: u64) -> u64 {
+    let w = bytecode::kind_bits(k);
+    if w == 64 {
+        return v;
+    }
+    let mask = (1u64 << (w as u64)) - 1u64;
+    let truncated = v & mask;
+    if bytecode::kind_is_signed(k) && (truncated >> ((w - 1) as u64)) & 1u64 == 1u64 {
+        // The high bits as the complement of the mask rather than as a shift: `<<` traps
+        // when it loses bits (ADR-0005), and shifting ones off the top is exactly what
+        // this would do.
+        return truncated | (mask ^ u64::MAX);
+    }
+    truncated
+}
+
+// --- Operators ------------------------------------------------------------------------------
+//
+// An operator is its own spelling in this tree rather than an enumerated kind, so the
+// tables `internal/compile` keeps as maps are these three functions. Integer arithmetic
+// traps on overflow (ADR-0005); float arithmetic never does.
+
+/// The opcode an operator lowers to on integers, or -1.
+fn int_op(op: String) -> i64 {
+    if op == "+" { return bytecode::OP_ADD; }
+    if op == "-" { return bytecode::OP_SUB; }
+    if op == "*" { return bytecode::OP_MUL; }
+    if op == "/" { return bytecode::OP_DIV; }
+    if op == "%" { return bytecode::OP_REM; }
+    if op == "&" { return bytecode::OP_AND; }
+    if op == "|" { return bytecode::OP_OR; }
+    if op == "^" { return bytecode::OP_XOR; }
+    if op == "<<" { return bytecode::OP_SHL; }
+    if op == ">>" { return bytecode::OP_SHR; }
+    0 - 1
+}
+
+/// The opcode an operator lowers to on floats, or -1.
+fn float_op(op: String) -> i64 {
+    if op == "+" { return bytecode::OP_ADDF; }
+    if op == "-" { return bytecode::OP_SUBF; }
+    if op == "*" { return bytecode::OP_MULF; }
+    if op == "/" { return bytecode::OP_DIVF; }
+    if op == "%" { return bytecode::OP_REMF; }
+    0 - 1
+}
+
+/// The opcode a comparison lowers to, or -1.
+fn cmp_op(op: String) -> i64 {
+    if op == "==" { return bytecode::OP_EQ; }
+    if op == "!=" { return bytecode::OP_NE; }
+    if op == "<" { return bytecode::OP_LT; }
+    if op == "<=" { return bytecode::OP_LE; }
+    if op == ">" { return bytecode::OP_GT; }
+    if op == ">=" { return bytecode::OP_GE; }
+    0 - 1
+}
+
+/// The arithmetic operator a compound assignment applies, or "" for a plain `=`.
+fn compound_operator(op: String) -> String {
+    if op == "=" {
+        return "";
+    }
+    op.slice(0, op.len() - 1)
+}
+
+impl Compiler {
+    fn unary(self, e: ast::Expr, op: String, x: ast::Expr) {
+        self.expr(x);
+        if self.failed() {
+            return;
+        }
+        if op == "!" {
+            self.emit(bytecode::OP_NOT, e.span);
+            return;
+        }
+        if self.is_float(x) {
+            self.emit(bytecode::OP_NEGF, e.span);
+            return;
+        }
+        // Negation traps at the operand's own width: `-(-128i8)` has no `i8` value.
+        self.emit_a(bytecode::OP_NEG, self.kind_of(x), e.span);
+    }
+
+    fn binary(self, e: ast::Expr, op: String, l: ast::Expr, r: ast::Expr) {
+        // `&&` and `||` short-circuit, so the right operand is compiled behind a jump
+        // (spec/04-expressions.md).
+        if op == "&&" || op == "||" {
+            self.expr(l);
+            if self.failed() {
+                return;
+            }
+            let mut jump = 0;
+            if op == "&&" {
+                jump = self.emit_a(bytecode::OP_JUMP_IF_FALSE, 0, e.span);
+            } else {
+                jump = self.emit_a(bytecode::OP_JUMP_IF_TRUE, 0, e.span);
+            }
+            self.expr(r);
+            if self.failed() {
+                return;
+            }
+            let to_end = self.emit_a(bytecode::OP_JUMP, 0, e.span);
+            self.patch(jump);
+            if op == "&&" {
+                self.emit(bytecode::OP_FALSE, e.span);
+            } else {
+                self.emit(bytecode::OP_TRUE, e.span);
+            }
+            self.patch(to_end);
+            return;
+        }
+
+        self.expr(l);
+        if self.failed() {
+            return;
+        }
+        self.expr(r);
+        if self.failed() {
+            return;
+        }
+        let cmp = cmp_op(op);
+        if cmp >= 0 {
+            // The operand kind travels with the instruction: `==` and `<` mean different
+            // machine code for an integer, a float and a String, and native code has no
+            // runtime tag to ask.
+            self.emit_a(cmp, self.kind_of(l), e.span);
+            return;
+        }
+        if self.is_float(l) {
+            let f = float_op(op);
+            if f >= 0 {
+                self.emit(f, e.span);
+                return;
+            }
+        }
+        let i = int_op(op);
+        if i >= 0 {
+            // The operand kind travels with the instruction, exactly as it does for a
+            // comparison, and for a stronger reason: `255u8 + 1` traps and `255u32 + 1` is
+            // 256, and nothing in a sixty-four-bit register tells the two apart. Division
+            // and the shifts need the signedness for the same reason.
+            self.emit_a(i, self.kind_of(l), e.span);
+            return;
+        }
+        self.unsupported("this operator", e.span);
+    }
+
+    /// The opcode a compound assignment's arithmetic lowers to, emitted with no operand
+    /// kind: the value has already been narrowed by the load it came from.
+    fn emit_arith(self, op: String, is_float: bool, at: ast::Span) {
+        if is_float {
+            let f = float_op(op);
+            if f >= 0 {
+                self.emit(f, at);
+                return;
+            }
+        }
+        let i = int_op(op);
+        if i >= 0 {
+            self.emit(i, at);
+        }
+    }
+
+    fn assign(self, e: ast::Expr, op: String, place: ast::Expr, value: ast::Expr) {
+        let compound = compound_operator(op);
+        match place.node {
+            ast::ExprKind::Path(path, _) => {
+                let r = self.ref_of(path.res);
+                match r.local {
+                    Option::None => {
+                        self.unsupported("an assignment to something that is not a local", e.span);
+                    }
+                    Option::Some(l) => {
+                        if compound != "" {
+                            let cap = self.capture_of(l);
+                            if cap >= 0 {
+                                self.emit_a(bytecode::OP_LOAD_CAPTURE, cap, place.span);
+                            } else {
+                                self.emit_a(bytecode::OP_LOAD, self.slot_of(l), place.span);
+                            }
+                            self.expr(value);
+                            if self.failed() {
+                                return;
+                            }
+                            self.emit_arith(compound, self.is_float(place), e.span);
+                        } else {
+                            self.expr(value);
+                            if self.failed() {
+                                return;
+                            }
+                        }
+                        if self.capture_of(l) >= 0 {
+                            // The resolver rejects this now (E0595), so reaching it means
+                            // the check was removed or bypassed rather than that the
+                            // feature is missing.
+                            self.unsupported(
+                                "this is a compiler bug: an assignment to a captured binding reached the compiler",
+                                e.span);
+                            return;
+                        }
+                        self.emit_a(bytecode::OP_STORE, self.slot_of(l), e.span);
+                        self.emit(bytecode::OP_UNIT, e.span);
+                    }
+                }
+            }
+            ast::ExprKind::Field(name, recv) => {
+                match types::as_named(self.type_of(recv)) {
+                    Option::None => {
+                        self.unsupported("a field assignment on a non-struct", e.span);
+                    }
+                    Option::Some(def) => {
+                        match def.struct_decl {
+                            Option::None => {
+                                self.unsupported("a field assignment on a non-struct", e.span);
+                            }
+                            Option::Some(sd) => {
+                                let idx = field_index_of_struct(sd, name);
+                                if idx < 0 {
+                                    self.unsupported("an unknown field", e.span);
+                                    return;
+                                }
+                                // The receiver is evaluated before the value
+                                // (spec/04-expressions.md).
+                                self.expr(recv);
+                                if self.failed() {
+                                    return;
+                                }
+                                let recv_slot = self.temp();
+                                self.emit_a(bytecode::OP_STORE, recv_slot, e.span);
+
+                                if compound != "" {
+                                    self.emit_a(bytecode::OP_LOAD, recv_slot, e.span);
+                                    self.emit_ak(bytecode::OP_GET_FIELD, idx,
+                                                 self.kind_of(place), e.span);
+                                    self.expr(value);
+                                    if self.failed() {
+                                        return;
+                                    }
+                                    self.emit_arith(compound, self.is_float(place), e.span);
+                                } else {
+                                    self.expr(value);
+                                    if self.failed() {
+                                        return;
+                                    }
+                                }
+                                let val = self.temp();
+                                self.emit_a(bytecode::OP_STORE, val, e.span);
+                                self.emit_a(bytecode::OP_LOAD, recv_slot, e.span);
+                                self.emit_a(bytecode::OP_LOAD, val, e.span);
+                                self.emit_a(bytecode::OP_SET_FIELD, idx, e.span);
+                                self.emit(bytecode::OP_UNIT, e.span);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => self.unsupported("this assignment target", e.span),
+        }
+    }
+
+    fn cast(self, e: ast::Expr, x: ast::Expr) {
+        self.expr(x);
+        if self.failed() {
+            return;
+        }
+        let from = types::as_prim(self.type_of(x));
+        let to = types::as_prim(self.type_of(e));
+        if from < 0 || to < 0 {
+            self.unsupported("this cast", e.span);
+            return;
+        }
+        if types::is_integer(from) && types::is_integer(to) {
+            self.emit_ab(bytecode::OP_CAST, bytecode::CAST_INT_TRUNC, cast_width(to), e.span);
+            return;
+        }
+        if types::is_integer(from) && types::is_float(to) {
+            self.emit_ab(bytecode::OP_CAST, bytecode::CAST_INT_TO_FLOAT, cast_width(to), e.span);
+            return;
+        }
+        if types::is_float(from) && types::is_integer(to) {
+            self.emit_ab(bytecode::OP_CAST, bytecode::CAST_FLOAT_TO_INT, cast_width(to), e.span);
+            return;
+        }
+        if types::is_float(from) && to == types::P_F32 {
+            self.emit_ab(bytecode::OP_CAST, bytecode::CAST_FLOAT_NARROW, 32, e.span);
+            return;
+        }
+        if types::is_float(from) && to == types::P_F64 {
+            self.emit_ab(bytecode::OP_CAST, bytecode::CAST_FLOAT_WIDEN, 64, e.span);
+            return;
+        }
+        if from == types::P_BOOL && types::is_integer(to) {
+            self.emit_ab(bytecode::OP_CAST, bytecode::CAST_BOOL_TO_INT, cast_width(to), e.span);
+            return;
+        }
+        if from == types::P_CHAR && types::is_integer(to) {
+            self.emit_ab(bytecode::OP_CAST, bytecode::CAST_CHAR_TO_INT, cast_width(to), e.span);
+            return;
+        }
+        self.unsupported("this cast", e.span);
+    }
+}
+
+/// Packs the target's width and signedness into one operand: the width in bits, with bit 8
+/// set for a signed type.
+fn cast_width(k: i64) -> i64 {
+    if types::is_float(k) {
+        if k == types::P_F32 {
+            return 32;
+        }
+        return 64;
+    }
+    let mut w = types::prim_bits(k);
+    if types::is_signed(k) {
+        w = w | 256;
+    }
+    w
+}
+
+// --- `match` --------------------------------------------------------------------------------
+//
+// A linear chain of arm tests. A decision tree would test no subexpression twice
+// (spec/05-patterns.md), and the SSA IR is where that lowering belongs -- it needs the
+// control-flow graph the optimizer works on. What matters here is that the observable
+// behaviour is the specified one: arms are tried top to bottom, a guard runs only after its
+// pattern has fully matched, and testing a pattern never traps.
+
+impl Compiler {
+    fn match_expr(self, e: ast::Expr, scrut: ast::Expr, arms: List[ast::Arm]) {
+        self.expr(scrut);
+        if self.failed() {
+            return;
+        }
+        let slot = self.temp();
+        self.emit_a(bytecode::OP_STORE, slot, e.span);
+
+        let to_end = list::new[i64]();
+        let mut i = 0;
+        while i < arms.len() {
+            let arm = arms.at(i);
+            let fails = list::new[i64]();
+            self.test_pattern(arm.pat, slot, fails);
+            if self.failed() {
+                return;
+            }
+            match arm.guard {
+                Option::Some(g) => {
+                    self.expr(g);
+                    if self.failed() {
+                        return;
+                    }
+                    fails.push(self.emit_a(bytecode::OP_JUMP_IF_FALSE, 0, g.span));
+                }
+                Option::None => {}
+            }
+            self.expr(arm.body);
+            if self.failed() {
+                return;
+            }
+            to_end.push(self.emit_a(bytecode::OP_JUMP, 0, arm.body.span));
+            let mut f = 0;
+            while f < fails.len() {
+                self.patch(fails.at(f));
+                f = f + 1;
+            }
+            i = i + 1;
+        }
+
+        // Unreachable: the exhaustiveness checker rejects a match that can fall through
+        // (spec/05-patterns.md), so this trap exists to make the failure loud rather than
+        // to be taken.
+        self.emit_a(bytecode::OP_TRAP, self.str_const("no match arm matched"), e.span);
+        let mut j = 0;
+        while j < to_end.len() {
+            self.patch(to_end.at(j));
+            j = j + 1;
+        }
+    }
+
+    /// The static kind of the value an arm test compares against, which the comparison has
+    /// to carry for the reason a source-level `==` does: a register holds sixty-four bits
+    /// and nothing in it says whether they are a signed integer, an unsigned one, a float
+    /// or a pointer to a String (ADR-0021).
+    ///
+    /// A `match` arm's test is a comparison the programmer never wrote, so there is no
+    /// expression to read a type from -- it is the *pattern's* type.
+    fn scrutinee_kind(self, p: ast::Pat) -> i64 {
+        kind_of_type(self.pat_type_of(p))
+    }
+
+    /// Emits code that tests the value in `slot` against a pattern, binding as it goes.
+    /// Every way the test can fail is appended to `fails` as a jump to patch.
+    fn test_pattern(self, p: ast::Pat, slot: i64, fails: List[i64]) {
+        if self.failed() {
+            return;
+        }
+        match p.node {
+            ast::PatKind::Wild => {}
+            ast::PatKind::ErrorPat => {}
+            ast::PatKind::Bind(_, name, sub) => {
+                let r = self.ref_of(name.res);
+                if r.kind == resolve::K_VARIANT {
+                    match r.variant {
+                        Option::None => self.unsupported("this pattern", p.span),
+                        Option::Some(variant) => {
+                            let vi = self.variant_inst(variant, self.pat_type_of(p));
+                            if self.failed() {
+                                return;
+                            }
+                            self.emit_a(bytecode::OP_LOAD, slot, p.span);
+                            self.emit_a(bytecode::OP_IS_VARIANT, vi, p.span);
+                            fails.push(self.emit_a(bytecode::OP_JUMP_IF_FALSE, 0, p.span));
+                        }
+                    }
+                    return;
+                }
+                if r.kind == resolve::K_CONST {
+                    match r.const_decl {
+                        Option::None => self.unsupported("this pattern", p.span),
+                        Option::Some(cd) => {
+                            self.emit_a(bytecode::OP_LOAD, slot, p.span);
+                            self.expr(cd.value);
+                            if self.failed() {
+                                return;
+                            }
+                            self.emit_a(bytecode::OP_EQ, self.scrutinee_kind(p), p.span);
+                            fails.push(self.emit_a(bytecode::OP_JUMP_IF_FALSE, 0, p.span));
+                        }
+                    }
+                    return;
+                }
+                match r.local {
+                    Option::Some(l) => {
+                        self.emit_a(bytecode::OP_LOAD, slot, p.span);
+                        self.emit_a(bytecode::OP_STORE, self.slot_of(l), p.span);
+                    }
+                    Option::None => {}
+                }
+                match sub {
+                    Option::Some(s) => self.test_pattern(s, slot, fails),
+                    Option::None => {}
+                }
+            }
+            ast::PatKind::Lit(neg, lit) => {
+                self.emit_a(bytecode::OP_LOAD, slot, p.span);
+                self.literal(p, neg, lit);
+                if self.failed() {
+                    return;
+                }
+                self.emit_a(bytecode::OP_EQ, self.scrutinee_kind(p), p.span);
+                fails.push(self.emit_a(bytecode::OP_JUMP_IF_FALSE, 0, p.span));
+            }
+            ast::PatKind::Tup(elems) => {
+                let mut i = 0;
+                while i < elems.len() {
+                    let sub = self.temp();
+                    self.emit_a(bytecode::OP_LOAD, slot, p.span);
+                    self.emit_ak(bytecode::OP_GET_TUPLE_ELEM, i,
+                                 kind_of_type(self.pat_type_of(elems.at(i))), p.span);
+                    self.emit_a(bytecode::OP_STORE, sub, p.span);
+                    self.test_pattern(elems.at(i), sub, fails);
+                    if self.failed() {
+                        return;
+                    }
+                    i = i + 1;
+                }
+            }
+            ast::PatKind::PathUnit(path) => self.test_path_pattern(p, path, slot, fails),
+            ast::PatKind::PathTuple(path, _) => self.test_path_pattern(p, path, slot, fails),
+            ast::PatKind::PathStruct(path, _, _) => {
+                self.test_path_pattern(p, path, slot, fails);
+            }
+            ast::PatKind::Or(alts) => self.test_or_pattern(p, alts, slot, fails),
+        }
+    }
+
+    fn test_path_pattern(self, p: ast::Pat, path: ast::PathRef, slot: i64, fails: List[i64]) {
+        let elems = path_pat_elems(p);
+        let fields = path_pat_fields(p);
+        let r = self.ref_of(path.res);
+        if r.kind == resolve::K_VARIANT {
+            match r.variant {
+                Option::None => { self.unsupported("this pattern", p.span); }
+                Option::Some(variant) => {
+                    let vi = self.variant_inst(variant, self.pat_type_of(p));
+                    if self.failed() {
+                        return;
+                    }
+                    self.emit_a(bytecode::OP_LOAD, slot, p.span);
+                    self.emit_a(bytecode::OP_IS_VARIANT, vi, p.span);
+                    fails.push(self.emit_a(bytecode::OP_JUMP_IF_FALSE, 0, p.span));
+
+                    let mut i = 0;
+                    while i < elems.len() {
+                        let sub = self.temp();
+                        self.emit_a(bytecode::OP_LOAD, slot, p.span);
+                        self.emit_ak(bytecode::OP_GET_PAYLOAD, i,
+                                     kind_of_type(self.pat_type_of(elems.at(i))), p.span);
+                        self.emit_a(bytecode::OP_STORE, sub, p.span);
+                        self.test_pattern(elems.at(i), sub, fails);
+                        if self.failed() {
+                            return;
+                        }
+                        i = i + 1;
+                    }
+                    let mut k = 0;
+                    while k < fields.len() {
+                        let idx = field_index_of_variant(variant, fields.at(k).name.name);
+                        if idx < 0 {
+                            self.unsupported("an unknown field in a pattern", p.span);
+                            return;
+                        }
+                        let sub = self.temp();
+                        self.emit_a(bytecode::OP_LOAD, slot, p.span);
+                        self.emit_ak(bytecode::OP_GET_PAYLOAD, idx,
+                                     kind_of_type(self.pat_type_of(fields.at(k).pat)), p.span);
+                        self.emit_a(bytecode::OP_STORE, sub, p.span);
+                        self.test_pattern(fields.at(k).pat, sub, fails);
+                        if self.failed() {
+                            return;
+                        }
+                        k = k + 1;
+                    }
+                }
+            }
+            return;
+        }
+        if r.kind == resolve::K_STRUCT {
+            match r.struct_decl {
+                Option::None => { self.unsupported("this pattern", p.span); }
+                Option::Some(sd) => {
+                    let mut k = 0;
+                    while k < fields.len() {
+                        let idx = field_index_of_struct(sd, fields.at(k).name.name);
+                        if idx < 0 {
+                            self.unsupported("an unknown field in a pattern", p.span);
+                            return;
+                        }
+                        let sub = self.temp();
+                        self.emit_a(bytecode::OP_LOAD, slot, p.span);
+                        self.emit_ak(bytecode::OP_GET_FIELD, idx,
+                                     kind_of_type(self.pat_type_of(fields.at(k).pat)), p.span);
+                        self.emit_a(bytecode::OP_STORE, sub, p.span);
+                        self.test_pattern(fields.at(k).pat, sub, fails);
+                        if self.failed() {
+                            return;
+                        }
+                        k = k + 1;
+                    }
+                }
+            }
+            return;
+        }
+        self.unsupported("this pattern", p.span);
+    }
+
+    /// Tries each alternative in turn, jumping to the arm's body on the first that matches.
+    /// Every alternative binds the same names (E0007), so whichever succeeds leaves the
+    /// frame in the same shape.
+    fn test_or_pattern(self, p: ast::Pat, alts: List[ast::Pat], slot: i64, fails: List[i64]) {
+        let matched = list::new[i64]();
+        let mut i = 0;
+        while i < alts.len() {
+            let alt_fails = list::new[i64]();
+            self.test_pattern(alts.at(i), slot, alt_fails);
+            if self.failed() {
+                return;
+            }
+            if i == alts.len() - 1 {
+                // The last alternative's failure is the whole pattern's failure.
+                let mut f = 0;
+                while f < alt_fails.len() {
+                    fails.push(alt_fails.at(f));
+                    f = f + 1;
+                }
+                i = alts.len();
+            } else {
+                matched.push(self.emit_a(bytecode::OP_JUMP, 0, p.span));
+                let mut f = 0;
+                while f < alt_fails.len() {
+                    self.patch(alt_fails.at(f));
+                    f = f + 1;
+                }
+                i = i + 1;
+            }
+        }
+        let mut m = 0;
+        while m < matched.len() {
+            self.patch(matched.at(m));
+            m = m + 1;
+        }
+    }
+
+    /// Pushes a literal pattern's value.
+    fn literal(self, p: ast::Pat, neg: bool, lit: ast::Expr) {
+        match lit.node {
+            ast::ExprKind::Int(v, _, _) => {
+                let mut val = v as i64;
+                if neg {
+                    val = 0 - val;
+                }
+                self.emit_a(bytecode::OP_CONST, self.int_const(val), p.span);
+            }
+            ast::ExprKind::Float(_, _) => self.unsupported("a float literal pattern", p.span),
+            ast::ExprKind::Str(v) => {
+                self.emit_a(bytecode::OP_CONST, self.str_const(v), p.span);
+            }
+            ast::ExprKind::Char(v) => {
+                let k = self.constant(bytecode::CONST_CHAR, v as u64, "");
+                self.emit_a(bytecode::OP_CONST, k, p.span);
+            }
+            ast::ExprKind::Bool(v) => {
+                if v {
+                    self.emit(bytecode::OP_TRUE, p.span);
+                } else {
+                    self.emit(bytecode::OP_FALSE, p.span);
+                }
+            }
+            _ => self.unsupported("this literal pattern", p.span),
+        }
+    }
+}
+
+// --- Calls -----------------------------------------------------------------------------------
+
+/// A compiler-provided function's path mapped to its builtin index, or -1.
+fn builtin_index(path: String) -> i64 {
+    if path == "io::print" { return BUILTIN_PRINT; }
+    if path == "io::println" { return BUILTIN_PRINTLN; }
+    if path == "panic" { return BUILTIN_PANIC; }
+    if path == "ref_eq" { return BUILTIN_REF_EQ; }
+    if path == "thread::spawn" { return BUILTIN_SPAWN; }
+    if path == "thread::join_thread" { return BUILTIN_JOIN; }
+    if path == "chan::channel" { return BUILTIN_CHANNEL; }
+    if path == "chan::send_value" { return BUILTIN_SEND; }
+    if path == "chan::await_value" { return BUILTIN_AWAIT; }
+    if path == "chan::taken_value" { return BUILTIN_TAKEN; }
+    if path == "chan::close_sender" { return BUILTIN_CLOSE_CHAN; }
+    if path == "sync::mutex" { return BUILTIN_MUTEX; }
+    if path == "sync::with_lock" { return BUILTIN_WITH_LOCK; }
+    if path == "array::new" { return BUILTIN_NEW_ARRAY; }
+    if path == "array::len" { return BUILTIN_ARRAY_LEN; }
+    if path == "array::cap" { return BUILTIN_ARRAY_CAP; }
+    if path == "array::at" { return BUILTIN_ARRAY_AT; }
+    if path == "array::set" { return BUILTIN_ARRAY_SET; }
+    if path == "array::push" { return BUILTIN_ARRAY_PUSH; }
+    if path == "array::truncate" { return BUILTIN_ARRAY_TRUNCATE; }
+    if path == "list::new" { return BUILTIN_LIST_NEW; }
+    if path == "map::new" { return BUILTIN_MAP_NEW; }
+    if path == "hash::of" { return BUILTIN_HASH; }
+    if path == "str::len" { return BUILTIN_STR_LEN; }
+    if path == "str::byte_at" { return BUILTIN_STR_BYTE_AT; }
+    if path == "str::slice" { return BUILTIN_STR_SLICE; }
+    if path == "str::concat" { return BUILTIN_STR_CONCAT; }
+    if path == "str::char_at" { return BUILTIN_STR_CHAR_AT; }
+    if path == "str::char_width" { return BUILTIN_STR_CHAR_WIDTH; }
+    if path == "char::from_u32" { return BUILTIN_CHAR_VALID; }
+    if path == "env::arg_count" { return BUILTIN_ARG_COUNT; }
+    if path == "env::arg_at" { return BUILTIN_ARG_AT; }
+    if path == "process::exit" { return BUILTIN_EXIT; }
+    if path == "float::bits" { return BUILTIN_FLOAT_BITS; }
+    if path == "float::from_bits" { return BUILTIN_FLOAT_FROM_BITS; }
+    if path == "fs::read_file" { return BUILTIN_READ_FILE; }
+    if path == "fs::taken_text" { return BUILTIN_TAKEN_TEXT; }
+    if path == "fs::write_file" { return BUILTIN_WRITE_FILE; }
+    if path == "fs::file_exists" { return BUILTIN_FILE_EXISTS; }
+    0 - 1
+}
+
+/// The methods the compiler knows without an impl to call, as an opcode. The prelude
+/// declares their signatures and every engine implements them.
+fn builtin_method_op(name: String) -> i64 {
+    if name == "wrapping_add" { return bytecode::OP_WRAP_ADD; }
+    if name == "wrapping_sub" { return bytecode::OP_WRAP_SUB; }
+    if name == "wrapping_mul" { return bytecode::OP_WRAP_MUL; }
+    0 - 1
+}
+
+fn builtin_method_call(name: String) -> i64 {
+    if name == "saturating_add" { return BUILTIN_SATURATING_ADD; }
+    if name == "saturating_sub" { return BUILTIN_SATURATING_SUB; }
+    if name == "saturating_mul" { return BUILTIN_SATURATING_MUL; }
+    0 - 1
+}
+
+/// `checked_add` and its siblings, mapped to the predicate that decides them.
+fn checked_method(name: String) -> i64 {
+    if name == "checked_add" { return BUILTIN_FITS_ADD; }
+    if name == "checked_sub" { return BUILTIN_FITS_SUB; }
+    if name == "checked_mul" { return BUILTIN_FITS_MUL; }
+    0 - 1
+}
+
+/// The operation whose result a checked one returns when it fits. Wrapping and exact
+/// arithmetic agree on exactly the values that fit, which is what makes this the same
+/// answer.
+fn wrapping_for(fits: i64) -> i64 {
+    if fits == BUILTIN_FITS_ADD { return bytecode::OP_WRAP_ADD; }
+    if fits == BUILTIN_FITS_SUB { return bytecode::OP_WRAP_SUB; }
+    bytecode::OP_WRAP_MUL
+}
+
+/// Which of the per-kind `cmp` builtins a call needs, or -1. `Ord` is registered for every
+/// signed and unsigned integer width, both float widths, `char` and `String`; nothing else
+/// reaches here for a well-typed program.
+fn cmp_builtin_for(k: i64) -> i64 {
+    if k == bytecode::KIND_CHAR
+        || (bytecode::kind_is_integer(k) && bytecode::kind_is_signed(k)) {
+        return BUILTIN_CMP_INT;
+    }
+    if bytecode::kind_is_integer(k) { return BUILTIN_CMP_UINT; }
+    if k == bytecode::KIND_FLOAT { return BUILTIN_CMP_FLOAT; }
+    if k == bytecode::KIND_STRING { return BUILTIN_CMP_STRING; }
+    0 - 1
+}
+
+/// Whether a builtin takes the extra "is this a reference" argument.
+fn wants_is_ref(idx: i64) -> bool {
+    idx == BUILTIN_SPAWN || idx == BUILTIN_CHANNEL || idx == BUILTIN_MUTEX
+}
+
+/// How much room a fresh map's index has. Eight is two cache lines and enough for three
+/// entries before the prelude's own half-full rule grows it.
+const MAP_INITIAL_SLOTS: i64 = 8;
+
+impl Compiler {
+    fn call(self, e: ast::Expr, f: ast::Expr, args: List[ast::Expr]) {
+        // A call to a tuple variant constructs it rather than calling anything.
+        match f.node {
+            ast::ExprKind::Path(path, _) => {
+                let r = self.ref_of(path.res);
+                if r.kind == resolve::K_VARIANT {
+                    let mut i = 0;
+                    while i < args.len() {
+                        self.expr(args.at(i));
+                        if self.failed() {
+                            return;
+                        }
+                        i = i + 1;
+                    }
+                    match r.variant {
+                        Option::None => { self.unsupported("an unknown variant", e.span); }
+                        Option::Some(variant) => {
+                            let vi = self.variant_inst(variant, self.type_of(e));
+                            if self.failed() {
+                                return;
+                            }
+                            self.emit_ab(bytecode::OP_VARIANT, vi, args.len(), e.span);
+                        }
+                    }
+                    return;
+                }
+                if r.kind == resolve::K_BUILTIN {
+                    self.builtin_call(e, r.builtin, args);
+                    return;
+                }
+            }
+            _ => {}
+        }
+
+        self.expr(f);
+        if self.failed() {
+            return;
+        }
+        let mut i = 0;
+        while i < args.len() {
+            self.expr(args.at(i));
+            if self.failed() {
+                return;
+            }
+            i = i + 1;
+        }
+        self.emit_ak(bytecode::OP_CALL, args.len(), self.kind_of(e), e.span);
+    }
+
+    fn builtin_call(self, e: ast::Expr, name: String, args: List[ast::Expr]) {
+        let idx = builtin_index(name);
+        if idx < 0 {
+            self.unsupported("builtin `\(name)`", e.span);
+            return;
+        }
+        if idx == BUILTIN_LIST_NEW {
+            self.list_new(e);
+            return;
+        }
+        if idx == BUILTIN_MAP_NEW {
+            self.map_new(e);
+            return;
+        }
+        if idx == BUILTIN_CHAR_VALID {
+            self.char_from_u32(e, args);
+            return;
+        }
+        let mut i = 0;
+        while i < args.len() {
+            self.expr(args.at(i));
+            if self.failed() {
+                return;
+            }
+            i = i + 1;
+        }
+        let mut argc = args.len();
+        if idx == BUILTIN_NEW_ARRAY {
+            // `array::new` takes one more argument than it is written with: the layout of
+            // the array it is about to make. An array's shape says whether its elements are
+            // references, which only the compiler knows and every collector must (ADR-0028,
+            // spec/13-collections.md).
+            let id = self.array_inst(self.type_of(e), e.span);
+            if self.failed() {
+                return;
+            }
+            self.emit_a(bytecode::OP_CONST, self.int_const(id), e.span);
+            argc = argc + 1;
+        }
+        if wants_is_ref(idx) {
+            // These three take one more argument than they are written with: whether the
+            // value they will hold on the program's behalf is a reference. Native code
+            // keeps a thread's result, a channel's queue and a mutex's guarded value in raw
+            // memory with no stack map over it, so the collector cannot tell a reference
+            // from an integer there. Only the compiler knows -- it has the checker's own
+            // `T` -- so it says. The other two engines ignore the argument; their hosts
+            // find references without being told (spec/12-concurrency.md).
+            let is_ref = self.concurrency_elem_is_ref(idx, e);
+            if self.failed() {
+                return;
+            }
+            self.emit_a(bytecode::OP_CONST, self.int_const(is_ref), e.span);
+            argc = argc + 1;
+        }
+        self.emit_abk(bytecode::OP_CALL_BUILTIN, idx, argc, self.kind_of(e), e.span);
+        self.wrap_concurrency_handle(idx, e);
+    }
+
+    /// `list::new[T]()`: an empty array, wrapped in the prelude's `List[T]`.
+    ///
+    /// No engine implements this. It is bytecode the compiler writes out of operations that
+    /// already exist -- the same arrangement `wrap_concurrency_handle` uses, and for the
+    /// same reason: the runtime has no business knowing what a prelude type is, and here it
+    /// does not even have to know that a list was made.
+    fn list_new(self, e: ast::Expr) {
+        let t = self.concrete_type(self.type_of(e));
+        let args = types::named_args(t);
+        if types::as_named(t).is_none() || args.len() != 1 {
+            self.unsupported("a `list::new` whose type is not List[T]", e.span);
+            return;
+        }
+        self.emit_new_array(args.at(0), 0, e);
+        if self.failed() {
+            return;
+        }
+        let si = self.struct_inst(self.type_of(e), e.span);
+        if self.failed() {
+            return;
+        }
+        self.emit_ab(bytecode::OP_STRUCT, si, 1, e.span);
+    }
+
+    /// A fresh array of `cap` slots' capacity. `list::new` asks for none -- the first push
+    /// grows it, which is one allocation nobody pays for until the collection is actually
+    /// used -- and a map's index asks for room, because a probe reads every slot on its
+    /// path.
+    fn emit_new_array(self, elem: types::Type, cap: i64, e: ast::Expr) {
+        match self.array_def() {
+            Option::None => self.unsupported("an array before the compiler provides one", e.span),
+            Option::Some(def) => {
+                let one = list::new[types::Type]();
+                one.push(elem);
+                let id = self.array_inst(types::Type::Named(def, one), e.span);
+                if self.failed() {
+                    return;
+                }
+                self.emit_a(bytecode::OP_CONST, self.int_const(cap), e.span);
+                self.emit_a(bytecode::OP_CONST, self.int_const(id), e.span);
+                self.emit_abk(bytecode::OP_CALL_BUILTIN, BUILTIN_NEW_ARRAY, 2,
+                              bytecode::KIND_REF, e.span);
+            }
+        }
+    }
+
+    /// `map::new[K, V]()`: an empty list of entries and an index with room in it, wrapped in
+    /// the prelude's `Map[K, V]`.
+    ///
+    /// The index starts with slots rather than empty, because the prelude's own probe
+    /// divides by its capacity: a table with no slots has nowhere to put anything, and
+    /// growing it is `insert`'s job rather than a special case at the start.
+    fn map_new(self, e: ast::Expr) {
+        let t = self.concrete_type(self.type_of(e));
+        let args = types::named_args(t);
+        if types::as_named(t).is_none() || args.len() != 2 {
+            self.unsupported("a `map::new` whose type is not Map[K, V]", e.span);
+            return;
+        }
+        match self.prelude_def("Entry") {
+            Option::None => {
+                self.unsupported("a `map::new` before the prelude declares `Entry`", e.span);
+            }
+            Option::Some(entry_def) => {
+                let kv = list::new[types::Type]();
+                kv.push(args.at(0));
+                kv.push(args.at(1));
+                self.emit_list_of(types::Type::Named(entry_def, kv), e);
+                if self.failed() {
+                    return;
+                }
+                self.emit_zeroed_index(MAP_INITIAL_SLOTS, e);
+                if self.failed() {
+                    return;
+                }
+                let si = self.struct_inst(self.type_of(e), e.span);
+                if self.failed() {
+                    return;
+                }
+                self.emit_ab(bytecode::OP_STRUCT, si, 2, e.span);
+            }
+        }
+    }
+
+    /// Pushes an empty `List[T]`, the same two operations `list_new` emits.
+    fn emit_list_of(self, elem: types::Type, e: ast::Expr) {
+        self.emit_new_array(elem, 0, e);
+        if self.failed() {
+            return;
+        }
+        match self.prelude_def("List") {
+            Option::None => {
+                self.unsupported("a list before the prelude declares `List`", e.span);
+            }
+            Option::Some(def) => {
+                let one = list::new[types::Type]();
+                one.push(elem);
+                let si = self.struct_inst(types::Type::Named(def, one), e.span);
+                if self.failed() {
+                    return;
+                }
+                self.emit_ab(bytecode::OP_STRUCT, si, 1, e.span);
+            }
+        }
+    }
+
+    /// Pushes an `Array[i64]` of `n` zeroed slots: the map's own index, which is
+    /// full-length from the start because a probe reads every slot on its path.
+    fn emit_zeroed_index(self, n: i64, e: ast::Expr) {
+        self.emit_new_array(types::Type::Prim(types::P_I64), n, e);
+        if self.failed() {
+            return;
+        }
+        let slot = self.temp();
+        self.emit_a(bytecode::OP_STORE, slot, e.span);
+        let mut i = 0;
+        while i < n {
+            self.emit_a(bytecode::OP_LOAD, slot, e.span);
+            self.emit_a(bytecode::OP_CONST, self.int_const(0), e.span);
+            self.emit_abk(bytecode::OP_CALL_BUILTIN, BUILTIN_ARRAY_PUSH, 2,
+                          bytecode::KIND_BOOL, e.span);
+            self.emit(bytecode::OP_POP, e.span);
+            i = i + 1;
+        }
+        self.emit_a(bytecode::OP_LOAD, slot, e.span);
+    }
+
+    /// The compiler-provided `Array` definition, which every collection is built over
+    /// (ADR-0028). The checker memoizes it rather than declaring it, so it is asked for
+    /// rather than found among the declarations.
+    fn array_def(self) -> Option[types::Def] {
+        Option::Some(self.tys.lookup.array_def())
+    }
+
+    /// A prelude type by name. The prelude declares one type per name, so there is nothing
+    /// to disambiguate.
+    fn prelude_def(self, name: String) -> Option[types::Def] {
+        match self.prelude_defs.get(name) {
+            Option::Some(d) => return Option::Some(d),
+            Option::None => {}
+        }
+        let mut i = 0;
+        while i < self.tys.defs.len() {
+            let d = self.tys.defs.at(i);
+            if d.file == check::PRELUDE_NAME && d.name == name {
+                self.prelude_defs.insert(name, d);
+                return Option::Some(d);
+            }
+            i = i + 1;
+        }
+        Option::None
+    }
+}
+
+// --- Method calls, `?`, `for` and the concurrency wrappers -------------------------------------
+
+impl Compiler {
+    fn method_call(self, e: ast::Expr, name: String, recv: ast::Expr, args: List[ast::Expr]) {
+        // A method resolving to Origin source -- a user impl, or a trait's default body --
+        // is a direct call to the copy monomorphization picked for this call site. Which
+        // copy that is depends on the receiver's concrete type, which is why the same
+        // source call `a.cmp(b)` inside a generic body can reach a different callee in each
+        // instantiation (ADR-0010).
+        let target = self.call_target(e);
+        if target >= 0 {
+            self.emit_a(bytecode::OP_FUNC, self.inst_index.at(target), e.span);
+            self.expr(recv);
+            if self.failed() {
+                return;
+            }
+            let mut i = 0;
+            while i < args.len() {
+                self.expr(args.at(i));
+                if self.failed() {
+                    return;
+                }
+                i = i + 1;
+            }
+            self.emit_ak(bytecode::OP_CALL, args.len() + 1, self.kind_of(e), e.span);
+            return;
+        }
+
+        // Otherwise it is one of the compiler-provided methods on a primitive.
+        if name == "to_str" && args.is_empty() {
+            self.expr(recv);
+            if self.failed() {
+                return;
+            }
+            // Rendering depends on what is being rendered, and native code cannot ask a
+            // register what it holds, so the kind travels with the instruction.
+            self.emit_a(bytecode::OP_TO_STR, self.kind_of(recv), e.span);
+            return;
+        }
+        let op = builtin_method_op(name);
+        if op >= 0 && args.len() == 1 {
+            self.expr(recv);
+            if self.failed() {
+                return;
+            }
+            self.expr(args.at(0));
+            if self.failed() {
+                return;
+            }
+            // `wrapping_add` wraps at the receiver's own width, which is the whole point of
+            // it: `255u8.wrapping_add(1)` is 0, not 256.
+            self.emit_a(op, self.kind_of(recv), e.span);
+            return;
+        }
+        if name == "cmp" && args.len() == 1 {
+            let idx = cmp_builtin_for(self.kind_of(recv));
+            if idx < 0 {
+                self.unsupported(
+                    "`cmp` on a \(bytecode::kind_name(self.kind_of(recv)))", e.span);
+                return;
+            }
+            self.expr(recv);
+            if self.failed() {
+                return;
+            }
+            self.expr(args.at(0));
+            if self.failed() {
+                return;
+            }
+            self.emit_ab(bytecode::OP_CALL_BUILTIN, idx, 2, e.span);
+            return;
+        }
+        let fits = checked_method(name);
+        if fits >= 0 && args.len() == 1 {
+            self.checked_call(e, recv, args.at(0), fits);
+            return;
+        }
+        let bi = builtin_method_call(name);
+        if bi >= 0 {
+            self.expr(recv);
+            if self.failed() {
+                return;
+            }
+            let mut i = 0;
+            while i < args.len() {
+                self.expr(args.at(i));
+                if self.failed() {
+                    return;
+                }
+                i = i + 1;
+            }
+            // `checked_*` and `saturating_*` answer at the receiver's own width too, so the
+            // kind rides along on the instruction that has room for it.
+            self.emit_abk(bytecode::OP_CALL_BUILTIN, bi, args.len() + 1,
+                          self.kind_of(recv), e.span);
+            return;
+        }
+        self.unsupported("method `\(name)`", e.span);
+    }
+
+    /// `a.checked_add(b)` and its siblings, lowered into the `Option` they mean.
+    ///
+    /// The wrapping is here rather than in a runtime because the `Option` it builds is the
+    /// call's own instantiation: `Option[u8]` and `Option[i64]` are different types with
+    /// different layouts (ADR-0019), and a runtime has only one recorded variant index to
+    /// build from. It is the same arrangement `?` and the concurrency handles use, and for
+    /// the same reason -- the native backend has no way to know which prelude type a call
+    /// meant.
+    fn checked_call(self, e: ast::Expr, recv: ast::Expr, arg: ast::Expr, fits: i64) {
+        let kind = self.kind_of(recv);
+        let vs = self.option_variants(self.type_of(e), e.span);
+        if self.failed() {
+            return;
+        }
+
+        // Both operands land in temporaries: the predicate and the arithmetic each read
+        // them, and evaluating either twice would run its side effects twice.
+        self.expr(recv);
+        if self.failed() {
+            return;
+        }
+        let lhs = self.temp();
+        self.emit_a(bytecode::OP_STORE, lhs, e.span);
+        self.expr(arg);
+        if self.failed() {
+            return;
+        }
+        let rhs = self.temp();
+        self.emit_a(bytecode::OP_STORE, rhs, e.span);
+
+        self.emit_a(bytecode::OP_LOAD, lhs, e.span);
+        self.emit_a(bytecode::OP_LOAD, rhs, e.span);
+        self.emit_abk(bytecode::OP_CALL_BUILTIN, fits, 2, kind, e.span);
+        let to_none = self.emit_a(bytecode::OP_JUMP_IF_FALSE, 0, e.span);
+
+        self.emit_a(bytecode::OP_LOAD, lhs, e.span);
+        self.emit_a(bytecode::OP_LOAD, rhs, e.span);
+        self.emit_a(wrapping_for(fits), kind, e.span);
+        self.emit_ab(bytecode::OP_VARIANT, vs.some, 1, e.span);
+        let to_end = self.emit_a(bytecode::OP_JUMP, 0, e.span);
+
+        self.patch(to_none);
+        self.emit_ab(bytecode::OP_VARIANT, vs.none, 0, e.span);
+        self.patch(to_end);
+    }
+
+    /// `char::from_u32`, the checked `u32` -> `char` conversion.
+    ///
+    /// The same shape as `checked_call`: the compiler provides only the predicate, and the
+    /// `Option` is built here, at this call's own instantiation. Nothing converts -- a
+    /// `char` and its scalar value are the same sixty-four bits, and what the predicate
+    /// decides is whether reading them as a `char` is allowed at all
+    /// (spec/04-expressions.md).
+    fn char_from_u32(self, e: ast::Expr, args: List[ast::Expr]) {
+        if args.len() != 1 {
+            self.unsupported("`char::from_u32` takes one argument", e.span);
+            return;
+        }
+        let vs = self.option_variants(self.type_of(e), e.span);
+        if self.failed() {
+            return;
+        }
+        self.expr(args.at(0));
+        if self.failed() {
+            return;
+        }
+        let slot = self.temp();
+        self.emit_a(bytecode::OP_STORE, slot, e.span);
+
+        self.emit_a(bytecode::OP_LOAD, slot, e.span);
+        self.emit_abk(bytecode::OP_CALL_BUILTIN, BUILTIN_CHAR_VALID, 1,
+                      bytecode::KIND_U32, e.span);
+        let to_none = self.emit_a(bytecode::OP_JUMP_IF_FALSE, 0, e.span);
+
+        self.emit_a(bytecode::OP_LOAD, slot, e.span);
+        self.emit_ab(bytecode::OP_VARIANT, vs.some, 1, e.span);
+        let to_end = self.emit_a(bytecode::OP_JUMP, 0, e.span);
+
+        self.patch(to_none);
+        self.emit_ab(bytecode::OP_VARIANT, vs.none, 0, e.span);
+        self.patch(to_end);
+    }
+
+    /// The `Some` and `None` indices for a concrete `Option[T]`.
+    fn option_variants(self, t: types::Type, at: ast::Span) -> TwoVariants {
+        let none = TwoVariants { some: 0, none: 0 };
+        let concrete = self.concrete_type(t);
+        match types::as_named(concrete) {
+            Option::None => {
+                self.unsupported(
+                    "a checked operation whose result is not an `Option`", at);
+                none
+            }
+            Option::Some(def) => {
+                if def.name != "Option" {
+                    self.unsupported(
+                        "a checked operation whose result is not an `Option`", at);
+                    return none;
+                }
+                match def.enum_decl {
+                    Option::None => {
+                        self.unsupported(
+                            "a checked operation whose result is not an `Option`", at);
+                        none
+                    }
+                    Option::Some(ed) => {
+                        let some_var = find_variant(ed, "Some");
+                        let none_var = find_variant(ed, "None");
+                        if some_var.is_none() || none_var.is_none() {
+                            self.unsupported("an `Option` without `Some` and `None`", at);
+                            return none;
+                        }
+                        TwoVariants {
+                            some: self.variant_inst(some_var.expect("Some"), concrete),
+                            none: self.variant_inst(none_var.expect("None"), concrete),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The two variant indices `?` needs for a concrete `Result` or `Option`: the one it
+    /// unwraps, and the one it returns early with.
+    fn try_variants(self, t: types::Type, at: ast::Span) -> TwoVariants {
+        let none = TwoVariants { some: 0, none: 0 };
+        let concrete = self.concrete_type(t);
+        match types::as_named(concrete) {
+            Option::None => {
+                self.unsupported(
+                    "`?` on something that is not a `Result` or an `Option`", at);
+                none
+            }
+            Option::Some(def) => {
+                match def.enum_decl {
+                    Option::None => {
+                        self.unsupported(
+                            "`?` on something that is not a `Result` or an `Option`", at);
+                        none
+                    }
+                    Option::Some(ed) => {
+                        let mut some_var = no_variant();
+                        let mut fail_var = no_variant();
+                        let mut i = 0;
+                        while i < ed.variants.len() {
+                            let v = ed.variants.at(i);
+                            if v.name.name == "Ok" || v.name.name == "Some" {
+                                some_var = Option::Some(v);
+                            }
+                            if v.name.name == "Err" || v.name.name == "None" {
+                                fail_var = Option::Some(v);
+                            }
+                            i = i + 1;
+                        }
+                        if some_var.is_none() || fail_var.is_none() {
+                            self.unsupported(
+                                "`?` on something that is not a `Result` or an `Option`", at);
+                            return none;
+                        }
+                        TwoVariants {
+                            some: self.variant_inst(some_var.expect("ok"), concrete),
+                            none: self.variant_inst(fail_var.expect("err"), concrete),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `?` (spec/09-errors.md): unwrap the success variant, or return early.
+    ///
+    /// The early return does not hand back the value it was given. `Result[i64, E]::Err(e)`
+    /// and `Result[String, E]::Err(e)` are different types with different layouts
+    /// (ADR-0019), and a function returning the second cannot return an object of the first
+    /// -- its caller's own `match` tests variant indices belonging to *its* instantiation
+    /// and would match none of them. So the payload is unwrapped and rebuilt at the
+    /// enclosing function's return type. `None` is rebuilt for the same reason, and carries
+    /// no payload to move.
+    fn try_expr(self, e: ast::Expr, x: ast::Expr) {
+        self.expr(x);
+        if self.failed() {
+            return;
+        }
+        let inner = self.concrete_type(self.type_of(x));
+        match types::as_named(inner) {
+            Option::None => {
+                self.unsupported(
+                    "`?` on something that is not a `Result` or an `Option`", e.span);
+            }
+            Option::Some(def) => {
+                let is_option = def.name == "Option";
+                let inner_vs = self.try_variants(inner, e.span);
+                if self.failed() {
+                    return;
+                }
+                // The enclosing function's own return type, which is what the early return
+                // builds.
+                let ret = self.concrete_type(self.enclosing_ret());
+                let ret_vs = self.try_variants(ret, e.span);
+                if self.failed() {
+                    return;
+                }
+
+                let args = types::named_args(inner);
+                let mut payload_kind = bytecode::KIND_UNKNOWN;
+                if args.len() > 0 {
+                    payload_kind = kind_of_type(self.concrete_type(args.at(0)));
+                }
+                let mut fail_kind = bytecode::KIND_UNKNOWN;
+                if args.len() > 1 {
+                    fail_kind = kind_of_type(self.concrete_type(args.at(1)));
+                }
+
+                let slot = self.temp();
+                self.emit_a(bytecode::OP_STORE, slot, e.span);
+                self.emit_a(bytecode::OP_LOAD, slot, e.span);
+                self.emit_a(bytecode::OP_IS_VARIANT, inner_vs.some, e.span);
+                let to_fail = self.emit_a(bytecode::OP_JUMP_IF_FALSE, 0, e.span);
+
+                self.emit_a(bytecode::OP_LOAD, slot, e.span);
+                self.emit_ak(bytecode::OP_GET_PAYLOAD, 0, payload_kind, e.span);
+                let to_end = self.emit_a(bytecode::OP_JUMP, 0, e.span);
+
+                self.patch(to_fail);
+                if ret_vs.none == inner_vs.none {
+                    // The two instantiations agree, so the value already has the right
+                    // layout and rebuilding it would only cost an allocation.
+                    self.emit_a(bytecode::OP_LOAD, slot, e.span);
+                } else {
+                    if is_option {
+                        self.emit_ab(bytecode::OP_VARIANT, ret_vs.none, 0, e.span);
+                    } else {
+                        self.emit_a(bytecode::OP_LOAD, slot, e.span);
+                        self.emit_ak(bytecode::OP_GET_PAYLOAD, 0, fail_kind, e.span);
+                        self.emit_ab(bytecode::OP_VARIANT, ret_vs.none, 1, e.span);
+                    }
+                }
+                self.emit(bytecode::OP_RETURN, e.span);
+                self.emit(bytecode::OP_UNIT, e.span);
+
+                self.patch(to_end);
+            }
+        }
+    }
+
+    /// The return type of the function whose body is being lowered.
+    fn enclosing_ret(self) -> types::Type {
+        if self.inst < 0 {
+            return types::error_type();
+        }
+        match self.sig_of(self.mo.instances.at(self.inst).decl) {
+            Option::None => types::error_type(),
+            Option::Some(sig) => sig.ret,
+        }
+    }
+
+    /// The `Option::Some` index at a concrete `item` type, building its exact layout on
+    /// first use. A `for` loop uses it to test the `Option[Item]` its desugared `next()`
+    /// returns (spec/04-expressions.md); testing only `Some` and falling through to `break`
+    /// otherwise is equivalent to also testing `None`, since the checker already proved
+    /// `next()` returns nothing else.
+    fn option_some_variant(self, item: types::Type, at: ast::Span) -> i64 {
+        match self.option_def {
+            Option::None => {
+                self.unsupported("`for`: the prelude does not declare `Option`", at);
+                0
+            }
+            Option::Some(def) => {
+                match self.option_some {
+                    Option::None => {
+                        self.unsupported("`for`: the prelude does not declare `Option`", at);
+                        0
+                    }
+                    Option::Some(some) => {
+                        let one = list::new[types::Type]();
+                        one.push(item);
+                        self.variant_inst(some, types::Type::Named(def, one))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Turns the bare handle a concurrency builtin returns into the prelude type the
+    /// checker says the call has (spec/12-concurrency.md).
+    ///
+    /// The runtime deliberately knows nothing about `JoinHandle[T]` or `Sender[T]`: it
+    /// returns an integer, and the wrapping happens here, where the call's own checked type
+    /// names the instantiation to build. That is what keeps the three engines sharing one
+    /// design -- the native backend could not construct a prelude type from machine code,
+    /// and now nothing asks it to.
+    fn wrap_concurrency_handle(self, idx: i64, e: ast::Expr) {
+        if idx == BUILTIN_SPAWN || idx == BUILTIN_MUTEX {
+            // A single handle in a single-field struct: `JoinHandle[T]` or `Mutex[T]`.
+            let si = self.struct_inst(self.type_of(e), e.span);
+            if self.failed() {
+                return;
+            }
+            self.emit_ab(bytecode::OP_STRUCT, si, 1, e.span);
+            return;
+        }
+        if idx == BUILTIN_CHANNEL {
+            // One handle, two ends: `(Sender[T], Receiver[T])`. Both name the same queue --
+            // they are separate types so that a receiver cannot send and a sender cannot
+            // close what it does not own.
+            match self.concrete_type(self.type_of(e)) {
+                types::Type::Tuple(elems) => {
+                    if elems.len() != 2 {
+                        self.unsupported(
+                            "a channel whose type is not a pair of ends", e.span);
+                        return;
+                    }
+                    let sender = self.struct_inst(elems.at(0), e.span);
+                    let receiver = self.struct_inst(elems.at(1), e.span);
+                    if self.failed() {
+                        return;
+                    }
+                    // The handle is produced once and needed twice, so it goes through an
+                    // anonymous frame slot rather than a stack-duplicating opcode -- one
+                    // fewer instruction for three engines to agree on.
+                    let slot = self.temp();
+                    self.emit_a(bytecode::OP_STORE, slot, e.span);
+                    self.emit_a(bytecode::OP_LOAD, slot, e.span);
+                    self.emit_ab(bytecode::OP_STRUCT, sender, 1, e.span);
+                    self.emit_a(bytecode::OP_LOAD, slot, e.span);
+                    self.emit_ab(bytecode::OP_STRUCT, receiver, 1, e.span);
+                    let ti = self.tuple_inst(self.type_of(e), e.span);
+                    if self.failed() {
+                        return;
+                    }
+                    self.emit_ab(bytecode::OP_TUPLE, ti, 2, e.span);
+                }
+                _ => self.unsupported("a channel whose type is not a pair of ends", e.span),
+            }
+        }
+    }
+
+    /// Whether the value the runtime will hold for this call is something the collector
+    /// must treat as a reference.
+    ///
+    /// Which type that is depends on the call: `spawn` has `JoinHandle[T]`, `mutex` has
+    /// `Mutex[T]`, and `channel` has `(Sender[T], Receiver[T])` -- a pair, whose first end
+    /// names the same `T` the queue will hold.
+    fn concurrency_elem_is_ref(self, idx: i64, e: ast::Expr) -> i64 {
+        let mut t = self.concrete_type(self.type_of(e));
+        if idx == BUILTIN_CHANNEL {
+            match t {
+                types::Type::Tuple(elems) => {
+                    if elems.len() != 2 {
+                        self.unsupported(
+                            "a channel whose type is not a pair of ends", e.span);
+                        return 0;
+                    }
+                    t = self.concrete_type(elems.at(0));
+                }
+                _ => {
+                    self.unsupported("a channel whose type is not a pair of ends", e.span);
+                    return 0;
+                }
+            }
+        }
+        let args = types::named_args(t);
+        if types::as_named(t).is_none() || args.len() != 1 {
+            self.unsupported(
+                "a concurrency handle that is not of the form Handle[T]", e.span);
+            return 0;
+        }
+        let elem = self.concrete_type(args.at(0));
+        if !word_kind_for_known(elem) {
+            self.unsupported(
+                "a concurrency handle whose element type has no object layout", e.span);
+            return 0;
+        }
+        if word_kind_for(elem) == layout::WORD_REF {
+            return 1;
+        }
+        0
+    }
+
+    /// `for p in e { .. }`, lowered exactly to the desugaring spec/04-expressions.md makes
+    /// normative:
+    ///
+    /// ```text
+    /// {
+    ///     let mut __it = e.into_iter();
+    ///     loop {
+    ///         match __it.next() {
+    ///             Option::None => break,
+    ///             Option::Some(p) => { .. }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The checker records the two implicit calls' instantiations for monomorphization to
+    /// find, both keyed to this one expression -- `__it` is never a real binding, it is a
+    /// compiler temporary exactly as the desugaring's own is.
+    fn for_expr(self, e: ast::Expr, p: ast::Pat, iter: ast::Expr, body: ast::Expr) {
+        let iter_target = self.iter_target(e);
+        if iter_target < 0 {
+            self.unsupported(
+                "`for` over a type whose `into_iter` has no concrete body", iter.span);
+            return;
+        }
+        self.emit_a(bytecode::OP_FUNC, self.inst_index.at(iter_target), iter.span);
+        self.expr(iter);
+        if self.failed() {
+            return;
+        }
+        // The iterator's own kind is always a reference: `Iterator::next` takes `mut self`,
+        // and a mutation through it is only observable across the separate calls this
+        // desugaring makes if the type it mutates is a heap object
+        // (spec/08-memory-model.md -- mutability is a property of a field declaration,
+        // which only an aggregate has).
+        self.emit_ak(bytecode::OP_CALL, 1, bytecode::KIND_REF, iter.span);
+        let it_slot = self.temp();
+        self.emit_a(bytecode::OP_STORE, it_slot, iter.span);
+
+        let next_target = self.call_target(e);
+        if next_target < 0 {
+            self.unsupported("`for` over a type whose `next` has no concrete body", e.span);
+            return;
+        }
+        let some_idx = self.option_some_variant(self.pat_type_of(p), e.span);
+        if self.failed() {
+            return;
+        }
+
+        let top = self.here();
+        self.loops.push(new_loop(false));
+
+        self.emit_a(bytecode::OP_FUNC, self.inst_index.at(next_target), e.span);
+        self.emit_a(bytecode::OP_LOAD, it_slot, e.span);
+        // `next()`'s result is always `Option[Item]`, an enum with a payload variant:
+        // always a reference, regardless of what `Item` itself is.
+        self.emit_ak(bytecode::OP_CALL, 1, bytecode::KIND_REF, e.span);
+        let opt_slot = self.temp();
+        self.emit_a(bytecode::OP_STORE, opt_slot, e.span);
+
+        self.emit_a(bytecode::OP_LOAD, opt_slot, e.span);
+        self.emit_a(bytecode::OP_IS_VARIANT, some_idx, e.span);
+        let to_break = self.emit_a(bytecode::OP_JUMP_IF_FALSE, 0, e.span);
+
+        self.emit_a(bytecode::OP_LOAD, opt_slot, e.span);
+        self.emit_ak(bytecode::OP_GET_PAYLOAD, 0, kind_of_type(self.pat_type_of(p)), e.span);
+        self.bind_irrefutable(p, e.span);
+        if self.failed() {
+            return;
+        }
+        self.block_expr(body);
+        if self.failed() {
+            return;
+        }
+        self.emit(bytecode::OP_POP, e.span);  // a `for` body's value is discarded
+
+        let cont_target = self.here();
+        self.emit_a(bytecode::OP_JUMP, top, e.span);
+        self.patch(to_break);
+        self.close_loop(cont_target);
+        self.emit(bytecode::OP_UNIT, e.span);
+    }
+}
+
+/// Two variant indices from one enum: what `?` unwraps and what it returns early with, or
+/// `Option`'s own two.
+struct TwoVariants {
+    some: i64,
+    none: i64,
+}

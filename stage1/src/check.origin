@@ -168,8 +168,14 @@ pub struct Checked {
     /// node id, turned inside out for a tree that has no node ids.
     pub insts: List[Inst],
     /// Every signature, indexed by a declaration's `info` slot, so a later pass can ask
-    /// what generic parameters a function's body may mention without re-deriving them.
+    /// what generic parameters a function's body may mention, what it returns, and what
+    /// its receiver is, without re-deriving any of it.
     pub sigs: List[FnSig],
+    /// Every nominal definition, indexed by a declaration's `info` slot.
+    pub defs: List[types::Def],
+    /// Every type recorded against a node. An expression's or a pattern's `ty` slot is an
+    /// index into it.
+    pub types: List[types::Type],
     /// The checker itself, for the one question monomorphization must ask after checking
     /// is over: which impl a trait method reaches, once the type parameter it was called
     /// on has a type. `internal/check` exposes the same thing as `Result.Lookup`.
@@ -224,6 +230,9 @@ pub struct Checker {
     /// Every instantiation recorded, in order. An expression's `inst`/`iter_inst` slot is
     /// an index into it.
     insts: List[Inst],
+    /// Every type recorded against a node, in order. An expression's or a pattern's `ty`
+    /// slot is an index into it.
+    types: List[types::Type],
 
     /// Indexed by a declaration's `info` slot.
     defs: List[types::Def],
@@ -290,6 +299,19 @@ impl Checker {
 
     fn note_type(self, what: String, t: types::Type) {
         self.trace.push(TraceEntry { what: what, text: "", ty: t, has_ty: true });
+    }
+
+    /// Records a type against the node it belongs to, and traces it.
+    ///
+    /// The list is what `internal/check` keeps in `ExprTypes` and `PatTypes`, maps keyed
+    /// by node id; this tree has none, so the node keeps the index instead. Rendering is
+    /// still deferred to the end of the run for the trace's sake, and the *type* recorded
+    /// here is the same object, so a variable that later unification binds is followed
+    /// wherever it is read from.
+    fn file_type(self, what: String, t: types::Type) -> i64 {
+        self.note_type(what, t);
+        self.types.push(t);
+        self.types.len() - 1
     }
 
     fn note_text(self, what: String, text: String) {
@@ -359,10 +381,23 @@ fn render_trace(entries: List[TraceEntry]) -> List[String] {
 // a trait method reaches, now that the type parameter it was called on has a type. A
 // method call inside a generic body is recorded against the *trait's* declaration, which
 // may have no body at all; only the substituted receiver says which copy actually runs.
-// `internal/check` exposes the same thing as `Result.Lookup`, alongside a `Normalize` the
-// bytecode compiler needs and nothing here does yet.
+// `internal/check` exposes the same three things as `Result.Lookup` and its neighbours.
 
 impl Checker {
+    /// Reduces every associated-type projection a type contains, as far as the impls
+    /// allow. `Self::Tag` has to become the type this instantiation gives it: substitution
+    /// alone leaves the projection standing, and a projection has no layout, no width and
+    /// no kind (ADR-0021).
+    pub fn resolve_type(self, t: types::Type) -> types::Type {
+        self.normalize_deep(t)
+    }
+
+    /// The type a binding was given, for a later pass that needs a capture's or a local's
+    /// exact shape.
+    pub fn resolve_local(self, l: resolve::Local) -> Option[types::Type] {
+        self.local_type(l)
+    }
+
     /// Resolves a method call on a concrete receiver, reporting the declaration to call
     /// and the generic parameters of the impl that provides it.
     ///
@@ -428,6 +463,7 @@ pub fn program(res: resolve::Resolved, units: List[Unit]) -> Checked {
         trace: list::new[TraceEntry](),
         errors: list::new[CheckError](),
         insts: list::new[Inst](),
+        types: list::new[types::Type](),
         defs: list::new[types::Def](),
         fn_sigs: list::new[FnSig](),
         trait_infos: list::new[TraitInfo](),
@@ -464,7 +500,7 @@ pub fn program(res: resolve::Resolved, units: List[Unit]) -> Checked {
 
     Checked {
         trace: render_trace(c.trace), errors: c.errors, insts: c.insts, sigs: c.fn_sigs,
-        lookup: c,
+        defs: c.defs, types: c.types, lookup: c,
     }
 }
 
@@ -1140,7 +1176,10 @@ impl Checker {
     /// `Array[T]`, the declaration it does not have. One value for the whole checker,
     /// compared by identity, so that "is this an array?" has one answer rather than a name
     /// match (ADR-0028).
-    fn array_def(self) -> types::Def {
+    /// The compiler-provided `Array` definition, which every collection is built over
+    /// (ADR-0028). It is memoized rather than declared, so a later pass has to ask for it
+    /// rather than scanning the declarations.
+    pub fn array_def(self) -> types::Def {
         match self.prelude_defs.get(ARRAY_KEY) {
             Option::Some(d) => d,
             Option::None => {
@@ -2418,7 +2457,7 @@ impl Checker {
                     Option::None => types::unit(),
                     Option::Some(t) => {
                         let ty = self.infer(t);
-                        self.note_type("expr", ty);
+                        e.ty = self.file_type("expr", ty);
                         ty
                     }
                 }
@@ -2539,7 +2578,7 @@ impl Checker {
     /// Computes an expression's type, records it, and returns it.
     fn infer(self, e: ast::Expr) -> types::Type {
         let t = self.infer_kind(e);
-        self.note_type("expr", t);
+        e.ty = self.file_type("expr", t);
         t
     }
 
@@ -4039,7 +4078,7 @@ impl Checker {
     /// it introduces.
     fn bind_pattern(self, p: ast::Pat, want_in: types::Type, irrefutable: bool) {
         let want = self.normalize(want_in);
-        self.note_type("pat", want);
+        p.ty = self.file_type("pat", want);
 
         match p.node {
             ast::PatKind::ErrorPat => {}
