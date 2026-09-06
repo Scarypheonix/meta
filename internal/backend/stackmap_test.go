@@ -5,12 +5,14 @@ import (
 	"testing"
 
 	"github.com/scarypheonix/meta/internal/ast"
+	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/check"
 	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/layout"
 	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/obj"
+	"github.com/scarypheonix/meta/internal/opt"
 	"github.com/scarypheonix/meta/internal/parse"
 	"github.com/scarypheonix/meta/internal/prelude"
 	"github.com/scarypheonix/meta/internal/resolve"
@@ -26,7 +28,36 @@ func buildStackMapTestImage(t *testing.T, src string) *obj.Image {
 
 // buildStackMapTestImageFor is the same, for a chosen target: the Mach-O path needs its
 // own end-to-end coverage, not only the ELF one the container can execute.
+// buildStackMapTestImageAt is buildStackMapTestImageFor with the optimizer run at a
+// chosen level.
+//
+// It exists because every collector test built at -O0, so the optimizer and the collector
+// had never been tested against each other -- and a root set is exactly what an optimizer
+// changes, by moving a value's live range or removing the instruction that held it.
+func buildStackMapTestImageAt(t *testing.T, target obj.Target, level opt.Level, src string) *obj.Image {
+	t.Helper()
+	prog := stackMapTestProgram(t, src)
+	if err := opt.Run(prog, level); err != nil {
+		t.Fatalf("optimizing at -O%d: %v", int(level), err)
+	}
+	img, err := Build(prog, target)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return img
+}
+
 func buildStackMapTestImageFor(t *testing.T, target obj.Target, src string) *obj.Image {
+	t.Helper()
+	img, err := Build(stackMapTestProgram(t, src), target)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return img
+}
+
+// stackMapTestProgram compiles one source string to bytecode, with no optimizer.
+func stackMapTestProgram(t *testing.T, src string) *bytecode.Program {
 	t.Helper()
 	ids := ast.NewIDGen()
 	bag := diag.New()
@@ -51,11 +82,7 @@ func buildStackMapTestImageFor(t *testing.T, target obj.Target, src string) *obj
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	img, err := Build(prog, target)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	return img
+	return prog
 }
 
 // stackMapFrom reads the table an image's own runtime block points at, exactly the way

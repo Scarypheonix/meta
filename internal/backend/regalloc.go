@@ -545,7 +545,66 @@ func allocate(f *ir.Func, preempts bool) *alloc {
 		}
 		a.callSiteRegs[v] = regs
 	}
+	checkRootsAreDescribed(f, ivs, n, a)
 	return a
+}
+
+// checkRootsAreDescribed asserts the one property a precise collector rests on: at every
+// point where a collection can happen, every live reference is somewhere the stack map
+// names -- a reference-kind spill slot, or a callee-saved register listed for that site.
+//
+// It is here rather than in a test because the failure it catches is invisible until a
+// collection actually moves objects, and then it is a wrong value rather than a crash.
+// Phase 6 found five root-set holes this way, one at a time, each after the fact; Phase 9
+// found a sixth that only appears at -O2, which is the level no collector test built at.
+// An assertion at the point the map is built turns the whole class into a compiler-bug
+// panic at build time.
+func checkRootsAreDescribed(f *ir.Func, ivs []*interval, n *numbering, a *alloc) {
+	for v, at := range n.index {
+		if !clobbersCallerSaved(v.Op) && !n.backEdge[v] {
+			continue
+		}
+		named := map[x86.Reg]bool{}
+		for _, r := range a.callSiteRegs[v] {
+			named[r] = true
+		}
+		for _, iv := range ivs {
+			if !(at > iv.start && at <= iv.end) {
+				continue
+			}
+			if iv.val.Kind == bytecode.KindUnknown {
+				// A value live across a collection point whose kind nothing resolved is
+				// a root the map cannot describe either way: called a reference it would
+				// have the collector follow an integer, called raw it would have the
+				// collector leave a pointer behind.
+				panic(fmt.Sprintf(
+					"this is a compiler bug: %s in %s is live at %s with no known kind",
+					iv.val, f.Name, v))
+			}
+			if !isRefKind(iv.val.Kind) {
+				continue
+			}
+			l, ok := a.where[iv.val]
+			if !ok {
+				panic(fmt.Sprintf(
+					"this is a compiler bug: %s in %s is a live reference at %s with no location",
+					iv.val, f.Name, v))
+			}
+			if l.spilled() {
+				if l.slot >= 1 && l.slot <= a.refSlots {
+					continue
+				}
+				panic(fmt.Sprintf(
+					"this is a compiler bug: %s in %s is a live reference at %s spilled to raw slot %d of %d (%d are references)",
+					iv.val, f.Name, v, l.slot, a.slots, a.refSlots))
+			}
+			if !named[l.reg] {
+				panic(fmt.Sprintf(
+					"this is a compiler bug: %s in %s is a live reference at %s in %v, which the stack map does not name",
+					iv.val, f.Name, v, l.reg))
+			}
+		}
+	}
 }
 
 // isRefKind reports whether a value's kind is a heap reference a collector would need

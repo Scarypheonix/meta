@@ -13,6 +13,7 @@ import (
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/ir"
 	"github.com/scarypheonix/meta/internal/obj"
+	"github.com/scarypheonix/meta/internal/opt"
 )
 
 // A collection is where every root the backend forgot to declare shows itself, and only
@@ -30,9 +31,19 @@ func runWithHeap(t *testing.T, size int32, src string) (string, int) {
 		t.Skipf("this host cannot run an x86-64 ELF (%s/%s)", runtime.GOOS, runtime.GOARCH)
 	}
 
+	return runWithHeapAt(t, size, opt.O0, src)
+}
+
+// runWithHeapAt is runWithHeap at a chosen optimization level.
+func runWithHeapAt(t *testing.T, size int32, level opt.Level, src string) (string, int) {
+	t.Helper()
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skipf("this host cannot run an x86-64 ELF (%s/%s)", runtime.GOOS, runtime.GOARCH)
+	}
+
 	restore := heapSize
 	heapSize = size
-	img := buildStackMapTestImageFor(t, obj.Linux, src)
+	img := buildStackMapTestImageAt(t, obj.Linux, level, src)
 	heapSize = restore
 
 	path := filepath.Join(t.TempDir(), "prog")
@@ -62,14 +73,24 @@ func runWithHeap(t *testing.T, size int32, src string) (string, int) {
 	return stdout.String(), code
 }
 
+// checkRun runs a collector case at every optimization level.
+//
+// Every level, because an optimizer is exactly the thing that changes a root set: it moves
+// a value's live range, removes the instruction that held a reference, or splices a
+// callee's allocation into a caller whose stack map was computed for a different shape.
+// These tests built only at -O0 until Phase 9, when writing a second compiler in Origin
+// produced a program that traps at -O2 and not at -O0 -- so the one combination the
+// collector was never tested at is the one that was wrong.
 func checkRun(t *testing.T, src, want string) {
 	t.Helper()
-	out, code := runWithHeap(t, 64<<10, src)
-	if code != 0 {
-		t.Fatalf("exit status %d, want 0 (stdout %q)", code, out)
-	}
-	if strings.TrimSpace(out) != want {
-		t.Errorf("stdout is %q, want %q", strings.TrimSpace(out), want)
+	for _, level := range []opt.Level{opt.O0, opt.O1, opt.O2} {
+		out, code := runWithHeapAt(t, 64<<10, level, src)
+		if code != 0 {
+			t.Fatalf("-O%d: exit status %d, want 0 (stdout %q)", int(level), code, out)
+		}
+		if strings.TrimSpace(out) != want {
+			t.Errorf("-O%d: stdout is %q, want %q", int(level), strings.TrimSpace(out), want)
+		}
 	}
 }
 
@@ -803,4 +824,58 @@ fn main() {
     io::println(seen.len().to_str());
 }
 `, "52770\ntrue\n7")
+}
+
+// TestACollectionSurvivesAnInlinedAllocatingReturn is the shape a second compiler written
+// in Origin tripped over: a small callee with two returns, one of which allocates, whose
+// result the caller discards -- while the caller holds a reference the collector must
+// find. `List::pop` is exactly that callee (it answers `Option[T]`, and `Some` is an
+// allocation), and -O2 is the only level that splices it into its caller.
+func TestACollectionSurvivesAnInlinedAllocatingReturn(t *testing.T) {
+	checkRun(t, `
+use std::io;
+use std::list;
+
+struct Node { value: i64, tail: Option[Node] }
+
+struct Holder { mut stack: List[Node] }
+
+impl Holder {
+    // out is built before the loop and returned after it, so it is live across every
+    // allocation the discarded pop makes inside the loop.
+    fn take(self, n: i64) -> List[Node] {
+        let out = list::new[Node]();
+        let mut i = self.stack.len() - n;
+        while i < self.stack.len() {
+            out.push(self.stack.at(i));
+            i = i + 1;
+        }
+        let mut k = 0;
+        while k < n {
+            self.stack.pop();
+            k = k + 1;
+        }
+        out
+    }
+}
+
+fn main() {
+    let h = Holder { stack: list::new[Node]() };
+    let mut round = 0;
+    let mut total = 0;
+    while round < 200 {
+        let mut i = 0;
+        while i < 8 {
+            h.stack.push(Node { value: i, tail: Option::None });
+            i = i + 1;
+        }
+        let got = h.take(5);
+        let mut j = 0;
+        while j < got.len() { total = total + got.at(j).value; j = j + 1; }
+        h.stack.clear();
+        round = round + 1;
+    }
+    io::println(total.to_str());
+}
+`, "5000") // 200 rounds of 3+4+5+6+7.
 }

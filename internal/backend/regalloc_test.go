@@ -44,6 +44,20 @@ func twoPhiLoop(t *testing.T) (f *ir.Func, header, body *ir.Block, iPhi, accPhi,
 
 	exit.SetTerminator(f.NewValue(ir.OpReturn, diag.Span{}, accPhi))
 
+	// Kinds, which the real pipeline's kind-propagation pass would have filled in
+	// before allocation: the loop is entirely `i64` apart from its condition. Without
+	// them every value here is KindUnknown, and the allocator's root-set assertion
+	// cannot tell a reference from an integer.
+	for _, b := range f.Blocks {
+		for _, v := range b.Phis {
+			v.Kind = bytecode.KindI64
+		}
+		for _, v := range b.Instr {
+			v.Kind = bytecode.KindI64
+		}
+	}
+	cond.Kind = bytecode.KindBool
+
 	f.RecomputeUses()
 	return f, header, body, iPhi, accPhi, accNext
 }

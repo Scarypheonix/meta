@@ -237,14 +237,15 @@ which is where stage1 keeps what `internal/check` keeps in a map keyed by `ast.N
 rule `ast.origin` states — a slot arrives when a reader does — is why they landed in the
 same commit as the reader.
 
-**Next action: find the -O2 miscompilation stage1 exposed**, recorded at the top of
-`docs/deferred.md`. It is the one thing in the project that is known-wrong, it violates the
-invariant every other differential rests on ("identical output at every optimization
-level"), and it will corrupt anything built on top of it. The reproduction is stage1
-itself and it is reliable; what is missing is a small case. The strongest lead is that
-**every test in `internal/backend/collect_test.go` builds at `-O0`**, so the optimizer has
-never been exercised against a real collection — an `-O2` variant of those tests is where
-to start.
+**Next action: find the lost root stage1 exposed**, recorded at the top of
+`docs/deferred.md`. It is the one thing in the project that is known-wrong, it corrupts
+memory, and it will corrupt anything built on top of it. The register allocator is ruled
+out by assertion, and the collector corpus now runs at every level and passes, so the
+remaining places to look are the runtime's own scan (`internal/backend/collect.go`) and the
+roots it never sees: the scratch registers across an allocation, a value in flight during a
+`for` loop's desugaring, the argument registers at the moment a callee allocates before its
+prologue has run. The reproduction is stage1 itself at `-O2` with `heapSize` at exactly
+64 MiB, and it is reliable.
 
 After that: `internal/opt` (1,338 lines), then `internal/x86` (722), `internal/obj`
 (1,135) and `internal/backend` (7,064), with `arith`, `dwarf` and `codesign` (1,087
@@ -283,18 +284,26 @@ every bug came from *running Origin*, not from reading Go.
   the first of a duplicated name wins. The degenerate input is the most valuable file in
   the corpus, and a fourth case of the same thing — `checkBodies` visiting an impl's methods
   in map order — was found the same way.
-- **stage1 found a miscompilation at `-O2`, and it is still open.** stage1 built at `-O2`
-  traps building the SSA of its own `pop_n`; at `-O0` and `-O1` it is correct, and at `-O2`
-  with a 512 MiB heap it is correct too — which is what makes it a *root-set hole the
-  optimizer opens*, not an arithmetic slip. Disabling `Inline` makes it go away, and a
-  bisection on the number of inlines puts it at exactly one. Four attempts at a small
-  reproduction all behave identically at every level, so what exists is the reliable
-  reproduction on stage1 itself (`docs/deferred.md`). The reason it survived four phases is
-  worth more than the bug: **every collector test builds at `-O0`**, so the optimizer and
-  the collector have never been tested against each other. That is the same shape as the
-  tuple-layout bug below — a pass that nothing executes — and the same shape as Phase 6's
-  five root-set holes, every one of which was invisible until a collection actually moved
-  objects.
+- **stage1 found a lost root, and it is still open.** stage1 built at `-O2` traps building
+  the SSA of its own `env_for`, inside a `Map` in the prelude. The most diagnostic fact is
+  the **heap window**: correct at
+  48 MiB, wrong at 64 MiB, correct at 80 MiB and above. That is neither "too little heap"
+  nor "no collection" — it is one particular collection, landing at one particular moment,
+  losing a reference. `-O1` is correct at every size that fits the program.
+  `internal/backend/regalloc.go`'s new `checkRootsAreDescribed` rules out the register
+  allocator: it asserts at build time that every live reference at every collection point
+  is in a reference spill slot or a callee-saved register the stack map names, and that
+  nothing live there lacks a kind. Neither fires. So the hole is outside the allocator's
+  model. Five attempts at a small reproduction all behave identically at every level;
+  `docs/deferred.md` has the full state.
+
+  Two lessons are worth more than the bug. **Every collector test built at `-O0`**, so the
+  optimizer and the collector had never been tested against each other — now closed, every
+  case runs at all three levels, and all fifteen pass, which is why this is recorded rather
+  than fixed: the corpus does not contain its shape. And the first characterization was
+  wrong twice — "an inlining bug", then "a bug at every level" — because a sweep printed
+  `FAIL` without distinguishing `index out of range` from an honest `out of memory`. **A
+  bisection is only as good as its predicate.**
 - **Two tuples of the same arity could not coexist in one compiled program.** A
   descriptor's *name* is its identity in the layout registry, and a tuple's was its arity
   alone, so `(i64, bool)` and `(bool, String)` were the same type: the second registration
