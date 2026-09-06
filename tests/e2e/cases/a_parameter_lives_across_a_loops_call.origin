@@ -1,0 +1,57 @@
+// A parameter used by a loop whose header is the function's own entry block.
+//
+// `align` is the shape: the condition is the first thing in the function, so the entry
+// block is also the loop header, and both parameters are live across the call in the body.
+// A liveness dataflow that counts `param` as a *definition* of that block concludes they
+// are dead at the end of the body -- they are "defined" in the successor -- and the
+// register allocator hands their registers to something in the loop. The next iteration
+// then compares against whatever that left behind: 4 instead of 8 here, and an unbounded
+// loop in the version that also divides.
+//
+// The engines disagree, and only in native code, which is the whole reason this file
+// exists. A parameter is not defined by any block; it arrives with the frame.
+use std::io;
+use std::list;
+
+fn align(c: List[i64], n: i64) {
+    while c.len() < n {
+        c.push(0);
+    }
+}
+
+/// The same shape with a remainder, which is what a code emitter's `align` really is.
+fn pad(c: List[i64], n: i64) {
+    while c.len() % n != 0 {
+        c.push(0);
+    }
+}
+
+/// And with a capture rather than a parameter, which arrives the same way.
+fn make_padder(n: i64) -> fn(List[i64]) -> i64 {
+    |c: List[i64]| -> i64 {
+        while c.len() % n != 0 {
+            c.push(0);
+        }
+        c.len()
+    }
+}
+
+fn main() {
+    let a = list::new[i64]();
+    a.push(1);
+    a.push(2);
+    a.push(3);
+    align(a, 8);
+    io::println("\(a.len())");
+
+    let b = list::new[i64]();
+    b.push(1);
+    pad(b, 16);
+    io::println("\(b.len())");
+
+    let c = list::new[i64]();
+    c.push(1);
+    c.push(2);
+    let padder = make_padder(32);
+    io::println("\(padder(c))");
+}

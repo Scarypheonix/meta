@@ -1,0 +1,659 @@
+// x86-64 machine code, encoded by hand.
+//
+// A translation of `internal/x86`. It is the bottom of the backend: everything above it
+// decides *what* to emit, and this decides what bytes that is. There is no external
+// assembler (ADR-0017), so an encoding mistake here is a mistake nothing else will catch.
+//
+// The encoder is deliberately explicit. There is no general operand type and no
+// instruction-selection cleverness: one function per (instruction, operand shape) the
+// backend actually needs. A wrong encoding is then a wrong constant in one function
+// rather than an emergent property of a table.
+//
+// Only the baseline of `docs/spec/11-codegen.md` is emitted: the target is a Broadwell
+// i5-5350U, and code that cannot run on the machine the differential tests run on cannot
+// be tested by running it.
+
+use std::list;
+use std::str;
+
+/// The general-purpose registers, numbered as the instruction encoding numbers them.
+pub const RAX: i64 = 0;
+pub const RCX: i64 = 1;
+pub const RDX: i64 = 2;
+pub const RBX: i64 = 3;
+pub const RSP: i64 = 4;
+pub const RBP: i64 = 5;
+pub const RSI: i64 = 6;
+pub const RDI: i64 = 7;
+pub const R8: i64 = 8;
+pub const R9: i64 = 9;
+pub const R10: i64 = 10;
+pub const R11: i64 = 11;
+pub const R12: i64 = 12;
+pub const R13: i64 = 13;
+pub const R14: i64 = 14;
+pub const R15: i64 = 15;
+
+pub fn reg_name(r: i64) -> String {
+    if r == RAX { return "rax"; }
+    if r == RCX { return "rcx"; }
+    if r == RDX { return "rdx"; }
+    if r == RBX { return "rbx"; }
+    if r == RSP { return "rsp"; }
+    if r == RBP { return "rbp"; }
+    if r == RSI { return "rsi"; }
+    if r == RDI { return "rdi"; }
+    if r >= R8 && r <= R15 { return "r\(r)"; }
+    "r?\(r)"
+}
+
+/// The SSE registers, used for `f64` values. They are numbered the same way and share the
+/// encoding's register field, which is why one `rex` serves both.
+pub const XMM0: i64 = 0;
+pub const XMM1: i64 = 1;
+pub const XMM2: i64 = 2;
+pub const XMM3: i64 = 3;
+pub const XMM4: i64 = 4;
+pub const XMM5: i64 = 5;
+pub const XMM6: i64 = 6;
+pub const XMM7: i64 = 7;
+pub const XMM8: i64 = 8;
+pub const XMM9: i64 = 9;
+pub const XMM10: i64 = 10;
+pub const XMM11: i64 = 11;
+pub const XMM12: i64 = 12;
+pub const XMM13: i64 = 13;
+pub const XMM14: i64 = 14;
+pub const XMM15: i64 = 15;
+
+pub fn xmm_name(x: i64) -> String { "xmm\(x)" }
+
+/// The condition codes, numbered as the `jcc`, `setcc` and `cmovcc` opcodes number them:
+/// the opcode is a base plus the condition.
+///
+/// Signed and unsigned comparisons are distinct instructions, so the caller picks:
+/// Origin's `<` on `u64` is `BELOW`, on `i64` it is `LESS`.
+pub const OVERFLOW: i64 = 0x0;
+pub const NO_OVERFLOW: i64 = 0x1;
+pub const BELOW: i64 = 0x2;
+/// `CARRY` is `BELOW` under its other name. The same flag answers "was there a borrow or a
+/// carry" and "is the unsigned comparison below", and naming both makes the calling code
+/// say which question it asked.
+pub const CARRY: i64 = 0x2;
+pub const ABOVE_EQUAL: i64 = 0x3;
+pub const EQUAL: i64 = 0x4;
+pub const NOT_EQUAL: i64 = 0x5;
+pub const BELOW_EQUAL: i64 = 0x6;
+pub const ABOVE: i64 = 0x7;
+pub const SIGN: i64 = 0x8;
+pub const NO_SIGN: i64 = 0x9;
+pub const PARITY: i64 = 0xA;
+pub const NO_PARITY: i64 = 0xB;
+pub const LESS: i64 = 0xC;
+pub const GREATER_EQUAL: i64 = 0xD;
+pub const LESS_EQUAL: i64 = 0xE;
+pub const GREATER: i64 = 0xF;
+
+pub fn cond_name(c: i64) -> String {
+    if c == OVERFLOW { return "o"; }
+    if c == NO_OVERFLOW { return "no"; }
+    if c == BELOW { return "b"; }
+    if c == ABOVE_EQUAL { return "ae"; }
+    if c == EQUAL { return "e"; }
+    if c == NOT_EQUAL { return "ne"; }
+    if c == BELOW_EQUAL { return "be"; }
+    if c == ABOVE { return "a"; }
+    if c == SIGN { return "s"; }
+    if c == NO_SIGN { return "ns"; }
+    if c == PARITY { return "p"; }
+    if c == NO_PARITY { return "np"; }
+    if c == LESS { return "l"; }
+    if c == GREATER_EQUAL { return "ge"; }
+    if c == LESS_EQUAL { return "le"; }
+    if c == GREATER { return "g"; }
+    "cc?\(c)"
+}
+
+/// The condition that is true exactly when `c` is false. Emitting `jne` to skip a `then`
+/// block is how a two-way branch becomes one conditional jump, so the backend asks for
+/// this constantly.
+pub fn invert(c: i64) -> i64 { c ^ 1 }
+
+/// A memory operand, `[base + disp]`. It is the only addressing form the backend needs --
+/// a frame slot, a field at a constant offset, or a runtime-block member -- and leaving out
+/// index-scale addressing keeps the encoder small enough to verify.
+pub struct Mem {
+    pub base: i64,
+    pub disp: i64,
+}
+
+pub fn at(base: i64, disp: i64) -> Mem { Mem { base: base, disp: disp } }
+
+/// A named position in the instruction stream, as an index into the assembler's labels.
+pub struct Label {
+    pub id: i64,
+}
+
+struct LabelState {
+    pub name: String,
+    pub mut bound: bool,
+    pub mut at: i64,
+}
+
+struct Fixup {
+    /// The offset of the four-byte field to patch.
+    pub at: i64,
+    /// The offset of the instruction after this one: a rel32 is relative to it.
+    pub end: i64,
+    pub label: i64,
+}
+
+/// Accumulates encoded instructions.
+///
+/// Addresses are known while emitting (ADR-0017: the executable is laid out statically and
+/// has no relocations), but a forward jump's target is not known when the jump is emitted.
+/// Labels close that gap: a jump to an unbound label records a fixup, and binding the label
+/// patches every fixup that names it.
+pub struct Asm {
+    pub code: List[i64],
+    pub labels: List[LabelState],
+    pub fixups: List[Fixup],
+    /// The virtual address the first emitted byte will live at, so that a RIP-relative
+    /// reference can be computed against the final layout.
+    pub mut base: i64,
+    /// The first label left unbound when the code was asked for, or `""`. A jump into
+    /// nowhere is not something to discover at run time.
+    pub mut error: String,
+}
+
+pub fn new_asm(base: i64) -> Asm {
+    Asm {
+        code: list::new[i64](),
+        labels: list::new[LabelState](),
+        fixups: list::new[Fixup](),
+        base: base,
+        error: "",
+    }
+}
+
+impl Asm {
+    /// How many bytes have been emitted.
+    pub fn len(self) -> i64 { self.code.len() }
+
+    /// The virtual address of the next byte to be emitted.
+    pub fn pc(self) -> i64 { self.base + self.code.len() }
+
+    /// Checks that every label a jump names was bound. It fills `error` rather than
+    /// answering the bytes, which the caller already has.
+    pub fn finish(self) {
+        let mut i = 0;
+        while i < self.fixups.len() {
+            let f = self.fixups.at(i);
+            i = i + 1;
+            let l = self.labels.at(f.label);
+            if !l.bound && self.error == "" {
+                self.error = "label `\(l.name)` is never bound";
+            }
+        }
+    }
+
+    /// Creates an unbound label.
+    pub fn new_label(self, name: String) -> Label {
+        self.labels.push(LabelState { name: name, bound: false, at: 0 });
+        Label { id: self.labels.len() - 1 }
+    }
+
+    /// Fixes a label at the current position and patches every jump to it.
+    pub fn bind(self, l: Label) {
+        let st = self.labels.at(l.id);
+        if st.bound {
+            if self.error == "" { self.error = "label `\(st.name)` is bound twice"; }
+            return;
+        }
+        st.bound = true;
+        st.at = self.code.len();
+        let mut i = 0;
+        while i < self.fixups.len() {
+            let f = self.fixups.at(i);
+            i = i + 1;
+            if f.label != l.id { continue; }
+            self.patch32(f.at, st.at - f.end);
+        }
+    }
+
+    /// Where a bound label sits in the instruction stream.
+    pub fn offset(self, l: Label) -> i64 {
+        let st = self.labels.at(l.id);
+        if !st.bound && self.error == "" {
+            self.error = "label `\(st.name)` is not bound";
+        }
+        st.at
+    }
+
+    /// The virtual address of a bound label.
+    pub fn addr(self, l: Label) -> i64 { self.base + self.offset(l) }
+
+    fn put(self, b: i64) { self.code.push(b & 255); }
+
+    fn imm32(self, v: i64) {
+        self.put(v);
+        self.put(v >> 8);
+        self.put(v >> 16);
+        self.put(v >> 24);
+    }
+
+    fn imm64(self, v: u64) {
+        let mut i = 0;
+        while i < 8 {
+            self.put(((v >> ((8 * i) as u64)) & 255u64) as i64);
+            i = i + 1;
+        }
+    }
+
+    fn patch32(self, at: i64, v: i64) {
+        self.code.set(at, v & 255);
+        self.code.set(at + 1, (v >> 8) & 255);
+        self.code.set(at + 2, (v >> 16) & 255);
+        self.code.set(at + 3, (v >> 24) & 255);
+    }
+
+    /// Emits a placeholder for a label-relative displacement and records the fixup. A label
+    /// already bound is patched immediately, which is what makes a backward jump -- a
+    /// loop's back edge -- need no second pass.
+    fn ref32(self, l: Label) {
+        let at = self.code.len();
+        self.imm32(0);
+        let end = self.code.len();
+        let st = self.labels.at(l.id);
+        if st.bound {
+            self.patch32(at, st.at - end);
+            return;
+        }
+        self.fixups.push(Fixup { at: at, end: end, label: l.id });
+    }
+
+    // --- Encoding primitives -----------------------------------------------------------
+
+    /// Emits a REX prefix when one is needed. `w` selects 64-bit operand size; `r`, `x` and
+    /// `b` are the high bits of the register fields.
+    ///
+    /// `force` exists for the byte-operand instructions: `setcc spl` needs an empty REX
+    /// prefix to mean `spl` rather than `ah`, and leaving it out silently writes a
+    /// different register.
+    fn rex(self, w: bool, r: i64, x: i64, b: i64, force: bool) {
+        let mut v = 0;
+        if w { v = v | 0x08; }
+        if r >= R8 { v = v | 0x04; }
+        if x >= R8 { v = v | 0x02; }
+        if b >= R8 { v = v | 0x01; }
+        if v != 0 || force { self.put(0x40 | v); }
+    }
+
+    /// Encodes a register-to-register operand pair (mod = 11).
+    fn modrm_reg(self, reg: i64, rm: i64) {
+        self.put(0xC0 | ((reg & 7) << 3) | (rm & 7));
+    }
+
+    /// Encodes `[base + disp]`.
+    ///
+    /// Two cases in the encoding are not uniform and are the usual source of a wrong
+    /// address: rm = 4 (rsp, r12) always needs a SIB byte, and rm = 5 (rbp, r13) has no
+    /// disp-less form because that slot means RIP-relative, so it takes an explicit zero
+    /// displacement.
+    fn modrm_mem(self, reg: i64, m: Mem) {
+        let base = m.base;
+        let need_disp8 = m.disp != 0 || (base & 7) == 5;
+        let mut mode = 0x00;
+        if need_disp8 {
+            if m.disp >= -128 && m.disp <= 127 { mode = 0x40; } else { mode = 0x80; }
+        }
+
+        self.put(mode | ((reg & 7) << 3) | (base & 7));
+        if (base & 7) == 4 {
+            self.put(0x24); // SIB with no index: base only.
+        }
+        if mode == 0x40 { self.put(m.disp); }
+        if mode == 0x80 { self.imm32(m.disp); }
+    }
+
+    /// A REX.W instruction with a register-register ModRM.
+    fn op64rr(self, opcode: i64, reg: i64, rm: i64) {
+        self.rex(true, reg, 0, rm, false);
+        self.put(opcode);
+        self.modrm_reg(reg, rm);
+    }
+
+    /// A REX.W instruction with a register-memory ModRM.
+    fn op64rm(self, opcode: i64, reg: i64, m: Mem) {
+        self.rex(true, reg, 0, m.base, false);
+        self.put(opcode);
+        self.modrm_mem(reg, m);
+    }
+
+    // --- Data movement ------------------------------------------------------------------
+
+    /// `mov dst, src`.
+    pub fn mov_rr(self, dst: i64, src: i64) {
+        if dst == src { return; }
+        self.op64rr(0x89, src, dst);
+    }
+
+    /// `mov dst, imm64`, always in the ten-byte form so the instruction's length does not
+    /// depend on the value. A backend that patches an immediate after the fact needs the
+    /// length to be fixed; a peephole can shrink it later.
+    pub fn mov_ri(self, dst: i64, imm: u64) {
+        self.rex(true, 0, 0, dst, false);
+        self.put(0xB8 | (dst & 7));
+        self.imm64(imm);
+    }
+
+    /// `mov dst, [base+disp]`.
+    pub fn mov_rm(self, dst: i64, m: Mem) { self.op64rm(0x8B, dst, m); }
+
+    /// `mov [base+disp], src`.
+    pub fn mov_mr(self, m: Mem, src: i64) { self.op64rm(0x89, src, m); }
+
+    /// `mov qword [base+disp], imm32`, sign-extended to 64 bits.
+    pub fn mov_mi(self, m: Mem, imm: i64) {
+        self.rex(true, 0, 0, m.base, false);
+        self.put(0xC7);
+        self.modrm_mem(0, m);
+        self.imm32(imm);
+    }
+
+    /// `lea dst, [base+disp]`.
+    pub fn lea(self, dst: i64, m: Mem) { self.op64rm(0x8D, dst, m); }
+
+    /// `lea dst, [rip + (label - next instruction)]`: the address of a label, computed
+    /// without a relocation.
+    pub fn lea_label(self, dst: i64, l: Label) {
+        self.rex(true, dst, 0, 0, false);
+        self.put(0x8D);
+        // mod = 00, rm = 101 is RIP-relative.
+        self.put(0x00 | ((dst & 7) << 3) | 0x05);
+        self.ref32(l);
+    }
+
+    /// `push src`.
+    pub fn push(self, src: i64) {
+        self.rex(false, 0, 0, src, false);
+        self.put(0x50 | (src & 7));
+    }
+
+    /// `pop dst`.
+    pub fn pop(self, dst: i64) {
+        self.rex(false, 0, 0, dst, false);
+        self.put(0x58 | (dst & 7));
+    }
+
+    /// `movzx dst, src8`: zero-extend a byte register to 64 bits, which is how a `setcc`
+    /// result becomes an Origin `bool`.
+    pub fn movzx8(self, dst: i64, src: i64) {
+        self.rex(true, dst, 0, src, false);
+        self.put(0x0F);
+        self.put(0xB6);
+        self.modrm_reg(dst, src);
+    }
+
+    /// `mov dst8, byte [base+disp]`, zero-extending nothing: only the low byte of `dst`
+    /// changes. The runtime's byte copies use it.
+    pub fn mov_rm8(self, dst: i64, m: Mem) {
+        self.rex(false, dst, 0, m.base, dst >= RSP && dst < R8);
+        self.put(0x8A);
+        self.modrm_mem(dst, m);
+    }
+
+    /// `mov byte [base+disp], src8`.
+    pub fn mov_mr8(self, m: Mem, src: i64) {
+        self.rex(false, src, 0, m.base, src >= RSP && src < R8);
+        self.put(0x88);
+        self.modrm_mem(src, m);
+    }
+
+    /// `cmovcc dst, src`.
+    pub fn cmov(self, c: i64, dst: i64, src: i64) {
+        self.rex(true, dst, 0, src, false);
+        self.put(0x0F);
+        self.put(0x40 | c);
+        self.modrm_reg(dst, src);
+    }
+
+    /// `setcc dst8`: set the low byte to 0 or 1. The REX prefix is forced so that `dst`
+    /// 4..7 means `spl`/`bpl`/`sil`/`dil` rather than `ah`/`ch`/`dh`/`bh`.
+    pub fn setcc(self, c: i64, dst: i64) {
+        self.rex(false, 0, 0, dst, dst >= RSP && dst < R8);
+        self.put(0x0F);
+        self.put(0x90 | c);
+        self.put(0xC0 | (dst & 7));
+    }
+
+    // --- Integer arithmetic --------------------------------------------------------------
+
+    pub fn add_rr(self, dst: i64, src: i64) { self.op64rr(0x01, src, dst); }
+    pub fn sub_rr(self, dst: i64, src: i64) { self.op64rr(0x29, src, dst); }
+    pub fn and_rr(self, dst: i64, src: i64) { self.op64rr(0x21, src, dst); }
+    pub fn or_rr(self, dst: i64, src: i64) { self.op64rr(0x09, src, dst); }
+    pub fn xor_rr(self, dst: i64, src: i64) { self.op64rr(0x31, src, dst); }
+    pub fn cmp_rr(self, x: i64, y: i64) { self.op64rr(0x39, y, x); }
+    pub fn test_rr(self, x: i64, y: i64) { self.op64rr(0x85, y, x); }
+
+    /// `imul dst, src`: the two-operand form, which keeps the result in `dst` and sets OF
+    /// on signed overflow. ADR-0005 makes that flag the whole point.
+    pub fn imul_rr(self, dst: i64, src: i64) {
+        self.rex(true, dst, 0, src, false);
+        self.put(0x0F);
+        self.put(0xAF);
+        self.modrm_reg(dst, src);
+    }
+
+    /// One of the `81 /n` group with a 32-bit immediate. The 8-bit form is not used: a
+    /// fixed instruction length is worth more here than a byte.
+    fn alu_imm(self, ext: i64, dst: i64, imm: i64) {
+        self.rex(true, 0, 0, dst, false);
+        self.put(0x81);
+        self.put(0xC0 | (ext << 3) | (dst & 7));
+        self.imm32(imm);
+    }
+
+    pub fn add_ri(self, dst: i64, imm: i64) { self.alu_imm(0, dst, imm); }
+    pub fn or_ri(self, dst: i64, imm: i64) { self.alu_imm(1, dst, imm); }
+    pub fn and_ri(self, dst: i64, imm: i64) { self.alu_imm(4, dst, imm); }
+    pub fn sub_ri(self, dst: i64, imm: i64) { self.alu_imm(5, dst, imm); }
+    pub fn xor_ri(self, dst: i64, imm: i64) { self.alu_imm(6, dst, imm); }
+    pub fn cmp_ri(self, dst: i64, imm: i64) { self.alu_imm(7, dst, imm); }
+
+    /// One of the `F7 /n` group.
+    fn unary(self, ext: i64, r: i64) {
+        self.rex(true, 0, 0, r, false);
+        self.put(0xF7);
+        self.put(0xC0 | (ext << 3) | (r & 7));
+    }
+
+    pub fn not_r(self, r: i64) { self.unary(2, r); }
+
+    /// `neg r`, which sets OF when the operand is the most negative integer -- the one case
+    /// where negation overflows.
+    pub fn neg_r(self, r: i64) { self.unary(3, r); }
+
+    /// `mul r`: multiplies RAX by `r` as unsigned, low half in RAX and high half in RDX. A
+    /// non-zero high half is exactly an unsigned overflow, which `imul`'s OF does not
+    /// answer -- it answers the signed question instead.
+    pub fn mul_r(self, r: i64) { self.unary(4, r); }
+
+    /// `div r`: divides RDX:RAX by `r` as unsigned. Rendering a negative integer needs it --
+    /// the magnitude of the most negative integer does not fit in a signed 64-bit value, so
+    /// the digits are produced by unsigned division of the negated bits.
+    pub fn div_r(self, r: i64) { self.unary(6, r); }
+
+    /// `idiv r`: quotient in RAX, remainder in RDX. The caller must have executed `cqo`,
+    /// and must have already excluded a zero divisor and the `MIN / -1` overflow, both of
+    /// which raise a hardware exception rather than trapping the way the spec requires.
+    pub fn idiv_r(self, r: i64) { self.unary(7, r); }
+
+    /// `cqo` sign-extends RAX into RDX:RAX, which is what makes `idiv` a signed division.
+    pub fn cqo(self) { self.put(0x48); self.put(0x99); }
+
+    /// One of the `D3 /n` group: shift by the count in CL.
+    fn shift_cl(self, ext: i64, r: i64) {
+        self.rex(true, 0, 0, r, false);
+        self.put(0xD3);
+        self.put(0xC0 | (ext << 3) | (r & 7));
+    }
+
+    pub fn shl_cl(self, r: i64) { self.shift_cl(4, r); }
+    pub fn shr_cl(self, r: i64) { self.shift_cl(5, r); }
+    pub fn sar_cl(self, r: i64) { self.shift_cl(7, r); }
+
+    /// One of the `C1 /n` group.
+    fn shift_imm(self, ext: i64, r: i64, count: i64) {
+        self.rex(true, 0, 0, r, false);
+        self.put(0xC1);
+        self.put(0xC0 | (ext << 3) | (r & 7));
+        self.put(count);
+    }
+
+    pub fn shl_i(self, r: i64, count: i64) { self.shift_imm(4, r, count); }
+    pub fn shr_i(self, r: i64, count: i64) { self.shift_imm(5, r, count); }
+    pub fn sar_i(self, r: i64, count: i64) { self.shift_imm(7, r, count); }
+
+    // --- Control flow ---------------------------------------------------------------------
+
+    /// `jmp label`, always in the rel32 form so that binding a label never changes an
+    /// instruction's length.
+    pub fn jmp(self, l: Label) {
+        self.put(0xE9);
+        self.ref32(l);
+    }
+
+    /// `jcc label`, rel32.
+    pub fn jcc(self, c: i64, l: Label) {
+        self.put(0x0F);
+        self.put(0x80 | c);
+        self.ref32(l);
+    }
+
+    /// `call label`, rel32.
+    pub fn call(self, l: Label) {
+        self.put(0xE8);
+        self.ref32(l);
+    }
+
+    /// `call r`, for a call through a function value.
+    pub fn call_reg(self, r: i64) {
+        self.rex(false, 0, 0, r, false);
+        self.put(0xFF);
+        self.put(0xD0 | (r & 7));
+    }
+
+    /// `jmp r`.
+    pub fn jmp_reg(self, r: i64) {
+        self.rex(false, 0, 0, r, false);
+        self.put(0xFF);
+        self.put(0xE0 | (r & 7));
+    }
+
+    pub fn ret(self) { self.put(0xC3); }
+
+    /// The only way this runtime reaches the operating system (ADR-0017).
+    pub fn syscall(self) { self.put(0x0F); self.put(0x05); }
+
+    /// `ud2`, an instruction guaranteed to fault. It is emitted where control must not
+    /// reach -- after a trap that exits, or off the end of a function that always returns --
+    /// so that a bug in the code generator crashes immediately instead of executing
+    /// whatever bytes follow.
+    pub fn ud2(self) { self.put(0x0F); self.put(0x0B); }
+
+    /// A one-byte `nop`, used to pad a function to an alignment boundary.
+    pub fn nop(self) { self.put(0x90); }
+
+    /// Pads with `nop` until the next multiple of `n`.
+    pub fn align(self, n: i64) {
+        while self.code.len() % n != 0 { self.nop(); }
+    }
+
+    // --- Floating point (SSE2, doubles) -----------------------------------------------------
+
+    /// A two-byte-opcode SSE instruction with an xmm-xmm operand pair. The prefix order
+    /// matters and is easy to get backwards: legacy prefix, then REX, then opcode.
+    fn sse(self, prefix: i64, opcode: i64, dst: i64, src: i64) {
+        if prefix != 0 { self.put(prefix); }
+        self.rex(false, dst, 0, src, false);
+        self.put(0x0F);
+        self.put(opcode);
+        self.put(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    /// `movsd dst, src` between registers.
+    pub fn movsd_xx(self, dst: i64, src: i64) {
+        if dst == src { return; }
+        self.sse(0xF2, 0x10, dst, src);
+    }
+
+    /// `movsd dst, [base+disp]`.
+    pub fn movsd_xm(self, dst: i64, m: Mem) {
+        self.put(0xF2);
+        self.rex(false, dst, 0, m.base, false);
+        self.put(0x0F);
+        self.put(0x10);
+        self.modrm_mem(dst, m);
+    }
+
+    /// `movsd [base+disp], src`.
+    pub fn movsd_mx(self, m: Mem, src: i64) {
+        self.put(0xF2);
+        self.rex(false, src, 0, m.base, false);
+        self.put(0x0F);
+        self.put(0x11);
+        self.modrm_mem(src, m);
+    }
+
+    pub fn addsd_xx(self, dst: i64, src: i64) { self.sse(0xF2, 0x58, dst, src); }
+    pub fn subsd_xx(self, dst: i64, src: i64) { self.sse(0xF2, 0x5C, dst, src); }
+    pub fn mulsd_xx(self, dst: i64, src: i64) { self.sse(0xF2, 0x59, dst, src); }
+
+    /// `divsd dst, src`. Float division never traps: it produces an infinity or a NaN.
+    pub fn divsd_xx(self, dst: i64, src: i64) { self.sse(0xF2, 0x5E, dst, src); }
+
+    /// `ucomisd a, b`: an unordered compare setting ZF, PF and CF. PF is set when either
+    /// operand is NaN, which is how `NaN != NaN` is implemented.
+    pub fn ucomisd_xx(self, x: i64, y: i64) { self.sse(0x66, 0x2E, x, y); }
+
+    /// `xorps dst, src`, used with `dst == src` to make a zero.
+    pub fn xorps_xx(self, dst: i64, src: i64) { self.sse(0, 0x57, dst, src); }
+
+    /// `movq dst_xmm, src_reg`: move the raw bits, no conversion.
+    pub fn movq_xr(self, dst: i64, src: i64) {
+        self.put(0x66);
+        self.rex(true, dst, 0, src, false);
+        self.put(0x0F);
+        self.put(0x6E);
+        self.put(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    /// `movq dst_reg, src_xmm`: move the raw bits, no conversion.
+    pub fn movq_rx(self, dst: i64, src: i64) {
+        self.put(0x66);
+        self.rex(true, src, 0, dst, false);
+        self.put(0x0F);
+        self.put(0x7E);
+        self.put(0xC0 | ((src & 7) << 3) | (dst & 7));
+    }
+
+    /// `cvtsi2sd dst, src`: signed 64-bit integer to double.
+    pub fn cvtsi2sd(self, dst: i64, src: i64) {
+        self.put(0xF2);
+        self.rex(true, dst, 0, src, false);
+        self.put(0x0F);
+        self.put(0x2A);
+        self.put(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    /// `cvttsd2si dst, src`: double to signed 64-bit integer, truncating toward zero.
+    pub fn cvttsd2si(self, dst: i64, src: i64) {
+        self.put(0xF2);
+        self.rex(true, dst, 0, src, false);
+        self.put(0x0F);
+        self.put(0x2C);
+        self.put(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+}

@@ -80,7 +80,8 @@ stage1/src/           from Phase 9: the compiler for Origin, written in Origin -
                       resolve.origin, types.origin, check.origin, mono.origin,
                       layout.origin, bytecode.origin, compile.origin, ir.origin,
                       irbuild.origin, dom.origin, arith.origin, opt.origin,
-                      emit.origin and main.origin (its own command line) so far
+                      emit.origin, x86.origin and main.origin (its own command
+                      line) so far
 bootstrap/            from Phase 9: the last known-good stage1 binary
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```
@@ -191,11 +192,11 @@ in Origin. What exists in `stage1/src/` is everything except the machine code --
 `lex.origin`, `ast.origin`, `parse.origin`, `source.origin`, `resolve.origin`,
 `types.origin`, `check.origin`, `mono.origin`, `layout.origin`, `bytecode.origin`,
 `compile.origin`, `ir.origin`, `irbuild.origin`, `dom.origin`, `arith.origin`,
-`opt.origin`, `emit.origin` -- and `main.origin`, which makes stage1 an actual
+`opt.origin`, `emit.origin`, `x86.origin` -- and `main.origin`, which makes stage1 an actual
 command-line program (`stage1
 dump-tokens|dump-ast|parse|resolve|check|mono|dump-bytecode|dump-ir [-O0|-O1|-O2]
 <file>...`, plus `--package <root>` for a whole package) shaped like `cmd/originc`'s. That
-is about 22,100 lines of Origin, and every component is held to the Go one it replaces over this
+is about 22,900 lines of Origin, and every component is held to the Go one it replaces over this
 repository's own ~400 `.origin` files, all in `tests/selfhost`: the token stream against
 `internal/lex`, the dumped syntax tree against `internal/ast`, the position mapping against
 `internal/source`, the *places* syntax errors are reported against `internal/lex` +
@@ -213,8 +214,9 @@ of SSA at `-O0`, 80,816 at `-O1` and 102,586 at `-O2`**, and then that SSA back 
 
 That is the whole compiler except the machine code, and it is a *complete* compiler at the
 bytecode level: what stage1 emits at `-O2` is what the virtual machine runs. What stands
-between it and a self-hosted **binary** is `internal/x86` (722 lines), `internal/obj`
-(1,135) and `internal/backend` (7,064).
+between it and a self-hosted **binary** is `internal/obj` (1,135 lines) and
+`internal/backend` (7,064); `internal/x86` is done, held to **5,118 bytes of encoded
+instructions, identical on all four engines**.
 
 The language grew what a compiler cannot be written without: **the command line and the
 exit status** (`docs/spec/17-process.md`) — `args()` in the prelude over `env::arg_count`
@@ -243,12 +245,13 @@ which is where stage1 keeps what `internal/check` keeps in a map keyed by `ast.N
 rule `ast.origin` states — a slot arrives when a reader does — is why they landed in the
 same commit as the reader.
 
-**Next action: `internal/x86` (722 lines), then `internal/obj` (1,135) and
-`internal/backend` (7,064)**, with `dwarf` and `codesign` (782 between them) pulled in as
-their consumers need them — roughly 9,700 lines of Go, and the last of it. `internal/x86`
-first because it is self-contained and has its own oracle: an encoder is right when the
-bytes match, and `internal/x86`'s own tests are a table of instructions and their
-encodings that stage1 can be held to directly. Nothing in the project is known-wrong.
+**Next action: `internal/obj` (1,135 lines), then `internal/backend` (7,064)**, with
+`dwarf` and `codesign` (782 between them) pulled in as their consumers need them — roughly
+9,000 lines of Go, and the last of it. `internal/obj` next because it is the other
+self-contained half of "write an executable": given a code blob and a data blob it writes
+an ELF or a Mach-O, and two writers that produce the same bytes for the same input are
+comparable directly, exactly the way the encoder is. Nothing in the project is
+known-wrong.
 
 **The alternative worth weighing first**: a stage1 that ends at bytecode is already a
 compiler, if something runs the bytecode. Writing the *virtual machine* in Origin
@@ -282,6 +285,24 @@ every bug came from *running Origin*, not from reading Go.
   the first of a duplicated name wins. The degenerate input is the most valuable file in
   the corpus, and a fourth case of the same thing — `checkBodies` visiting an impl's methods
   in map order — was found the same way.
+- **Writing the encoder found a register-allocator bug four phases old.** Liveness counted
+  `OpParam` and `OpCapture` as *definitions* of the block they appear in. They are not: a
+  parameter arrives with the frame, before the entry block runs, and the value is a name
+  for something already there. That is wrong exactly when the entry block is also a loop
+  header — `fn align(c: List[i64], n: i64) { while c.len() < n { c.push(0); } }` builds
+  precisely that shape, because the condition is the first thing in the function — and the
+  dataflow then concludes both parameters are dead at the end of the loop body, since they
+  are "defined" in the successor. The allocator hands their registers to something in the
+  body and the next iteration compares against whatever that left behind.
+
+  Native code only, and only at `-O0` and `-O1`: at `-O2` inlining reshapes the function
+  and it comes out right by accident, which is why every existing differential passed
+  through it. The tell was the same one Phase 8 recorded — **it turned up the moment
+  something real was written in Origin**, not from reading the allocator. An encoder pads
+  to an alignment boundary, `align` is that shape, and nothing else in twenty thousand
+  lines of Origin had happened to write a loop whose condition is a function's first
+  statement.
+
 - **The optimizer's first full run found one bug, and it was in the new code.** Folding
   `-x` as `0.0 - x` answers `+0.0` for `-0.0`, and the two are different constants with
   different bits, so stage1's CSE merged a `-0.0` into a `+0.0` that the Go compiler kept

@@ -219,7 +219,21 @@ func liveness(f *ir.Func, n *numbering) (in, out map[*ir.Block]map[*ir.Value]boo
 					u[a] = true
 				}
 			}
-			d[v] = true
+			// A parameter and a capture are not *defined* by the block they appear in.
+			// They arrive with the frame, before the entry block runs, and the OpParam
+			// value is a name for something already there rather than an instruction
+			// that computes it.
+			//
+			// Counting one as a definition is wrong exactly when the entry block is also
+			// a loop header -- `fn f(c: List[i64], n: i64) { while c.len() < n { ... } }`
+			// builds precisely that, because the condition is the first thing in the
+			// function. The dataflow then concludes the parameter is dead at the end of
+			// the loop body (it is "defined" in the successor), the allocator hands its
+			// register to something in the body, and the next iteration compares against
+			// whatever that left behind. The engines disagree, and only in native code.
+			if v.Op != ir.OpParam && v.Op != ir.OpCapture {
+				d[v] = true
+			}
 		}
 		if b.Term != nil {
 			for _, a := range b.Term.Args {

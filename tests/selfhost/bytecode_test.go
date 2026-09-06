@@ -48,6 +48,14 @@ func TestStage1BytecodeMatchesTheGoCompiler(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The Go answer for one (file, level) pair does not depend on which engine row asked
+	// for it, and two of the rows below walk the whole corpus. Computing it twice means
+	// parsing, resolving, checking, monomorphizing and lowering four hundred files a second
+	// time for an answer already in hand -- which is the shape of waste this suite has been
+	// caught in before (CLAUDE.md, "the self-hosting suite was 92% of the five-minute
+	// budget").
+	memo := map[goKey][]string{}
+
 	engines := []struct {
 		name   string
 		engine driver.Engine
@@ -103,7 +111,9 @@ func TestStage1BytecodeMatchesTheGoCompiler(t *testing.T) {
 			preludeTree := parse.FileWith(source.NewFile(prelude.Name, string(pdata)), diag.New(), ids)
 			at, total, bad, compiled := 0, 0, 0, 0
 			for _, path := range files {
-				want := goBytecode(t, ids, preludeTree, path, e.dump)
+				want := memoized(memo, path, e.dump, func() []string {
+					return goBytecode(t, ids, preludeTree, path, e.dump)
+				})
 				if len(want) > 1 {
 					compiled++
 				}
@@ -435,6 +445,8 @@ func TestStage1BuildsTheSameSSAAsTheGoCompiler(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	memo := map[goKey][]string{}
+
 	engines := []struct {
 		name   string
 		engine driver.Engine
@@ -483,7 +495,9 @@ func TestStage1BuildsTheSameSSAAsTheGoCompiler(t *testing.T) {
 			preludeTree := parse.FileWith(source.NewFile(prelude.Name, string(pdata)), diag.New(), ids)
 			at, total, bad := 0, 0, 0
 			for _, path := range files {
-				want := goSSA(t, ids, preludeTree, path, e.dump)
+				want := memoized(memo, path, e.dump, func() []string {
+					return goSSA(t, ids, preludeTree, path, e.dump)
+				})
 				total += len(want)
 				for i, w := range want {
 					if at+i >= len(got) {
@@ -566,4 +580,23 @@ func levelFlag(level opt.Level) string {
 		return "-O2"
 	}
 	return "-O0"
+}
+
+// goKey identifies one Go-side answer: a file and the level it was asked for at.
+type goKey struct {
+	path  string
+	level opt.Level
+}
+
+// memoized computes a Go-side answer once per (file, level) and hands the same lines back
+// to every engine row that asks for it. The rows differ in which *engine* runs stage1;
+// what the Go compiler says is the same either way.
+func memoized(memo map[goKey][]string, path string, level opt.Level, compute func() []string) []string {
+	k := goKey{path, level}
+	if v, ok := memo[k]; ok {
+		return v
+	}
+	v := compute()
+	memo[k] = v
+	return v
 }
