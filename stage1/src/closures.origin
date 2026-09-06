@@ -1,0 +1,149 @@
+// Boxing a function value that escapes being called directly.
+//
+// A translation of `internal/backend/closures.go`, and the one native-only pass that runs
+// over every function's IR before lowering sees it. It closes a soundness gap: a bare
+// function value is its entry address, a raw word with no heap object and no runtime tag,
+// which is fine as long as the only thing that ever happens to it is an immediate call --
+// but once such a value can flow anywhere else (a return, an argument, a phi, a struct
+// field), an indirect call site has no way to tell "this register holds a code address"
+// apart from "this register holds a closure object" by looking at the value alone, the way
+// the virtual machine can from a value's own runtime tag.
+//
+// The fix makes the answer static instead of dynamic: after this pass, a function-typed
+// value is either a bare reference every one of whose uses is being the immediate callee of
+// a call (left alone), or it is provably a real object -- a genuine closure, or a function
+// reference this pass has wrapped in a one-word box because some use of it was not an
+// immediate call. Every call whose callee is not, after boxing, a bare function reference
+// is then repointed at the closure-call form, so the backend's dispatch on the op needs no
+// further reasoning about where the value came from.
+//
+// A boxed value and a real closure share one calling convention: the object's field 0 is
+// always the code address to call, and the object reference itself travels to the callee on
+// the stack, in the fixed spot a call always leaves just above the return address, never in
+// an argument register. An ordinary function boxed this way was compiled with no knowledge
+// that it might be called this way and simply never reads that spot; a real closure's body
+// does. That is what lets one convention serve both without the call site ever needing to
+// know, at compile time or at run time, which of the two it has (ADR-0020).
+
+use std::list;
+use std::map;
+
+use ir;
+
+pub fn resolve_closure_calls(f: ir::Func) {
+    box_escaping_func_values(f);
+    classify_calls(f);
+}
+
+/// One place a value is read: by which value, at which argument position.
+struct Use {
+    pub by: ir::Value,
+    pub index: i64,
+}
+
+/// Finds every function reference with a use that is not being the immediate callee of a
+/// call, and wraps each in a box right after its definition, repointing every one of its
+/// uses (including its call uses, if it has any left) at the box. A value with no such use
+/// is untouched, so a function called only directly keeps paying nothing for this pass.
+fn box_escaping_func_values(f: ir::Func) {
+    let uses = map::new[i64, List[Use]]();
+    let all = f.values();
+    let mut i = 0;
+    while i < all.len() {
+        let u = all.at(i);
+        i = i + 1;
+        let mut a = 0;
+        while a < u.args.len() {
+            let arg = u.args.at(a);
+            let at = a;
+            a = a + 1;
+            let l = match uses.get(arg.id) {
+                Option::Some(x) => x,
+                Option::None => {
+                    let x = list::new[Use]();
+                    uses.insert(arg.id, x);
+                    x
+                },
+            };
+            l.push(Use { by: u, index: at });
+        }
+    }
+
+    let to_box = list::new[ir::Value]();
+    let mut k = 0;
+    while k < all.len() {
+        let v = all.at(k);
+        k = k + 1;
+        if v.op != ir::OP_FUNC { continue; }
+        match uses.get(v.id) {
+            Option::None => {},
+            Option::Some(us) => {
+                let mut u = 0;
+                while u < us.len() {
+                    let one = us.at(u);
+                    u = u + 1;
+                    if one.by.op != ir::OP_CALL || one.index != 0 {
+                        to_box.push(v);
+                        u = us.len();
+                    }
+                }
+            },
+        }
+    }
+
+    let mut b = 0;
+    while b < to_box.len() {
+        let v = to_box.at(b);
+        b = b + 1;
+        let args = list::new[ir::Value]();
+        args.push(v);
+        let boxed = f.new_value(ir::OP_BOX_FN, v.span, v.file, args);
+        // `replace_all_uses` must run before the box is spliced into the block: it rewrites
+        // every argument list currently reachable through the function that names `v`, and
+        // the box's own first argument names `v` too. Inserting first would make it rewrite
+        // the box's own argument into itself.
+        f.replace_all_uses(v, boxed);
+        match v.block {
+            Option::Some(blk) => { insert_after(blk, v, boxed); },
+            Option::None => {},
+        }
+    }
+}
+
+/// Repoints a call whose callee is not a bare function reference at the closure-call form.
+/// It runs after boxing, so every remaining call's callee is either an untouched function
+/// reference (every use of it was an immediate call, so it never got boxed) or something
+/// that correctly needs the closure-object calling convention: a boxed value, a real
+/// closure, or anything derived from one.
+fn classify_calls(f: ir::Func) {
+    let all = f.values();
+    let mut i = 0;
+    while i < all.len() {
+        let v = all.at(i);
+        i = i + 1;
+        if v.op == ir::OP_CALL && !v.args.is_empty() && v.args.at(0).op != ir::OP_FUNC {
+            v.op = ir::OP_CALL_CLOSURE;
+        }
+    }
+}
+
+/// Splices `v` into the block's own instruction list immediately following `after`, which
+/// must already be there. Definition-before-use only needs `v` to sit somewhere after
+/// `after` within the same block; immediately after is simplest and always correct.
+fn insert_after(b: ir::Block, after: ir::Value, v: ir::Value) {
+    v.block = Option::Some(b);
+    let out = list::new[ir::Value]();
+    let mut placed = false;
+    let mut i = 0;
+    while i < b.instr.len() {
+        let ins = b.instr.at(i);
+        i = i + 1;
+        out.push(ins);
+        if !placed && ref_eq(ins, after) {
+            out.push(v);
+            placed = true;
+        }
+    }
+    if !placed { out.push(v); }
+    b.instr = out;
+}

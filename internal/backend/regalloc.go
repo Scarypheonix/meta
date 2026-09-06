@@ -503,7 +503,19 @@ func allocate(f *ir.Func, preempts bool) *alloc {
 		regOf[iv] = chosen
 		a.where[iv.val] = inReg(chosen)
 		active = append(active, iv)
-		sort.Slice(active, func(i, j int) bool { return active[i].end < active[j].end })
+		// By end, then by value id. The tie-break is not cosmetic: `expire` releases in
+		// this order and every released register is appended to a free list, so which of
+		// two intervals ending together gives its register back first decides which
+		// register the next value gets. `sort.Slice` is not stable, so leaving the tie
+		// unspecified would make the emitted bytes depend on a sort's internal choices --
+		// the same shape as the map-iteration order that made this compiler's own output
+		// nondeterministic in Phase 9, and the same fix: say what the order is.
+		sort.SliceStable(active, func(i, j int) bool {
+			if active[i].end != active[j].end {
+				return active[i].end < active[j].end
+			}
+			return active[i].val.ID < active[j].val.ID
+		})
 	}
 
 	// A function with captures is only ever entered through lower.go's callClosure, which

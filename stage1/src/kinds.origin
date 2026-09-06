@@ -1,0 +1,247 @@
+// Kind propagation: completing what the SSA builder seeded.
+//
+// A translation of `internal/backend/kinds.go`. It is the native-only pass that turns the
+// kind `irbuild.origin` could read straight off the bytecode into every value's actual kind
+// (ADR-0021). It runs once per function, after closure resolution: a value's kind depends
+// only on its own operation and its operands' kinds, never on anything the boxing pass
+// changes, but running after it means a boxed function reference already has its final op.
+//
+// This, plus the builder's own seeding, is the whole of what "a value's kind travels with
+// it" means for the operations the optimizer and the virtual machine never needed it for:
+// `ir.origin` stays otherwise untyped, and this data exists only inside the backend's own
+// copy of the IR.
+
+use std::list;
+
+use bytecode;
+use compile;
+use ir;
+
+pub fn propagate_kinds(f: ir::Func, prog: bytecode::Program) -> String {
+    let phis = list::new[ir::Value]();
+    let all = f.values();
+    let mut i = 0;
+    while i < all.len() {
+        let v = all.at(i);
+        i = i + 1;
+        if v.op == ir::OP_PHI {
+            phis.push(v);
+            continue;
+        }
+        let k = static_kind(v, prog);
+        if k != bytecode::KIND_UNKNOWN { v.kind = k; }
+    }
+
+    // A phi's kind is whatever its operands' already is -- a well-typed program's static
+    // type does not change across branches -- but an operand can itself be another phi (a
+    // loop-carried value), so this is a small fixed point rather than one pass. A phi
+    // resolves at most twice (unknown, then possibly a unit placeholder, then its real
+    // kind), and every round makes at least one of those transitions, so twice the number
+    // of phis bounds it.
+    let mut round = 0;
+    while round < 2 * phis.len() + 1 {
+        round = round + 1;
+        let mut changed = false;
+        let mut p = 0;
+        while p < phis.len() {
+            let phi = phis.at(p);
+            p = p + 1;
+            let k = phi_kind(phi);
+            if k != bytecode::KIND_UNKNOWN && k != phi.kind {
+                phi.kind = k;
+                changed = true;
+            }
+        }
+        if !changed { round = 2 * phis.len() + 1; }
+    }
+    check_phi_kinds(f)
+}
+
+/// The kind of the operands that actually carry a value.
+///
+/// "Whatever its operands' kind is" is not "the first operand's kind", because one operand
+/// may be a placeholder rather than a value. The inliner gives the phi standing in for a
+/// call one operand per cloned `return`, and a return that carries nothing -- the arm of
+/// the callee that diverges, `Option::expect`'s `panic` -- gets a synthetic unit, since a
+/// phi needs an operand for every predecessor whether or not that predecessor can arrive.
+/// Let that unit answer for the phi and a reference merged with it becomes a raw word:
+/// spilled to a raw slot, and never updated when a collection moves the object. That is a
+/// lost root, and it is what stage1 found in the Go compiler.
+fn phi_kind(p: ir::Value) -> i64 {
+    let mut fallback = bytecode::KIND_UNKNOWN;
+    let mut i = 0;
+    while i < p.args.len() {
+        let a = p.args.at(i);
+        i = i + 1;
+        if a.kind == bytecode::KIND_UNKNOWN { continue; }
+        if a.kind == bytecode::KIND_UNIT {
+            // Only if nothing real ever turns up: a phi of genuine units is genuinely unit.
+            fallback = bytecode::KIND_UNIT;
+            continue;
+        }
+        return a.kind;
+    }
+    fallback
+}
+
+/// Whether a kind is a heap reference a collector would need to trace: an aggregate, or a
+/// `String`, which is byte-array-shaped but still a heap object.
+pub fn is_ref_kind(k: i64) -> bool {
+    k == bytecode::KIND_REF || k == bytecode::KIND_STRING
+}
+
+/// Asserts what `phi_kind`'s rule rests on: apart from the inliner's unit placeholder, a
+/// phi's operands agree about whether they are a reference. Disagreement means one branch
+/// of a well-typed program produced a heap object where another produced a machine word,
+/// and whichever answer the phi took, the stack map would be wrong about it at every
+/// collection point the phi is live across -- a silently corrupted heap rather than a
+/// crash, which is exactly the class this pass is here to get right.
+fn check_phi_kinds(f: ir::Func) -> String {
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks.at(bi);
+        bi = bi + 1;
+        let mut p = 0;
+        while p < b.phis.len() {
+            let phi = b.phis.at(p);
+            p = p + 1;
+            let mut a = 0;
+            while a < phi.args.len() {
+                let arg = phi.args.at(a);
+                a = a + 1;
+                if arg.kind == bytecode::KIND_UNKNOWN || arg.kind == bytecode::KIND_UNIT {
+                    continue;
+                }
+                if is_ref_kind(arg.kind) != is_ref_kind(phi.kind) {
+                    return "this is a compiler bug: \(ir::value_name(phi)) in \(f.name) is \(bytecode::kind_name(phi.kind)) but its operand \(ir::value_name(arg)) is \(bytecode::kind_name(arg.kind)), and the two disagree about being a reference";
+                }
+            }
+        }
+    }
+    ""
+}
+
+/// The kind an operation fixes on its own, or `KIND_UNKNOWN` when it does not.
+///
+/// A parameter, a capture, a field read, a call and a closure call already carry their kind
+/// from the SSA builder -- this just reports it, or reports it as not yet known when the
+/// builder had nothing to seed it with.
+fn static_kind(v: ir::Value, prog: bytecode::Program) -> i64 {
+    if v.op == ir::OP_PARAM || v.op == ir::OP_CAPTURE || v.op == ir::OP_GET_FIELD
+        || v.op == ir::OP_CALL || v.op == ir::OP_CALL_CLOSURE {
+        return v.kind;
+    }
+    if v.op == ir::OP_CONST {
+        if v.a < 0 || v.a >= prog.consts.len() { return bytecode::KIND_UNKNOWN; }
+        let c = prog.consts.at(v.a).kind;
+        if c == bytecode::CONST_INT { return bytecode::KIND_I64; }
+        if c == bytecode::CONST_FLOAT { return bytecode::KIND_FLOAT; }
+        if c == bytecode::CONST_CHAR { return bytecode::KIND_CHAR; }
+        if c == bytecode::CONST_STRING { return bytecode::KIND_STRING; }
+        return bytecode::KIND_UNKNOWN;
+    }
+    if v.op == ir::OP_UNIT { return bytecode::KIND_UNIT; }
+    if v.op == ir::OP_TRUE || v.op == ir::OP_FALSE { return bytecode::KIND_BOOL; }
+    if v.op == ir::OP_ADD || v.op == ir::OP_SUB || v.op == ir::OP_MUL || v.op == ir::OP_DIV
+        || v.op == ir::OP_REM || v.op == ir::OP_NEG || v.op == ir::OP_WRAP_ADD
+        || v.op == ir::OP_WRAP_SUB || v.op == ir::OP_WRAP_MUL || v.op == ir::OP_AND
+        || v.op == ir::OP_OR || v.op == ir::OP_XOR || v.op == ir::OP_SHL
+        || v.op == ir::OP_SHR {
+        // Every one of these is an integer op. Every integer kind is "raw" to a stack map --
+        // the only distinction that matters here -- so neither the width nor the signedness
+        // the checker resolved needs to travel this far, and `KIND_I64` stands for "a
+        // machine word that is not a reference".
+        return bytecode::KIND_I64;
+    }
+    if v.op == ir::OP_ADDF || v.op == ir::OP_SUBF || v.op == ir::OP_MULF
+        || v.op == ir::OP_DIVF || v.op == ir::OP_REMF || v.op == ir::OP_NEGF {
+        return bytecode::KIND_FLOAT;
+    }
+    if v.op == ir::OP_EQ || v.op == ir::OP_NE || v.op == ir::OP_LT || v.op == ir::OP_LE
+        || v.op == ir::OP_GT || v.op == ir::OP_GE || v.op == ir::OP_NOT
+        || v.op == ir::OP_IS_VARIANT {
+        return bytecode::KIND_BOOL;
+    }
+    if v.op == ir::OP_FUNC {
+        // A bare code address: raw, never a reference. The boxing pass has already wrapped
+        // any function value that escapes being an immediate call's own callee, so every
+        // one reaching here really is just an address.
+        return bytecode::KIND_I64;
+    }
+    if v.op == ir::OP_STRUCT || v.op == ir::OP_TUPLE || v.op == ir::OP_VARIANT
+        || v.op == ir::OP_CLOSURE || v.op == ir::OP_BOX_FN {
+        return bytecode::KIND_REF;
+    }
+    if v.op == ir::OP_TO_STR { return bytecode::KIND_STRING; }
+    if v.op == ir::OP_CAST { return cast_result_kind(v.a, v.b); }
+    if v.op == ir::OP_CALL_BUILTIN {
+        let k = builtin_result_kind(v.a);
+        if k != bytecode::KIND_UNKNOWN { return k; }
+        // A builtin whose result is the program's own T (`join`, `taken`, `with`) already
+        // carries its kind on the instruction, seeded from the checker's types. Returning
+        // "unknown, and I am sure" here would overwrite that with nothing -- which is how a
+        // program that builds at `-O1` came to panic at `-O2`.
+        return v.kind;
+    }
+    bytecode::KIND_UNKNOWN
+}
+
+/// A cast's result kind, from its cast kind and the packed width/signedness the lowering
+/// gave it. Always raw, since `as` only converts between primitives, so only *which* raw
+/// kind is in question.
+fn cast_result_kind(k: i64, aux: i64) -> i64 {
+    if k == bytecode::CAST_INT_TO_FLOAT || k == bytecode::CAST_FLOAT_NARROW
+        || k == bytecode::CAST_FLOAT_WIDEN {
+        return bytecode::KIND_FLOAT;
+    }
+    if k == bytecode::CAST_INT_TRUNC || k == bytecode::CAST_FLOAT_TO_INT
+        || k == bytecode::CAST_BOOL_TO_INT || k == bytecode::CAST_CHAR_TO_INT {
+        if (aux & 256) != 0 { return bytecode::KIND_I64; }
+        return bytecode::KIND_U64;
+    }
+    bytecode::KIND_UNKNOWN
+}
+
+/// Each compiler-provided builtin's fixed result kind. `checked_*` wraps in `Option`,
+/// `saturating_*` never fails so it does not, and every `cmp_*` builds an `Ordering`.
+fn builtin_result_kind(idx: i64) -> i64 {
+    if idx == compile::BUILTIN_PRINT || idx == compile::BUILTIN_PRINTLN
+        || idx == compile::BUILTIN_PANIC {
+        return bytecode::KIND_UNIT;
+    }
+    if idx == compile::BUILTIN_REF_EQ { return bytecode::KIND_BOOL; }
+    if idx == compile::BUILTIN_CMP_INT || idx == compile::BUILTIN_CMP_UINT
+        || idx == compile::BUILTIN_CMP_FLOAT || idx == compile::BUILTIN_CMP_STRING {
+        return bytecode::KIND_REF;
+    }
+    if idx == compile::BUILTIN_FITS_ADD || idx == compile::BUILTIN_FITS_SUB
+        || idx == compile::BUILTIN_FITS_MUL {
+        return bytecode::KIND_BOOL;
+    }
+    if idx == compile::BUILTIN_CHAR_VALID { return bytecode::KIND_BOOL; }
+    if idx == compile::BUILTIN_ARG_COUNT { return bytecode::KIND_I64; }
+    if idx == compile::BUILTIN_ARG_AT { return bytecode::KIND_STRING; }
+    // `exit` does not return, so nothing reads a result; `!` has no representation.
+    if idx == compile::BUILTIN_EXIT { return bytecode::KIND_UNIT; }
+    if idx == compile::BUILTIN_FLOAT_BITS { return bytecode::KIND_U64; }
+    if idx == compile::BUILTIN_FLOAT_FROM_BITS { return bytecode::KIND_FLOAT; }
+    if idx == compile::BUILTIN_SATURATING_ADD || idx == compile::BUILTIN_SATURATING_SUB
+        || idx == compile::BUILTIN_SATURATING_MUL {
+        return bytecode::KIND_I64;
+    }
+    if idx == compile::BUILTIN_SPAWN || idx == compile::BUILTIN_CHANNEL
+        || idx == compile::BUILTIN_MUTEX {
+        // A bare handle: an index into the runtime's own tables, which the lowering then
+        // wraps in the prelude type the call's checked type names.
+        return bytecode::KIND_I64;
+    }
+    if idx == compile::BUILTIN_AWAIT { return bytecode::KIND_BOOL; }
+    if idx == compile::BUILTIN_SEND || idx == compile::BUILTIN_CLOSE_CHAN {
+        return bytecode::KIND_UNIT;
+    }
+    // `join`, `taken` and `with` yield the program's own T, whose kind varies per call
+    // site. It is on the instruction, put there from the checker's own types (ADR-0021),
+    // so there is nothing fixed to return here -- and answering anyway would be the
+    // "plausible wrong answer" process rule 8 refuses.
+    bytecode::KIND_UNKNOWN
+}

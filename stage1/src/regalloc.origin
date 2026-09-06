@@ -1,0 +1,840 @@
+// Register allocation: linear scan over live intervals (ADR-0018).
+//
+// A translation of `internal/backend/regalloc.go`. The pools below are what is left after
+// the reservations `docs/spec/11-codegen.md` makes: r15 holds the runtime block (ADR-0017);
+// rax, rdx, r10 and r11 are scratch, kept out of the pool so that any instruction needing a
+// fixed register -- `idiv` wants rdx:rax, a variable shift wants cl, a call wants its
+// arguments in order -- can always be fixed up without first evicting somebody.
+
+use std::list;
+use std::map;
+
+use bytecode;
+use ir;
+use kinds;
+use x86;
+
+/// Registers that survive a call, so an interval that spans one prefers them.
+fn callee_saved() -> List[i64] {
+    let l = list::new[i64]();
+    l.push(x86::RBX);
+    l.push(x86::R12);
+    l.push(x86::R13);
+    l.push(x86::R14);
+    l
+}
+
+/// Cheaper -- no prologue cost -- but clobbered by every call.
+fn caller_saved() -> List[i64] {
+    let l = list::new[i64]();
+    l.push(x86::RCX);
+    l.push(x86::RSI);
+    l.push(x86::RDI);
+    l.push(x86::R8);
+    l.push(x86::R9);
+    l
+}
+
+pub fn is_callee_saved(r: i64) -> bool {
+    r == x86::RBX || r == x86::R12 || r == x86::R13 || r == x86::R14
+}
+
+/// Never allocated. Lowering uses these to hold a spilled operand while it computes, so a
+/// two-operand instruction never needs a free register to exist.
+pub const SCRATCH_A: i64 = x86::R10;
+pub const SCRATCH_B: i64 = x86::R11;
+
+/// Where a value lives: a register, or a slot in the frame.
+pub struct Loc {
+    pub reg: i64,
+    /// 1-based; 0 means "in a register".
+    pub slot: i64,
+    pub in_reg: bool,
+}
+
+pub fn in_reg(r: i64) -> Loc { Loc { reg: r, slot: 0, in_reg: true } }
+pub fn in_slot(n: i64) -> Loc { Loc { reg: 0, slot: n, in_reg: false } }
+pub fn spilled(l: Loc) -> bool { !l.in_reg }
+
+/// One value's live range in the linearized instruction numbering.
+pub struct Interval {
+    pub val: ir::Value,
+    pub mut start: i64,
+    pub mut end: i64,
+    /// Marks an interval live across an instruction that clobbers the caller-saved
+    /// registers. Such an interval gets a callee-saved register or a frame slot, and never
+    /// a register a call would destroy.
+    pub mut spans_call: bool,
+}
+
+/// The result: a location for every value, and how big the frame must be.
+pub struct Alloc {
+    /// A value's location, by value id.
+    pub where_of: Map[i64, Loc],
+    pub mut slots: i64,
+    /// How many of the low-numbered spill slots (1..ref_slots) hold references; the rest
+    /// are raw. `docs/spec/11-codegen.md`'s "Stack frames" requires every reference-kind
+    /// slot to sit below every raw one, so that a stack map can describe the reference area
+    /// as one offset and one count instead of a bitmap.
+    pub mut ref_slots: i64,
+    /// The reference slot holding this function's own closure object, or 0 for a function
+    /// with no captures to read one for.
+    pub mut closure_slot: i64,
+    /// The callee-saved registers the function actually assigned, so the prologue saves
+    /// those and no others.
+    pub used: List[i64],
+    /// The blocks whose terminator jumps backwards in the emission order, by block id. A
+    /// loop that calls nothing yields nowhere, so when the program can have more than one
+    /// thread these are where the preemption check goes, which makes them call sites like
+    /// any other.
+    pub back_edges: Map[i64, bool],
+    /// The callee-saved registers holding a live reference at each call site, by value id.
+    /// Necessarily a subset of the four callee-saved registers, never a caller-saved one,
+    /// because any interval spanning a call already had to choose one of those or spill.
+    /// This is a stack map's register-root set, in the deterministic order `intervals`
+    /// itself sorts in.
+    pub call_site_regs: Map[i64, List[i64]],
+    /// The first thing that went wrong, or `""`.
+    pub mut error: String,
+}
+
+/// One frame of the postorder walk.
+struct Frame {
+    pub block: ir::Block,
+    pub mut next: i64,
+}
+
+/// Linearizes the blocks in reverse postorder, which is the order the code is emitted in
+/// and therefore the order intervals are measured against.
+pub fn order(f: ir::Func) -> List[ir::Block] {
+    let post = list::new[ir::Block]();
+    let seen = map::new[i64, bool]();
+    let stack = list::new[Frame]();
+    seen.insert(f.entry.id, true);
+    stack.push(Frame { block: f.entry, next: 0 });
+    while !stack.is_empty() {
+        let top = stack.at(stack.len() - 1);
+        if top.next < top.block.succs.len() {
+            let s = top.block.succs.at(top.next);
+            top.next = top.next + 1;
+            if !seen.contains(s.id) {
+                seen.insert(s.id, true);
+                stack.push(Frame { block: s, next: 0 });
+            }
+        } else {
+            stack.pop();
+            post.push(top.block);
+        }
+    }
+    let out = list::new[ir::Block]();
+    let mut i = post.len() - 1;
+    while i >= 0 {
+        out.push(post.at(i));
+        i = i - 1;
+    }
+    out
+}
+
+/// Every value's index in the linear order: the phis of a block, then its instructions,
+/// then its terminator.
+pub struct Numbering {
+    pub blocks: List[ir::Block],
+    /// A value's index, by value id, and the values themselves in index order.
+    pub index: Map[i64, i64],
+    pub numbered: List[ir::Value],
+    pub start: Map[i64, i64],
+    pub end: Map[i64, i64],
+    /// The indices where the caller-saved registers are destroyed.
+    pub call_at: Map[i64, bool],
+    /// The terminators that jump backwards, which are call sites too when the program is
+    /// preemptible. By value id.
+    pub back_edge: Map[i64, bool],
+    pub mut next: i64,
+}
+
+pub fn number(f: ir::Func, preempts: bool) -> Numbering {
+    let n = Numbering {
+        blocks: order(f),
+        index: map::new[i64, i64](),
+        numbered: list::new[ir::Value](),
+        start: map::new[i64, i64](),
+        end: map::new[i64, i64](),
+        call_at: map::new[i64, bool](),
+        back_edge: map::new[i64, bool](),
+        next: 0,
+    };
+    let mut bi = 0;
+    while bi < n.blocks.len() {
+        let b = n.blocks.at(bi);
+        bi = bi + 1;
+        n.start.insert(b.id, n.next);
+        let mut p = 0;
+        while p < b.phis.len() {
+            place(n, b.phis.at(p));
+            p = p + 1;
+        }
+        let mut k = 0;
+        while k < b.instr.len() {
+            let v = b.instr.at(k);
+            k = k + 1;
+            if clobbers_caller_saved(v.op) { n.call_at.insert(n.next, true); }
+            place(n, v);
+        }
+        match b.term {
+            Option::Some(t) => { place(n, t); },
+            Option::None => {},
+        }
+        n.end.insert(b.id, n.next);
+    }
+    if preempts {
+        let mut i = 0;
+        while i < n.blocks.len() {
+            let b = n.blocks.at(i);
+            i = i + 1;
+            if b.term.is_none() { continue; }
+            if !jumps_backwards(n, b) { continue; }
+            let t = b.term.expect("a terminator");
+            n.back_edge.insert(t.id, true);
+            n.call_at.insert(index_of(n, t), true);
+        }
+    }
+    n
+}
+
+fn place(n: Numbering, v: ir::Value) {
+    n.index.insert(v.id, n.next);
+    n.numbered.push(v);
+    n.next = n.next + 1;
+}
+
+pub fn index_of(n: Numbering, v: ir::Value) -> i64 {
+    match n.index.get(v.id) {
+        Option::Some(i) => i,
+        Option::None => 0,
+    }
+}
+
+fn start_of(n: Numbering, b: ir::Block) -> i64 {
+    match n.start.get(b.id) {
+        Option::Some(i) => i,
+        Option::None => 0,
+    }
+}
+
+pub fn end_of(n: Numbering, b: ir::Block) -> i64 {
+    match n.end.get(b.id) {
+        Option::Some(i) => i,
+        Option::None => 0,
+    }
+}
+
+/// Whether any of a block's outgoing edges lands at or before the block itself in the
+/// emission order -- the shape of every loop, and the only way control can repeat without
+/// a call.
+fn jumps_backwards(n: Numbering, b: ir::Block) -> bool {
+    let t = b.term.expect("a terminator");
+    let at = index_of(n, t);
+    let mut i = 0;
+    while i < b.succs.len() {
+        let s = b.succs.at(i);
+        i = i + 1;
+        if n.start.contains(s.id) && start_of(n, s) <= at { return true; }
+    }
+    false
+}
+
+/// Whether lowering an operation emits a `call`. Every allocation is a call to the
+/// runtime's allocator, which is why the aggregate constructors are in this list beside the
+/// obvious ones. The comparison operators are here even though most of them lower to a
+/// plain register compare: a structural `==`/`!=` and a `String`'s ordering both call into
+/// the runtime, and this only sees the op, not the kind that decides which lowering a given
+/// occurrence gets -- so every comparison is treated as call-clobbering, which is
+/// conservative for the common case and correct for both.
+pub fn clobbers_caller_saved(op: i64) -> bool {
+    op == ir::OP_CALL || op == ir::OP_CALL_CLOSURE || op == ir::OP_CALL_BUILTIN
+        || op == ir::OP_STRUCT || op == ir::OP_TUPLE || op == ir::OP_VARIANT
+        || op == ir::OP_CLOSURE || op == ir::OP_BOX_FN || op == ir::OP_TO_STR
+        || op == ir::OP_EQ || op == ir::OP_NE || op == ir::OP_LT || op == ir::OP_LE
+        || op == ir::OP_GT || op == ir::OP_GE
+}
+
+/// A block's live-in and live-out sets, by block id and then by value id.
+struct Live {
+    pub in_of: Map[i64, Map[i64, ir::Value]],
+    pub out_of: Map[i64, Map[i64, ir::Value]],
+}
+
+fn empty_set() -> Map[i64, ir::Value] { map::new[i64, ir::Value]() }
+
+fn union_into(dst: Map[i64, ir::Value], src: Map[i64, ir::Value], keys: List[i64]) {
+    let mut i = 0;
+    while i < keys.len() {
+        let k = keys.at(i);
+        i = i + 1;
+        match src.get(k) {
+            Option::Some(v) => { dst.insert(k, v); },
+            Option::None => {},
+        }
+    }
+}
+
+/// Computes live-in and live-out sets per block by the usual backward dataflow.
+///
+/// Intervals cannot be read off definition and use positions alone: a value defined before
+/// a loop and used inside it is live across the whole loop, including the part of the
+/// linear order that comes *after* its last use. Doing the dataflow first and building
+/// intervals from block-level liveness is what makes the back edge count.
+fn liveness(f: ir::Func, n: Numbering) -> Live {
+    let live = Live {
+        in_of: map::new[i64, Map[i64, ir::Value]](),
+        out_of: map::new[i64, Map[i64, ir::Value]](),
+    };
+    let uses = map::new[i64, Map[i64, ir::Value]]();
+    let defs = map::new[i64, Map[i64, bool]]();
+    let use_keys = map::new[i64, List[i64]]();
+    let in_keys = map::new[i64, List[i64]]();
+
+    let mut bi = 0;
+    while bi < n.blocks.len() {
+        let b = n.blocks.at(bi);
+        bi = bi + 1;
+        let u = empty_set();
+        let uk = list::new[i64]();
+        let d = map::new[i64, bool]();
+        // A phi's operands are used by the *predecessor*, not here: the copy that gives a
+        // phi its value is emitted on the edge. Treating them as used here would keep a
+        // value alive along paths that never carry it.
+        let mut p = 0;
+        while p < b.phis.len() {
+            d.insert(b.phis.at(p).id, true);
+            p = p + 1;
+        }
+        let mut k = 0;
+        while k < b.instr.len() {
+            let v = b.instr.at(k);
+            k = k + 1;
+            note_uses(v, d, u, uk);
+            // A parameter and a capture are not *defined* by the block they appear in.
+            // They arrive with the frame, before the entry block runs, and the value is a
+            // name for something already there.
+            //
+            // Counting one as a definition is wrong exactly when the entry block is also a
+            // loop header -- `fn f(c: List[i64], n: i64) { while c.len() < n { ... } }`
+            // builds precisely that, because the condition is the first thing in the
+            // function. The dataflow then concludes the parameter is dead at the end of the
+            // loop body (it is "defined" in the successor), the allocator hands its register
+            // to something in the body, and the next iteration compares against whatever
+            // that left behind.
+            if v.op != ir::OP_PARAM && v.op != ir::OP_CAPTURE { d.insert(v.id, true); }
+        }
+        match b.term {
+            Option::Some(t) => { note_uses(t, d, u, uk); },
+            Option::None => {},
+        }
+        // The operands a block supplies to its successors' phis are used at its end.
+        let mut s = 0;
+        while s < b.succs.len() {
+            let succ = b.succs.at(s);
+            s = s + 1;
+            let idx = pred_index(succ, b);
+            if idx < 0 { continue; }
+            let mut q = 0;
+            while q < succ.phis.len() {
+                let phi = succ.phis.at(q);
+                q = q + 1;
+                if idx >= phi.args.len() { continue; }
+                let a = phi.args.at(idx);
+                if !d.contains(a.id) && !u.contains(a.id) {
+                    u.insert(a.id, a);
+                    uk.push(a.id);
+                }
+            }
+        }
+        uses.insert(b.id, u);
+        use_keys.insert(b.id, uk);
+        defs.insert(b.id, d);
+        live.in_of.insert(b.id, empty_set());
+        live.out_of.insert(b.id, empty_set());
+        in_keys.insert(b.id, list::new[i64]());
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = n.blocks.len() - 1;
+        while i >= 0 {
+            let b = n.blocks.at(i);
+            i = i - 1;
+            let new_out = empty_set();
+            let out_keys = list::new[i64]();
+            let mut s = 0;
+            while s < b.succs.len() {
+                let succ = b.succs.at(s);
+                s = s + 1;
+                let sin = live.in_of.get(succ.id).expect("a live-in set");
+                let sk = in_keys.get(succ.id).expect("its keys");
+                let mut q = 0;
+                while q < sk.len() {
+                    let key = sk.at(q);
+                    q = q + 1;
+                    if new_out.contains(key) { continue; }
+                    new_out.insert(key, sin.get(key).expect("a live value"));
+                    out_keys.push(key);
+                }
+            }
+            let new_in = empty_set();
+            let new_in_keys = list::new[i64]();
+            let u = uses.get(b.id).expect("a use set");
+            let uk = use_keys.get(b.id).expect("its keys");
+            let mut q = 0;
+            while q < uk.len() {
+                let key = uk.at(q);
+                q = q + 1;
+                if new_in.contains(key) { continue; }
+                new_in.insert(key, u.get(key).expect("a used value"));
+                new_in_keys.push(key);
+            }
+            let d = defs.get(b.id).expect("a def set");
+            let mut o = 0;
+            while o < out_keys.len() {
+                let key = out_keys.at(o);
+                o = o + 1;
+                if d.contains(key) || new_in.contains(key) { continue; }
+                new_in.insert(key, new_out.get(key).expect("a live value"));
+                new_in_keys.push(key);
+            }
+            // Sizes rather than contents, which is enough because the dataflow is
+            // monotone: `uses` and `defs` are fixed, and a successor's live-in only ever
+            // grows, so neither set here can shrink. A set that changed at all got bigger.
+            let old_in = live.in_of.get(b.id).expect("a live-in set");
+            let old_out = live.out_of.get(b.id).expect("a live-out set");
+            if new_in.len() != old_in.len() || new_out.len() != old_out.len() {
+                changed = true;
+            }
+            live.in_of.insert(b.id, new_in);
+            live.out_of.insert(b.id, new_out);
+            in_keys.insert(b.id, new_in_keys);
+        }
+    }
+    live
+}
+
+fn note_uses(v: ir::Value, d: Map[i64, bool], u: Map[i64, ir::Value], uk: List[i64]) {
+    let mut i = 0;
+    while i < v.args.len() {
+        let a = v.args.at(i);
+        i = i + 1;
+        if d.contains(a.id) || u.contains(a.id) { continue; }
+        u.insert(a.id, a);
+        uk.push(a.id);
+    }
+}
+
+fn pred_index(b: ir::Block, pred: ir::Block) -> i64 {
+    let mut i = 0;
+    while i < b.preds.len() {
+        if ref_eq(b.preds.at(i), pred) { return i; }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// Builds one live interval per value.
+pub fn intervals(f: ir::Func, n: Numbering) -> List[Interval] {
+    let live = liveness(f, n);
+    let by_val = map::new[i64, Interval]();
+    let found = list::new[Interval]();
+
+    let mut bi = 0;
+    while bi < n.blocks.len() {
+        let b = n.blocks.at(bi);
+        bi = bi + 1;
+        extend_set(by_val, found, live.in_of.get(b.id).expect("a live-in set"), start_of(n, b));
+        extend_set(by_val, found, live.out_of.get(b.id).expect("a live-out set"), end_of(n, b));
+
+        // Every phi of a block is written by the *same* parallel copy, on the edge into the
+        // block, so no two of them may share a location however short one's own life is.
+        // Numbering them one after another does not say that: a phi nothing reads would be
+        // a one-point interval, expire before the next phi's began, and hand its register to
+        // a later phi of the same block. The edge's copies would then write both through
+        // that one register, and whichever landed first would be lost. Giving every phi of a
+        // block the whole run of phis as its interval makes them pairwise overlapping, which
+        // is what they actually are.
+        let mut last = start_of(n, b);
+        if !b.phis.is_empty() { last = index_of(n, b.phis.at(b.phis.len() - 1)); }
+        let mut p = 0;
+        while p < b.phis.len() {
+            let phi = b.phis.at(p);
+            p = p + 1;
+            extend(by_val, found, phi, start_of(n, b));
+            extend(by_val, found, phi, last);
+        }
+        let mut k = 0;
+        while k < b.instr.len() {
+            let v = b.instr.at(k);
+            k = k + 1;
+            let at = index_of(n, v);
+            extend(by_val, found, v, at);
+            let mut a = 0;
+            while a < v.args.len() {
+                extend(by_val, found, v.args.at(a), at);
+                a = a + 1;
+            }
+        }
+        match b.term {
+            Option::Some(t) => {
+                let at = index_of(n, t);
+                let mut a = 0;
+                while a < t.args.len() {
+                    extend(by_val, found, t.args.at(a), at);
+                    a = a + 1;
+                }
+            },
+            Option::None => {},
+        }
+        // A value a block supplies to a successor's phi must survive to the physical end of
+        // that block, where the edge's copy code reads it -- even when the value is defined
+        // in the block itself. The live-out set does not carry this: the dataflow
+        // deliberately excludes a same-block definition from that block's "uses", which is
+        // correct for propagating liveness *across* block boundaries but leaves a
+        // purely-local definition-then-phi-use invisible to it. Without this, such a value's
+        // interval ends at its own defining instruction, the allocator reuses its register
+        // for whatever comes next in the block, and the copy reads back garbage.
+        let mut s = 0;
+        while s < b.succs.len() {
+            let succ = b.succs.at(s);
+            s = s + 1;
+            let idx = pred_index(succ, b);
+            if idx < 0 { continue; }
+            let mut q = 0;
+            while q < succ.phis.len() {
+                let phi = succ.phis.at(q);
+                q = q + 1;
+                if idx >= phi.args.len() { continue; }
+                extend(by_val, found, phi.args.at(idx), end_of(n, b));
+            }
+        }
+    }
+
+    // The positions a call destroys the caller-saved registers at, in index order.
+    let calls = list::new[i64]();
+    let mut c = 0;
+    while c < n.next {
+        if n.call_at.contains(c) { calls.push(c); }
+        c = c + 1;
+    }
+
+    let mut i = 0;
+    while i < found.len() {
+        let iv = found.at(i);
+        i = i + 1;
+        let mut j = 0;
+        while j < calls.len() {
+            let at = calls.at(j);
+            j = j + 1;
+            // A call at the interval's own definition point does not clobber it: the result
+            // is produced in rax after the call has returned.
+            if at > iv.start && at <= iv.end {
+                iv.spans_call = true;
+                j = calls.len();
+            }
+        }
+    }
+    // Sorted by start, then by value id so that two intervals starting together are ordered
+    // the same way on every run: the allocator's output feeds the emitted bytes, and
+    // `docs/spec/11-codegen.md` requires two builds to be byte-identical.
+    sort_intervals(found, false);
+    found
+}
+
+fn extend_set(by_val: Map[i64, Interval], found: List[Interval],
+        set: Map[i64, ir::Value], at: i64) {
+    // A `Map`'s own entry order is insertion order, which is the order liveness recorded
+    // these in; nothing here depends on it, since `extend` only widens a range.
+    let vals = set.values();
+    let mut i = 0;
+    while i < vals.len() {
+        extend(by_val, found, vals.at(i), at);
+        i = i + 1;
+    }
+}
+
+fn extend(by_val: Map[i64, Interval], found: List[Interval], v: ir::Value, at: i64) {
+    match by_val.get(v.id) {
+        Option::None => {
+            let iv = Interval { val: v, start: at, end: at, spans_call: false };
+            by_val.insert(v.id, iv);
+            found.push(iv);
+        },
+        Option::Some(iv) => {
+            if at < iv.start { iv.start = at; }
+            if at > iv.end { iv.end = at; }
+        },
+    }
+}
+
+/// Insertion sort, by end position when `by_end` and by start position otherwise, with the
+/// value id breaking every tie.
+///
+/// The tie-break is not cosmetic on the active list: `expire` releases in this order and
+/// every released register is appended to a free list, so which of two intervals ending
+/// together gives its register back first decides which register the next value gets.
+fn sort_intervals(l: List[Interval], by_end: bool) {
+    let mut i = 1;
+    while i < l.len() {
+        let cur = l.at(i);
+        let mut j = i;
+        while j > 0 && interval_before(cur, l.at(j - 1), by_end) {
+            l.set(j, l.at(j - 1));
+            j = j - 1;
+        }
+        l.set(j, cur);
+        i = i + 1;
+    }
+}
+
+fn interval_before(a: Interval, b: Interval, by_end: bool) -> bool {
+    let mut ka = a.start;
+    let mut kb = b.start;
+    if by_end { ka = a.end; kb = b.end; }
+    if ka != kb { return ka < kb; }
+    a.val.id < b.val.id
+}
+
+/// Assigns every value a register or a frame slot. `preempts` says whether this program's
+/// loops carry a preemption check, which makes every back edge a call site.
+pub fn allocate(f: ir::Func, preempts: bool) -> Alloc {
+    let n = number(f, preempts);
+    let ivs = intervals(f, n);
+
+    let a = Alloc {
+        where_of: map::new[i64, Loc](),
+        slots: 0, ref_slots: 0, closure_slot: 0,
+        used: list::new[i64](),
+        back_edges: map::new[i64, bool](),
+        call_site_regs: map::new[i64, List[i64]](),
+        error: "",
+    };
+    let free_callee = callee_saved();
+    let free_caller = caller_saved();
+    let used_callee = map::new[i64, bool]();
+
+    let mut active = list::new[Interval]();
+    /// The register each active interval holds, by value id.
+    let reg_of = map::new[i64, i64]();
+
+    // Spilled intervals, in the order they were spilled; final slot numbers are assigned
+    // afterward so that every reference-kind slot ends up below every raw one, regardless
+    // of the arrival order the linear scan itself spills them in.
+    let ref_spills = list::new[Interval]();
+    let raw_spills = list::new[Interval]();
+
+    let mut i = 0;
+    while i < ivs.len() {
+        let iv = ivs.at(i);
+        i = i + 1;
+
+        // Expire: release every active interval that ended before this one starts.
+        let kept = list::new[Interval]();
+        let mut k = 0;
+        while k < active.len() {
+            let other = active.at(k);
+            k = k + 1;
+            if other.end < iv.start {
+                match reg_of.get(other.val.id) {
+                    Option::Some(r) => {
+                        reg_of.remove(other.val.id);
+                        if is_callee_saved(r) { free_callee.push(r); } else { free_caller.push(r); }
+                    },
+                    Option::None => {},
+                }
+                continue;
+            }
+            kept.push(other);
+        }
+        active = kept;
+
+        let mut chosen = 0;
+        let mut got = false;
+        if iv.spans_call {
+            if !free_callee.is_empty() {
+                chosen = take_first(free_callee);
+                got = true;
+            }
+        } else {
+            if !free_caller.is_empty() {
+                chosen = take_first(free_caller);
+                got = true;
+            } else {
+                if !free_callee.is_empty() {
+                    chosen = take_first(free_callee);
+                    got = true;
+                }
+            }
+        }
+        if !got {
+            if iv.spans_call && iv.val.kind == bytecode::KIND_UNKNOWN {
+                // A value the allocator has to keep alive across a call, whose kind the
+                // propagation pass still could not resolve, is exactly the case a stack map
+                // cannot afford to guess about: grouping it as "raw" when it might actually
+                // be a reference would make a future collection corrupt memory instead of
+                // merely computing a worse layout. Reaching this is a gap in the kind pass's
+                // coverage, not a program the language rejects.
+                if a.error == "" {
+                    a.error = "this is a compiler bug: \(ir::value_name(iv.val)) in \(f.name) spans a call with no known kind";
+                }
+            }
+            if kinds::is_ref_kind(iv.val.kind) { ref_spills.push(iv); } else { raw_spills.push(iv); }
+            continue;
+        }
+        if is_callee_saved(chosen) { used_callee.insert(chosen, true); }
+        reg_of.insert(iv.val.id, chosen);
+        a.where_of.insert(iv.val.id, in_reg(chosen));
+        active.push(iv);
+        sort_intervals(active, true);
+    }
+
+    // A function with captures is only ever entered through the closure calling convention,
+    // which leaves the closure object one word above the return address rather than in any
+    // register or slot -- a live reference sitting where a stack map has no way to name it,
+    // so a collection during the body would move the object and leave every later capture
+    // read pointing into the space just vacated. Reserving the first reference slot for it,
+    // which the prologue fills and every capture read reads from thereafter, puts it inside
+    // the reference area the stack map already describes.
+    a.closure_slot = 0;
+    if f.captures > 0 { a.closure_slot = 1; }
+    let mut r = 0;
+    while r < ref_spills.len() {
+        a.where_of.insert(ref_spills.at(r).val.id, in_slot(a.closure_slot + r + 1));
+        r = r + 1;
+    }
+    let mut w = 0;
+    while w < raw_spills.len() {
+        a.where_of.insert(raw_spills.at(w).val.id,
+            in_slot(a.closure_slot + ref_spills.len() + w + 1));
+        w = w + 1;
+    }
+    a.ref_slots = a.closure_slot + ref_spills.len();
+    a.slots = a.closure_slot + ref_spills.len() + raw_spills.len();
+
+    let cs = callee_saved();
+    let mut u = 0;
+    while u < cs.len() {
+        if used_callee.contains(cs.at(u)) { a.used.push(cs.at(u)); }
+        u = u + 1;
+    }
+
+    let mut bi = 0;
+    while bi < n.blocks.len() {
+        let b = n.blocks.at(bi);
+        bi = bi + 1;
+        match b.term {
+            Option::Some(t) => {
+                if n.back_edge.contains(t.id) { a.back_edges.insert(b.id, true); }
+            },
+            Option::None => {},
+        }
+    }
+
+    let mut v = 0;
+    while v < n.numbered.len() {
+        let val = n.numbered.at(v);
+        v = v + 1;
+        if !clobbers_caller_saved(val.op) && !n.back_edge.contains(val.id) { continue; }
+        let at = index_of(n, val);
+        let regs = list::new[i64]();
+        let mut j = 0;
+        while j < ivs.len() {
+            let iv = ivs.at(j);
+            j = j + 1;
+            if !(at > iv.start && at <= iv.end) { continue; }
+            if !kinds::is_ref_kind(iv.val.kind) { continue; }
+            match a.where_of.get(iv.val.id) {
+                Option::None => {},
+                Option::Some(l) => {
+                    if spilled(l) || !is_callee_saved(l.reg) { continue; }
+                    regs.push(l.reg);
+                },
+            }
+        }
+        a.call_site_regs.insert(val.id, regs);
+    }
+    check_roots_are_described(f, ivs, n, a);
+    a
+}
+
+fn take_first(l: List[i64]) -> i64 {
+    let first = l.at(0);
+    let mut i = 1;
+    while i < l.len() {
+        l.set(i - 1, l.at(i));
+        i = i + 1;
+    }
+    l.pop();
+    first
+}
+
+/// Asserts the one property a precise collector rests on: at every point where a collection
+/// can happen, every live reference is somewhere the stack map names -- a reference-kind
+/// spill slot, or a callee-saved register listed for that site.
+///
+/// It is here rather than in a test because the failure it catches is invisible until a
+/// collection actually moves objects, and then it is a wrong value rather than a crash.
+fn check_roots_are_described(f: ir::Func, ivs: List[Interval], n: Numbering, a: Alloc) {
+    let mut v = 0;
+    while v < n.numbered.len() {
+        let val = n.numbered.at(v);
+        v = v + 1;
+        if !clobbers_caller_saved(val.op) && !n.back_edge.contains(val.id) { continue; }
+        let at = index_of(n, val);
+        let named = map::new[i64, bool]();
+        match a.call_site_regs.get(val.id) {
+            Option::Some(regs) => {
+                let mut r = 0;
+                while r < regs.len() {
+                    named.insert(regs.at(r), true);
+                    r = r + 1;
+                }
+            },
+            Option::None => {},
+        }
+        let mut j = 0;
+        while j < ivs.len() {
+            let iv = ivs.at(j);
+            j = j + 1;
+            if !(at > iv.start && at <= iv.end) { continue; }
+            if iv.val.kind == bytecode::KIND_UNKNOWN {
+                // A value live across a collection point whose kind nothing resolved is a
+                // root the map cannot describe either way: called a reference it would have
+                // the collector follow an integer, called raw it would have the collector
+                // leave a pointer behind.
+                if a.error == "" {
+                    a.error = "this is a compiler bug: \(ir::value_name(iv.val)) in \(f.name) is live at \(ir::value_name(val)) with no known kind";
+                }
+                continue;
+            }
+            if !kinds::is_ref_kind(iv.val.kind) { continue; }
+            match a.where_of.get(iv.val.id) {
+                Option::None => {
+                    if a.error == "" {
+                        a.error = "this is a compiler bug: \(ir::value_name(iv.val)) in \(f.name) is a live reference at \(ir::value_name(val)) with no location";
+                    }
+                },
+                Option::Some(l) => {
+                    if spilled(l) {
+                        if l.slot >= 1 && l.slot <= a.ref_slots { continue; }
+                        if a.error == "" {
+                            a.error = "this is a compiler bug: \(ir::value_name(iv.val)) in \(f.name) is a live reference at \(ir::value_name(val)) spilled to raw slot \(l.slot) of \(a.slots)";
+                        }
+                        continue;
+                    }
+                    if !named.contains(l.reg) {
+                        if a.error == "" {
+                            a.error = "this is a compiler bug: \(ir::value_name(iv.val)) in \(f.name) is a live reference at \(ir::value_name(val)) in \(x86::reg_name(l.reg)), which the stack map does not name";
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
