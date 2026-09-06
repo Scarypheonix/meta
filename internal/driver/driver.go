@@ -451,7 +451,7 @@ func DumpAST(path string, stdout, stderr io.Writer) int {
 
 // DumpBytecode compiles a program and prints its bytecode. It is the snapshot artefact
 // process rule 2 requires for every feature that reaches code generation.
-func DumpBytecode(path string, stdout, stderr io.Writer) int {
+func DumpBytecode(path string, level opt.Level, stdout, stderr io.Writer) int {
 	units, err := LoadUnits(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
@@ -464,6 +464,13 @@ func DumpBytecode(path string, stdout, stderr io.Writer) int {
 	code, cerr := compile.Program(prog.Resolved, prog.Types, prog.Mono, prog.AllASTs...)
 	if cerr != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", cerr)
+		return ExitDiagnostics
+	}
+	// At -O1 and -O2 what is printed is the bytecode the optimizer *emitted back*, which
+	// is the artefact ir.Emit produces and the only place the SSA-to-bytecode direction
+	// is visible at all: -O0 never builds SSA, and dump-ir stops before the return trip.
+	if err := opt.Run(code, level); err != nil {
+		fmt.Fprintf(stderr, "originc: %v\n", err)
 		return ExitDiagnostics
 	}
 	fmt.Fprint(stdout, code.Disassemble())

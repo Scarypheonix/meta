@@ -52,12 +52,18 @@ func TestStage1BytecodeMatchesTheGoCompiler(t *testing.T) {
 		name   string
 		engine driver.Engine
 		level  opt.Level
+		// dump is the level stage1 is asked to optimize at before disassembling, which is
+		// independent of the level stage1 itself was built at. Past -O0 what it prints is
+		// the bytecode the optimizer *emitted back*, which is the only place the
+		// SSA-to-bytecode direction is visible at all.
+		dump   opt.Level
 		stride int
 	}{
-		{"native-O2", driver.Native, opt.O2, 1},
-		{"native-O0", driver.Native, opt.O0, 1},
-		{"vm-O2", driver.VM, opt.O2, 24},
-		{"interpreter", driver.Interpreter, opt.O0, 40},
+		{"native-O2", driver.Native, opt.O2, opt.O0, 1},
+		{"native-O2/dump-O2", driver.Native, opt.O2, opt.O2, 1},
+		{"native-O0", driver.Native, opt.O0, opt.O0, 1},
+		{"vm-O2", driver.VM, opt.O2, opt.O0, 24},
+		{"interpreter", driver.Interpreter, opt.O0, opt.O0, 40},
 	}
 	for _, e := range engines {
 		t.Run(e.name, func(t *testing.T) {
@@ -75,7 +81,11 @@ func TestStage1BytecodeMatchesTheGoCompiler(t *testing.T) {
 			}
 			defer func() { _ = os.Chdir(wd) }()
 
-			args := append([]string{"dump-bytecode", preludePath}, files...)
+			head := []string{"dump-bytecode", preludePath}
+			if e.dump != opt.O0 {
+				head = []string{"dump-bytecode", levelFlag(e.dump), preludePath}
+			}
+			args := append(head, files...)
 			var stdout, stderr bytes.Buffer
 			code := runStage1(t, stage1Root, e.engine, e.level, &stdout, &stderr, args...)
 			if stderr.Len() > 0 {
@@ -93,7 +103,7 @@ func TestStage1BytecodeMatchesTheGoCompiler(t *testing.T) {
 			preludeTree := parse.FileWith(source.NewFile(prelude.Name, string(pdata)), diag.New(), ids)
 			at, total, bad, compiled := 0, 0, 0, 0
 			for _, path := range files {
-				want := goBytecode(t, ids, preludeTree, path)
+				want := goBytecode(t, ids, preludeTree, path, e.dump)
 				if len(want) > 1 {
 					compiled++
 				}
@@ -145,9 +155,12 @@ func TestStage1CompilesItsOwnSourceToBytecode(t *testing.T) {
 		name   string
 		engine driver.Engine
 		level  opt.Level
+		dump   opt.Level
 	}{
-		{"native-O2", driver.Native, opt.O2},
-		{"native-O0", driver.Native, opt.O0},
+		{"native-O2", driver.Native, opt.O2, opt.O0},
+		{"native-O2/dump-O1", driver.Native, opt.O2, opt.O1},
+		{"native-O2/dump-O2", driver.Native, opt.O2, opt.O2},
+		{"native-O0", driver.Native, opt.O0, opt.O0},
 	}
 	for _, e := range engines {
 		t.Run(e.name, func(t *testing.T) {
@@ -165,6 +178,9 @@ func TestStage1CompilesItsOwnSourceToBytecode(t *testing.T) {
 				t.Fatal(err)
 			}
 			args := []string{"dump-bytecode", preludePath, "--package", srcRoot}
+			if e.dump != opt.O0 {
+				args = []string{"dump-bytecode", levelFlag(e.dump), preludePath, "--package", srcRoot}
+			}
 			for _, u := range units {
 				args = append(args, u.File.Name)
 			}
@@ -176,7 +192,7 @@ func TestStage1CompilesItsOwnSourceToBytecode(t *testing.T) {
 			}
 			got := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
 
-			want := goBytecodePackage(t, string(pdata), srcRoot, units)
+			want := goBytecodePackage(t, string(pdata), srcRoot, units, e.dump)
 			if len(got) != len(want) {
 				t.Errorf("stage1 printed %d lines, the Go compiler %d", len(got), len(want))
 			}
@@ -202,7 +218,7 @@ func TestStage1CompilesItsOwnSourceToBytecode(t *testing.T) {
 // goBytecode renders the Go compiler's bytecode for one file, in stage1's own output
 // format: the `== path` header, then the disassembly. A file that does not get that far
 // contributes its header and nothing else, which is what stage1 does too.
-func goBytecode(t *testing.T, ids *ast.IDGen, preludeTree *ast.File, path string) []string {
+func goBytecode(t *testing.T, ids *ast.IDGen, preludeTree *ast.File, path string, level opt.Level) []string {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -246,13 +262,19 @@ func goBytecode(t *testing.T, ids *ast.IDGen, preludeTree *ast.File, path string
 	if cerr != nil {
 		t.Fatalf("%s: the Go compiler could not lower a checked program: %v", path, cerr)
 	}
+	if oerr := opt.Run(code, level); oerr != nil {
+		t.Fatalf("%s: the Go compiler could not optimize at %v: %v", path, level, oerr)
+	}
 	return append(out, strings.Split(strings.TrimSuffix(code.Disassemble(), "\n"), "\n")...)
 }
 
 // goBytecodePackage is goBytecode over one whole package.
-func goBytecodePackage(t *testing.T, preludeSrc, srcRoot string, units []driver.Unit) []string {
+func goBytecodePackage(t *testing.T, preludeSrc, srcRoot string, units []driver.Unit, level opt.Level) []string {
 	t.Helper()
 	code := goProgramOf(t, preludeSrc, srcRoot, units)
+	if err := opt.Run(code, level); err != nil {
+		t.Fatalf("the Go compiler could not optimize %s at %v: %v", srcRoot, level, err)
+	}
 	out := []string{"== " + srcRoot}
 	return append(out, strings.Split(strings.TrimSuffix(code.Disassemble(), "\n"), "\n")...)
 }

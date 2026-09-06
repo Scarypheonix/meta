@@ -79,8 +79,8 @@ stage1/src/           from Phase 9: the compiler for Origin, written in Origin -
                       lex.origin, ast.origin, parse.origin, source.origin,
                       resolve.origin, types.origin, check.origin, mono.origin,
                       layout.origin, bytecode.origin, compile.origin, ir.origin,
-                      irbuild.origin, dom.origin, arith.origin, opt.origin and
-                      main.origin (its own command line) so far
+                      irbuild.origin, dom.origin, arith.origin, opt.origin,
+                      emit.origin and main.origin (its own command line) so far
 bootstrap/            from Phase 9: the last known-good stage1 binary
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```
@@ -187,14 +187,15 @@ This project outlasts any single context window.
 ## Status
 
 **Phase 9 is in progress.** Its scope is **self-hosting**: a compiler for Origin, written
-in Origin. What exists in `stage1/src/` is everything through **the optimizer** --
+in Origin. What exists in `stage1/src/` is everything except the machine code --
 `lex.origin`, `ast.origin`, `parse.origin`, `source.origin`, `resolve.origin`,
 `types.origin`, `check.origin`, `mono.origin`, `layout.origin`, `bytecode.origin`,
 `compile.origin`, `ir.origin`, `irbuild.origin`, `dom.origin`, `arith.origin`,
-`opt.origin` -- and `main.origin`, which makes stage1 an actual command-line program
-(`stage1 dump-tokens|dump-ast|parse|resolve|check|mono|dump-bytecode|dump-ir [-O0|-O1|-O2]
+`opt.origin`, `emit.origin` -- and `main.origin`, which makes stage1 an actual
+command-line program (`stage1
+dump-tokens|dump-ast|parse|resolve|check|mono|dump-bytecode|dump-ir [-O0|-O1|-O2]
 <file>...`, plus `--package <root>` for a whole package) shaped like `cmd/originc`'s. That
-is about 21,700 lines of Origin, and every component is held to the Go one it replaces over this
+is about 22,100 lines of Origin, and every component is held to the Go one it replaces over this
 repository's own ~400 `.origin` files, all in `tests/selfhost`: the token stream against
 `internal/lex`, the dumped syntax tree against `internal/ast`, the position mapping against
 `internal/source`, the *places* syntax errors are reported against `internal/lex` +
@@ -203,13 +204,17 @@ lines), inference against `internal/check` (399 packages, 1,647,768 trace lines)
 instantiation set against `internal/mono`, the bytecode against `internal/compile`, and the
 SSA against `internal/ir`.
 
-**stage1 compiles and optimizes its own source, byte for byte.** `stage1/src` as one
-package, with the prelude, gives bytecode identical to the Go compiler's — every
+**stage1 compiles, optimizes and re-emits its own source, byte for byte.** `stage1/src` as
+one package, with the prelude, gives bytecode identical to the Go compiler's — every
 instruction, every operand, the constant pool and its order, every exact object layout
-(ADR-0019) and the static kind each instruction carries (ADR-0021) — and then **95,132
-lines of SSA at `-O0`, 80,816 at `-O1` and 102,586 at `-O2`, every one of them identical**.
-That is the whole compiler except the machine code: what stands between stage1 and a
-self-hosted binary is `internal/x86`, `internal/obj` and `internal/backend`.
+(ADR-0019) and the static kind each instruction carries (ADR-0021) — then **95,132 lines
+of SSA at `-O0`, 80,816 at `-O1` and 102,586 at `-O2`**, and then that SSA back to
+**113,793, 178,173 and 192,181 lines of bytecode**. Every one of them identical.
+
+That is the whole compiler except the machine code, and it is a *complete* compiler at the
+bytecode level: what stage1 emits at `-O2` is what the virtual machine runs. What stands
+between it and a self-hosted **binary** is `internal/x86` (722 lines), `internal/obj`
+(1,135) and `internal/backend` (7,064).
 
 The language grew what a compiler cannot be written without: **the command line and the
 exit status** (`docs/spec/17-process.md`) — `args()` in the prelude over `env::arg_count`
@@ -238,13 +243,12 @@ which is where stage1 keeps what `internal/check` keeps in a map keyed by `ast.N
 rule `ast.origin` states — a slot arrives when a reader does — is why they landed in the
 same commit as the reader.
 
-**Next action: `internal/ir/emit.go` (378 lines), then `internal/x86` (722),
-`internal/obj` (1,135) and `internal/backend` (7,064)**, with `dwarf` and `codesign` (782
-between them) pulled in as their consumers need them — roughly 10,000 lines of Go still to
-translate. `emit.go` comes first and is small: the optimizer works on SSA and the virtual
-machine runs bytecode, so turning optimized SSA back into bytecode is what makes a
-stage1-optimized program *runnable* without touching machine code at all. Nothing in the
-project is known-wrong.
+**Next action: `internal/x86` (722 lines), then `internal/obj` (1,135) and
+`internal/backend` (7,064)**, with `dwarf` and `codesign` (782 between them) pulled in as
+their consumers need them — roughly 9,700 lines of Go, and the last of it. `internal/x86`
+first because it is self-contained and has its own oracle: an encoder is right when the
+bytes match, and `internal/x86`'s own tests are a table of instructions and their
+encodings that stage1 can be held to directly. Nothing in the project is known-wrong.
 
 **The alternative worth weighing first**: a stage1 that ends at bytecode is already a
 compiler, if something runs the bytecode. Writing the *virtual machine* in Origin

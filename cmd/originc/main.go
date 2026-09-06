@@ -30,7 +30,7 @@ usage:
   originc run -O1 <file>     run it on the VM with the optimizer (also -O0, -O2)
   originc dump-ir <file>     print the SSA intermediate representation
   originc dump-ast <file>    print the parsed syntax tree
-  originc dump-bytecode <f>  print the compiled bytecode
+  originc dump-bytecode <f>  print the compiled bytecode, -O1/-O2 optimized
   originc build <file>       compile to a native executable
   originc build -o <out> --target linux|macos <file>
 
@@ -141,7 +141,7 @@ func run(args []string) int {
 			// `originc run p.origin -O2` passes `-O2` to the program (spec/17-process.md).
 			return driver.RunAt(rest[0], engine, level, os.Stdout, os.Stderr, rest[1:]...)
 		case "dump-bytecode":
-			return driver.DumpBytecode(rest[0], os.Stdout, os.Stderr)
+			return driver.DumpBytecode(rest[0], level, os.Stdout, os.Stderr)
 		case "dump-ir":
 			return driver.DumpIR(rest[0], level, os.Stdout, os.Stderr)
 		default:

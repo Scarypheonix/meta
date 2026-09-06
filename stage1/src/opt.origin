@@ -18,6 +18,7 @@ use arith;
 use ast;
 use bytecode;
 use dom;
+use emit;
 use ir;
 use irbuild;
 
@@ -1261,4 +1262,30 @@ pub struct Optimized {
 /// that the difference is the difference between running and running out of memory.
 pub fn dump(prog: bytecode::Program, level: i64) -> Optimized {
     optimize_all(prog, level)
+}
+
+/// Optimizes a program in place: build every function's SSA, run the pipeline, and emit
+/// the result back to bytecode. Answers `""`, or the first thing that went wrong.
+///
+/// This is the whole round trip, and it is what makes `-O1` and `-O2` reach a running
+/// program at all: the passes work on SSA, and both engines that execute anything read
+/// bytecode. `-O0` does not build the IR, so there is nothing to emit back.
+pub fn run(prog: bytecode::Program, level: i64) -> String {
+    if level == O0 { return ""; }
+    let built = optimize_all(prog, level);
+    if built.error != "" { return built.error; }
+    let mut i = 0;
+    while i < built.funcs.len() {
+        match built.funcs.at(i) {
+            Option::Some(f) => {
+                let old = prog.fns.at(i);
+                let out = emit::emit(f, old.name, old.span, old.file);
+                if out.error != "" { return "emitting \(old.name): \(out.error)"; }
+                prog.fns.set(i, out.f);
+            },
+            Option::None => {},
+        }
+        i = i + 1;
+    }
+    ""
 }

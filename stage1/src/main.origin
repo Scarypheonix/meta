@@ -37,7 +37,8 @@ commands:
                 monomorphization trace: which copy of each generic function the
                 program needs, and which copy every call site reaches
   dump-bytecode compile each file after the first the same way and print the
-                bytecode, in `originc dump-bytecode`'s own format
+                bytecode, in `originc dump-bytecode`'s own format. -O1 and -O2
+                print what the optimizer emitted back
   dump-ir       compile each file after the first the same way and print the SSA
                 the bytecode builds, in `originc dump-ir`'s own format. -O0
                 (the default) prints what the builder produced; -O1 and -O2 run
@@ -551,6 +552,13 @@ fn report_lowered(out: compile::Lowered, command: String, level: i64) -> bool {
     }
     if command == "dump-ir" {
         return report_ir(out.prog, level);
+    }
+    // At -O1 and -O2 what `dump-bytecode` prints is the bytecode the optimizer emitted
+    // back, which is the only place the SSA-to-bytecode direction is visible at all.
+    let oerr = opt::run(out.prog, level);
+    if oerr != "" {
+        io::println("stage1: \(oerr)");
+        return false;
     }
     let parts = out.prog.disassemble();
     let mut i = 0;

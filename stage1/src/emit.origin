@@ -1,0 +1,470 @@
+// SSA back to stack bytecode.
+//
+// A translation of `internal/ir/emit.go`, and the return half of the round trip
+// `irbuild.origin` opens: the optimizer works on SSA and both the virtual machine and the
+// native backend read bytecode, so `-O1` and `-O2` only reach a running program through
+// here.
+//
+// SSA is destroyed the classic way: every value gets a frame slot, and a phi becomes
+// copies at the end of each predecessor. The copies are performed through the operand
+// stack -- all sources pushed, then all destinations popped in reverse -- which makes a
+// parallel copy correct without a swap analysis, because the stack holds the old values
+// while the new ones are written.
+
+use std::list;
+use std::map;
+
+use ast;
+use bytecode;
+use ir;
+
+/// Where an instruction came from: a span and the file it is an offset into.
+///
+/// One struct rather than two parameters because the native backend passes at most six
+/// arguments in registers and stops past that (`docs/deferred.md`), and `put` wants an
+/// opcode, two operands, a kind and a source location -- which is seven the other way.
+struct Where {
+    pub at: ast::Span,
+    pub file: String,
+}
+
+/// A jump whose target block's address is not known yet.
+struct PendingJump {
+    pub at: i64,
+    pub block: ir::Block,
+}
+
+struct Emitter {
+    pub f: ir::Func,
+    pub fn_out: bytecode::Fn,
+    /// A value's frame slot, by value id.
+    pub slots: Map[i64, i64],
+    pub mut next_slot: i64,
+    pub mut order: List[ir::Block],
+    /// A block's first instruction index, by block id.
+    pub blocks_at: Map[i64, i64],
+    pub jumps: List[PendingJump],
+    pub mut error: String,
+}
+
+/// The bytecode function, or the first thing that went wrong producing it.
+pub struct Emitted {
+    pub f: bytecode::Fn,
+    pub error: String,
+}
+
+/// Lowers an SSA function back to stack bytecode.
+pub fn emit(f: ir::Func, name: String, at: ast::Span, file: String) -> Emitted {
+    let out = bytecode::new_fn(name);
+    out.params = f.params;
+    out.captures = f.captures;
+    out.span = at;
+    out.file = file;
+    out.param_kinds = param_kinds(f);
+    out.capture_kinds = capture_kinds(f);
+
+    let e = Emitter {
+        f: f, fn_out: out,
+        slots: map::new[i64, i64](),
+        next_slot: 0,
+        order: list::new[ir::Block](),
+        blocks_at: map::new[i64, i64](),
+        jumps: list::new[PendingJump](),
+        error: "",
+    };
+    assign_slots(e);
+    if e.error != "" { return Emitted { f: out, error: e.error }; }
+    layout(e);
+    emit_blocks(e);
+    if e.error != "" { return Emitted { f: out, error: e.error }; }
+    patch_jumps(e);
+    out.locals = e.next_slot;
+    Emitted { f: out, error: "" }
+}
+
+/// Rebuilds `param_kinds` and `capture_kinds` (ADR-0021) from the function's own parameter
+/// and capture values, which already carry them.
+///
+/// Emitting must not simply drop this: `-O1` and `-O2` build a fresh bytecode function
+/// here, and the native backend's own rebuild of the result needs it exactly where the SSA
+/// builder originally read it from.
+fn param_kinds(f: ir::Func) -> List[i64] {
+    let out = filled(f.params);
+    let all = f.values();
+    let mut i = 0;
+    while i < all.len() {
+        let v = all.at(i);
+        i = i + 1;
+        if v.op == ir::OP_PARAM && v.b >= 0 && v.b < out.len() { out.set(v.b, v.kind); }
+    }
+    out
+}
+
+fn capture_kinds(f: ir::Func) -> List[i64] {
+    let out = filled(f.captures);
+    let all = f.values();
+    let mut i = 0;
+    while i < all.len() {
+        let v = all.at(i);
+        i = i + 1;
+        if v.op == ir::OP_CAPTURE && v.b >= 0 && v.b < out.len() { out.set(v.b, v.kind); }
+    }
+    out
+}
+
+fn filled(n: i64) -> List[i64] {
+    let out = list::new[i64]();
+    let mut i = 0;
+    while i < n {
+        out.push(bytecode::KIND_UNKNOWN);
+        i = i + 1;
+    }
+    out
+}
+
+/// Gives every value a frame slot. Parameters keep the slots the calling convention put
+/// them in, so slot i is argument i.
+fn assign_slots(e: Emitter) {
+    e.next_slot = e.f.params;
+    let mut bi = 0;
+    while bi < e.f.blocks.len() {
+        let b = e.f.blocks.at(bi);
+        bi = bi + 1;
+        let mut p = 0;
+        while p < b.phis.len() {
+            slot_for(e, b.phis.at(p));
+            p = p + 1;
+        }
+        let mut k = 0;
+        while k < b.instr.len() {
+            slot_for(e, b.instr.at(k));
+            k = k + 1;
+        }
+    }
+}
+
+fn slot_for(e: Emitter, v: ir::Value) {
+    if v.op == ir::OP_PARAM {
+        if v.b >= e.f.params {
+            if e.error == "" {
+                e.error = "this is a compiler bug: parameter \(v.b) in a function taking \(e.f.params)";
+            }
+            return;
+        }
+        e.slots.insert(v.id, v.b);
+        return;
+    }
+    e.slots.insert(v.id, e.next_slot);
+    e.next_slot = e.next_slot + 1;
+}
+
+fn slot_of(e: Emitter, v: ir::Value) -> i64 {
+    match e.slots.get(v.id) {
+        Option::Some(s) => s,
+        Option::None => 0,
+    }
+}
+
+/// One frame of the postorder walk, the same shape `dom.origin` uses and for the same
+/// reason: a chain of blocks as long as a compiled function's is not a depth to spend a
+/// stack on.
+struct Frame {
+    pub block: ir::Block,
+    pub mut next: i64,
+}
+
+/// Orders blocks in reverse postorder, which puts a block's predecessors before it wherever
+/// the control-flow graph allows and turns most jumps into fallthroughs.
+fn layout(e: Emitter) {
+    let post = list::new[ir::Block]();
+    let seen = map::new[i64, bool]();
+    let stack = list::new[Frame]();
+    seen.insert(e.f.entry.id, true);
+    stack.push(Frame { block: e.f.entry, next: 0 });
+    while !stack.is_empty() {
+        let top = stack.at(stack.len() - 1);
+        if top.next < top.block.succs.len() {
+            let s = top.block.succs.at(top.next);
+            top.next = top.next + 1;
+            if !seen.contains(s.id) {
+                seen.insert(s.id, true);
+                stack.push(Frame { block: s, next: 0 });
+            }
+        } else {
+            stack.pop();
+            post.push(top.block);
+        }
+    }
+    let mut i = post.len() - 1;
+    while i >= 0 {
+        e.order.push(post.at(i));
+        i = i - 1;
+    }
+}
+
+fn put(e: Emitter, op: i64, a: i64, b: i64, kind: i64, w: Where) -> i64 {
+    e.fn_out.code.push(bytecode::Instr {
+        op: op, a: a, b: b, kind: kind, span: w.at, file: w.file,
+    });
+    e.fn_out.code.len() - 1
+}
+
+/// `put` for the majority of instructions, which carry no kind and no second operand.
+fn put_a(e: Emitter, op: i64, a: i64, w: Where) -> i64 {
+    put(e, op, a, 0, bytecode::KIND_UNKNOWN, w)
+}
+
+/// Pushes a value from its slot.
+fn load(e: Emitter, v: ir::Value, w: Where) {
+    put_a(e, bytecode::OP_LOAD, slot_of(e, v), w);
+}
+
+fn emit_blocks(e: Emitter) {
+    let mut i = 0;
+    while i < e.order.len() {
+        let b = e.order.at(i);
+        e.blocks_at.insert(b.id, e.fn_out.code.len());
+        let mut k = 0;
+        while k < b.instr.len() {
+            emit_value(e, b.instr.at(k));
+            if e.error != "" { return; }
+            k = k + 1;
+        }
+        let mut next = Option::None;
+        if i + 1 < e.order.len() { next = Option::Some(e.order.at(i + 1)); }
+        emit_term(e, b, next);
+        if e.error != "" { return; }
+        i = i + 1;
+    }
+}
+
+/// The one-to-one operations: the IR op that maps straight onto a bytecode op, or
+/// `OP_NOP` for one that does not.
+fn back_op(op: i64) -> i64 {
+    if op == ir::OP_ADD { return bytecode::OP_ADD; }
+    if op == ir::OP_SUB { return bytecode::OP_SUB; }
+    if op == ir::OP_MUL { return bytecode::OP_MUL; }
+    if op == ir::OP_DIV { return bytecode::OP_DIV; }
+    if op == ir::OP_REM { return bytecode::OP_REM; }
+    if op == ir::OP_NEG { return bytecode::OP_NEG; }
+    if op == ir::OP_WRAP_ADD { return bytecode::OP_WRAP_ADD; }
+    if op == ir::OP_WRAP_SUB { return bytecode::OP_WRAP_SUB; }
+    if op == ir::OP_WRAP_MUL { return bytecode::OP_WRAP_MUL; }
+    if op == ir::OP_AND { return bytecode::OP_AND; }
+    if op == ir::OP_OR { return bytecode::OP_OR; }
+    if op == ir::OP_XOR { return bytecode::OP_XOR; }
+    if op == ir::OP_SHL { return bytecode::OP_SHL; }
+    if op == ir::OP_SHR { return bytecode::OP_SHR; }
+    if op == ir::OP_ADDF { return bytecode::OP_ADDF; }
+    if op == ir::OP_SUBF { return bytecode::OP_SUBF; }
+    if op == ir::OP_MULF { return bytecode::OP_MULF; }
+    if op == ir::OP_DIVF { return bytecode::OP_DIVF; }
+    if op == ir::OP_REMF { return bytecode::OP_REMF; }
+    if op == ir::OP_NEGF { return bytecode::OP_NEGF; }
+    if op == ir::OP_EQ { return bytecode::OP_EQ; }
+    if op == ir::OP_NE { return bytecode::OP_NE; }
+    if op == ir::OP_LT { return bytecode::OP_LT; }
+    if op == ir::OP_LE { return bytecode::OP_LE; }
+    if op == ir::OP_GT { return bytecode::OP_GT; }
+    if op == ir::OP_GE { return bytecode::OP_GE; }
+    if op == ir::OP_NOT { return bytecode::OP_NOT; }
+    bytecode::OP_NOP
+}
+
+fn struct_op(op: i64) -> i64 {
+    if op == ir::OP_STRUCT { return bytecode::OP_STRUCT; }
+    if op == ir::OP_TUPLE { return bytecode::OP_TUPLE; }
+    bytecode::OP_VARIANT
+}
+
+fn load_all(e: Emitter, v: ir::Value, w: Where) {
+    let mut i = 0;
+    while i < v.args.len() {
+        load(e, v.args.at(i), w);
+        i = i + 1;
+    }
+}
+
+/// Computes a value and stores it in its slot.
+fn emit_value(e: Emitter, v: ir::Value) {
+    let w = Where { at: v.span, file: v.file };
+
+    if v.op == ir::OP_PARAM { return; } // already in its slot
+
+    if v.op == ir::OP_SET_FIELD {
+        load(e, v.args.at(0), w);
+        load(e, v.args.at(1), w);
+        put_a(e, bytecode::OP_SET_FIELD, v.a, w);
+        return; // no value produced
+    }
+    if v.op == ir::OP_TRAP {
+        put_a(e, bytecode::OP_TRAP, v.a, w);
+        return;
+    }
+
+    if v.op == ir::OP_CONST {
+        put_a(e, bytecode::OP_CONST, v.a, w);
+    } else if v.op == ir::OP_UNIT {
+        put_a(e, bytecode::OP_UNIT, 0, w);
+    } else if v.op == ir::OP_TRUE {
+        put_a(e, bytecode::OP_TRUE, 0, w);
+    } else if v.op == ir::OP_FALSE {
+        put_a(e, bytecode::OP_FALSE, 0, w);
+    } else if v.op == ir::OP_CAPTURE {
+        put_a(e, bytecode::OP_LOAD_CAPTURE, v.b, w);
+    } else if v.op == ir::OP_FUNC {
+        put_a(e, bytecode::OP_FUNC, v.a, w);
+    } else if v.op == ir::OP_CALL {
+        load_all(e, v, w);
+        put(e, bytecode::OP_CALL, v.b, 0, v.kind, w);
+    } else if v.op == ir::OP_CALL_BUILTIN {
+        load_all(e, v, w);
+        // `operand_kind` is what the builder read off the instruction; `kind` may since
+        // have been rewritten by a backend pass that does not run on this path, so the
+        // round trip writes back what came in.
+        let mut k = v.operand_kind;
+        if k == bytecode::KIND_UNKNOWN { k = v.kind; }
+        put(e, bytecode::OP_CALL_BUILTIN, v.a, v.b, k, w);
+    } else if v.op == ir::OP_CLOSURE {
+        load_all(e, v, w);
+        put(e, bytecode::OP_CLOSURE, v.a, v.b, bytecode::KIND_UNKNOWN, w);
+    } else if v.op == ir::OP_STRUCT || v.op == ir::OP_TUPLE || v.op == ir::OP_VARIANT {
+        load_all(e, v, w);
+        put(e, struct_op(v.op), v.a, v.b, bytecode::KIND_UNKNOWN, w);
+    } else if v.op == ir::OP_GET_FIELD {
+        load(e, v.args.at(0), w);
+        put(e, bytecode::OP_GET_FIELD, v.a, 0, v.kind, w);
+    } else if v.op == ir::OP_IS_VARIANT {
+        load(e, v.args.at(0), w);
+        put_a(e, bytecode::OP_IS_VARIANT, v.a, w);
+    } else if v.op == ir::OP_CAST {
+        load(e, v.args.at(0), w);
+        put(e, bytecode::OP_CAST, v.a, v.b, bytecode::KIND_UNKNOWN, w);
+    } else if v.op == ir::OP_TO_STR {
+        load(e, v.args.at(0), w);
+        put_a(e, bytecode::OP_TO_STR, v.a, w);
+    } else {
+        let op = back_op(v.op);
+        if op == bytecode::OP_NOP {
+            e.error = "this is a compiler bug: no bytecode form for IR \(ir::op_name(v.op))";
+            return;
+        }
+        load_all(e, v, w);
+        // `a` travels back out even for the operations that mostly do not have one. A
+        // comparison carries the static kind of its operands, and dropping it here would
+        // leave the round trip lossy in a way only the native backend notices -- the
+        // virtual machine reads a tag off the value instead, so it would keep working
+        // while compiled code got it wrong.
+        put_a(e, op, v.a, w);
+    }
+
+    put_a(e, bytecode::OP_STORE, slot_of(e, v), w);
+}
+
+/// Writes the values a successor's phis expect, at the end of a predecessor.
+///
+/// Every source is pushed before any destination is written, so a cycle among the copies --
+/// `x, y = y, x` at a loop back edge -- comes out right without special handling.
+fn emit_phi_copies(e: Emitter, from: ir::Block, to: ir::Block, w: Where) {
+    if to.phis.is_empty() { return; }
+    let mut idx = 0 - 1;
+    let mut i = 0;
+    while i < to.preds.len() {
+        if ref_eq(to.preds.at(i), from) { idx = i; i = to.preds.len(); }
+        i = i + 1;
+    }
+    if idx < 0 { return; }
+
+    let dests = list::new[i64]();
+    let mut p = 0;
+    while p < to.phis.len() {
+        let phi = to.phis.at(p);
+        p = p + 1;
+        if idx >= phi.args.len() { continue; }
+        load(e, phi.args.at(idx), w);
+        dests.push(slot_of(e, phi));
+    }
+    let mut d = dests.len() - 1;
+    while d >= 0 {
+        put_a(e, bytecode::OP_STORE, dests.at(d), w);
+        d = d - 1;
+    }
+}
+
+fn emit_term(e: Emitter, b: ir::Block, next: Option[ir::Block]) {
+    if b.term.is_none() {
+        e.error = "this is a compiler bug: block \(ir::block_name(b)) has no terminator";
+        return;
+    }
+    let t = b.term.expect("a terminator");
+    let w = Where { at: t.span, file: t.file };
+
+    if t.op == ir::OP_RETURN {
+        if !t.args.is_empty() {
+            load(e, t.args.at(0), w);
+        } else {
+            put_a(e, bytecode::OP_UNIT, 0, w);
+        }
+        put_a(e, bytecode::OP_RETURN, 0, w);
+        return;
+    }
+    if t.op == ir::OP_JUMP {
+        let target = b.succs.at(0);
+        emit_phi_copies(e, b, target, w);
+        let mut fallthrough = false;
+        match next {
+            Option::Some(n) => { fallthrough = n.id == target.id; },
+            Option::None => {},
+        }
+        if !fallthrough {
+            let site = put_a(e, bytecode::OP_JUMP, 0, w);
+            e.jumps.push(PendingJump { at: site, block: target });
+        }
+        return;
+    }
+    if t.op == ir::OP_BRANCH {
+        let true_b = b.succs.at(0);
+        let false_b = b.succs.at(1);
+        // Phi copies differ per edge, so a branch whose successors both have phis needs a
+        // landing pad on at least one edge. Emitting the copies for the taken edge before
+        // the jump only works when the other edge needs none; otherwise the false edge
+        // gets its own block of copies after the branch.
+        load(e, t.args.at(0), w);
+        let jf = put_a(e, bytecode::OP_JUMP_IF_FALSE, 0, w);
+
+        emit_phi_copies(e, b, true_b, w);
+        let jt = put_a(e, bytecode::OP_JUMP, 0, w);
+        e.jumps.push(PendingJump { at: jt, block: true_b });
+
+        // The false edge lands here.
+        patch_at(e, jf, e.fn_out.code.len());
+        emit_phi_copies(e, b, false_b, w);
+        let jfj = put_a(e, bytecode::OP_JUMP, 0, w);
+        e.jumps.push(PendingJump { at: jfj, block: false_b });
+        return;
+    }
+    e.error = "this is a compiler bug: \(ir::op_name(t.op)) is not a terminator";
+}
+
+/// Points a previously emitted jump at `target`.
+///
+/// An `Instr` is immutable (ADR-0004), so the whole instruction is rewritten rather than
+/// its operand -- which is what `compile.origin`'s own `patch` does, for the same reason.
+fn patch_at(e: Emitter, at: i64, target: i64) {
+    let old = e.fn_out.code.at(at);
+    e.fn_out.code.set(at, bytecode::Instr {
+        op: old.op, a: target, b: old.b, kind: old.kind, span: old.span, file: old.file,
+    });
+}
+
+fn patch_jumps(e: Emitter) {
+    let mut i = 0;
+    while i < e.jumps.len() {
+        let j = e.jumps.at(i);
+        i = i + 1;
+        match e.blocks_at.get(j.block.id) {
+            Option::Some(target) => { patch_at(e, j.at, target); },
+            Option::None => {},
+        }
+    }
+}
