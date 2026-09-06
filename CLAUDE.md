@@ -78,8 +78,8 @@ docs/deferred.md      everything deliberately left out, each tagged with a phase
 stage1/src/           from Phase 9: the compiler for Origin, written in Origin --
                       lex.origin, ast.origin, parse.origin, source.origin,
                       resolve.origin, types.origin, check.origin, mono.origin,
-                      layout.origin, bytecode.origin, compile.origin and
-                      main.origin (its own command line) so far
+                      layout.origin, bytecode.origin, compile.origin, ir.origin,
+                      irbuild.origin and main.origin (its own command line) so far
 bootstrap/            from Phase 9: the last known-good stage1 binary
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```
@@ -186,26 +186,29 @@ This project outlasts any single context window.
 ## Status
 
 **Phase 9 is in progress.** Its scope is **self-hosting**: a compiler for Origin, written
-in Origin. What exists in `stage1/src/` is everything through **bytecode** --
+in Origin. What exists in `stage1/src/` is everything through **SSA construction** --
 `lex.origin`, `ast.origin`, `parse.origin`, `source.origin`, `resolve.origin`,
 `types.origin`, `check.origin`, `mono.origin`, `layout.origin`, `bytecode.origin`,
-`compile.origin` -- and `main.origin`, which makes stage1 an actual command-line program
-(`stage1 dump-tokens|dump-ast|parse|resolve|check|mono|dump-bytecode <file>...`, plus
-`--package <root>` for a whole package) shaped like `cmd/originc`'s. That is about 18,000
+`compile.origin`, `ir.origin`, `irbuild.origin` -- and `main.origin`, which makes stage1 an
+actual command-line program (`stage1
+dump-tokens|dump-ast|parse|resolve|check|mono|dump-bytecode|dump-ir <file>...`, plus
+`--package <root>` for a whole package) shaped like `cmd/originc`'s. That is about 19,700
 lines of Origin, and every component is held to the Go one it replaces over this
 repository's own ~400 `.origin` files, all in `tests/selfhost`: the token stream against
 `internal/lex`, the dumped syntax tree against `internal/ast`, the position mapping against
 `internal/source`, the *places* syntax errors are reported against `internal/lex` +
 `internal/parse`, resolution against `internal/resolve` (397 packages, 744,896 trace
 lines), inference against `internal/check` (399 packages, 1,647,768 trace lines), the
-instantiation set against `internal/mono`, and the bytecode against `internal/compile`.
+instantiation set against `internal/mono`, the bytecode against `internal/compile`, and the
+SSA against `internal/ir`.
 
 **stage1 compiles its own source to bytecode, byte for byte.** `stage1/src` as one package,
 with the prelude, gives **91,609 lines of bytecode identical to the Go compiler's** —
 every instruction, every operand, the constant pool and its order, every exact object
-layout (ADR-0019) and the static kind each instruction carries (ADR-0021). That bytecode
-runs on the virtual machine today; what stands between it and a self-hosted compiler is
-only the back half of code generation.
+layout (ADR-0019) and the static kind each instruction carries (ADR-0021) — and **86,986
+lines of SSA**, which is that bytecode built into the form the optimizer and the native
+backend work on. Both bytecode and SSA run on the virtual machine today; what stands
+between them and a self-hosted compiler is the optimizer and the native backend.
 
 The language grew what a compiler cannot be written without: **the command line and the
 exit status** (`docs/spec/17-process.md`) — `args()` in the prelude over `env::arg_count`
@@ -234,12 +237,19 @@ which is where stage1 keeps what `internal/check` keeps in a map keyed by `ast.N
 rule `ast.origin` states — a slot arrives when a reader does — is why they landed in the
 same commit as the reader.
 
-**Next action: `internal/ir` (1,800 lines) and `internal/opt` (1,338)**, then
-`internal/x86` (722), `internal/obj` (1,135) and `internal/backend` (7,064), with `arith`,
-`dwarf` and `codesign` (1,087 between them) pulled in as their consumers need them —
-roughly 13,000 lines of Go still to translate. `originc dump-ir` is the oracle for the
-first stretch, exactly as `dump-bytecode` was for the last: the artefact itself, compared
-directly.
+**Next action: find the -O2 miscompilation stage1 exposed**, recorded at the top of
+`docs/deferred.md`. It is the one thing in the project that is known-wrong, it violates the
+invariant every other differential rests on ("identical output at every optimization
+level"), and it will corrupt anything built on top of it. The reproduction is stage1
+itself and it is reliable; what is missing is a small case. The strongest lead is that
+**every test in `internal/backend/collect_test.go` builds at `-O0`**, so the optimizer has
+never been exercised against a real collection — an `-O2` variant of those tests is where
+to start.
+
+After that: `internal/opt` (1,338 lines), then `internal/x86` (722), `internal/obj`
+(1,135) and `internal/backend` (7,064), with `arith`, `dwarf` and `codesign` (1,087
+between them) pulled in as their consumers need them — roughly 11,000 lines of Go still to
+translate.
 
 **The alternative worth weighing first**: a stage1 that ends at bytecode is already a
 compiler, if something runs the bytecode. Writing the *virtual machine* in Origin
@@ -273,6 +283,18 @@ every bug came from *running Origin*, not from reading Go.
   the first of a duplicated name wins. The degenerate input is the most valuable file in
   the corpus, and a fourth case of the same thing — `checkBodies` visiting an impl's methods
   in map order — was found the same way.
+- **stage1 found a miscompilation at `-O2`, and it is still open.** stage1 built at `-O2`
+  traps building the SSA of its own `pop_n`; at `-O0` and `-O1` it is correct, and at `-O2`
+  with a 512 MiB heap it is correct too — which is what makes it a *root-set hole the
+  optimizer opens*, not an arithmetic slip. Disabling `Inline` makes it go away, and a
+  bisection on the number of inlines puts it at exactly one. Four attempts at a small
+  reproduction all behave identically at every level, so what exists is the reliable
+  reproduction on stage1 itself (`docs/deferred.md`). The reason it survived four phases is
+  worth more than the bug: **every collector test builds at `-O0`**, so the optimizer and
+  the collector have never been tested against each other. That is the same shape as the
+  tuple-layout bug below — a pass that nothing executes — and the same shape as Phase 6's
+  five root-set holes, every one of which was invisible until a collection actually moved
+  objects.
 - **Two tuples of the same arity could not coexist in one compiled program.** A
   descriptor's *name* is its identity in the layout registry, and a tuple's was its arity
   alone, so `(i64, bool)` and `(bool, String)` were the same type: the second registration

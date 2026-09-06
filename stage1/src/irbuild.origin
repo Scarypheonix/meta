@@ -1,0 +1,762 @@
+// Building SSA from bytecode: Braun et al.'s on-demand construction.
+//
+// A translation of `internal/ir/build.go`. The whole construction rests on knowing the
+// operand stack's depth at every program point, because a stack slot live across a branch
+// is a variable and has to be given a phi. A wrong entry in the stack-effect table does not
+// produce slightly worse code, it produces a wrong program, so the builder checks the
+// depths it derives for consistency and reports a compiler bug rather than continuing.
+
+use std::list;
+use std::map;
+use std::str;
+
+use ast;
+use bytecode;
+use ir;
+
+/// How many values an instruction pops. The table has to be exact (see the header).
+fn pops_of(x: bytecode::Instr) -> i64 {
+    if x.op == bytecode::OP_NOP || x.op == bytecode::OP_JUMP || x.op == bytecode::OP_TRAP
+        || x.op == bytecode::OP_HALT {
+        return 0;
+    }
+    if x.op == bytecode::OP_CONST || x.op == bytecode::OP_UNIT || x.op == bytecode::OP_TRUE
+        || x.op == bytecode::OP_FALSE || x.op == bytecode::OP_LOAD
+        || x.op == bytecode::OP_LOAD_CAPTURE || x.op == bytecode::OP_FUNC {
+        return 0;
+    }
+    if x.op == bytecode::OP_STORE || x.op == bytecode::OP_POP
+        || x.op == bytecode::OP_JUMP_IF_FALSE || x.op == bytecode::OP_JUMP_IF_TRUE
+        || x.op == bytecode::OP_RETURN {
+        return 1;
+    }
+    if x.op == bytecode::OP_NEG || x.op == bytecode::OP_NEGF || x.op == bytecode::OP_NOT
+        || x.op == bytecode::OP_TO_STR || x.op == bytecode::OP_GET_FIELD
+        || x.op == bytecode::OP_GET_PAYLOAD || x.op == bytecode::OP_GET_TUPLE_ELEM
+        || x.op == bytecode::OP_IS_VARIANT || x.op == bytecode::OP_CAST {
+        return 1;
+    }
+    if x.op == bytecode::OP_SET_FIELD {
+        return 2;
+    }
+    if x.op == bytecode::OP_CALL {
+        return x.a + 1;
+    }
+    if x.op == bytecode::OP_CALL_BUILTIN || x.op == bytecode::OP_CLOSURE
+        || x.op == bytecode::OP_STRUCT || x.op == bytecode::OP_TUPLE
+        || x.op == bytecode::OP_VARIANT {
+        return x.b;
+    }
+    // Everything else is a binary operator.
+    2
+}
+
+fn pushes_of(x: bytecode::Instr) -> i64 {
+    if x.op == bytecode::OP_NOP || x.op == bytecode::OP_JUMP || x.op == bytecode::OP_TRAP
+        || x.op == bytecode::OP_HALT {
+        return 0;
+    }
+    if x.op == bytecode::OP_STORE || x.op == bytecode::OP_POP
+        || x.op == bytecode::OP_JUMP_IF_FALSE || x.op == bytecode::OP_JUMP_IF_TRUE
+        || x.op == bytecode::OP_RETURN || x.op == bytecode::OP_SET_FIELD {
+        return 0;
+    }
+    1
+}
+
+/// The IR operation a bytecode operation translates to one-to-one, or -1.
+fn ir_op_of(o: i64) -> i64 {
+    if o == bytecode::OP_ADD { return ir::OP_ADD; }
+    if o == bytecode::OP_SUB { return ir::OP_SUB; }
+    if o == bytecode::OP_MUL { return ir::OP_MUL; }
+    if o == bytecode::OP_DIV { return ir::OP_DIV; }
+    if o == bytecode::OP_REM { return ir::OP_REM; }
+    if o == bytecode::OP_NEG { return ir::OP_NEG; }
+    if o == bytecode::OP_WRAP_ADD { return ir::OP_WRAP_ADD; }
+    if o == bytecode::OP_WRAP_SUB { return ir::OP_WRAP_SUB; }
+    if o == bytecode::OP_WRAP_MUL { return ir::OP_WRAP_MUL; }
+    if o == bytecode::OP_AND { return ir::OP_AND; }
+    if o == bytecode::OP_OR { return ir::OP_OR; }
+    if o == bytecode::OP_XOR { return ir::OP_XOR; }
+    if o == bytecode::OP_SHL { return ir::OP_SHL; }
+    if o == bytecode::OP_SHR { return ir::OP_SHR; }
+    if o == bytecode::OP_ADDF { return ir::OP_ADDF; }
+    if o == bytecode::OP_SUBF { return ir::OP_SUBF; }
+    if o == bytecode::OP_MULF { return ir::OP_MULF; }
+    if o == bytecode::OP_DIVF { return ir::OP_DIVF; }
+    if o == bytecode::OP_REMF { return ir::OP_REMF; }
+    if o == bytecode::OP_NEGF { return ir::OP_NEGF; }
+    if o == bytecode::OP_EQ { return ir::OP_EQ; }
+    if o == bytecode::OP_NE { return ir::OP_NE; }
+    if o == bytecode::OP_LT { return ir::OP_LT; }
+    if o == bytecode::OP_LE { return ir::OP_LE; }
+    if o == bytecode::OP_GT { return ir::OP_GT; }
+    if o == bytecode::OP_GE { return ir::OP_GE; }
+    if o == bytecode::OP_NOT { return ir::OP_NOT; }
+    if o == bytecode::OP_TO_STR { return ir::OP_TO_STR; }
+    if o == bytecode::OP_GET_FIELD { return ir::OP_GET_FIELD; }
+    if o == bytecode::OP_GET_PAYLOAD { return ir::OP_GET_FIELD; }
+    if o == bytecode::OP_GET_TUPLE_ELEM { return ir::OP_GET_FIELD; }
+    if o == bytecode::OP_IS_VARIANT { return ir::OP_IS_VARIANT; }
+    if o == bytecode::OP_CAST { return ir::OP_CAST; }
+    0 - 1
+}
+
+/// Turns one bytecode function into SSA.
+struct Builder {
+    src: bytecode::Fn,
+    f: ir::Func,
+    /// The block each leader instruction begins, by program counter.
+    leaders: Map[i64, ir::Block],
+    /// The operand-stack depth on entry to each instruction.
+    depth: List[i64],
+    /// Which instructions the entry can reach.
+    reachable: List[bool],
+    n_locals: i64,
+    /// The abstract operand stack while translating a block.
+    mut stack: List[ir::Value],
+    mut error: String,
+}
+
+/// The result of building: the function, and what went wrong if anything did.
+pub struct Built {
+    pub f: ir::Func,
+    pub error: String,
+}
+
+/// Converts a bytecode function to SSA form.
+pub fn build(src: bytecode::Fn) -> Built {
+    let b = Builder {
+        src: src,
+        f: ir::new_func(src.name, src.params, src.captures),
+        leaders: map::new[i64, ir::Block](),
+        depth: list::new[i64](),
+        reachable: list::new[bool](),
+        n_locals: src.locals,
+        stack: list::new[ir::Value](),
+        error: "",
+    };
+    b.compute_depths();
+    if b.error != "" {
+        return Built { f: b.f, error: b.error };
+    }
+    b.find_leaders();
+    b.translate();
+    if b.error != "" {
+        return Built { f: b.f, error: b.error };
+    }
+    remove_trivial_phis(b.f);
+    b.f.recompute_uses();
+    Built { f: b.f, error: "" }
+}
+
+impl Builder {
+    /// Derives the operand-stack depth at every instruction and records which are
+    /// reachable.
+    fn compute_depths(self) {
+        let n = self.src.code.len();
+        let seen = list::new[bool]();
+        let mut i = 0;
+        while i <= n {
+            self.depth.push(0);
+            self.reachable.push(false);
+            seen.push(false);
+            i = i + 1;
+        }
+        if n == 0 {
+            return;
+        }
+
+        let work_pc = list::new[i64]();
+        let work_depth = list::new[i64]();
+        work_pc.push(0);
+        work_depth.push(0);
+
+        while !work_pc.is_empty() {
+            let pc = work_pc.at(work_pc.len() - 1);
+            let d = work_depth.at(work_depth.len() - 1);
+            work_pc.pop();
+            work_depth.pop();
+            if pc > n {
+                self.error = "this is a compiler bug: jump to \(pc), past the end of \(self.src.name)";
+                return;
+            }
+            if seen.at(pc) {
+                if self.depth.at(pc) != d {
+                    self.error = "this is a compiler bug: \(self.src.name) reaches instruction \(pc) with stack depth \(self.depth.at(pc)) and \(d)";
+                    return;
+                }
+                continue;
+            }
+            seen.set(pc, true);
+            self.reachable.set(pc, true);
+            self.depth.set(pc, d);
+            if pc == n {
+                continue;
+            }
+
+            let x = self.src.code.at(pc);
+            let pops = pops_of(x);
+            if d < pops {
+                self.error = "this is a compiler bug: \(self.src.name) underflows the stack at instruction \(pc)";
+                return;
+            }
+            let out = d - pops + pushes_of(x);
+
+            if x.op == bytecode::OP_JUMP {
+                work_pc.push(x.a);
+                work_depth.push(out);
+            } else {
+                if x.op == bytecode::OP_JUMP_IF_FALSE || x.op == bytecode::OP_JUMP_IF_TRUE {
+                    work_pc.push(x.a);
+                    work_depth.push(out);
+                    work_pc.push(pc + 1);
+                    work_depth.push(out);
+                } else {
+                    // A return, a halt and a trap do not fall through.
+                    if x.op != bytecode::OP_RETURN && x.op != bytecode::OP_HALT
+                        && x.op != bytecode::OP_TRAP {
+                        work_pc.push(pc + 1);
+                        work_depth.push(out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Marks the instructions that begin a basic block: the entry, every jump target, and
+    /// every instruction after a control transfer.
+    fn find_leaders(self) {
+        let n = self.src.code.len();
+        let is_leader = list::new[bool]();
+        let mut i = 0;
+        while i <= n {
+            is_leader.push(false);
+            i = i + 1;
+        }
+        if n > 0 {
+            is_leader.set(0, true);
+        }
+        let mut pc = 0;
+        while pc < n {
+            let x = self.src.code.at(pc);
+            if x.op == bytecode::OP_JUMP || x.op == bytecode::OP_JUMP_IF_FALSE
+                || x.op == bytecode::OP_JUMP_IF_TRUE {
+                if x.a >= 0 && x.a < is_leader.len() {
+                    is_leader.set(x.a, true);
+                }
+                if pc + 1 < is_leader.len() {
+                    is_leader.set(pc + 1, true);
+                }
+            }
+            if x.op == bytecode::OP_RETURN || x.op == bytecode::OP_HALT
+                || x.op == bytecode::OP_TRAP {
+                if pc + 1 < is_leader.len() {
+                    is_leader.set(pc + 1, true);
+                }
+            }
+            pc = pc + 1;
+        }
+        let mut k = 0;
+        while k < is_leader.len() {
+            if is_leader.at(k) && self.reachable.at(k) {
+                if k == 0 {
+                    self.leaders.insert(0, self.f.entry);
+                } else {
+                    self.leaders.insert(k, self.f.new_block());
+                }
+            }
+            k = k + 1;
+        }
+    }
+
+    fn block_at(self, pc: i64) -> Option[ir::Block] { self.leaders.get(pc) }
+}
+
+// --- Translation ------------------------------------------------------------------------
+
+impl Builder {
+    /// Walks the bytecode block by block, building SSA as it goes.
+    fn translate(self) {
+        // Parameters and captures are the entry block's initial definitions.
+        let mut i = 0;
+        while i < self.src.params && i < self.n_locals {
+            let v = self.f.new_value(ir::OP_PARAM, self.src.span, self.src.file,
+                                     list::new[ir::Value]());
+            v.b = i;
+            if i < self.src.param_kinds.len() {
+                v.kind = self.src.param_kinds.at(i);
+            }
+            self.f.entry.append(v);
+            self.f.entry.defs.insert(i, v);
+            i = i + 1;
+        }
+        // Every other local starts as unit: Origin has no uninitialized bindings
+        // (ADR-0007), and the lowering writes each before it reads it.
+        let mut k = self.src.params;
+        while k < self.n_locals {
+            let v = self.f.new_value(ir::OP_UNIT, self.src.span, self.src.file,
+                                     list::new[ir::Value]());
+            self.f.entry.append(v);
+            self.f.entry.defs.insert(k, v);
+            k = k + 1;
+        }
+        self.f.entry.sealed = true;
+
+        let starts = self.leaders.keys();
+        sort_ints(starts);
+
+        // Every block's predecessors are known once the whole function has been walked, so
+        // sealing happens in a second pass. Until then a read of a variable not defined
+        // locally creates an incomplete phi.
+        let mut s = 0;
+        while s < starts.len() {
+            if starts.at(s) < self.src.code.len() {
+                self.translate_block(starts.at(s));
+                if self.error != "" {
+                    return;
+                }
+            }
+            s = s + 1;
+        }
+        let mut t = 0;
+        while t < starts.len() {
+            match self.leaders.get(starts.at(t)) {
+                Option::Some(b) => self.seal_block(b),
+                Option::None => {}
+            }
+            t = t + 1;
+        }
+    }
+
+    /// Converts the straight-line run of instructions starting at `pc`.
+    fn translate_block(self, pc: i64) {
+        let blk = self.leaders.get(pc).expect("a leader has a block");
+        self.stack = list::new[ir::Value]();
+
+        // The block's entry stack becomes variables numbered above the locals, read on
+        // demand so that a value produced in one block and consumed in another gets a phi.
+        let mut i = 0;
+        while i < self.depth.at(pc) {
+            self.stack.push(self.read_var(self.n_locals + i, blk, self.src.span));
+            i = i + 1;
+        }
+
+        let mut at = pc;
+        while at < self.src.code.len() {
+            let x = self.src.code.at(at);
+            if at > pc && self.leaders.contains(at) {
+                // The next instruction begins a block: fall through to it.
+                self.write_stack(blk);
+                let t = self.f.new_value(ir::OP_JUMP, x.span, x.file, list::new[ir::Value]());
+                blk.append(t);
+                blk.set_succs(one_block(self.leaders.get(at).expect("a leader has a block")));
+                return;
+            }
+            if self.translate_instr(blk, x, at) {
+                return;
+            }
+            if self.error != "" {
+                return;
+            }
+            at = at + 1;
+        }
+        // Ran off the end without a terminator: the lowering always emits a return, so
+        // this is a compiler bug rather than something to paper over.
+        self.error = "this is a compiler bug: \(self.src.name) has a block with no terminator";
+    }
+
+    /// Records the block's outgoing operand stack as variable definitions, so a successor
+    /// can read them.
+    fn write_stack(self, blk: ir::Block) {
+        let mut i = 0;
+        while i < self.stack.len() {
+            blk.defs.insert(self.n_locals + i, self.stack.at(i));
+            i = i + 1;
+        }
+    }
+
+    fn push(self, v: ir::Value) { self.stack.push(v); }
+
+    fn pop(self) -> ir::Value {
+        let v = self.stack.at(self.stack.len() - 1);
+        self.stack.pop();
+        v
+    }
+
+    /// Removes `n` values and returns them in stack order.
+    fn pop_n(self, n: i64) -> List[ir::Value] {
+        let out = list::new[ir::Value]();
+        let mut i = self.stack.len() - n;
+        while i < self.stack.len() {
+            out.push(self.stack.at(i));
+            i = i + 1;
+        }
+        let mut k = 0;
+        while k < n {
+            self.stack.pop();
+            k = k + 1;
+        }
+        out
+    }
+
+    /// Converts the instruction at `pc`, reporting whether it terminated the block.
+    fn translate_instr(self, blk: ir::Block, x: bytecode::Instr, pc: i64) -> bool {
+        if x.op == bytecode::OP_NOP {
+            return false;
+        }
+        if x.op == bytecode::OP_CONST {
+            let v = self.f.new_value(ir::OP_CONST, x.span, x.file, list::new[ir::Value]());
+            v.a = x.a;
+            self.push(blk.append(v));
+            return false;
+        }
+        if x.op == bytecode::OP_UNIT || x.op == bytecode::OP_TRUE || x.op == bytecode::OP_FALSE {
+            let mut op = ir::OP_UNIT;
+            if x.op == bytecode::OP_TRUE { op = ir::OP_TRUE; }
+            if x.op == bytecode::OP_FALSE { op = ir::OP_FALSE; }
+            self.push(blk.append(
+                self.f.new_value(op, x.span, x.file, list::new[ir::Value]())));
+            return false;
+        }
+        if x.op == bytecode::OP_LOAD {
+            self.push(self.read_var(x.a, blk, x.span));
+            return false;
+        }
+        if x.op == bytecode::OP_STORE {
+            blk.defs.insert(x.a, self.pop());
+            return false;
+        }
+        if x.op == bytecode::OP_LOAD_CAPTURE {
+            let v = self.f.new_value(ir::OP_CAPTURE, x.span, x.file, list::new[ir::Value]());
+            v.b = x.a;
+            if x.a >= 0 && x.a < self.src.capture_kinds.len() {
+                v.kind = self.src.capture_kinds.at(x.a);
+            }
+            self.push(blk.append(v));
+            return false;
+        }
+        if x.op == bytecode::OP_POP {
+            self.pop();
+            return false;
+        }
+        if x.op == bytecode::OP_FUNC {
+            let v = self.f.new_value(ir::OP_FUNC, x.span, x.file, list::new[ir::Value]());
+            v.a = x.a;
+            self.push(blk.append(v));
+            return false;
+        }
+        if x.op == bytecode::OP_JUMP {
+            self.write_stack(blk);
+            blk.append(self.f.new_value(ir::OP_JUMP, x.span, x.file, list::new[ir::Value]()));
+            match self.block_at(x.a) {
+                Option::Some(target) => blk.set_succs(one_block(target)),
+                Option::None => {
+                    self.error = "this is a compiler bug: \(self.src.name) jumps to \(x.a), which begins no block";
+                }
+            }
+            return true;
+        }
+        if x.op == bytecode::OP_JUMP_IF_FALSE || x.op == bytecode::OP_JUMP_IF_TRUE {
+            let cond = self.pop();
+            self.write_stack(blk);
+            let t = self.f.new_value(ir::OP_BRANCH, x.span, x.file, one_value(cond));
+            blk.append(t);
+            match self.block_at(x.a) {
+                Option::None => {
+                    self.error = "this is a compiler bug: \(self.src.name) branches to \(x.a), which begins no block";
+                }
+                Option::Some(target) => {
+                    match self.block_at(pc + 1) {
+                        Option::None => {
+                            self.error = "this is a compiler bug: \(self.src.name) falls through to \(pc + 1), which begins no block";
+                        }
+                        Option::Some(next) => {
+                            let succs = list::new[ir::Block]();
+                            if x.op == bytecode::OP_JUMP_IF_TRUE {
+                                succs.push(target);
+                                succs.push(next);
+                            } else {
+                                succs.push(next);
+                                succs.push(target);
+                            }
+                            blk.set_succs(succs);
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        if x.op == bytecode::OP_RETURN {
+            let val = self.pop();
+            blk.append(self.f.new_value(ir::OP_RETURN, x.span, x.file, one_value(val)));
+            return true;
+        }
+        if x.op == bytecode::OP_HALT {
+            let u = blk.append(
+                self.f.new_value(ir::OP_UNIT, x.span, x.file, list::new[ir::Value]()));
+            blk.append(self.f.new_value(ir::OP_RETURN, x.span, x.file, one_value(u)));
+            return true;
+        }
+        if x.op == bytecode::OP_TRAP {
+            let v = self.f.new_value(ir::OP_TRAP, x.span, x.file, list::new[ir::Value]());
+            v.a = x.a;
+            blk.append(v);
+            let u = blk.append(
+                self.f.new_value(ir::OP_UNIT, x.span, x.file, list::new[ir::Value]()));
+            blk.append(self.f.new_value(ir::OP_RETURN, x.span, x.file, one_value(u)));
+            return true;
+        }
+        if x.op == bytecode::OP_CALL {
+            let args = self.pop_n(x.a + 1);
+            let v = self.f.new_value(ir::OP_CALL, x.span, x.file, args);
+            v.b = x.a;
+            v.kind = x.kind;
+            self.push(blk.append(v));
+            return false;
+        }
+        if x.op == bytecode::OP_CALL_BUILTIN {
+            let args = self.pop_n(x.b);
+            let v = self.f.new_value(ir::OP_CALL_BUILTIN, x.span, x.file, args);
+            v.a = x.a;
+            v.b = x.b;
+            // A builtin whose result kind is the program's own `T` carries it on the
+            // instruction (ADR-0021). Dropping it here would leave the value kindless
+            // after any optimizer round trip, which the register allocator refuses.
+            //
+            // It lands in both fields: for most builtins the instruction's kind is the
+            // result's, and for the width-sensitive ones (`checked_*`, `saturating_*`) it
+            // is the operands', which backend kind propagation must not overwrite.
+            v.kind = x.kind;
+            v.operand_kind = x.kind;
+            self.push(blk.append(v));
+            return false;
+        }
+        if x.op == bytecode::OP_CLOSURE {
+            let args = self.pop_n(x.b);
+            let v = self.f.new_value(ir::OP_CLOSURE, x.span, x.file, args);
+            v.a = x.a;
+            v.b = x.b;
+            self.push(blk.append(v));
+            return false;
+        }
+        if x.op == bytecode::OP_STRUCT || x.op == bytecode::OP_TUPLE
+            || x.op == bytecode::OP_VARIANT {
+            let args = self.pop_n(x.b);
+            let mut op = ir::OP_STRUCT;
+            if x.op == bytecode::OP_TUPLE { op = ir::OP_TUPLE; }
+            if x.op == bytecode::OP_VARIANT { op = ir::OP_VARIANT; }
+            let v = self.f.new_value(op, x.span, x.file, args);
+            v.a = x.a;
+            v.b = x.b;
+            self.push(blk.append(v));
+            return false;
+        }
+        if x.op == bytecode::OP_SET_FIELD {
+            let val = self.pop();
+            let obj = self.pop();
+            let args = list::new[ir::Value]();
+            args.push(obj);
+            args.push(val);
+            let v = self.f.new_value(ir::OP_SET_FIELD, x.span, x.file, args);
+            v.a = x.a;
+            blk.append(v);
+            return false;
+        }
+        if x.op == bytecode::OP_CAST {
+            let v = self.f.new_value(ir::OP_CAST, x.span, x.file, one_value(self.pop()));
+            v.a = x.a;
+            v.b = x.b;
+            self.push(blk.append(v));
+            return false;
+        }
+
+        let op = ir_op_of(x.op);
+        if op < 0 {
+            self.error = "this is a compiler bug: no IR form for \(bytecode::op_name(x.op))";
+            return false;
+        }
+        let args = self.pop_n(pops_of(x));
+        let v = self.f.new_value(op, x.span, x.file, args);
+        v.a = x.a;
+        // Only a field, payload or tuple-element read carries a meaningful kind here;
+        // every other operation reaching this point leaves the instruction's kind at
+        // unknown, which is exactly what a value whose kind is not yet known should have.
+        v.kind = x.kind;
+        self.push(blk.append(v));
+        false
+    }
+}
+
+fn one_block(b: ir::Block) -> List[ir::Block] {
+    let l = list::new[ir::Block]();
+    l.push(b);
+    l
+}
+
+fn one_value(v: ir::Value) -> List[ir::Value] {
+    let l = list::new[ir::Value]();
+    l.push(v);
+    l
+}
+
+/// An insertion sort, so that a block's translation order does not depend on a map's.
+fn sort_ints(l: List[i64]) {
+    let mut i = 1;
+    while i < l.len() {
+        let cur = l.at(i);
+        let mut j = i;
+        while j > 0 && l.at(j - 1) > cur {
+            l.set(j, l.at(j - 1));
+            j = j - 1;
+        }
+        l.set(j, cur);
+        i = i + 1;
+    }
+}
+
+// --- Braun et al.: on-demand SSA construction --------------------------------------------
+
+impl Builder {
+    /// The value of a variable at the end of a block, inserting phi-functions as needed.
+    fn read_var(self, v: i64, blk: ir::Block, at: ast::Span) -> ir::Value {
+        match blk.defs.get(v) {
+            Option::Some(val) => val,
+            Option::None => self.read_var_recursive(v, blk, at),
+        }
+    }
+
+    fn read_var_recursive(self, v: i64, blk: ir::Block, at: ast::Span) -> ir::Value {
+        if !blk.sealed {
+            // The block's predecessors are not all known yet, so the phi's operands cannot
+            // be filled in; it is recorded and completed when the block is sealed.
+            let val = self.f.new_value(ir::OP_PHI, at, self.src.file, list::new[ir::Value]());
+            val.b = v;
+            blk.append(val);
+            blk.incomplete.insert(v, val);
+            blk.defs.insert(v, val);
+            return val;
+        }
+        if blk.preds.len() == 1 {
+            return self.read_var(v, blk.preds.at(0), at);
+        }
+        let val = self.f.new_value(ir::OP_PHI, at, self.src.file, list::new[ir::Value]());
+        val.b = v;
+        blk.append(val);
+        // The phi is recorded before its operands are read, which is what breaks the cycle
+        // when a loop's back-edge reads the variable the phi defines.
+        blk.defs.insert(v, val);
+        self.add_phi_operands(v, val, at);
+        blk.defs.insert(v, val);
+        val
+    }
+
+    fn add_phi_operands(self, v: i64, phi: ir::Value, at: ast::Span) {
+        match phi.block {
+            Option::None => {}
+            Option::Some(blk) => {
+                let mut i = 0;
+                while i < blk.preds.len() {
+                    let operand = self.read_var(v, blk.preds.at(i), at);
+                    phi.args.push(operand);
+                    operand.uses = operand.uses + 1;
+                    i = i + 1;
+                }
+            }
+        }
+    }
+
+    /// Records that a block's predecessors are all known and completes the phis that were
+    /// created before that was true.
+    fn seal_block(self, blk: ir::Block) {
+        if blk.sealed {
+            return;
+        }
+        blk.sealed = true;
+        // In local-slot order, not map order: completing a phi reads its variable in every
+        // predecessor, which can create further phis, so the iteration order decides the
+        // order values are created and therefore how they are numbered. Snapshots compare
+        // printed IR, so a run-to-run renumbering is a spurious diff.
+        let vars = blk.incomplete.keys();
+        sort_ints(vars);
+        let mut i = 0;
+        while i < vars.len() {
+            match blk.incomplete.get(vars.at(i)) {
+                Option::Some(phi) => self.add_phi_operands(vars.at(i), phi, phi.span),
+                Option::None => {}
+            }
+            i = i + 1;
+        }
+        blk.incomplete = map::new[i64, ir::Value]();
+    }
+}
+
+/// Deletes phis whose operands are all the same value (or the phi itself), to a fixed
+/// point. Braun's algorithm removes them as it goes; doing it afterwards is simpler and
+/// reaches the same result, because triviality is monotone.
+fn remove_trivial_phis(f: ir::Func) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = 0;
+        while i < f.blocks.len() {
+            let blk = f.blocks.at(i);
+            let kept = list::new[ir::Value]();
+            let mut p = 0;
+            while p < blk.phis.len() {
+                let phi = blk.phis.at(p);
+                let t = trivial_operand(phi);
+                if t.trivial {
+                    let mut same = t.value;
+                    if !t.has_value {
+                        // No operand at all: the block is unreachable, so any value will do
+                        // and unit is the one with no other meaning.
+                        same = f.new_value(ir::OP_UNIT, phi.span, phi.file,
+                                           list::new[ir::Value]());
+                        blk.instr.push(same);
+                        let mut q = blk.instr.len() - 1;
+                        while q > 0 {
+                            blk.instr.set(q, blk.instr.at(q - 1));
+                            q = q - 1;
+                        }
+                        blk.instr.set(0, same);
+                        same.block = Option::Some(blk);
+                    }
+                    f.replace_all_uses(phi, same);
+                    changed = true;
+                } else {
+                    kept.push(phi);
+                }
+                p = p + 1;
+            }
+            blk.phis = kept;
+            i = i + 1;
+        }
+    }
+    f.recompute_uses();
+}
+
+/// A phi's single distinct operand, if it has one.
+struct Trivial {
+    trivial: bool,
+    has_value: bool,
+    value: ir::Value,
+}
+
+fn trivial_operand(phi: ir::Value) -> Trivial {
+    let mut has = false;
+    let mut same = phi;
+    let mut i = 0;
+    while i < phi.args.len() {
+        let op = phi.args.at(i);
+        if !ref_eq(op, phi) && !(has && ref_eq(op, same)) {
+            if has {
+                return Trivial { trivial: false, has_value: false, value: phi };
+            }
+            has = true;
+            same = op;
+        }
+        i = i + 1;
+    }
+    Trivial { trivial: true, has_value: has, value: same }
+}

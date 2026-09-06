@@ -16,9 +16,11 @@ use lex;
 use ast;
 use parse;
 use resolve;
+use bytecode;
 use check;
 use mono;
 use compile;
+use irbuild;
 
 const USAGE: String = "usage: stage1 <command> <file>...
 
@@ -35,8 +37,10 @@ commands:
                 program needs, and which copy every call site reaches
   dump-bytecode compile each file after the first the same way and print the
                 bytecode, in `originc dump-bytecode`'s own format
+  dump-ir       compile each file after the first the same way and print the SSA
+                the bytecode builds, in `originc dump-ir -O0`'s own format
 
-`resolve`, `check`, `mono` and `dump-bytecode` also take
+`resolve`, `check`, `mono`, `dump-bytecode` and `dump-ir` also take
 
   <prelude> --package <root> <file>...
 
@@ -65,7 +69,7 @@ fn main() {
     let command = argv.at(1);
     if command != "dump-tokens" && command != "dump-ast" && command != "parse"
         && command != "resolve" && command != "check" && command != "mono"
-        && command != "dump-bytecode" {
+        && command != "dump-bytecode" && command != "dump-ir" {
         io::println("stage1: unknown command `\(command)`");
         io::println(USAGE);
         process::exit(2);
@@ -75,7 +79,7 @@ fn main() {
     // imports (spec/07-modules.md), nothing can be checked before it is resolved, nothing
     // can be monomorphized before it is checked, and nothing can be lowered before that.
     if command == "resolve" || command == "check" || command == "mono"
-        || command == "dump-bytecode" {
+        || command == "dump-bytecode" || command == "dump-ir" {
         if !run_package(argv, command) {
             process::exit(1);
         }
@@ -156,7 +160,7 @@ fn run_package(argv: List[String], command: String) -> bool {
                 // to refuse, which is what `originc` does by stopping here
                 // (spec/09-errors.md). Both halves of syntax count: a bad escape is the
                 // lexer's diagnostic, and it leaves a tree just as unusable.
-                if command == "dump-bytecode"
+                if lowered_command(command)
                     && (!lexed.errors.is_empty() || !parsed.errors.is_empty()) {
                     i = i + 1;
                     continue;
@@ -196,14 +200,15 @@ fn run_package(argv: List[String], command: String) -> bool {
                                 if !report_mono(mo, command == "mono") {
                                     ok = false;
                                 } else {
-                                    if command == "dump-bytecode" {
+                                    if lowered_command(command) {
                                         let cunits = list::new[compile::Unit]();
                                         cunits.push(compile::Unit {
                                             file: PRELUDE_NAME, tree: prelude_tree,
                                         });
                                         cunits.push(compile::Unit { file: path, tree: tree });
-                                        if !report_bytecode(
-                                                compile::program(resolved, checked, mo, cunits)) {
+                                        if !report_lowered(
+                                                compile::program(resolved, checked, mo, cunits),
+                                                command) {
                                             ok = false;
                                         }
                                     }
@@ -268,7 +273,7 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String) ->
             Result::Ok(src) => {
                 let lexed = lex::lex(src);
                 let parsed = parse::parse(lexed.tokens);
-                if command == "dump-bytecode"
+                if lowered_command(command)
                     && (!lexed.errors.is_empty() || !parsed.errors.is_empty()) {
                     io::println("stage1: \(paths.at(u)) does not parse");
                     return false;
@@ -315,7 +320,7 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String) ->
     if !report_mono(mo, command == "mono") {
         return false;
     }
-    if command != "dump-bytecode" {
+    if !lowered_command(command) {
         return true;
     }
     let cunits = list::new[compile::Unit]();
@@ -325,16 +330,21 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String) ->
         cunits.push(compile::Unit { file: paths.at(b), tree: trees.at(b) });
         b = b + 1;
     }
-    report_bytecode(compile::program(resolved, checked, mo, cunits))
+    report_lowered(compile::program(resolved, checked, mo, cunits), command)
 }
 
 fn typed_command(command: String) -> bool {
-    command == "check" || command == "mono" || command == "dump-bytecode"
+    command == "check" || mono_command(command)
 }
 
 /// Whether a command needs the instantiation set.
 fn mono_command(command: String) -> bool {
-    command == "mono" || command == "dump-bytecode"
+    command == "mono" || lowered_command(command)
+}
+
+/// Whether a command needs the bytecode.
+fn lowered_command(command: String) -> bool {
+    command == "dump-bytecode" || command == "dump-ir"
 }
 
 /// A path under the source root becomes a module path: `resolve.origin` is `resolve`,
@@ -448,7 +458,7 @@ fn report_check(out: check::Checked, command: String) -> bool {
     // belongs in the output. `dump-bytecode`'s output is the artefact, and a warning is
     // not part of it: `originc` makes the same split by writing every diagnostic to
     // stderr and the bytecode to stdout, and stage1 has only one stream to write to.
-    let artefact = command == "dump-bytecode";
+    let artefact = lowered_command(command);
     let with_trace = command == "check";
     let errors = out.errors;
     sort_by(errors, |a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
@@ -504,10 +514,10 @@ fn report_mono(out: mono::Result, with_trace: bool) -> bool {
     out.errors.is_empty()
 }
 
-/// Prints the disassembled bytecode, in `originc dump-bytecode`'s own format, so that the
-/// two compilers' output is comparable directly rather than through a trace invented for
-/// the purpose.
-fn report_bytecode(out: compile::Lowered) -> bool {
+/// Prints the artefact a lowering command asks for -- the disassembled bytecode, or the
+/// SSA that bytecode builds -- in `originc`'s own format, so that the two compilers'
+/// output is comparable directly rather than through a trace invented for the purpose.
+fn report_lowered(out: compile::Lowered, command: String) -> bool {
     if !out.errors.is_empty() {
         let mut e = 0;
         while e < out.errors.len() {
@@ -518,14 +528,42 @@ fn report_bytecode(out: compile::Lowered) -> bool {
         return false;
     }
     // A package with no `main` is a library: nothing was lowered and nothing is wrong.
-    // `originc dump-bytecode` puts nothing on stdout for one either.
+    // `originc` puts nothing on stdout for one either.
     if !out.has_entry {
         return true;
+    }
+    if command == "dump-ir" {
+        return report_ir(out.prog);
     }
     let parts = out.prog.disassemble();
     let mut i = 0;
     while i < parts.len() {
         io::print(parts.at(i));
+        i = i + 1;
+    }
+    true
+}
+
+/// Prints every function's SSA, which is what `originc dump-ir -O0` prints: the IR the
+/// bytecode builds, before any optimizer has touched it.
+fn report_ir(prog: bytecode::Program) -> bool {
+    let mut i = 0;
+    while i < prog.fns.len() {
+        let f = prog.fns.at(i);
+        if !f.code.is_empty() {
+            let built = irbuild::build(f);
+            if built.error != "" {
+                io::println("stage1: building \(f.name): \(built.error)");
+                return false;
+            }
+            let parts = built.f.print(prog);
+            let mut k = 0;
+            while k < parts.len() {
+                io::print(parts.at(k));
+                k = k + 1;
+            }
+            io::print("\n");
+        }
         i = i + 1;
     }
     true

@@ -1,0 +1,906 @@
+// Origin's SSA intermediate representation.
+//
+// A function is a control-flow graph of basic blocks; a block is a list of instructions
+// ending in a terminator; every instruction defines at most one value, and every value is
+// defined exactly once. Uses point at definitions directly, so def-use information is the
+// representation rather than an analysis over it.
+//
+// A translation of `internal/ir`. The IR is built from bytecode and emitted back to
+// bytecode (ADR-0016), which is what makes the `-O0` / `-O1` / `-O2` differential an
+// oracle: the levels share a lowering and differ only by the optimizer's edits.
+
+use std::list;
+use std::map;
+use std::str;
+
+use ast;
+use bytecode;
+
+// --- Operations ------------------------------------------------------------------------
+//
+// Arithmetic keeps the trapping and non-trapping forms distinct, because ADR-0005 makes
+// that a semantic difference and not an implementation detail: the optimizer may fold a
+// wrapping add and must fold a trapping one *to the trap*.
+
+/// A constant: `a` holds its index in the program's pool.
+pub const OP_CONST: i64 = 0;
+/// The constants with no pool entry.
+pub const OP_UNIT: i64 = 1;
+pub const OP_TRUE: i64 = 2;
+pub const OP_FALSE: i64 = 3;
+/// Merges values from predecessors; its arguments are parallel to the block's predecessors.
+pub const OP_PHI: i64 = 4;
+/// A function parameter; `b` is its position.
+pub const OP_PARAM: i64 = 5;
+/// Reads a closure's capture; `b` is its position.
+pub const OP_CAPTURE: i64 = 6;
+
+// Trapping integer arithmetic.
+pub const OP_ADD: i64 = 7;
+pub const OP_SUB: i64 = 8;
+pub const OP_MUL: i64 = 9;
+pub const OP_DIV: i64 = 10;
+pub const OP_REM: i64 = 11;
+pub const OP_NEG: i64 = 12;
+// Non-trapping integer arithmetic.
+pub const OP_WRAP_ADD: i64 = 13;
+pub const OP_WRAP_SUB: i64 = 14;
+pub const OP_WRAP_MUL: i64 = 15;
+// Bitwise and shifts; shifts trap on an out-of-range amount.
+pub const OP_AND: i64 = 16;
+pub const OP_OR: i64 = 17;
+pub const OP_XOR: i64 = 18;
+pub const OP_SHL: i64 = 19;
+pub const OP_SHR: i64 = 20;
+// Float arithmetic, which never traps.
+pub const OP_ADDF: i64 = 21;
+pub const OP_SUBF: i64 = 22;
+pub const OP_MULF: i64 = 23;
+pub const OP_DIVF: i64 = 24;
+pub const OP_REMF: i64 = 25;
+pub const OP_NEGF: i64 = 26;
+
+// Comparison and logic.
+pub const OP_EQ: i64 = 27;
+pub const OP_NE: i64 = 28;
+pub const OP_LT: i64 = 29;
+pub const OP_LE: i64 = 30;
+pub const OP_GT: i64 = 31;
+pub const OP_GE: i64 = 32;
+pub const OP_NOT: i64 = 33;
+
+// Calls.
+pub const OP_CALL: i64 = 34;
+pub const OP_CALL_CLOSURE: i64 = 35;
+pub const OP_CALL_BUILTIN: i64 = 36;
+pub const OP_FUNC: i64 = 37;
+pub const OP_CLOSURE: i64 = 38;
+/// Wraps a bare function reference into a one-word captureless closure object. The native
+/// backend's own pass inserts it wherever a function reference does not provably stay a
+/// direct call's own callee, so that every other consumer of a function-typed value sees
+/// the same object shape a real closure produces. Never built from bytecode directly: the
+/// virtual machine's value model tells a bare function from a closure with a runtime tag,
+/// which native code has no room for, so this exists to make that distinction static
+/// instead, only where native lowering actually needs it.
+pub const OP_BOX_FN: i64 = 39;
+
+// Aggregates.
+pub const OP_STRUCT: i64 = 40;
+pub const OP_TUPLE: i64 = 41;
+pub const OP_VARIANT: i64 = 42;
+pub const OP_GET_FIELD: i64 = 43;
+pub const OP_SET_FIELD: i64 = 44;
+pub const OP_IS_VARIANT: i64 = 45;
+
+// Conversions.
+pub const OP_CAST: i64 = 46;
+pub const OP_TO_STR: i64 = 47;
+
+/// Stops with the message in `a`.
+pub const OP_TRAP: i64 = 48;
+
+// Terminators.
+/// Transfers to the first successor.
+pub const OP_JUMP: i64 = 49;
+/// Tests its argument and transfers to the first successor when true, the second otherwise.
+pub const OP_BRANCH: i64 = 50;
+/// Returns its argument.
+pub const OP_RETURN: i64 = 51;
+
+pub const NUM_OPS: i64 = 52;
+
+pub fn op_name(o: i64) -> String {
+    if o == OP_CONST { return "const"; }
+    if o == OP_UNIT { return "unit"; }
+    if o == OP_TRUE { return "true"; }
+    if o == OP_FALSE { return "false"; }
+    if o == OP_PHI { return "phi"; }
+    if o == OP_PARAM { return "param"; }
+    if o == OP_CAPTURE { return "capture"; }
+    if o == OP_ADD { return "add"; }
+    if o == OP_SUB { return "sub"; }
+    if o == OP_MUL { return "mul"; }
+    if o == OP_DIV { return "div"; }
+    if o == OP_REM { return "rem"; }
+    if o == OP_NEG { return "neg"; }
+    if o == OP_WRAP_ADD { return "wrap_add"; }
+    if o == OP_WRAP_SUB { return "wrap_sub"; }
+    if o == OP_WRAP_MUL { return "wrap_mul"; }
+    if o == OP_AND { return "and"; }
+    if o == OP_OR { return "or"; }
+    if o == OP_XOR { return "xor"; }
+    if o == OP_SHL { return "shl"; }
+    if o == OP_SHR { return "shr"; }
+    if o == OP_ADDF { return "addf"; }
+    if o == OP_SUBF { return "subf"; }
+    if o == OP_MULF { return "mulf"; }
+    if o == OP_DIVF { return "divf"; }
+    if o == OP_REMF { return "remf"; }
+    if o == OP_NEGF { return "negf"; }
+    if o == OP_EQ { return "eq"; }
+    if o == OP_NE { return "ne"; }
+    if o == OP_LT { return "lt"; }
+    if o == OP_LE { return "le"; }
+    if o == OP_GT { return "gt"; }
+    if o == OP_GE { return "ge"; }
+    if o == OP_NOT { return "not"; }
+    if o == OP_CALL { return "call"; }
+    if o == OP_CALL_CLOSURE { return "call_closure"; }
+    if o == OP_CALL_BUILTIN { return "call_builtin"; }
+    if o == OP_FUNC { return "func"; }
+    if o == OP_CLOSURE { return "closure"; }
+    if o == OP_BOX_FN { return "box_fn"; }
+    if o == OP_STRUCT { return "struct"; }
+    if o == OP_TUPLE { return "tuple"; }
+    if o == OP_VARIANT { return "variant"; }
+    if o == OP_GET_FIELD { return "get_field"; }
+    if o == OP_SET_FIELD { return "set_field"; }
+    if o == OP_IS_VARIANT { return "is_variant"; }
+    if o == OP_CAST { return "cast"; }
+    if o == OP_TO_STR { return "to_str"; }
+    if o == OP_TRAP { return "trap"; }
+    if o == OP_JUMP { return "jump"; }
+    if o == OP_BRANCH { return "branch"; }
+    if o == OP_RETURN { return "return"; }
+    "op(\(o))"
+}
+
+/// Whether an operation ends a block.
+pub fn is_terminator(o: i64) -> bool {
+    o == OP_JUMP || o == OP_BRANCH || o == OP_RETURN
+}
+
+/// Whether an operation can trap because of its operands.
+///
+/// Such an operation is never removed for being unused: ADR-0005 makes overflow a trap at
+/// every optimization level, so an ignored `a + b` that would overflow must still stop the
+/// program. Deleting it would make `-O1` produce output `-O0` does not, which is exactly
+/// what the phase's differential is built to catch.
+pub fn may_trap_on_values(o: i64) -> bool {
+    o == OP_ADD || o == OP_SUB || o == OP_MUL || o == OP_DIV || o == OP_REM || o == OP_NEG
+        || o == OP_SHL || o == OP_SHR || o == OP_CAST
+}
+
+/// Whether an operation creates a heap object.
+///
+/// Allocation matters twice. An unused allocation may be removed -- that is what escape
+/// analysis is for -- but two allocations may never be shared, because they produce
+/// distinct objects and `ref_eq` can tell them apart (spec/04-expressions.md).
+pub fn allocates(o: i64) -> bool {
+    o == OP_STRUCT || o == OP_TUPLE || o == OP_VARIANT || o == OP_CLOSURE
+        || o == OP_BOX_FN || o == OP_TO_STR
+}
+
+/// Whether an operation does something beyond producing its value. An instruction with an
+/// effect is never removed and never reordered past another.
+pub fn has_effect(o: i64) -> bool {
+    o == OP_SET_FIELD || o == OP_CALL || o == OP_CALL_CLOSURE || o == OP_CALL_BUILTIN
+        || o == OP_TRAP
+}
+
+/// Whether an unused instance of an operation may be deleted.
+pub fn removable(o: i64) -> bool {
+    !has_effect(o) && !may_trap_on_values(o) && !is_terminator(o)
+}
+
+/// Whether two instances computing the same thing may be merged.
+///
+/// Reading a field is excluded: a `mut` field can change between two reads, and proving it
+/// does not needs an alias analysis this phase does not have. That costs some optimization
+/// and keeps every case correct.
+pub fn op_shareable(o: i64) -> bool {
+    if o == OP_PHI || o == OP_PARAM || o == OP_GET_FIELD {
+        return false;
+    }
+    !has_effect(o) && !allocates(o)
+}
+
+/// Whether an operation may be hoisted out of a loop. A trapping one may not: hoisting it
+/// makes a program that never entered the loop trap.
+pub fn op_movable(o: i64) -> bool {
+    op_shareable(o) && !may_trap_on_values(o)
+}
+
+// --- Values, blocks and functions ---------------------------------------------------------
+
+/// A single SSA definition.
+///
+/// `a` and `b` are the two numeric operands, spelled the way `bytecode::Instr` spells its
+/// own: `a` is the constant-pool index for a constant, the callee index for a function
+/// reference or a call, the builtin index for a builtin call, the type index for a struct
+/// or tuple, the variant index for a variant or its test, the field index for a field read
+/// or write, the cast kind, and the message index for a trap. `b` is the second: an
+/// argument count, a capture count, a cast's target, or a parameter's or capture's
+/// position.
+pub struct Value {
+    /// Unique within a function and stable for the life of the value.
+    pub id: i64,
+    pub mut op: i64,
+    pub mut args: List[Value],
+    pub mut block: Option[Block],
+    pub mut a: i64,
+    pub mut b: i64,
+    /// Unknown for most values: it is populated where the builder can read it straight off
+    /// the bytecode with no extra context (a parameter or capture from the function's own
+    /// kind lists, and a field, payload or tuple-element read or a call from the
+    /// instruction's own kind, ADR-0021). It is not a general property of the IR -- the
+    /// optimizer and the virtual machine never read it -- and it is not, on its own, every
+    /// value's final kind: the backend's own kind-propagation pass extends this seed.
+    pub mut kind: i64,
+    /// What the *operands* are, for an operation whose behaviour depends on it rather than
+    /// only on its result's shape: `checked_add` on a `u8` answers differently from the
+    /// same call on a `u32`, and `kind` cannot say so because a checked operation's result
+    /// is an `Option` and the register allocator needs to be told that it is a reference
+    /// (ADR-0021). Two facts, two fields.
+    pub mut operand_kind: i64,
+    /// Where the value came from, so a trap names a source location.
+    pub mut span: ast::Span,
+    pub mut file: String,
+    /// Maintained by the block editing helpers, so that dead-code elimination and
+    /// replacement do not need a separate analysis.
+    pub mut uses: i64,
+}
+
+/// A value's name, as the printer writes it.
+pub fn value_name(v: Value) -> String { "v\(v.id)" }
+
+/// A basic block: a straight-line run of instructions ending in a terminator.
+pub struct Block {
+    pub id: i64,
+    pub mut phis: List[Value],
+    pub mut instr: List[Value],
+    pub mut term: Option[Value],
+    /// The control-flow edges. A phi's arguments are parallel to `preds`.
+    pub mut preds: List[Block],
+    pub mut succs: List[Block],
+
+    /// Marks a block whose predecessors are all known, which is what lets on-demand phi
+    /// insertion decide whether a variable's definition can be resolved.
+    pub mut sealed: bool,
+    /// A variable's definition in this block, during construction.
+    pub mut defs: Map[i64, Value],
+    /// Phis created before the block was sealed.
+    pub mut incomplete: Map[i64, Value],
+}
+
+pub fn block_name(b: Block) -> String { "b\(b.id)" }
+
+/// One function in SSA form.
+pub struct Func {
+    pub mut name: String,
+    pub mut params: i64,
+    pub mut captures: i64,
+    pub mut blocks: List[Block],
+    pub mut entry: Block,
+
+    pub mut next_value: i64,
+    pub mut next_block: i64,
+}
+
+fn empty_block(id: i64) -> Block {
+    Block {
+        id: id, phis: list::new[Value](), instr: list::new[Value](),
+        term: Option::None, preds: list::new[Block](), succs: list::new[Block](),
+        sealed: false, defs: map::new[i64, Value](), incomplete: map::new[i64, Value](),
+    }
+}
+
+/// An empty function with an entry block.
+pub fn new_func(name: String, params: i64, captures: i64) -> Func {
+    let entry = empty_block(0);
+    let blocks = list::new[Block]();
+    blocks.push(entry);
+    Func {
+        name: name, params: params, captures: captures, blocks: blocks, entry: entry,
+        next_value: 0, next_block: 1,
+    }
+}
+
+impl Func {
+    /// Adds a block. A block created after construction should be sealed.
+    pub fn new_block(self) -> Block {
+        let b = empty_block(self.next_block);
+        self.next_block = self.next_block + 1;
+        self.blocks.push(b);
+        b
+    }
+
+    /// Allocates a value without placing it in a block.
+    pub fn new_value(self, op: i64, at: ast::Span, file: String, args: List[Value]) -> Value {
+        let v = Value {
+            id: self.next_value, op: op, args: args, block: Option::None, a: 0, b: 0,
+            kind: bytecode::KIND_UNKNOWN, operand_kind: bytecode::KIND_UNKNOWN,
+            span: at, file: file, uses: 0,
+        };
+        self.next_value = self.next_value + 1;
+        let mut i = 0;
+        while i < args.len() {
+            args.at(i).uses = args.at(i).uses + 1;
+            i = i + 1;
+        }
+        v
+    }
+
+    /// Points every use of `v` at `with`, throughout the function.
+    pub fn replace_all_uses(self, v: Value, with: Value) {
+        if ref_eq(v, with) {
+            return;
+        }
+        let mut i = 0;
+        while i < self.blocks.len() {
+            let b = self.blocks.at(i);
+            replace_args_in(b.phis, v, with);
+            replace_args_in(b.instr, v, with);
+            match b.term {
+                Option::Some(t) => replace_args(t, v, with),
+                Option::None => {}
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Rebuilds every value's use count from scratch. Passes that rewrite instructions in
+    /// bulk call it rather than trying to keep the counts exact as they go.
+    pub fn recompute_uses(self) {
+        let mut i = 0;
+        while i < self.blocks.len() {
+            let b = self.blocks.at(i);
+            zero_uses(b.phis);
+            zero_uses(b.instr);
+            match b.term {
+                Option::Some(t) => { t.uses = 0; }
+                Option::None => {}
+            }
+            i = i + 1;
+        }
+        let mut k = 0;
+        while k < self.blocks.len() {
+            let b = self.blocks.at(k);
+            count_uses(b.phis);
+            count_uses(b.instr);
+            match b.term {
+                Option::Some(t) => count_args(t.args),
+                Option::None => {}
+            }
+            k = k + 1;
+        }
+    }
+}
+
+fn replace_args_in(vs: List[Value], v: Value, with: Value) {
+    let mut i = 0;
+    while i < vs.len() {
+        replace_args(vs.at(i), v, with);
+        i = i + 1;
+    }
+}
+
+fn replace_args(u: Value, v: Value, with: Value) {
+    let mut i = 0;
+    while i < u.args.len() {
+        if ref_eq(u.args.at(i), v) {
+            u.args.set(i, with);
+            v.uses = v.uses - 1;
+            with.uses = with.uses + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn zero_uses(vs: List[Value]) {
+    let mut i = 0;
+    while i < vs.len() {
+        vs.at(i).uses = 0;
+        i = i + 1;
+    }
+}
+
+fn count_uses(vs: List[Value]) {
+    let mut i = 0;
+    while i < vs.len() {
+        count_args(vs.at(i).args);
+        i = i + 1;
+    }
+}
+
+fn count_args(args: List[Value]) {
+    let mut i = 0;
+    while i < args.len() {
+        args.at(i).uses = args.at(i).uses + 1;
+        i = i + 1;
+    }
+}
+
+impl Block {
+    /// Places a value at the end of this block's instruction list.
+    pub fn append(self, v: Value) -> Value {
+        v.block = Option::Some(self);
+        if v.op == OP_PHI {
+            self.phis.push(v);
+            return v;
+        }
+        if is_terminator(v.op) {
+            self.term = Option::Some(v);
+            return v;
+        }
+        self.instr.push(v);
+        v
+    }
+
+    /// Replaces this block's successors, maintaining the predecessor lists.
+    pub fn set_succs(self, succs: List[Block]) {
+        let mut i = 0;
+        while i < self.succs.len() {
+            remove_pred(self.succs.at(i), self);
+            i = i + 1;
+        }
+        self.succs = succs;
+        let mut k = 0;
+        while k < succs.len() {
+            succs.at(k).preds.push(self);
+            k = k + 1;
+        }
+    }
+
+    /// Marks a block created after SSA construction as complete. The on-demand phi
+    /// machinery only runs during construction; a block spliced in later -- by inlining,
+    /// say -- has all its predecessors from the moment it exists.
+    pub fn seal(self) {
+        self.sealed = true;
+        self.defs = map::new[i64, Value]();
+        self.incomplete = map::new[i64, Value]();
+    }
+
+    /// Swaps one predecessor for another, leaving the phi operands exactly where they are.
+    ///
+    /// This is what a block split needs, and it is not the same as removing an edge and
+    /// adding one: a phi's operands are positional, parallel to the predecessor list, so
+    /// removing an entry and appending a new one silently reassigns every operand after it.
+    pub fn replace_pred(self, old: Block, with: Block) {
+        let mut i = 0;
+        while i < self.preds.len() {
+            if ref_eq(self.preds.at(i), old) {
+                self.preds.set(i, with);
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Drops every instruction after `after` in this block. Used when an instruction is
+    /// replaced by something that does not return -- a trap folded from a constant
+    /// overflow, for instance.
+    pub fn truncate(self, after: Value) {
+        let mut i = 0;
+        while i < self.instr.len() {
+            if ref_eq(self.instr.at(i), after) {
+                while self.instr.len() > i + 1 {
+                    self.instr.pop();
+                }
+                return;
+            }
+            i = i + 1;
+        }
+    }
+}
+
+fn remove_pred(b: Block, p: Block) {
+    let mut i = 0;
+    while i < b.preds.len() {
+        if ref_eq(b.preds.at(i), p) {
+            remove_block_at(b.preds, i);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn remove_block_at(l: List[Block], at: i64) {
+    let mut i = at;
+    while i + 1 < l.len() {
+        l.set(i, l.at(i + 1));
+        i = i + 1;
+    }
+    l.pop();
+}
+
+fn remove_value_at(l: List[Value], at: i64) {
+    let mut i = at;
+    while i + 1 < l.len() {
+        l.set(i, l.at(i + 1));
+        i = i + 1;
+    }
+    l.pop();
+}
+
+// --- Editing the graph ----------------------------------------------------------------------
+
+impl Func {
+    /// Deletes the control-flow edge from `from` to `to`, dropping the phi operands that
+    /// arrived along it. A phi's operands are positional, parallel to its block's
+    /// predecessor list, so removing a predecessor without removing the matching operand
+    /// silently misattributes every remaining one.
+    pub fn remove_edge(self, from: Block, to: Block) {
+        let mut idx = 0 - 1;
+        let mut i = 0;
+        while i < to.preds.len() {
+            if ref_eq(to.preds.at(i), from) {
+                idx = i;
+                i = to.preds.len();
+            } else {
+                i = i + 1;
+            }
+        }
+        if idx < 0 {
+            return;
+        }
+        remove_block_at(to.preds, idx);
+        let mut p = 0;
+        while p < to.phis.len() {
+            let phi = to.phis.at(p);
+            if idx < phi.args.len() {
+                remove_value_at(phi.args, idx);
+            }
+            p = p + 1;
+        }
+        let mut s = 0;
+        while s < from.succs.len() {
+            if ref_eq(from.succs.at(s), to) {
+                remove_block_at(from.succs, s);
+                return;
+            }
+            s = s + 1;
+        }
+    }
+
+    /// Replaces a block's terminator and its successors together, so the two can never
+    /// disagree.
+    pub fn set_terminator(self, b: Block, t: Value, succs: List[Block]) {
+        let old = list::new[Block]();
+        let mut i = 0;
+        while i < b.succs.len() {
+            old.push(b.succs.at(i));
+            i = i + 1;
+        }
+        let mut k = 0;
+        while k < old.len() {
+            self.remove_edge(b, old.at(k));
+            k = k + 1;
+        }
+        t.block = Option::Some(b);
+        b.term = Option::Some(t);
+        b.succs = list::new[Block]();
+        let mut s = 0;
+        while s < succs.len() {
+            b.succs.push(succs.at(s));
+            succs.at(s).preds.push(b);
+            s = s + 1;
+        }
+    }
+
+    /// The blocks the entry can reach, as a set of block ids.
+    pub fn reachable(self) -> Map[i64, bool] {
+        let seen = map::new[i64, bool]();
+        let stack = list::new[Block]();
+        stack.push(self.entry);
+        while !stack.is_empty() {
+            let b = stack.at(stack.len() - 1);
+            stack.pop();
+            if seen.contains(b.id) {
+                continue;
+            }
+            seen.insert(b.id, true);
+            let mut i = 0;
+            while i < b.succs.len() {
+                stack.push(b.succs.at(i));
+                i = i + 1;
+            }
+        }
+        seen
+    }
+
+    /// Removes blocks the entry cannot reach, fixing the edges and phi operands of the
+    /// blocks that survive.
+    pub fn drop_blocks(self, keep: Map[i64, bool]) -> bool {
+        let kept = list::new[Block]();
+        let mut changed = false;
+        let mut i = 0;
+        while i < self.blocks.len() {
+            let b = self.blocks.at(i);
+            if keep.contains(b.id) {
+                kept.push(b);
+            } else {
+                changed = true;
+                let old = list::new[Block]();
+                let mut s = 0;
+                while s < b.succs.len() {
+                    old.push(b.succs.at(s));
+                    s = s + 1;
+                }
+                let mut k = 0;
+                while k < old.len() {
+                    self.remove_edge(b, old.at(k));
+                    k = k + 1;
+                }
+            }
+            i = i + 1;
+        }
+        if !changed {
+            return false;
+        }
+        self.blocks = kept;
+        let mut n = 0;
+        while n < self.blocks.len() {
+            let b = self.blocks.at(n);
+            // A phi's operands are positional, so a dropped predecessor takes the operand
+            // at its own index with it. Both lists are rebuilt in one pass rather than
+            // deleting from the operand list by an index into the *predecessor* list:
+            // after the first deletion those two indices no longer agree, and the second
+            // dropped predecessor would take the wrong operand -- or, past the end, none.
+            let preds = list::new[Block]();
+            let kept_idx = list::new[i64]();
+            let mut p = 0;
+            while p < b.preds.len() {
+                if keep.contains(b.preds.at(p).id) {
+                    preds.push(b.preds.at(p));
+                    kept_idx.push(p);
+                }
+                p = p + 1;
+            }
+            if preds.len() != b.preds.len() {
+                let mut q = 0;
+                while q < b.phis.len() {
+                    let phi = b.phis.at(q);
+                    let args = list::new[Value]();
+                    let mut j = 0;
+                    while j < kept_idx.len() {
+                        if kept_idx.at(j) < phi.args.len() {
+                            args.push(phi.args.at(kept_idx.at(j)));
+                        }
+                        j = j + 1;
+                    }
+                    phi.args = args;
+                    q = q + 1;
+                }
+            }
+            b.preds = preds;
+            n = n + 1;
+        }
+        self.recompute_uses();
+        true
+    }
+
+    /// Every value in the function, phis first within each block.
+    pub fn values(self) -> List[Value] {
+        let out = list::new[Value]();
+        let mut i = 0;
+        while i < self.blocks.len() {
+            let b = self.blocks.at(i);
+            let mut p = 0;
+            while p < b.phis.len() {
+                out.push(b.phis.at(p));
+                p = p + 1;
+            }
+            let mut k = 0;
+            while k < b.instr.len() {
+                out.push(b.instr.at(k));
+                k = k + 1;
+            }
+            match b.term {
+                Option::Some(t) => { out.push(t); }
+                Option::None => {}
+            }
+            i = i + 1;
+        }
+        out
+    }
+}
+
+/// Verifies the one invariant every optimizer pass has to preserve and none of them state:
+/// a phi's operands are positional, so operand `i` is the value arriving along predecessor
+/// `i`, and the two lists must therefore have the same length. Empty when the function is
+/// well formed.
+///
+/// It is a structural check, not a dataflow one -- it cannot see an operand that is the
+/// right count but the wrong edge. What it does catch is a pass that adds or drops an edge
+/// without touching the phis on the other end, which is the shape of every bug of this kind
+/// found so far, and it catches it where it happened rather than three passes later.
+pub fn check_phis(f: Func) -> String {
+    let mut i = 0;
+    while i < f.blocks.len() {
+        let b = f.blocks.at(i);
+        let mut p = 0;
+        while p < b.phis.len() {
+            let phi = b.phis.at(p);
+            if phi.args.len() != b.preds.len() {
+                return "left \(block_name(b))'s v\(phi.id) with \(phi.args.len()) operands for \(b.preds.len()) predecessors";
+            }
+            p = p + 1;
+        }
+        let mut q = 0;
+        while q < b.preds.len() {
+            let pred = b.preds.at(q);
+            let mut found = false;
+            let mut s = 0;
+            while s < pred.succs.len() {
+                if ref_eq(pred.succs.at(s), b) {
+                    found = true;
+                    s = pred.succs.len();
+                } else {
+                    s = s + 1;
+                }
+            }
+            if !found {
+                return "left \(block_name(b)) listing \(block_name(pred)) as a predecessor with no edge back";
+            }
+            q = q + 1;
+        }
+        i = i + 1;
+    }
+    ""
+}
+
+// --- Printing --------------------------------------------------------------------------------
+//
+// Snapshot tests compare this output, and from Phase 9 a second compiler is held to it, so
+// its shape is stable: changing it means updating goldens deliberately.
+
+impl Func {
+    pub fn print(self, prog: bytecode::Program) -> List[String] {
+        let out = list::new[String]();
+        out.push("func \(self.name)(params=\(self.params) captures=\(self.captures))\n");
+        let mut i = 0;
+        while i < self.blocks.len() {
+            let b = self.blocks.at(i);
+            let preds = list::new[String]();
+            let mut p = 0;
+            while p < b.preds.len() {
+                preds.push(block_name(b.preds.at(p)));
+                p = p + 1;
+            }
+            // Sorted as *text*, which is what the Go printer's `sort.Strings` does: `b10`
+            // comes before `b2`.
+            sort_strings(preds);
+            if preds.is_empty() {
+                out.push("\(block_name(b)):\n");
+            } else {
+                out.push("\(block_name(b)):  ; preds \(join_with(preds, " "))\n");
+            }
+            let mut q = 0;
+            while q < b.phis.len() {
+                out.push("  \(print_value(b.phis.at(q), prog))\n");
+                q = q + 1;
+            }
+            let mut k = 0;
+            while k < b.instr.len() {
+                out.push("  \(print_value(b.instr.at(k), prog))\n");
+                k = k + 1;
+            }
+            match b.term {
+                Option::Some(t) => { out.push("  \(print_term(b, t))\n"); }
+                Option::None => {}
+            }
+            i = i + 1;
+        }
+        out
+    }
+}
+
+fn print_value(v: Value, prog: bytecode::Program) -> String {
+    let mut out = "\(value_name(v)) = \(op_name(v.op))";
+    if v.op == OP_CONST || v.op == OP_TRAP {
+        out = "\(out) \(const_text(prog, v.a))";
+    }
+    if v.op == OP_PARAM || v.op == OP_CAPTURE {
+        out = "\(out) \(v.b)";
+    }
+    if v.op == OP_FUNC || v.op == OP_GET_FIELD || v.op == OP_SET_FIELD {
+        out = "\(out) \(v.a)";
+    }
+    if v.op == OP_VARIANT || v.op == OP_IS_VARIANT {
+        if v.a < prog.variants.len() {
+            out = "\(out) \(prog.variants.at(v.a).name)";
+        } else {
+            out = "\(out) \(v.a)";
+        }
+    }
+    if v.op == OP_CALL || v.op == OP_CALL_BUILTIN || v.op == OP_STRUCT || v.op == OP_TUPLE
+        || v.op == OP_CLOSURE || v.op == OP_CAST {
+        out = "\(out) \(v.a) \(v.b)";
+    }
+    let mut i = 0;
+    while i < v.args.len() {
+        out = "\(out) \(value_name(v.args.at(i)))";
+        i = i + 1;
+    }
+    out
+}
+
+fn print_term(b: Block, t: Value) -> String {
+    if t.op == OP_JUMP {
+        return "jump \(block_name(b.succs.at(0)))";
+    }
+    if t.op == OP_BRANCH {
+        return "branch \(value_name(t.args.at(0))) ? \(block_name(b.succs.at(0))) : \(block_name(b.succs.at(1)))";
+    }
+    if !t.args.is_empty() {
+        return "return \(value_name(t.args.at(0)))";
+    }
+    "return"
+}
+
+fn const_text(prog: bytecode::Program, i: i64) -> String {
+    if i < 0 || i >= prog.consts.len() {
+        return "#\(i)";
+    }
+    let c = prog.consts.at(i);
+    if c.kind == bytecode::CONST_STRING {
+        return bytecode::quote_string(c.text);
+    }
+    if c.kind == bytecode::CONST_CHAR {
+        return bytecode::quote_char(c.bits as i64);
+    }
+    if c.kind == bytecode::CONST_FLOAT {
+        return "float";
+    }
+    "\(c.bits as i64)"
+}
+
+fn join_with(parts: List[String], sep: String) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < parts.len() {
+        if i > 0 {
+            out = "\(out)\(sep)";
+        }
+        out = "\(out)\(parts.at(i))";
+        i = i + 1;
+    }
+    out
+}
+
+/// An insertion sort by byte order, which is what Go's `sort.Strings` gives the printer.
+fn sort_strings(l: List[String]) {
+    let mut i = 1;
+    while i < l.len() {
+        let cur = l.at(i);
+        let mut j = i;
+        while j > 0 && str_before(cur, l.at(j - 1)) {
+            l.set(j, l.at(j - 1));
+            j = j - 1;
+        }
+        l.set(j, cur);
+        i = i + 1;
+    }
+}
+
+fn str_before(a: String, b: String) -> bool {
+    let mut i = 0;
+    while i < a.len() && i < b.len() {
+        if a.byte_at(i) != b.byte_at(i) {
+            return a.byte_at(i) < b.byte_at(i);
+        }
+        i = i + 1;
+    }
+    a.len() < b.len()
+}
