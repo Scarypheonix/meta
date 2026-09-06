@@ -1,0 +1,106 @@
+// The executable-writer differential's stage1 half: lay out an image, fill its segments
+// with a recognizable pattern, and print the ELF bytes.
+//
+// The oracle is the artefact again, and for the same reason the encoder's is: a writer is
+// right when the bytes are right. `tests/selfhost/obj_test.go` builds the same images with
+// `internal/obj` and compares.
+//
+// Four images rather than one, because the shapes that differ are the ones with something
+// missing. An image with no debug information writes two program headers and nothing past
+// them; one with functions grows a section header table, a symbol table and two string
+// tables. An image whose writable data is empty must still pad up to the data offset before
+// the appended sections begin, which is a case the code has a branch for and nothing else
+// would reach.
+
+use std::io;
+use std::list;
+use std::str;
+
+use obj;
+
+fn main() {
+    dump(build(64, 32, 16, 0, false));
+    dump(build(64, 32, 16, 4096, true));
+    dump(build(1, 1, 0, 0, true));
+    dump(build(4000, 200, 300, 65536, true));
+}
+
+/// Bytes that depend on their position, so that a writer putting a segment at the wrong
+/// offset shows up as content rather than only as a length.
+fn pattern(n: i64, seed: i64) -> List[i64] {
+    let out = list::new[i64]();
+    let mut i = 0;
+    while i < n {
+        out.push((i * 7 + seed * 31) % 251);
+        i = i + 1;
+    }
+    out
+}
+
+fn build(text: i64, ro: i64, data: i64, bss: i64, with_funcs: bool) -> obj::Image {
+    let t = obj::linux();
+    let l = obj::plan(t, text, ro, data);
+    let funcs = list::new[obj::Func]();
+    if with_funcs {
+        funcs.push(obj::Func { name: "main", address: l.text_addr, size: 16 });
+        funcs.push(obj::Func { name: "a_rather_longer_function_name", address: l.text_addr + 16, size: 24 });
+        funcs.push(obj::Func { name: "f", address: l.text_addr + 40, size: 1 });
+    }
+    let abbrev = list::new[i64]();
+    let info = list::new[i64]();
+    let line = list::new[i64]();
+    if with_funcs {
+        // Stand-ins for the three DWARF sections: this differential is about where the
+        // bytes land, not what they mean, and internal/dwarf is not translated yet.
+        let mut i = 0;
+        while i < 11 { abbrev.push(i + 1); i = i + 1; }
+        let mut j = 0;
+        while j < 23 { info.push(j + 100); j = j + 1; }
+        let mut k = 0;
+        while k < 37 { line.push(k + 200); k = k + 1; }
+    }
+    obj::Image {
+        target: t,
+        text: pattern(text, 1),
+        ro_data: pattern(ro, 2),
+        data: pattern(data, 3),
+        bss: bss,
+        entry: l.text_addr,
+        text_addr: l.text_addr,
+        ro_data_addr: l.ro_data_addr,
+        data_addr: l.data_addr,
+        debug_abbrev: abbrev,
+        debug_info: info,
+        debug_line: line,
+        funcs: funcs,
+    }
+}
+
+fn dump(img: obj::Image) {
+    let out = obj::write(img);
+    if out.error != "" {
+        io::println("stage1: \(out.error)");
+        return;
+    }
+    io::println("== \(out.bytes.len()) bytes");
+    print_hex(out.bytes);
+}
+
+const HEX: String = "0123456789abcdef";
+
+fn print_hex(code: List[i64]) {
+    let mut line = "";
+    let mut i = 0;
+    while i < code.len() {
+        let b = code.at(i);
+        line = "\(line)\(HEX.slice(b >> 4, (b >> 4) + 1))\(HEX.slice(b & 15, (b & 15) + 1))";
+        i = i + 1;
+        if i % 32 == 0 {
+            io::println(line);
+            line = "";
+        }
+    }
+    if line != "" {
+        io::println(line);
+    }
+}

@@ -1,0 +1,664 @@
+// Executable files.
+//
+// A translation of `internal/obj`. ADR-0017 makes these *complete* executables, not
+// relocatable objects: there is no linker, so what this module writes is what the kernel
+// maps and jumps into. Every address is already decided by the time an `Image` reaches
+// here -- the code generator knew where its own bytes would live -- so there is no
+// relocation table in either format.
+//
+// Two formats, one instruction stream (ADR-0003). A byte in `Image.text` is the same byte
+// in both files; the writers differ in headers, segment tables and how the entry point is
+// declared, and in nothing else. That is why this is not cross-compilation: there is one
+// target architecture and one encoder, and two ways to wrap the result so that two
+// operating systems will load it.
+//
+// **Mach-O is not written yet** (`docs/deferred.md`). ELF is the verification path -- the
+// container the compiler is developed in can run one -- so it comes first, and `write`
+// refuses a Mach-O rather than producing something that is not one.
+
+use std::list;
+use std::str;
+
+/// The Linux format, and the one this module writes.
+pub const ELF: i64 = 0;
+/// The macOS format, and the one Origin ships.
+pub const MACHO: i64 = 1;
+
+pub fn format_name(f: i64) -> String {
+    if f == ELF { return "elf"; }
+    if f == MACHO { return "macho"; }
+    "format(\(f))"
+}
+
+/// Everything about a platform the compiler must know before it emits a single byte,
+/// because ADR-0017's freestanding executables bake addresses in.
+///
+/// It is deliberately tiny. `docs/spec/11-codegen.md` claims the two builds differ only in
+/// where they are loaded, in their headers, and in syscall numbers; this struct is that
+/// claim written down, and anything that has to be added here later is a place the claim
+/// was too strong.
+pub struct Target {
+    pub format: i64,
+    /// The virtual address the file is mapped at. macOS reserves the whole first 4 GiB for
+    /// `__PAGEZERO` on 64-bit, so a Mach-O executable cannot live where an ELF one does.
+    pub base: i64,
+    /// The mapping granularity that segment boundaries must respect.
+    pub page_size: i64,
+    /// The syscall numbers. macOS ORs the BSD class `0x2000000` into every one of them.
+    pub sys_write: i64,
+    pub sys_exit: i64,
+    pub sys_mmap: i64,
+    /// The file operations (spec/15-files.md). `lseek` is what gives a file's size without
+    /// an `fstat`, whose struct layout is one of the few things the two systems genuinely
+    /// disagree about -- seeking to the end and back is portable arithmetic instead.
+    pub sys_open: i64,
+    pub sys_read: i64,
+    pub sys_close: i64,
+    pub sys_lseek: i64,
+    /// `O_WRONLY|O_CREAT|O_TRUNC`, which the two systems number differently for `O_CREAT`
+    /// and `O_TRUNC`.
+    pub open_write_flags: i64,
+    /// The errno values spec/15-files.md's first two statuses correspond to. A syscall
+    /// reports failure as `-errno` in rax on both systems.
+    pub err_not_found: i64,
+    pub err_permission: i64,
+    /// The mmap flag pair for a private anonymous mapping, which is how the runtime asks
+    /// for a heap. The two systems number `MAP_ANONYMOUS` differently, so it joins the
+    /// syscall numbers as a per-target constant.
+    pub map_anon_private: i64,
+}
+
+/// The x86-64 Linux target.
+pub fn linux() -> Target {
+    Target {
+        format: ELF,
+        base: 4194304,   // 0x400000
+        page_size: 4096, // 0x1000
+        sys_write: 1,
+        sys_exit: 231, // exit_group: exits every thread, which is what a program's end means
+        sys_mmap: 9,
+        sys_open: 2,
+        sys_read: 0,
+        sys_close: 3,
+        sys_lseek: 8,
+        open_write_flags: 577, // O_WRONLY | O_CREAT | O_TRUNC = 0o1 | 0o100 | 0o1000
+        err_not_found: 2,      // ENOENT
+        err_permission: 13,    // EACCES
+        map_anon_private: 34,  // MAP_PRIVATE | MAP_ANONYMOUS = 0x02 | 0x20
+    }
+}
+
+/// The x86-64 macOS target. Its writer is not written yet; the numbers are here because
+/// the backend reads them to emit syscalls, which it can do for a target it cannot yet
+/// wrap.
+pub fn macos() -> Target {
+    Target {
+        format: MACHO,
+        base: 4294967296, // 0x100000000, above __PAGEZERO
+        page_size: 4096,
+        sys_write: 33554436,  // 0x2000004
+        sys_exit: 33554433,   // 0x2000001
+        sys_mmap: 33554629,   // 0x20000C5
+        sys_open: 33554437,   // 0x2000005
+        sys_read: 33554435,   // 0x2000003
+        sys_close: 33554438,  // 0x2000006
+        sys_lseek: 33554631,  // 0x20000C7
+        open_write_flags: 1537, // O_WRONLY | O_CREAT | O_TRUNC = 0x0001 | 0x0200 | 0x0400
+        err_not_found: 2,
+        err_permission: 13,
+        map_anon_private: 4098, // MAP_PRIVATE | MAP_ANON = 0x0002 | 0x1000
+    }
+}
+
+/// The target for a format name, as `originc build --target` spells it. The `format` of
+/// the answer is -1 for a name that names neither.
+pub fn target_for(name: String) -> Target {
+    if name == "linux" || name == "elf" { return linux(); }
+    if name == "macos" || name == "darwin" || name == "macho" { return macos(); }
+    let t = linux();
+    Target {
+        format: 0 - 1, base: t.base, page_size: t.page_size,
+        sys_write: t.sys_write, sys_exit: t.sys_exit, sys_mmap: t.sys_mmap,
+        sys_open: t.sys_open, sys_read: t.sys_read, sys_close: t.sys_close,
+        sys_lseek: t.sys_lseek, open_write_flags: t.open_write_flags,
+        err_not_found: t.err_not_found, err_permission: t.err_permission,
+        map_anon_private: t.map_anon_private,
+    }
+}
+
+/// One compiled function, for the plain symbol table a backtrace names a frame from.
+pub struct Func {
+    pub name: String,
+    pub address: i64,
+    pub size: i64,
+}
+
+/// A laid-out program: the bytes of each segment and the addresses they were generated for.
+///
+/// The code generator produces one by asking `plan` where things will go, emitting into
+/// that layout, and filling in the segments. Nothing here recomputes an address; a mismatch
+/// between this and what the code assumed is a bug in the caller, and `validate` catches
+/// the ones that are visible from here.
+pub struct Image {
+    pub target: Target,
+    /// Executable code, mapped read+execute.
+    pub text: List[i64],
+    /// Constant data -- string literals, stack maps -- mapped read-only. It shares a
+    /// segment with the text, because a segment is a page-granular mapping and two of them
+    /// for a few kilobytes of constants is a page wasted per program.
+    pub ro_data: List[i64],
+    /// Writable data: the runtime block and any static buffers.
+    pub data: List[i64],
+    /// Writable space that is zero at start-up and takes no room in the file.
+    pub mut bss: i64,
+    /// The virtual address the kernel jumps to.
+    pub mut entry: i64,
+
+    /// The addresses `plan` assigned, which the code generator baked into the code.
+    pub mut text_addr: i64,
+    pub mut ro_data_addr: i64,
+    pub mut data_addr: i64,
+
+    /// ADR-0023's DWARF4 sections. Empty is valid: a build that never asked for debug info
+    /// omits the sections and the section table that describes them.
+    pub debug_abbrev: List[i64],
+    pub debug_info: List[i64],
+    pub debug_line: List[i64],
+    /// One entry per compiled function, for the symbol table.
+    pub funcs: List[Func],
+}
+
+/// Decides where each segment will be mapped, before any code exists.
+///
+/// The code generator calls this first with the sizes it is about to produce, emits against
+/// the addresses it returns, and then fills in the bytes. The order is forced by ADR-0017:
+/// with no relocations, an instruction that names an address must know it while being
+/// encoded.
+pub struct Layout {
+    pub target: Target,
+    pub text_addr: i64,
+    pub ro_data_addr: i64,
+    pub data_addr: i64,
+    pub text_off: i64,
+    pub ro_data_off: i64,
+    pub data_off: i64,
+}
+
+fn align_to(v: i64, to: i64) -> i64 {
+    if to == 0 { return v; }
+    (v + to - 1) / to * to
+}
+
+// --- ELF64 constants -------------------------------------------------------------------
+//
+// Spelled out rather than derived, so that the writer and anything that reads the result
+// back do not share a definition: a constant wrong in both places would cancel out.
+
+const ELF_HEADER_SIZE: i64 = 64;
+const ELF_PROG_HEADER_SIZE: i64 = 56;
+const ELF_SHDR_SIZE: i64 = 64;
+const ELF_SYM_SIZE: i64 = 24;
+
+const ET_EXEC: i64 = 2;  // a complete executable, not a relocatable object (ADR-0017)
+const EM_X86_64: i64 = 62;
+const PT_LOAD: i64 = 1;
+const PF_EXEC: i64 = 1;
+const PF_WRITE: i64 = 2;
+const PF_READ: i64 = 4;
+const ELF_CLASS64: i64 = 2;
+const ELF_DATA2LSB: i64 = 1;
+const ELF_VERSION: i64 = 1;
+
+const SHT_PROGBITS: i64 = 1;
+const SHT_SYMTAB: i64 = 2;
+const SHT_STRTAB: i64 = 3;
+
+const SHF_WRITE: i64 = 0x1;
+const SHF_ALLOC: i64 = 0x2;
+const SHF_EXEC_INSTR: i64 = 0x4;
+
+const STT_FUNC: i64 = 2;
+const STB_GLOBAL: i64 = 1;
+
+/// How much room the file's own headers need before the first byte of code.
+///
+/// The headers are part of the first mapped segment -- the standard trick that saves a
+/// page -- so the text cannot start at file offset zero. It must not depend on whether the
+/// image being built will carry debug information: `plan` decides `text_addr` before a
+/// single instruction is emitted, so this cannot depend on anything only known afterward.
+/// ELF's program-header region never grows for debug info, since the section header table,
+/// symbol table and DWARF sections all live past the loadable segments.
+fn header_size(t: Target) -> i64 {
+    ELF_HEADER_SIZE + 2 * ELF_PROG_HEADER_SIZE
+}
+
+/// Assigns addresses for segments of the given sizes.
+pub fn plan(t: Target, text_size: i64, ro_data_size: i64, data_size: i64) -> Layout {
+    let text_off = align_to(header_size(t), 16);
+    let ro_data_off = align_to(text_off + text_size, 16);
+    // The writable segment starts on a fresh page: a mapping's protection is page-granular,
+    // so data sharing a page with code would be either executable or unwritable.
+    let data_off = align_to(ro_data_off + ro_data_size, t.page_size);
+    Layout {
+        target: t,
+        text_addr: t.base + text_off,
+        ro_data_addr: t.base + ro_data_off,
+        data_addr: t.base + data_off,
+        text_off: text_off,
+        ro_data_off: ro_data_off,
+        data_off: data_off,
+    }
+}
+
+/// The inconsistencies that are visible without running the program: an entry point outside
+/// the text, or segments whose sizes have outgrown the addresses the code was generated
+/// against. `""` when there are none.
+pub fn validate(img: Image) -> String {
+    if img.entry < img.text_addr || img.entry >= img.text_addr + img.text.len() {
+        return "entry point \(img.entry) is not inside the text segment";
+    }
+    if img.text_addr + img.text.len() > img.ro_data_addr {
+        return "the text segment overruns the read-only data it was laid out against";
+    }
+    if img.ro_data_addr + img.ro_data.len() > img.data_addr {
+        return "the read-only data overruns the writable data it was laid out against";
+    }
+    ""
+}
+
+/// The executable's bytes, in its target's format, or an error.
+pub struct Written {
+    pub bytes: List[i64],
+    pub error: String,
+}
+
+pub fn write(img: Image) -> Written {
+    let bad = validate(img);
+    if bad != "" { return Written { bytes: list::new[i64](), error: bad }; }
+    if img.target.format == ELF { return write_elf(img); }
+    Written {
+        bytes: list::new[i64](),
+        error: "unimplemented: writing \(format_name(img.target.format))",
+    }
+}
+
+// --- The byte writer -------------------------------------------------------------------
+//
+// Accumulates the file, so that a header written before a size is known can be padded up to
+// rather than computed twice.
+
+struct Buf {
+    pub bytes: List[i64],
+    /// The first thing that went wrong, or `""`. A name too long for its field and a pad
+    /// backwards are both compiler bugs rather than conditions to handle, but a panic in a
+    /// self-hosting compiler is worse than an error that names itself.
+    pub mut error: String,
+}
+
+fn new_buf() -> Buf { Buf { bytes: list::new[i64](), error: "" } }
+
+impl Buf {
+    fn u8(self, v: i64) { self.bytes.push(v & 255); }
+
+    fn u16(self, v: i64) {
+        self.u8(v);
+        self.u8(v >> 8);
+    }
+
+    fn u32(self, v: i64) {
+        self.u16(v);
+        self.u16(v >> 16);
+    }
+
+    fn u64(self, v: i64) {
+        self.u32(v);
+        self.u32(v >> 32);
+    }
+
+    fn put_all(self, b: List[i64]) {
+        let mut i = 0;
+        while i < b.len() {
+            self.bytes.push(b.at(i));
+            i = i + 1;
+        }
+    }
+
+    /// The bytes of a string, which is how both formats carry a name.
+    fn put_str(self, s: String) {
+        let mut i = 0;
+        while i < s.len() {
+            self.bytes.push(s.byte_at(i));
+            i = i + 1;
+        }
+    }
+
+    fn pad(self, n: i64) {
+        let mut i = 0;
+        while i < n {
+            self.bytes.push(0);
+            i = i + 1;
+        }
+    }
+
+    /// Zero-fills up to an absolute file offset.
+    fn pad_to(self, off: i64) {
+        if self.bytes.len() > off {
+            if self.error == "" {
+                self.error = "this is a compiler bug: the file is already \(self.bytes.len()) bytes, cannot pad back to \(off)";
+            }
+            return;
+        }
+        self.pad(off - self.bytes.len());
+    }
+
+    fn len(self) -> i64 { self.bytes.len() }
+}
+
+/// An ELF string table under construction: `SHT_STRTAB`'s own format, a run of
+/// null-terminated strings with a mandatory empty string at offset 0.
+struct StrTable {
+    pub buf: Buf,
+}
+
+fn new_str_table() -> StrTable {
+    let b = new_buf();
+    b.u8(0);
+    StrTable { buf: b }
+}
+
+impl StrTable {
+    fn add(self, s: String) -> i64 {
+        let off = self.buf.len();
+        self.buf.put_str(s);
+        self.buf.u8(0);
+        off
+    }
+}
+
+// --- ELF -------------------------------------------------------------------------------
+
+/// Everything `write_elf` needs about the section header table before it can write the ELF
+/// header (which names the table's own file offset and size) and after the two loadable
+/// segments have been written (where the table's content actually lives). Computing it in
+/// one pass, before any byte of the file is written, is the same trick the segment offsets
+/// already use: every size here is known from the image alone.
+struct SectionPlan {
+    pub mut table_off: i64,
+    pub mut num_sections: i64,
+    pub mut shstrndx: i64,
+    /// The DWARF sections, the symbol table and the two string tables, back to back, in
+    /// exactly the order their section headers claim.
+    pub content: List[i64],
+    /// The `Elf64_Shdr` array itself.
+    pub table: List[i64],
+}
+
+/// Writes a static `ET_EXEC` with two loadable segments, plus -- when the image carries
+/// ADR-0023's debug information -- a section header table, a symbol table and the three
+/// DWARF sections, all appended after the loadable segments and reachable only through the
+/// section table. The kernel loads this executable by its program headers alone; a debugger
+/// reads sections directly from the file.
+fn write_elf(img: Image) -> Written {
+    let t = img.target;
+    let text_off = img.text_addr - t.base;
+    let ro_data_off = img.ro_data_addr - t.base;
+    let data_off = img.data_addr - t.base;
+
+    // The first segment covers the headers as well as the code: a mapping is page-granular
+    // and starts at file offset zero anyway, so the headers ride along rather than costing
+    // a page of their own.
+    let text_seg_file_size = ro_data_off + img.ro_data.len();
+    let data_seg_file_size = img.data.len();
+
+    let has_debug = !img.debug_abbrev.is_empty() || !img.funcs.is_empty();
+    let mut sections = Option::None;
+    if has_debug {
+        sections = Option::Some(build_sections(img, text_off, ro_data_off, data_off));
+    }
+
+    let f = new_buf();
+
+    // ELF identification.
+    f.u8(0x7F);
+    f.put_str("ELF");
+    f.u8(ELF_CLASS64);
+    f.u8(ELF_DATA2LSB);
+    f.u8(ELF_VERSION);
+    f.u8(0); // System V ABI
+    f.u8(0); // ABI version
+    f.pad(7);
+
+    f.u16(ET_EXEC);
+    f.u16(EM_X86_64);
+    f.u32(ELF_VERSION);
+    f.u64(img.entry);
+    f.u64(ELF_HEADER_SIZE); // program headers follow the ELF header
+    match sections {
+        Option::Some(s) => { f.u64(s.table_off); },
+        Option::None => { f.u64(0); }, // no section header table
+    }
+    f.u32(0); // no flags on x86-64
+    f.u16(ELF_HEADER_SIZE);
+    f.u16(ELF_PROG_HEADER_SIZE);
+    f.u16(2); // two PT_LOAD segments
+    match sections {
+        Option::Some(s) => {
+            f.u16(ELF_SHDR_SIZE);
+            f.u16(s.num_sections);
+            f.u16(s.shstrndx);
+        },
+        Option::None => {
+            f.u16(0); // no sections, so their size is irrelevant
+            f.u16(0);
+            f.u16(0);
+        },
+    }
+
+    // The read+execute segment: headers, code, and constants.
+    prog_header(f, PT_LOAD, PF_READ | PF_EXEC, ProgHeader {
+        off: 0, vaddr: t.base, filesz: text_seg_file_size, memsz: text_seg_file_size,
+        align: t.page_size,
+    });
+    // The read+write segment: the runtime block and static buffers, plus the zero-filled
+    // tail that costs nothing in the file.
+    prog_header(f, PT_LOAD, PF_READ | PF_WRITE, ProgHeader {
+        off: data_off, vaddr: img.data_addr, filesz: data_seg_file_size,
+        memsz: data_seg_file_size + img.bss, align: t.page_size,
+    });
+
+    f.pad_to(text_off);
+    f.put_all(img.text);
+    f.pad_to(ro_data_off);
+    f.put_all(img.ro_data);
+    if data_seg_file_size > 0 {
+        f.pad_to(data_off);
+        f.put_all(img.data);
+    } else {
+        // `build_sections` computed every appended section's offset starting at
+        // `data_off + len(data)`; with no data bytes to write, the file must still reach
+        // `data_off` before the debug content begins, or the two disagree.
+        if sections.is_some() { f.pad_to(data_off); }
+    }
+
+    match sections {
+        Option::Some(s) => {
+            f.put_all(s.content);
+            f.put_all(s.table);
+        },
+        Option::None => {},
+    }
+
+    Written { bytes: f.bytes, error: f.error }
+}
+
+/// One `Elf64_Phdr`'s variable half. It is a struct rather than five more parameters
+/// because the native backend passes at most six arguments in registers and stops past
+/// that (`docs/deferred.md`), and a program header wants eight fields written.
+struct ProgHeader {
+    pub off: i64,
+    pub vaddr: i64,
+    pub filesz: i64,
+    pub memsz: i64,
+    pub align: i64,
+}
+
+fn prog_header(f: Buf, typ: i64, flags: i64, h: ProgHeader) {
+    f.u32(typ);
+    f.u32(flags);
+    f.u64(h.off);
+    f.u64(h.vaddr);
+    f.u64(h.vaddr); // physical address: unused by a user-space loader, conventionally equal
+    f.u64(h.filesz);
+    f.u64(h.memsz);
+    f.u64(h.align);
+}
+
+/// One `Elf64_Shdr`, before it is serialized.
+struct Shdr {
+    pub mut name: i64,
+    pub mut typ: i64,
+    pub mut flags: i64,
+    pub mut addr: i64,
+    pub mut off: i64,
+    pub mut size: i64,
+    pub mut link: i64,
+    pub mut info: i64,
+    pub mut align: i64,
+    pub mut entsz: i64,
+}
+
+fn empty_shdr() -> Shdr {
+    Shdr { name: 0, typ: 0, flags: 0, addr: 0, off: 0, size: 0, link: 0, info: 0,
+        align: 0, entsz: 0 }
+}
+
+const SEC_TEXT: i64 = 1;
+const SEC_RO_DATA: i64 = 2;
+const SEC_DATA: i64 = 3;
+const SEC_DEBUG_ABBREV: i64 = 4;
+const SEC_DEBUG_INFO: i64 = 5;
+const SEC_DEBUG_LINE: i64 = 6;
+const SEC_SYMTAB: i64 = 7;
+const SEC_STRTAB: i64 = 8;
+const SEC_SHSTRTAB: i64 = 9;
+const NUM_SECTIONS: i64 = 10;
+
+/// Lays out the symbol table (one `STT_FUNC` per function, naming the address range a
+/// backtrace should resolve to it), the three DWARF sections (ADR-0023), and the section
+/// header table that describes all nine real sections plus the mandatory `SHT_NULL` at
+/// index 0. The three segment-backed sections point back at bytes `write_elf` already
+/// wrote; nothing here duplicates them.
+fn build_sections(img: Image, text_off: i64, ro_data_off: i64, data_off: i64) -> SectionPlan {
+    let shstrtab = new_str_table();
+    let name_text = shstrtab.add(".text");
+    let name_ro_data = shstrtab.add(".rodata");
+    let name_data = shstrtab.add(".data");
+    let name_debug_abbrev = shstrtab.add(".debug_abbrev");
+    let name_debug_info = shstrtab.add(".debug_info");
+    let name_debug_line = shstrtab.add(".debug_line");
+    let name_symtab = shstrtab.add(".symtab");
+    let name_strtab = shstrtab.add(".strtab");
+    let name_shstrtab = shstrtab.add(".shstrtab");
+
+    let strtab = new_str_table();
+    let symtab = new_buf();
+    symtab.pad(ELF_SYM_SIZE); // index 0: the mandatory null symbol
+    let mut i = 0;
+    while i < img.funcs.len() {
+        let fn_i = img.funcs.at(i);
+        i = i + 1;
+        let name_off = strtab.add(fn_i.name);
+        symtab.u32(name_off);
+        symtab.u8((STB_GLOBAL << 4) | STT_FUNC);
+        symtab.u8(0);
+        symtab.u16(SEC_TEXT);
+        symtab.u64(fn_i.address);
+        symtab.u64(fn_i.size);
+    }
+
+    let content_off = data_off + img.data.len();
+    let debug_abbrev_off = content_off;
+    let debug_info_off = debug_abbrev_off + img.debug_abbrev.len();
+    let debug_line_off = debug_info_off + img.debug_info.len();
+    let symtab_off = debug_line_off + img.debug_line.len();
+    let strtab_off = symtab_off + symtab.len();
+    let shstrtab_off = strtab_off + strtab.buf.len();
+    let table_off = shstrtab_off + shstrtab.buf.len();
+
+    let shdrs = list::new[Shdr]();
+    let mut s = 0;
+    while s < NUM_SECTIONS {
+        shdrs.push(empty_shdr());
+        s = s + 1;
+    }
+
+    let text = shdrs.at(SEC_TEXT);
+    text.name = name_text; text.typ = SHT_PROGBITS; text.flags = SHF_ALLOC | SHF_EXEC_INSTR;
+    text.addr = img.text_addr; text.off = text_off; text.size = img.text.len();
+    text.align = 16;
+
+    let ro = shdrs.at(SEC_RO_DATA);
+    ro.name = name_ro_data; ro.typ = SHT_PROGBITS; ro.flags = SHF_ALLOC;
+    ro.addr = img.ro_data_addr; ro.off = ro_data_off; ro.size = img.ro_data.len();
+    ro.align = 1;
+
+    let da = shdrs.at(SEC_DATA);
+    da.name = name_data; da.typ = SHT_PROGBITS; da.flags = SHF_ALLOC | SHF_WRITE;
+    da.addr = img.data_addr; da.off = data_off; da.size = img.data.len();
+    da.align = 8;
+
+    let ab = shdrs.at(SEC_DEBUG_ABBREV);
+    ab.name = name_debug_abbrev; ab.typ = SHT_PROGBITS;
+    ab.off = debug_abbrev_off; ab.size = img.debug_abbrev.len(); ab.align = 1;
+
+    let inf = shdrs.at(SEC_DEBUG_INFO);
+    inf.name = name_debug_info; inf.typ = SHT_PROGBITS;
+    inf.off = debug_info_off; inf.size = img.debug_info.len(); inf.align = 1;
+
+    let ln = shdrs.at(SEC_DEBUG_LINE);
+    ln.name = name_debug_line; ln.typ = SHT_PROGBITS;
+    ln.off = debug_line_off; ln.size = img.debug_line.len(); ln.align = 1;
+
+    let sym = shdrs.at(SEC_SYMTAB);
+    sym.name = name_symtab; sym.typ = SHT_SYMTAB;
+    sym.off = symtab_off; sym.size = symtab.len(); sym.link = SEC_STRTAB; sym.info = 1;
+    sym.align = 8; sym.entsz = ELF_SYM_SIZE;
+
+    let st = shdrs.at(SEC_STRTAB);
+    st.name = name_strtab; st.typ = SHT_STRTAB;
+    st.off = strtab_off; st.size = strtab.buf.len(); st.align = 1;
+
+    let sh = shdrs.at(SEC_SHSTRTAB);
+    sh.name = name_shstrtab; sh.typ = SHT_STRTAB;
+    sh.off = shstrtab_off; sh.size = shstrtab.buf.len(); sh.align = 1;
+
+    let content = new_buf();
+    content.put_all(img.debug_abbrev);
+    content.put_all(img.debug_info);
+    content.put_all(img.debug_line);
+    content.put_all(symtab.bytes);
+    content.put_all(strtab.buf.bytes);
+    content.put_all(shstrtab.buf.bytes);
+
+    let table = new_buf();
+    let mut k = 0;
+    while k < shdrs.len() {
+        let h = shdrs.at(k);
+        k = k + 1;
+        table.u32(h.name);
+        table.u32(h.typ);
+        table.u64(h.flags);
+        table.u64(h.addr);
+        table.u64(h.off);
+        table.u64(h.size);
+        table.u32(h.link);
+        table.u32(h.info);
+        table.u64(h.align);
+        table.u64(h.entsz);
+    }
+
+    SectionPlan {
+        table_off: table_off, num_sections: NUM_SECTIONS, shstrndx: SEC_SHSTRTAB,
+        content: content.bytes, table: table.bytes,
+    }
+}

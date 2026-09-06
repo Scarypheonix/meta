@@ -80,8 +80,8 @@ stage1/src/           from Phase 9: the compiler for Origin, written in Origin -
                       resolve.origin, types.origin, check.origin, mono.origin,
                       layout.origin, bytecode.origin, compile.origin, ir.origin,
                       irbuild.origin, dom.origin, arith.origin, opt.origin,
-                      emit.origin, x86.origin and main.origin (its own command
-                      line) so far
+                      emit.origin, x86.origin, obj.origin and main.origin (its
+                      own command line) so far
 bootstrap/            from Phase 9: the last known-good stage1 binary
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```
@@ -192,11 +192,11 @@ in Origin. What exists in `stage1/src/` is everything except the machine code --
 `lex.origin`, `ast.origin`, `parse.origin`, `source.origin`, `resolve.origin`,
 `types.origin`, `check.origin`, `mono.origin`, `layout.origin`, `bytecode.origin`,
 `compile.origin`, `ir.origin`, `irbuild.origin`, `dom.origin`, `arith.origin`,
-`opt.origin`, `emit.origin`, `x86.origin` -- and `main.origin`, which makes stage1 an actual
+`opt.origin`, `emit.origin`, `x86.origin`, `obj.origin` -- and `main.origin`, which makes stage1 an actual
 command-line program (`stage1
 dump-tokens|dump-ast|parse|resolve|check|mono|dump-bytecode|dump-ir [-O0|-O1|-O2]
 <file>...`, plus `--package <root>` for a whole package) shaped like `cmd/originc`'s. That
-is about 22,900 lines of Origin, and every component is held to the Go one it replaces over this
+is about 23,600 lines of Origin, and every component is held to the Go one it replaces over this
 repository's own ~400 `.origin` files, all in `tests/selfhost`: the token stream against
 `internal/lex`, the dumped syntax tree against `internal/ast`, the position mapping against
 `internal/source`, the *places* syntax errors are reported against `internal/lex` +
@@ -214,9 +214,10 @@ of SSA at `-O0`, 80,816 at `-O1` and 102,586 at `-O2`**, and then that SSA back 
 
 That is the whole compiler except the machine code, and it is a *complete* compiler at the
 bytecode level: what stage1 emits at `-O2` is what the virtual machine runs. What stands
-between it and a self-hosted **binary** is `internal/obj` (1,135 lines) and
-`internal/backend` (7,064); `internal/x86` is done, held to **5,118 bytes of encoded
-instructions, identical on all four engines**.
+between it and a self-hosted **binary** is `internal/backend` (7,064 lines) and the
+Mach-O half of `internal/obj`. `internal/x86` is done, held to **5,118 bytes of encoded
+instructions**, and `internal/obj`'s ELF writer is done, held to **four executables, byte
+for byte** — both on all four engines.
 
 The language grew what a compiler cannot be written without: **the command line and the
 exit status** (`docs/spec/17-process.md`) — `args()` in the prelude over `env::arg_count`
@@ -245,13 +246,16 @@ which is where stage1 keeps what `internal/check` keeps in a map keyed by `ast.N
 rule `ast.origin` states — a slot arrives when a reader does — is why they landed in the
 same commit as the reader.
 
-**Next action: `internal/obj` (1,135 lines), then `internal/backend` (7,064)**, with
-`dwarf` and `codesign` (782 between them) pulled in as their consumers need them — roughly
-9,000 lines of Go, and the last of it. `internal/obj` next because it is the other
-self-contained half of "write an executable": given a code blob and a data blob it writes
-an ELF or a Mach-O, and two writers that produce the same bytes for the same input are
-comparable directly, exactly the way the encoder is. Nothing in the project is
-known-wrong.
+**Next action: `internal/backend` (7,064 lines)** — the last big one, and the only piece
+between stage1 and a binary of its own. Everything under it is in place and independently
+checked: the encoder byte for byte, the executable writer byte for byte, the optimizer and
+the emitter line for line. After it, `internal/obj`'s Mach-O writer with `dwarf` and
+`codesign` (782 lines between them), which is what makes a stage1 build runnable on the
+target machine rather than only in the container. Nothing in the project is known-wrong.
+
+The oracle for the backend is the strongest one yet and needs no invention: `originc build`
+writes an executable, stage1 will write one, and **two files that are byte-identical are
+the same program**. It subsumes every differential below it.
 
 **The alternative worth weighing first**: a stage1 that ends at bytecode is already a
 compiler, if something runs the bytecode. Writing the *virtual machine* in Origin
