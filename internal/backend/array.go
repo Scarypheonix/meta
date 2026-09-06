@@ -17,6 +17,54 @@ import "github.com/scarypheonix/meta/internal/x86"
 // room for -- which is also why there is no operation that lengthens the array without
 // writing the element first.
 
+// debugStaleRefs turns on a run-time assertion: every array operation checks that the
+// reference it was handed points inside the semispace the program is currently allocating
+// out of. A reference that does not is one a collection moved and something failed to
+// update -- a lost root, which otherwise surfaces much later, somewhere else, as a wrong
+// length, a wrong capacity, or an index the caller had every reason to believe was in
+// range. Turning it on is what named the failure in Phase 9's lost root: not "index out of
+// range seven thousand lines into a dump" but "a stale, already-forwarded array reached
+// rt_array_push", which says in one line that the object was copied and one reference to
+// it was not updated.
+//
+// Off by default -- it costs four instructions on the hottest primitive in the language --
+// and on in internal/backend/collect_test.go, which is where it has to keep working. Every
+// array is heap-allocated (ADR-0028), so "outside the current semispace" and "stale" are
+// the same thing here; a String literal in read-only data, which is neither, never reaches
+// these routines.
+var debugStaleRefs = false
+
+// checkInSpace traps if the reference in reg is outside [end-heapSize, end), the
+// semispace alloc is currently handing out of. Two messages: a stale reference whose
+// old header carries a forwarding pointer is one the collector *did* copy and something
+// failed to update (a missed root), and one without is an object the walk never reached
+// at all. Clobbers rax and rcx.
+func (e *emitter) checkInSpace(reg x86.Reg, name string) {
+	if !debugStaleRefs {
+		return
+	}
+	a := e.a
+	ok := a.NewLabel("in_space")
+	stale := a.NewLabel("stale_ref")
+	fwd := a.NewLabel("stale_fwd")
+	a.MovRM(x86.RAX, x86.At(x86.R15, rtEndOff))
+	a.CmpRR(reg, x86.RAX)
+	a.Jcc(x86.AboveEqual, stale)
+	a.SubRI(x86.RAX, heapSize)
+	a.CmpRR(reg, x86.RAX)
+	a.Jcc(x86.AboveEqual, ok)
+
+	a.Bind(stale)
+	a.MovRM(x86.RAX, x86.At(reg, 0))
+	a.ShrI(x86.RAX, 63)
+	a.TestRR(x86.RAX, x86.RAX)
+	a.Jcc(x86.NotEqual, fwd)
+	e.trapWith(e.rawString("origin: stale reference (never copied) in " + name + "\n"))
+	a.Bind(fwd)
+	e.trapWith(e.rawString("origin: stale reference (forwarded) in " + name + "\n"))
+	a.Bind(ok)
+}
+
 // arrayLenOff is the payload word holding the length; arrayFirstOff is where element 0
 // begins, one word past it.
 const (
@@ -69,6 +117,7 @@ func (e *emitter) emitArrayLen() {
 	a := e.a
 	a.Align(16)
 	a.Bind(e.rt.arrayLen)
+	e.checkInSpace(x86.RDI, "rt_array_len")
 	a.MovRM(x86.RAX, x86.At(x86.RDI, arrayLenOff))
 	a.Ret()
 }
@@ -79,6 +128,7 @@ func (e *emitter) emitArrayCap() {
 	a := e.a
 	a.Align(16)
 	a.Bind(e.rt.arrayCap)
+	e.checkInSpace(x86.RDI, "rt_array_cap")
 	e.arrayWords(x86.RAX, x86.RDI)
 	a.SubRI(x86.RAX, 1)
 	a.Ret()
@@ -107,6 +157,7 @@ func (e *emitter) emitArrayAt() {
 	a := e.a
 	a.Align(16)
 	a.Bind(e.rt.arrayAt)
+	e.checkInSpace(x86.RDI, "rt_array_at")
 
 	refused := a.NewLabel("array_at_refused")
 	e.arrayBoundsCheck(refused)
@@ -126,6 +177,7 @@ func (e *emitter) emitArraySet() {
 	a := e.a
 	a.Align(16)
 	a.Bind(e.rt.arraySet)
+	e.checkInSpace(x86.RDI, "rt_array_set")
 
 	refused := a.NewLabel("array_set_refused")
 	e.arrayBoundsCheck(refused)
@@ -151,6 +203,7 @@ func (e *emitter) emitArrayPush() {
 	a := e.a
 	a.Align(16)
 	a.Bind(e.rt.arrayPush)
+	e.checkInSpace(x86.RDI, "rt_array_push")
 
 	full := a.NewLabel("array_push_full")
 	e.arrayWords(x86.RAX, x86.RDI)
@@ -183,6 +236,7 @@ func (e *emitter) emitArrayTruncate() {
 	a := e.a
 	a.Align(16)
 	a.Bind(e.rt.arrayTruncate)
+	e.checkInSpace(x86.RDI, "rt_array_truncate")
 
 	done := a.NewLabel("array_truncate_done")
 	clamp := a.NewLabel("array_truncate_clamp")

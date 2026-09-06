@@ -20,6 +20,20 @@ const inlineBudget = 24
 // callees cannot compound into something enormous.
 const maxInlinesPerFunction = 8
 
+// DebugInlineLimit, when non-negative, is how many inlines the whole program may perform
+// before the inliner stops; DebugInlineCount is how many it did, and DebugInlineTrace, if
+// set, is told about each one as it happens. -1 is no limit, which is every normal build.
+//
+// A binary search on the limit turns "a program that is wrong at -O2 and right at -O1"
+// into the number of one splice, and the trace then names it -- which is how Phase 9's
+// lost root was found: inline 1843, Option::expect into irbuild's translate_block. There
+// is no other way to ask which of two thousand inlines matters.
+var (
+	DebugInlineLimit = -1
+	DebugInlineCount = 0
+	DebugInlineTrace func(n int, callee, caller string)
+)
+
 // Inline replaces direct calls to small functions with their bodies.
 //
 // Only a call whose callee is a named function is considered: a closure is called
@@ -33,6 +47,13 @@ func Inline(f *ir.Func, selfIndex int, funcs []*ir.Func, prog *bytecode.Program,
 		if site == nil {
 			break
 		}
+		if DebugInlineLimit >= 0 && DebugInlineCount >= DebugInlineLimit {
+			break
+		}
+		if DebugInlineTrace != nil {
+			DebugInlineTrace(DebugInlineCount, prog.Fns[calleeIndex].Name, prog.Fns[selfIndex].Name)
+		}
+		DebugInlineCount++
 		inlineOne(f, site, callee, calleeIndex)
 		changed = true
 	}

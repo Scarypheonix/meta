@@ -115,7 +115,7 @@ func optimizeAll(prog *bytecode.Program, level Level) ([]*ir.Func, error) {
 		if err := runPasses(f, prog, level); err != nil {
 			return nil, fmt.Errorf("optimizing %s: %w", prog.Fns[i].Name, err)
 		}
-		if level >= O2 && Inline(f, i, funcs, prog, level) {
+		if level >= O2 && !DebugSkip["inline"] && Inline(f, i, funcs, prog, level) {
 			// Inlining exposes constants across the call boundary, so the local passes
 			// run again on the enlarged function.
 			if err := runPasses(f, prog, level); err != nil {
@@ -181,12 +181,23 @@ func DumpIR(prog *bytecode.Program, level Level) (string, error) {
 	return out, nil
 }
 
+// DebugSkip names passes to leave out of the pipeline, for bisecting a miscompilation
+// down to the one pass that causes it: "inline" names the inliner, which is not in
+// `passes`, and every other key is a Pass.Name. Empty in every normal build.
+//
+// It is here rather than reconstructed each time because a wrong answer at -O2 says
+// nothing at all about which of seven passes produced it, and the alternative -- reading
+// the passes and reasoning about which could be at fault -- was tried first, twice, and
+// was wrong both times. Phase 9's lost root took two runs of this and DebugInlineLimit to
+// go from "somewhere in the optimizer" to one named splice.
+var DebugSkip = map[string]bool{}
+
 // runPasses iterates the pipeline to a fixed point.
 func runPasses(f *ir.Func, prog *bytecode.Program, level Level) error {
 	for round := 0; round < maxRounds; round++ {
 		changed := false
 		for _, p := range passes {
-			if p.MinLevel > level {
+			if p.MinLevel > level || DebugSkip[p.Name] {
 				continue
 			}
 			if p.Run(f, prog) {

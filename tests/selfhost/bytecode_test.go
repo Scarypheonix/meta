@@ -315,9 +315,7 @@ func TestStage1BuildsItsOwnSSA(t *testing.T) {
 		// silently (process rule 8).
 		skip string
 	}{
-		{"native-O2", driver.Native, opt.O2,
-			"Phase 9: stage1 built at -O2 miscompiles its own pop_n and traps here; " +
-				"-O0 and -O1 are correct, and a bigger heap hides it (docs/deferred.md)"},
+		{"native-O2", driver.Native, opt.O2, ""},
 		{"native-O0", driver.Native, opt.O0, ""},
 	}
 	for _, e := range engines {

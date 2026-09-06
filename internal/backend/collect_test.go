@@ -879,3 +879,56 @@ fn main() {
 }
 `, "5000") // 200 rounds of 3+4+5+6+7.
 }
+
+// TestACollectionSurvivesAnInlinedDivergingArm is the regression test for the lost root
+// stage1 found: the φ that stands in for an inlined call whose callee has one arm that
+// diverges. `Option::expect` is that shape -- `Some(v) => v` yields a reference,
+// `None => panic(msg)` yields nothing -- so internal/opt's inliner gives the φ a synthetic
+// OpUnit for the second, since a φ needs an operand per predecessor whether or not that
+// predecessor can arrive. Reading the φ's kind off its first operand made a `Node` a unit:
+// raw to the stack map, spilled to a raw slot, never updated when a collection moved the
+// object, and read back afterwards as whatever the vacated semispace happened to hold.
+//
+// It runs with a collection forced on every single allocation and with the array
+// primitives asserting that the references they are handed are in the space the program is
+// allocating out of -- the two knobs that turned this from "stage1 is wrong at 64 MiB and
+// right at 48 and 80" into a three-second reproduction.
+func TestACollectionSurvivesAnInlinedDivergingArm(t *testing.T) {
+	restoreEvery, restoreStale := debugCollectEvery, debugStaleRefs
+	debugCollectEvery, debugStaleRefs = 1, true
+	defer func() { debugCollectEvery, debugStaleRefs = restoreEvery, restoreStale }()
+
+	checkRun(t, `
+use std::io;
+use std::list;
+use std::map;
+
+struct Node { value: i64 }
+
+// One arm of the expect this calls yields the Node and the other panics, yielding
+// nothing at all.
+fn lookup(m: Map[i64, Node], k: i64) -> Node {
+    m.get(k).expect("present")
+}
+
+fn main() {
+    let m = map::new[i64, Node]();
+    m.insert(1, Node { value: 7 });
+    let mut total = 0;
+    let mut round = 0;
+    while round < 200 {
+        // n is live across every allocation the loop below makes.
+        let n = lookup(m, 1);
+        let xs = list::new[Node]();
+        let mut i = 0;
+        while i < 8 {
+            xs.push(Node { value: i });
+            i = i + 1;
+        }
+        total = total + n.value + xs.at(3).value;
+        round = round + 1;
+    }
+    io::println(total.to_str());
+}
+`, "2000") // 200 rounds of 7 + 3.
+}

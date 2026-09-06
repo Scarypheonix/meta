@@ -1,6 +1,8 @@
 package backend
 
 import (
+	"fmt"
+
 	"github.com/scarypheonix/meta/internal/bytecode"
 	"github.com/scarypheonix/meta/internal/compile"
 	"github.com/scarypheonix/meta/internal/ir"
@@ -32,25 +34,73 @@ func propagateKinds(f *ir.Func, prog *bytecode.Program) {
 
 	// A φ's kind is whatever its operands' already is -- a well-typed program's static
 	// type does not change across branches -- but an operand can itself be another φ (a
-	// loop-carried value), so this is a small fixed point rather than one pass. Each
-	// round resolves at least one φ that was blocked only on another φ in this same
-	// set, so it converges in at most len(phis) rounds.
-	for round := 0; round < len(phis)+1; round++ {
+	// loop-carried value), so this is a small fixed point rather than one pass. A φ
+	// resolves at most twice (unknown, then possibly a unit placeholder, then its real
+	// kind), and every round makes at least one of those transitions, so twice the
+	// number of φs bounds it.
+	for round := 0; round < 2*len(phis)+1; round++ {
 		changed := false
 		for _, p := range phis {
-			if p.Kind != bytecode.KindUnknown {
-				continue
-			}
-			for _, a := range p.Args {
-				if a != nil && a.Kind != bytecode.KindUnknown {
-					p.Kind = a.Kind
-					changed = true
-					break
-				}
+			if k := phiKind(p); k != bytecode.KindUnknown && k != p.Kind {
+				p.Kind = k
+				changed = true
 			}
 		}
 		if !changed {
 			break
+		}
+	}
+	checkPhiKinds(f)
+}
+
+// phiKind is the kind of the operands that actually carry a value.
+//
+// "Whatever its operands' kind is" is not "the first operand's kind", because one
+// operand may be a placeholder rather than a value. internal/opt's inliner gives the φ
+// standing in for a call one operand per cloned `return`, and a return that carries
+// nothing -- the arm of the callee that diverges, `Option::expect`'s `panic` -- gets a
+// synthetic OpUnit, since a φ needs an operand for every predecessor whether or not that
+// predecessor can arrive. Let that unit answer for the φ and a `Block` merged with it
+// becomes KindUnit: raw, spilled to a raw slot, and never updated when a collection moves
+// the object. That is a lost root, and it is what stage1 found -- reachable only at -O2,
+// and only through inlining, because nothing else in the compiler builds a φ whose
+// operands disagree.
+func phiKind(p *ir.Value) bytecode.Kind {
+	fallback := bytecode.KindUnknown
+	for _, a := range p.Args {
+		if a == nil || a.Kind == bytecode.KindUnknown {
+			continue
+		}
+		if a.Kind == bytecode.KindUnit {
+			// Only if nothing real ever turns up: a φ of genuine units is genuinely unit.
+			fallback = bytecode.KindUnit
+			continue
+		}
+		return a.Kind
+	}
+	return fallback
+}
+
+// checkPhiKinds asserts what phiKind's rule rests on: apart from the inliner's unit
+// placeholder, a φ's operands agree about whether they are a reference. Disagreement
+// means one branch of a well-typed program produced a heap object where another produced
+// a machine word, and whichever answer the φ took, the stack map would be wrong about it
+// at every collection point the φ is live across -- a silently corrupted heap rather than
+// a crash, which is exactly the class this pass is here to get right.
+func checkPhiKinds(f *ir.Func) {
+	for _, b := range f.Blocks {
+		for _, p := range b.Phis {
+			for _, a := range p.Args {
+				if a == nil || a.Kind == bytecode.KindUnknown || a.Kind == bytecode.KindUnit {
+					continue
+				}
+				if isRefKind(a.Kind) != isRefKind(p.Kind) {
+					panic(fmt.Sprintf(
+						"this is a compiler bug: %s in %s is %v but its operand %s is %v, "+
+							"and the two disagree about being a reference",
+						p, f.Name, p.Kind, a, a.Kind))
+				}
+			}
 		}
 	}
 }

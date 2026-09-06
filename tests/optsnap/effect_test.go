@@ -160,3 +160,52 @@ func findFn(t *testing.T, prog *bytecode.Program, name string) *bytecode.Fn {
 	t.Fatalf("no function named %q in the program", name)
 	return nil
 }
+
+// TestTheBisectionKnobsWork covers internal/opt's two debugging knobs -- DebugSkip and
+// DebugInlineLimit/DebugInlineTrace -- because a debugging tool nothing exercises is a
+// tool that has quietly stopped working by the time it is needed, and this pair is what
+// took Phase 9's lost root from "wrong somewhere at -O2" to one named splice in two runs.
+func TestTheBisectionKnobsWork(t *testing.T) {
+	const src = `
+use std::io;
+
+fn double(n: i64) -> i64 {
+    n * 2
+}
+
+fn main() {
+    io::println((double(21) + double(3)).to_str());
+}
+`
+	defer func() {
+		opt.DebugSkip = map[string]bool{}
+		opt.DebugInlineLimit, opt.DebugInlineCount, opt.DebugInlineTrace = -1, 0, nil
+	}()
+
+	full := count(optimized(t, "knobs", src, opt.O2), bytecode.OpCall)
+
+	opt.DebugSkip = map[string]bool{"inline": true}
+	skipped := count(optimized(t, "knobs", src, opt.O2), bytecode.OpCall)
+	opt.DebugSkip = map[string]bool{}
+	if skipped <= full {
+		t.Errorf("calls with inlining skipped is %d and with it %d: DebugSkip did nothing", skipped, full)
+	}
+
+	// One inline, and the trace names it: `double` into `main`, both times it fires.
+	var seen []string
+	opt.DebugInlineLimit, opt.DebugInlineCount = 1, 0
+	opt.DebugInlineTrace = func(n int, callee, caller string) {
+		seen = append(seen, callee+" into "+caller)
+	}
+	one := count(optimized(t, "knobs", src, opt.O2), bytecode.OpCall)
+	if opt.DebugInlineCount != 1 {
+		t.Errorf("the inliner performed %d inlines under a limit of 1", opt.DebugInlineCount)
+	}
+	if len(seen) != 1 || seen[0] != "double into main" {
+		t.Errorf("the trace saw %q, want one `double into main`", seen)
+	}
+	if !(full < one && one < skipped) {
+		t.Errorf("calls are %d unlimited, %d at a limit of one and %d with none: "+
+			"the limit did not land between them", full, one, skipped)
+	}
+}

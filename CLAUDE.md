@@ -237,20 +237,10 @@ which is where stage1 keeps what `internal/check` keeps in a map keyed by `ast.N
 rule `ast.origin` states — a slot arrives when a reader does — is why they landed in the
 same commit as the reader.
 
-**Next action: find the lost root stage1 exposed**, recorded at the top of
-`docs/deferred.md`. It is the one thing in the project that is known-wrong, it corrupts
-memory, and it will corrupt anything built on top of it. The register allocator is ruled
-out by assertion, and the collector corpus now runs at every level and passes, so the
-remaining places to look are the runtime's own scan (`internal/backend/collect.go`) and the
-roots it never sees: the scratch registers across an allocation, a value in flight during a
-`for` loop's desugaring, the argument registers at the moment a callee allocates before its
-prologue has run. The reproduction is stage1 itself at `-O2` with `heapSize` at exactly
-64 MiB, and it is reliable.
-
-After that: `internal/opt` (1,338 lines), then `internal/x86` (722), `internal/obj`
-(1,135) and `internal/backend` (7,064), with `arith`, `dwarf` and `codesign` (1,087
+**Next action: `internal/opt` (1,338 lines), then `internal/x86` (722), `internal/obj`
+(1,135) and `internal/backend` (7,064)**, with `arith`, `dwarf` and `codesign` (1,087
 between them) pulled in as their consumers need them — roughly 11,000 lines of Go still to
-translate.
+translate. The lost root is fixed (below); nothing in the project is known-wrong.
 
 **The alternative worth weighing first**: a stage1 that ends at bytecode is already a
 compiler, if something runs the bytecode. Writing the *virtual machine* in Origin
@@ -284,26 +274,49 @@ every bug came from *running Origin*, not from reading Go.
   the first of a duplicated name wins. The degenerate input is the most valuable file in
   the corpus, and a fourth case of the same thing — `checkBodies` visiting an impl's methods
   in map order — was found the same way.
-- **stage1 found a lost root, and it is still open.** stage1 built at `-O2` traps building
-  the SSA of its own `env_for`, inside a `Map` in the prelude. The most diagnostic fact is
-  the **heap window**: correct at
-  48 MiB, wrong at 64 MiB, correct at 80 MiB and above. That is neither "too little heap"
-  nor "no collection" — it is one particular collection, landing at one particular moment,
-  losing a reference. `-O1` is correct at every size that fits the program.
-  `internal/backend/regalloc.go`'s new `checkRootsAreDescribed` rules out the register
-  allocator: it asserts at build time that every live reference at every collection point
-  is in a reference spill slot or a callee-saved register the stack map names, and that
-  nothing live there lacks a kind. Neither fires. So the hole is outside the allocator's
-  model. Five attempts at a small reproduction all behave identically at every level;
-  `docs/deferred.md` has the full state.
+- **stage1 found a lost root, and finding it was a lesson about tools.** The φ that
+  stands in for an inlined call took its kind from its first operand, and after inlining
+  that operand can be a *placeholder* rather than a value: `internal/opt`'s inliner gives
+  the φ one operand per cloned `return`, and a `return` that carries nothing — the arm of
+  the callee that diverges, `Option::expect`'s `panic` — gets a synthetic `OpUnit`,
+  because a φ needs an operand for every predecessor whether or not that predecessor can
+  arrive. `internal/backend/kinds.go` let that unit answer for the whole φ, so a `Block`
+  merged with it became `KindUnit`: raw to the stack map, spilled to a raw slot, never
+  updated when a collection moved the object, and read back afterwards as whatever the
+  vacated semispace happened to hold. Only at `-O2`, only through inlining, and only when
+  a collection landed while the φ was live — which is why the heap window was so narrow,
+  correct at 48 MiB, wrong at 64, correct at 80.
 
-  Two lessons are worth more than the bug. **Every collector test built at `-O0`**, so the
-  optimizer and the collector had never been tested against each other — now closed, every
-  case runs at all three levels, and all fifteen pass, which is why this is recorded rather
-  than fixed: the corpus does not contain its shape. And the first characterization was
-  wrong twice — "an inlining bug", then "a bug at every level" — because a sweep printed
-  `FAIL` without distinguishing `index out of range` from an honest `out of memory`. **A
-  bisection is only as good as its predicate.**
+  **Three days of reading the code got the characterization wrong twice; three tools got
+  it in twenty minutes.** They are all still in the tree, and the next miscompilation
+  should reach for them first rather than for the source:
+  - `debugCollectEvery` (`internal/backend/runtime.go`) forces a collection every N
+    allocations. A lost root is a coincidence between one collection and one moment;
+    collecting constantly removes the coincidence. It turned "stage1 on the whole corpus
+    at exactly 64 MiB" into "stage1 on one small file, in three seconds".
+  - `debugStaleRefs` (`internal/backend/array.go`) makes the array primitives check that
+    the reference they were handed is inside the semispace the program is allocating out
+    of. It turned `index out of range`, seven thousand lines into a dump, into `stale
+    reference (forwarded) in rt_array_push` — which says in one line that the object was
+    copied and one reference to it was not updated.
+  - `opt.DebugSkip` and `opt.DebugInlineLimit` bisect the optimizer. Skipping one pass at
+    a time said `inline`; a binary search on the limit said inline **1843**, and the trace
+    named it: `Option::expect` into `irbuild`'s `translate_block`.
+
+  `checkPhiKinds` now asserts at build time that a φ's operands agree about being a
+  reference, the unit placeholder aside, and the old rule fires it on stage1 immediately.
+  `checkRootsAreDescribed` (`internal/backend/regalloc.go`) had missed this because it
+  only rejects a value with *no* kind; a wrong but definite kind looked fine to it, which
+  is the general shape of what an assertion over a derived fact cannot see.
+  `internal/backend/collect_test.go`'s `TestACollectionSurvivesAnInlinedDivergingArm`
+  fails on the code it replaced, and every collector case now builds at all three levels —
+  the optimizer and the collector had never been tested against each other at all, which
+  is why a bug this loud lived through four phases.
+
+  The two smaller lessons: a sweep that printed `FAIL` without separating `index out of
+  range` from an honest `out of memory` produced a wrong bisection, so **a bisection is
+  only as good as its predicate**; and both wrong characterizations came from reasoning
+  about which pass *could* be at fault instead of asking the program.
 - **Two tuples of the same arity could not coexist in one compiled program.** A
   descriptor's *name* is its identity in the layout registry, and a tuple's was its arity
   alone, so `(i64, bool)` and `(bool, String)` were the same type: the second registration

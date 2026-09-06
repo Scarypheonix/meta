@@ -74,8 +74,12 @@ const (
 	// `_start` saves it before it aligns the stack, which is the only moment it exists --
 	// there is no libc to have kept a copy.
 	rtArgvOff = 104
+	// rtGcCountdownOff is how many more allocations may succeed before debugCollectEvery
+	// forces a collection. Present whether or not that knob is on, so the block's shape
+	// does not depend on a debugging switch.
+	rtGcCountdownOff = 112
 	// rtBlockSize is the block's size in bytes; it lives in the writable segment.
-	rtBlockSize = 112
+	rtBlockSize = 120
 
 	// wordSize is the size of everything the machine holds in a register.
 	wordSize = 8
@@ -346,6 +350,13 @@ func (e *emitter) emitPanic() {
 	a.Ud2()
 }
 
+// debugCollectEvery, when positive, forces a collection every that many successful
+// allocations, on top of the ones running out of space causes. It is a debugging knob and
+// zero in a shipped compiler: it makes a program allocate into a fresh semispace
+// constantly, which is exactly what a lost root needs in order to be caught near where it
+// was lost rather than thousands of allocations later.
+var debugCollectEvery int32 = 0
+
 // mmapHeap maps one heapSize-byte anonymous, read-write, private region and leaves its
 // address in rax, trapping with `out of memory` on failure. It is inlined at both of
 // emitStart's two call sites (ADR-0022's two semispaces) rather than a callable routine,
@@ -395,6 +406,9 @@ func (e *emitter) emitStart(mainLabel x86.Label) {
 	a.AddRI(x86.RCX, heapSize)
 	a.MovMR(x86.At(x86.R15, rtEndOff), x86.RCX)
 	a.MovMR(x86.At(x86.R15, rtOtherStartOff), x86.RAX)
+	if debugCollectEvery > 0 {
+		a.MovMI(x86.At(x86.R15, rtGcCountdownOff), debugCollectEvery)
+	}
 
 	// The kernel hands over a 16-byte aligned stack with argc on top. That address is the
 	// argument vector and this is the only moment it is known, so it is saved before the
@@ -453,7 +467,23 @@ func (e *emitter) emitAlloc() {
 	fits := a.NewLabel("alloc_fits")
 	a.MovRM(x86.RCX, x86.At(x86.R15, rtEndOff))
 	a.CmpRR(x86.RDX, x86.RCX)
-	a.Jcc(x86.BelowEqual, fits)
+	if debugCollectEvery > 0 {
+		// The debugging knob: it fits, but count the allocation down and collect anyway
+		// when the count runs out. A lost root is a rare coincidence of one collection
+		// landing at one moment; forcing them every few allocations turns the whole class
+		// into something a small program reproduces.
+		countdown := a.NewLabel("alloc_countdown")
+		a.Jcc(x86.Above, countdown) // does not fit: collect, as always
+		a.MovRM(x86.RCX, x86.At(x86.R15, rtGcCountdownOff))
+		a.SubRI(x86.RCX, 1)
+		a.MovMR(x86.At(x86.R15, rtGcCountdownOff), x86.RCX)
+		a.TestRR(x86.RCX, x86.RCX)
+		a.Jcc(x86.NotEqual, fits)
+		a.MovMI(x86.At(x86.R15, rtGcCountdownOff), debugCollectEvery)
+		a.Bind(countdown)
+	} else {
+		a.Jcc(x86.BelowEqual, fits)
+	}
 
 	// Doesn't fit: collect once and retry. rt_collect's own calling convention (ADR-0022)
 	// takes the caller of `alloc` as its first frame to walk: r9 names its return
