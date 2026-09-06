@@ -1,0 +1,1264 @@
+// The optimizer: folding, copy propagation, common subexpressions, loop-invariant code
+// motion, escape analysis, dead code, unreachable blocks and inlining.
+//
+// A translation of `internal/opt`. Every pass rewrites one function's SSA in place and
+// reports whether it changed anything, and the pipeline iterates to a fixed point.
+//
+// The rule that shapes all of it is that **optimization is unobservable**: identical
+// stdout and exit code at `-O0`, `-O1` and `-O2` (ADR-0005, ADR-0012). That is why an
+// operation that would trap folds *to the trap* rather than around it, why a trapping
+// value is never hoisted out of a loop, why an allocation is never shared, and why float
+// arithmetic is folded but never reassociated.
+
+use std::list;
+use std::map;
+use std::float;
+
+use arith;
+use ast;
+use bytecode;
+use dom;
+use ir;
+use irbuild;
+
+/// `-O0` does not build the IR at all: the bytecode the lowering produced is what runs.
+pub const O0: i64 = 0;
+/// `-O1` runs the passes that are cheap and always profitable.
+pub const O1: i64 = 1;
+/// `-O2` adds the passes that cost compile time or code size.
+pub const O2: i64 = 2;
+
+/// Bounds the pipeline's iteration. Every pass is monotone -- it removes work or makes a
+/// value cheaper -- so a fixed point exists; the bound is there to turn a pass that
+/// oscillates into a bug report rather than a hang.
+const MAX_ROUNDS: i64 = 8;
+
+/// One optimization over one function.
+struct Pass {
+    pub name: String,
+    /// Rewrites the function and reports whether it changed anything.
+    pub run: fn(ir::Func, bytecode::Program) -> bool,
+    /// The lowest level at which the pass runs.
+    pub min_level: i64,
+}
+
+/// The pipeline, in order. Order matters: folding creates dead values, so elimination
+/// follows it; elimination exposes more folding, so the pipeline iterates.
+fn pipeline() -> List[Pass] {
+    let out = list::new[Pass]();
+    out.push(Pass { name: "constant-fold", run: constant_fold, min_level: O1 });
+    out.push(Pass { name: "copy-propagate", run: copy_propagate, min_level: O1 });
+    out.push(Pass { name: "cse", run: common_subexpressions, min_level: O2 });
+    out.push(Pass { name: "licm", run: loop_invariant_code_motion, min_level: O2 });
+    out.push(Pass { name: "escape-analysis", run: escape_analysis, min_level: O2 });
+    out.push(Pass { name: "dce", run: dead_code_elimination, min_level: O1 });
+    out.push(Pass { name: "unreachable-blocks", run: remove_unreachable_blocks, min_level: O1 });
+    out
+}
+
+fn no_values() -> List[ir::Value] { list::new[ir::Value]() }
+fn no_blocks() -> List[ir::Block] { list::new[ir::Block]() }
+
+fn one_value(v: ir::Value) -> List[ir::Value] {
+    let l = no_values();
+    l.push(v);
+    l
+}
+
+fn one_block(b: ir::Block) -> List[ir::Block] {
+    let l = no_blocks();
+    l.push(b);
+    l
+}
+
+// --- Constant folding ------------------------------------------------------------------
+
+/// Evaluates operations whose operands are all constants, and folds a branch on a constant
+/// condition into a jump.
+///
+/// The rule that shapes it is ADR-0005: an operation that would trap folds *to the trap*,
+/// not around it and not away. `let x = i64::MAX + 1;` must stop the program at every
+/// optimization level, so folding it produces an unconditional trap in the same place
+/// rather than a wrapped constant or nothing at all.
+pub fn constant_fold(f: ir::Func, prog: bytecode::Program) -> bool {
+    let mut changed = false;
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks.at(bi);
+        let mut i = 0;
+        while i < b.instr.len() {
+            if fold_value(f, b, b.instr.at(i), prog) { changed = true; }
+            i = i + 1;
+        }
+        if fold_branch(f, b) { changed = true; }
+        bi = bi + 1;
+    }
+    changed
+}
+
+/// A value's compile-time constant, if it has one.
+fn const_of(v: ir::Value, prog: bytecode::Program) -> Option[bytecode::Const] {
+    if v.op == ir::OP_CONST {
+        if v.a < 0 || v.a >= prog.consts.len() { return Option::None; }
+        return Option::Some(prog.consts.at(v.a));
+    }
+    if v.op == ir::OP_TRUE {
+        return Option::Some(bytecode::Const { kind: bytecode::CONST_INT, bits: 1u64, text: "" });
+    }
+    if v.op == ir::OP_FALSE {
+        return Option::Some(bytecode::Const { kind: bytecode::CONST_INT, bits: 0u64, text: "" });
+    }
+    Option::None
+}
+
+fn bool_const(v: ir::Value) -> Option[bool] {
+    if v.op == ir::OP_TRUE { return Option::Some(true); }
+    if v.op == ir::OP_FALSE { return Option::Some(false); }
+    Option::None
+}
+
+/// Adds an integer to the pool, reusing an existing entry.
+fn int_const(prog: bytecode::Program, val: u64) -> i64 {
+    let mut i = 0;
+    while i < prog.consts.len() {
+        let c = prog.consts.at(i);
+        if c.kind == bytecode::CONST_INT && c.bits == val { return i; }
+        i = i + 1;
+    }
+    prog.consts.push(bytecode::Const { kind: bytecode::CONST_INT, bits: val, text: "" });
+    prog.consts.len() - 1
+}
+
+fn float_const(prog: bytecode::Program, val: f64) -> i64 {
+    let bits = float::bits(val);
+    let mut i = 0;
+    while i < prog.consts.len() {
+        let c = prog.consts.at(i);
+        if c.kind == bytecode::CONST_FLOAT && c.bits == bits { return i; }
+        i = i + 1;
+    }
+    prog.consts.push(bytecode::Const { kind: bytecode::CONST_FLOAT, bits: bits, text: "" });
+    prog.consts.len() - 1
+}
+
+fn string_const(prog: bytecode::Program, s: String) -> i64 {
+    let mut i = 0;
+    while i < prog.consts.len() {
+        let c = prog.consts.at(i);
+        if c.kind == bytecode::CONST_STRING && c.text == s { return i; }
+        i = i + 1;
+    }
+    prog.consts.push(bytecode::Const { kind: bytecode::CONST_STRING, bits: 0u64, text: s });
+    prog.consts.len() - 1
+}
+
+/// Rewrites one instruction in place when its operands are constant.
+fn fold_value(f: ir::Func, b: ir::Block, v: ir::Value, prog: bytecode::Program) -> bool {
+    if v.args.is_empty() || v.op == ir::OP_PHI { return false; }
+    if v.args.len() == 2 {
+        let x = const_of(v.args.at(0), prog);
+        let y = const_of(v.args.at(1), prog);
+        if x.is_none() || y.is_none() { return false; }
+        return fold_binary(f, b, v, x.expect("a constant"), y.expect("a constant"), prog);
+    }
+    if v.args.len() == 1 {
+        let x = const_of(v.args.at(0), prog);
+        if x.is_none() { return false; }
+        return fold_unary(f, b, v, x.expect("a constant"), prog);
+    }
+    false
+}
+
+/// Replaces an instruction with an unconditional trap and cuts the block short.
+/// Everything after it is unreachable, so the block returns and its successors lose an
+/// edge; the unreachable-block pass then removes whatever that orphaned.
+fn trap_here(f: ir::Func, b: ir::Block, v: ir::Value, prog: bytecode::Program, msg: String) -> bool {
+    v.op = ir::OP_TRAP;
+    v.a = string_const(prog, msg);
+    v.args = no_values();
+    b.truncate(v);
+
+    let unit = f.new_value(ir::OP_UNIT, v.span, v.file, no_values());
+    unit.block = Option::Some(b);
+    b.instr.push(unit);
+    f.set_terminator(b, f.new_value(ir::OP_RETURN, v.span, v.file, one_value(unit)), no_blocks());
+    true
+}
+
+fn replace_with_const(v: ir::Value, idx: i64) -> bool {
+    v.op = ir::OP_CONST;
+    v.a = idx;
+    v.args = no_values();
+    true
+}
+
+fn replace_with_bool(v: ir::Value, val: bool) -> bool {
+    v.op = ir::OP_FALSE;
+    if val { v.op = ir::OP_TRUE; }
+    v.args = no_values();
+    true
+}
+
+fn is_comparison(op: i64) -> bool {
+    op == ir::OP_EQ || op == ir::OP_NE || op == ir::OP_LT
+        || op == ir::OP_LE || op == ir::OP_GT || op == ir::OP_GE
+}
+
+fn fold_binary(
+    f: ir::Func, b: ir::Block, v: ir::Value,
+    x: bytecode::Const, y: bytecode::Const, prog: bytecode::Program,
+) -> bool {
+    // Comparison and equality work on any constant kind.
+    if is_comparison(v.op) {
+        match fold_compare(v.op, v.a, x, y) {
+            Option::Some(res) => { return replace_with_bool(v, res); },
+            Option::None => { return false; },
+        }
+    }
+    if x.kind == bytecode::CONST_FLOAT && y.kind == bytecode::CONST_FLOAT {
+        return fold_float(v, float::from_bits(x.bits), float::from_bits(y.bits), prog);
+    }
+    if x.kind != bytecode::CONST_INT || y.kind != bytecode::CONST_INT { return false; }
+    fold_int(f, b, v, x.bits, y.bits, prog)
+}
+
+/// Evaluates an integer operation on two constants, at the width the instruction carries.
+///
+/// The rules are `arith`'s, which is not a convenience: folding is only allowed because it
+/// is unobservable, and a folder with its own arithmetic is a second definition of what
+/// `255u8 + 1` means.
+fn fold_int(
+    f: ir::Func, b: ir::Block, v: ir::Value, x: u64, y: u64, prog: bytecode::Program,
+) -> bool {
+    let k = v.a;
+    if !bytecode::kind_is_integer(k) {
+        // An instruction with no kind is one no engine could run either; leave it for the
+        // backend to reject rather than inventing a width here.
+        return false;
+    }
+    let mut r = 0u64;
+    let mut trap = "";
+    let mut known = true;
+    if v.op == ir::OP_ADD {
+        let a = arith::add(k, x, y); r = a.value; trap = a.trap;
+    } else if v.op == ir::OP_SUB {
+        let a = arith::sub(k, x, y); r = a.value; trap = a.trap;
+    } else if v.op == ir::OP_MUL {
+        let a = arith::mul(k, x, y); r = a.value; trap = a.trap;
+    } else if v.op == ir::OP_DIV {
+        let a = arith::div(k, x, y); r = a.value; trap = a.trap;
+    } else if v.op == ir::OP_REM {
+        let a = arith::rem(k, x, y); r = a.value; trap = a.trap;
+    } else if v.op == ir::OP_AND {
+        r = arith::and_of(k, x, y);
+    } else if v.op == ir::OP_OR {
+        r = arith::or_of(k, x, y);
+    } else if v.op == ir::OP_XOR {
+        r = arith::xor_of(k, x, y);
+    } else if v.op == ir::OP_SHL {
+        let a = arith::shl(k, x, y); r = a.value; trap = a.trap;
+    } else if v.op == ir::OP_SHR {
+        let a = arith::shr(k, x, y); r = a.value; trap = a.trap;
+    } else if v.op == ir::OP_WRAP_ADD {
+        r = arith::wrap(k, x.wrapping_add(y));
+    } else if v.op == ir::OP_WRAP_SUB {
+        r = arith::wrap(k, x.wrapping_sub(y));
+    } else if v.op == ir::OP_WRAP_MUL {
+        r = arith::wrap(k, x.wrapping_mul(y));
+    } else {
+        known = false;
+    }
+    if !known { return false; }
+    if trap != "" { return trap_here(f, b, v, prog, trap); }
+    replace_with_const(v, int_const(prog, r))
+}
+
+fn fold_float(v: ir::Value, x: f64, y: f64, prog: bytecode::Program) -> bool {
+    // Float arithmetic is folded, but never reassociated and never contracted: ADR-0012
+    // forbids both, because they would change results between optimization levels.
+    if v.op == ir::OP_ADDF { return replace_with_const(v, float_const(prog, x + y)); }
+    if v.op == ir::OP_SUBF { return replace_with_const(v, float_const(prog, x - y)); }
+    if v.op == ir::OP_MULF { return replace_with_const(v, float_const(prog, x * y)); }
+    if v.op == ir::OP_DIVF { return replace_with_const(v, float_const(prog, x / y)); }
+    if v.op == ir::OP_REMF { return replace_with_const(v, float_const(prog, float_mod(x, y))); }
+    false
+}
+
+/// `x` remainder `y`, truncated toward zero, without using `%` on floats.
+///
+/// stage1 is compiled natively and SSE has no remainder instruction, so `%` on an `f64`
+/// does not reach machine code at all (`docs/deferred.md`). The subtraction below is what
+/// the hardware would do anyway: doubling and halving a binary float are exact, so the
+/// answer carries no rounding of its own.
+fn float_mod(x: f64, y: f64) -> f64 {
+    if is_nan(x) || is_nan(y) || is_inf(x) || y == 0.0 { return nan(); }
+    if is_inf(y) { return x; }
+    let neg = x < 0.0;
+    let mut a = x;
+    if neg { a = fneg(a); }
+    let mut d = y;
+    if d < 0.0 { d = fneg(d); }
+    if a < d {
+        if neg { return fneg(a); }
+        return a;
+    }
+    let mut scaled = d;
+    while scaled * 2.0 <= a { scaled = scaled * 2.0; }
+    while scaled >= d {
+        if a >= scaled { a = a - scaled; }
+        scaled = scaled / 2.0;
+    }
+    if neg { return fneg(a); }
+    a
+}
+
+/// Negation flips the sign bit, which `0.0 - x` does not: it answers `+0.0` for `-0.0`
+/// and for `+0.0` alike, and the two are different constants with different bits. The
+/// corpus has `-0.0` in it, so this is not a hypothetical -- it is what the `-O2`
+/// differential caught on the first run.
+fn fneg(x: f64) -> f64 { float::from_bits(float::bits(x) ^ SIGN_BIT) }
+
+const SIGN_BIT: u64 = 9223372036854775808u64;
+
+fn is_nan(x: f64) -> bool { x != x }
+fn is_inf(x: f64) -> bool { !is_nan(x) && (x > F64_HUGE || x < fneg(F64_HUGE)) }
+fn nan() -> f64 { float::from_bits(9221120237041090560u64) }
+
+/// Larger than every finite `f64` below it and smaller than infinity: `f64::MAX`.
+const F64_HUGE: f64 = 17976931348623157.0e292;
+
+/// Evaluates a comparison of two constants, answering `None` when the pair cannot be
+/// compared at compile time.
+fn fold_compare(op: i64, k: i64, x: bytecode::Const, y: bytecode::Const) -> Option[bool] {
+    if x.kind != y.kind { return Option::None; }
+    let mut cmp = 0;
+    if x.kind == bytecode::CONST_INT || x.kind == bytecode::CONST_CHAR {
+        // Signed or unsigned as the operand kind says, which is the same question the
+        // backend asks: the bits of `u64::MAX` and `-1i64` are identical and their order
+        // against 1 is not.
+        if x.kind == bytecode::CONST_INT && bytecode::kind_is_integer(k) {
+            if arith::less(k, x.bits, y.bits) { cmp = 0 - 1; }
+            if arith::less(k, y.bits, x.bits) { cmp = 1; }
+        } else {
+            let a = x.bits as i64;
+            let b = y.bits as i64;
+            if a < b { cmp = 0 - 1; }
+            if a > b { cmp = 1; }
+        }
+    } else if x.kind == bytecode::CONST_FLOAT {
+        let a = float::from_bits(x.bits);
+        let b = float::from_bits(y.bits);
+        // NaN compares false against everything, including itself, so a comparison
+        // involving one is only foldable for `!=`.
+        if is_nan(a) || is_nan(b) {
+            if op == ir::OP_NE { return Option::Some(true); }
+            if is_comparison(op) { return Option::Some(false); }
+            return Option::None;
+        }
+        if a < b { cmp = 0 - 1; }
+        if a > b { cmp = 1; }
+    } else if x.kind == bytecode::CONST_STRING {
+        if ir::str_before(x.text, y.text) { cmp = 0 - 1; }
+        if ir::str_before(y.text, x.text) { cmp = 1; }
+    } else {
+        return Option::None;
+    }
+
+    if op == ir::OP_EQ { return Option::Some(cmp == 0); }
+    if op == ir::OP_NE { return Option::Some(cmp != 0); }
+    if op == ir::OP_LT { return Option::Some(cmp < 0); }
+    if op == ir::OP_LE { return Option::Some(cmp <= 0); }
+    if op == ir::OP_GT { return Option::Some(cmp > 0); }
+    if op == ir::OP_GE { return Option::Some(cmp >= 0); }
+    Option::None
+}
+
+fn fold_unary(
+    f: ir::Func, b: ir::Block, v: ir::Value, x: bytecode::Const, prog: bytecode::Program,
+) -> bool {
+    if v.op == ir::OP_NOT {
+        if x.kind != bytecode::CONST_INT { return false; }
+        return replace_with_bool(v, x.bits == 0u64);
+    }
+    if v.op == ir::OP_NEG {
+        if x.kind != bytecode::CONST_INT { return false; }
+        let k = v.a;
+        if !bytecode::kind_is_integer(k) { return false; }
+        let a = arith::neg(k, x.bits);
+        if a.trap != "" { return trap_here(f, b, v, prog, a.trap); }
+        return replace_with_const(v, int_const(prog, a.value));
+    }
+    if v.op == ir::OP_NEGF {
+        if x.kind != bytecode::CONST_FLOAT { return false; }
+        return replace_with_const(v, float_const(prog, fneg(float::from_bits(x.bits))));
+    }
+    false
+}
+
+/// Turns a branch on a constant condition into an unconditional jump, which is what makes
+/// the unreachable arm removable.
+fn fold_branch(f: ir::Func, b: ir::Block) -> bool {
+    if b.term.is_none() { return false; }
+    let term = b.term.expect("a terminator");
+    if term.op != ir::OP_BRANCH || b.succs.len() != 2 { return false; }
+    match bool_const(term.args.at(0)) {
+        Option::Some(val) => {
+            let mut taken = b.succs.at(0);
+            if !val { taken = b.succs.at(1); }
+            f.set_terminator(b, f.new_value(ir::OP_JUMP, term.span, term.file, no_values()),
+                one_block(taken));
+            true
+        },
+        Option::None => false,
+    }
+}
+
+// --- Copy propagation and common subexpressions ----------------------------------------
+
+/// Removes the values that merely forward another.
+///
+/// SSA construction leaves two kinds behind: a phi whose operands are all the same value,
+/// and a phi in a block with one predecessor. Braun's algorithm removes most of them as it
+/// builds, but folding a branch can make a phi trivial afterwards, so the pass runs in the
+/// pipeline rather than only at construction.
+pub fn copy_propagate(f: ir::Func, prog: bytecode::Program) -> bool {
+    let mut changed = false;
+    let mut again = true;
+    while again {
+        again = false;
+        let mut bi = 0;
+        while bi < f.blocks.len() {
+            let b = f.blocks.at(bi);
+            let kept = no_values();
+            let mut i = 0;
+            while i < b.phis.len() {
+                let phi = b.phis.at(i);
+                i = i + 1;
+                match trivial_phi(phi) {
+                    Option::Some(same) => {
+                        f.replace_all_uses(phi, same);
+                        again = true;
+                        changed = true;
+                    },
+                    Option::None => { kept.push(phi); },
+                }
+            }
+            b.phis = kept;
+            bi = bi + 1;
+        }
+        f.recompute_uses();
+    }
+    changed
+}
+
+/// The single distinct operand of a phi, if it has one. A phi with no operands at all is
+/// not trivial: there is nothing to forward it to.
+fn trivial_phi(phi: ir::Value) -> Option[ir::Value] {
+    let mut same = Option::None;
+    let mut i = 0;
+    while i < phi.args.len() {
+        let op = phi.args.at(i);
+        i = i + 1;
+        if ref_eq(op, phi) { continue; }
+        match same {
+            Option::Some(s) => {
+                if ref_eq(op, s) { continue; }
+                return Option::None;
+            },
+            Option::None => { same = Option::Some(op); },
+        }
+    }
+    same
+}
+
+/// Replaces a value with an earlier one computing the same thing.
+///
+/// Two restrictions keep it correct. The earlier value must *dominate* the later one, or
+/// the replacement would read a value that may not have been computed. And an operation
+/// that allocates is never shared: two `Point { x: 1 }` literals are distinct objects, and
+/// `ref_eq` can tell them apart, so merging them would change what a program observes.
+pub fn common_subexpressions(f: ir::Func, prog: bytecode::Program) -> bool {
+    let d = dom::compute(f);
+    // Candidates are grouped by a key describing what they compute; within a group the
+    // list is scanned for one that dominates.
+    let groups = map::new[String, List[ir::Value]]();
+    let mut changed = false;
+
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks.at(bi);
+        bi = bi + 1;
+        let mut i = 0;
+        while i < b.instr.len() {
+            let v = b.instr.at(i);
+            i = i + 1;
+            if !value_shareable(v) { continue; }
+            let key = value_key(v);
+            if key == "" { continue; }
+            let group = match groups.get(key) {
+                Option::Some(g) => g,
+                Option::None => {
+                    let g = no_values();
+                    groups.insert(key, g);
+                    g
+                },
+            };
+            let mut replaced = false;
+            let mut e = 0;
+            while e < group.len() {
+                let earlier = group.at(e);
+                e = e + 1;
+                if ref_eq(earlier, v) || !dom::value_dominates(d, earlier, v) { continue; }
+                replaced = true;
+                // A trapping op's own instruction survives dead-code elimination even
+                // with no uses left, so a value already fully replaced in an earlier
+                // round is still here to be found again -- rediscovering it is not new
+                // work. Reporting `changed` only when there was a use left to replace is
+                // what makes this pass idempotent once nothing is actually being
+                // rewritten any more; without it, the pipeline never reaches a fixed
+                // point on a function with an unused-but-still-present duplicate of a
+                // trapping expression.
+                if v.uses > 0 {
+                    f.replace_all_uses(v, earlier);
+                    changed = true;
+                }
+                e = group.len();
+            }
+            if !replaced { group.push(v); }
+        }
+    }
+    if changed { f.recompute_uses(); }
+    changed
+}
+
+/// Whether two instances of this value computing the same thing may be merged. Structural
+/// equality on a reference operand is not shareable: it is a call, and a call is not.
+fn value_shareable(v: ir::Value) -> bool {
+    if !ir::op_shareable(v.op) { return false; }
+    if v.op == ir::OP_EQ || v.op == ir::OP_NE { return v.a != bytecode::KIND_REF; }
+    true
+}
+
+fn value_movable(v: ir::Value) -> bool {
+    value_shareable(v) && !ir::may_trap_on_values(v.op)
+}
+
+/// Describes what an instruction computes, for grouping. It answers `""` for anything
+/// whose identity is not determined by its operation and operands.
+fn value_key(v: ir::Value) -> String {
+    let mut key = "\(ir::op_name(v.op))/\(v.a)/\(v.b)";
+    let mut i = 0;
+    while i < v.args.len() {
+        key = "\(key)/\(v.args.at(i).id)";
+        i = i + 1;
+    }
+    key
+}
+
+// --- Loop-invariant code motion ---------------------------------------------------------
+
+/// Hoists computations that do not change across a loop's iterations into the block
+/// before it.
+///
+/// Two conditions are load-bearing. The value may not trap: hoisting `a / b` out of a loop
+/// that never executes turns a program that ran fine into one that traps on a zero
+/// divisor, which is a different program at `-O2` than at `-O0`. And the loop needs a
+/// preheader -- a single entry from outside -- so a hoisted value runs exactly once before
+/// the loop rather than on some paths and not others.
+pub fn loop_invariant_code_motion(f: ir::Func, prog: bytecode::Program) -> bool {
+    let d = dom::compute(f);
+    let ls = dom::loops(f, d);
+    if ls.is_empty() { return false; }
+
+    let mut changed = false;
+    let mut li = 0;
+    while li < ls.len() {
+        let l = ls.at(li);
+        li = li + 1;
+        if l.preheader.is_none() { continue; }
+        let pre = l.preheader.expect("a preheader");
+        // Repeat until nothing more moves: hoisting one value can make another invariant,
+        // because its operand is now defined outside.
+        let mut again = true;
+        while again {
+            again = false;
+            let mut bi = 0;
+            while bi < f.blocks.len() {
+                let b = f.blocks.at(bi);
+                bi = bi + 1;
+                if !dom::in_loop(l, b) { continue; }
+                let kept = no_values();
+                let mut i = 0;
+                while i < b.instr.len() {
+                    let v = b.instr.at(i);
+                    i = i + 1;
+                    if invariant(v, l) {
+                        pre.instr.push(v);
+                        v.block = Option::Some(pre);
+                        again = true;
+                        changed = true;
+                        continue;
+                    }
+                    kept.push(v);
+                }
+                b.instr = kept;
+            }
+        }
+    }
+    if changed { f.recompute_uses(); }
+    changed
+}
+
+/// Whether a value can be computed once before the loop instead of on every iteration.
+fn invariant(v: ir::Value, l: dom::Loop) -> bool {
+    if !value_movable(v) { return false; }
+    if v.args.is_empty() {
+        // A constant inside a loop is invariant, but moving it buys nothing and churns
+        // the output of every snapshot; leave it where it is.
+        return false;
+    }
+    let mut i = 0;
+    while i < v.args.len() {
+        let a = v.args.at(i);
+        i = i + 1;
+        if a.block.is_none() { return false; }
+        if dom::in_loop(l, a.block.expect("a block")) {
+            return false; // defined inside the loop, so it may change each iteration
+        }
+    }
+    true
+}
+
+// --- Escape analysis ---------------------------------------------------------------------
+
+/// Removes heap allocations whose object never leaves the function.
+///
+/// ADR-0008 made every aggregate a heap object so that a moving collector never sees an
+/// interior pointer. This pass is what claws the cost back: an object that is built, read,
+/// and forgotten within one function does not need to exist at all, and each of its fields
+/// can be the SSA value that was stored into it.
+///
+/// The version here handles the case that is both common and unambiguous: an allocation
+/// whose only uses are field reads at constant indices. Anything else counts as an
+/// escape -- passing the object to a call, storing it into another object, returning it,
+/// comparing it, or writing a field after construction -- because proving those safe needs
+/// an alias analysis this phase does not have. `ref_eq` is a builtin call, so an object
+/// whose identity is observed escapes automatically.
+pub fn escape_analysis(f: ir::Func, prog: bytecode::Program) -> bool {
+    let mut changed = false;
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks.at(bi);
+        bi = bi + 1;
+        let mut i = 0;
+        while i < b.instr.len() {
+            let v = b.instr.at(i);
+            i = i + 1;
+            if !ir::allocates(v.op) || v.op == ir::OP_TO_STR || v.op == ir::OP_CLOSURE {
+                continue;
+            }
+            match non_escaping_reads(f, v) {
+                Option::None => {},
+                Option::Some(reads) => {
+                    // Every read becomes the value that was stored at construction.
+                    let mut ok = true;
+                    let mut r = 0;
+                    while r < reads.len() {
+                        let idx = reads.at(r).a;
+                        if idx < 0 || idx >= v.args.len() { ok = false; }
+                        r = r + 1;
+                    }
+                    if ok {
+                        let mut k = 0;
+                        while k < reads.len() {
+                            f.replace_all_uses(reads.at(k), v.args.at(reads.at(k).a));
+                            k = k + 1;
+                        }
+                        changed = true;
+                        // The allocation itself is now unused; dead-code elimination
+                        // removes it on the next pass rather than this one guessing about
+                        // its other uses.
+                    }
+                },
+            }
+        }
+    }
+    if changed { f.recompute_uses(); }
+    changed
+}
+
+/// The field reads of an allocation, or `None` when the object is used in any other way.
+fn non_escaping_reads(f: ir::Func, alloc: ir::Value) -> Option[List[ir::Value]] {
+    let reads = no_values();
+    let all = f.values();
+    let mut i = 0;
+    while i < all.len() {
+        let u = all.at(i);
+        i = i + 1;
+        if ref_eq(u, alloc) { continue; }
+        let mut a = 0;
+        while a < u.args.len() {
+            let arg = u.args.at(a);
+            a = a + 1;
+            if !ref_eq(arg, alloc) { continue; }
+            if u.op == ir::OP_GET_FIELD { reads.push(u); continue; }
+            return Option::None;
+        }
+    }
+    Option::Some(reads)
+}
+
+// --- Dead code -----------------------------------------------------------------------------
+
+/// Removes instructions whose value nothing uses.
+///
+/// What it may *not* remove is the interesting part. An operation that can trap on its
+/// operands stays even when its result is ignored, because ADR-0005 makes overflow a trap
+/// at every optimization level: deleting an unused `a + b` that overflows would make `-O1`
+/// print output that `-O0` never reaches. Anything with an effect stays for the obvious
+/// reason. Everything else -- including an unused allocation, which is what escape analysis
+/// exists to remove -- goes.
+pub fn dead_code_elimination(f: ir::Func, prog: bytecode::Program) -> bool {
+    let mut changed = false;
+    let mut again = true;
+    while again {
+        again = false;
+        f.recompute_uses();
+        let mut bi = 0;
+        while bi < f.blocks.len() {
+            let b = f.blocks.at(bi);
+            bi = bi + 1;
+            let phis = keep_live(b.phis);
+            if phis.len() != b.phis.len() {
+                b.phis = phis;
+                again = true;
+                changed = true;
+            }
+            let instr = keep_live(b.instr);
+            if instr.len() != b.instr.len() {
+                b.instr = instr;
+                again = true;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn keep_live(vals: List[ir::Value]) -> List[ir::Value] {
+    let kept = no_values();
+    let mut i = 0;
+    while i < vals.len() {
+        let v = vals.at(i);
+        i = i + 1;
+        if v.uses == 0 && ir::removable(v.op) { continue; }
+        kept.push(v);
+    }
+    kept
+}
+
+/// Drops blocks the entry cannot reach, which is what constant branch folding leaves
+/// behind.
+pub fn remove_unreachable_blocks(f: ir::Func, prog: bytecode::Program) -> bool {
+    f.drop_blocks(f.reachable())
+}
+
+// --- Inlining --------------------------------------------------------------------------
+
+/// The cost model: a callee is inlined when it is no larger than this, counted in IR
+/// instructions.
+///
+/// The number is deliberately small. Inlining pays for itself by exposing constants and
+/// removing call overhead, and stops paying when it multiplies code size -- and this
+/// compiler must eventually compile itself inside a sixty-second budget on two cores, so
+/// growth is a cost that lands on the project directly.
+const INLINE_BUDGET: i64 = 24;
+
+/// Bounds how much one function can grow, so that a chain of small callees cannot compound
+/// into something enormous.
+const MAX_INLINES_PER_FUNCTION: i64 = 8;
+
+/// The name the prelude's own file carries, which `inlined_span` needs to recognize.
+const PRELUDE_NAME: String = "<prelude>";
+
+/// One call site the inliner found: the call and the callee it names.
+struct Site {
+    pub call: ir::Value,
+    pub callee: ir::Func,
+}
+
+/// Replaces direct calls to small functions with their bodies.
+///
+/// Only a call whose callee is a named function is considered: a closure is called through
+/// a heap object whose target is not known statically, and devirtualizing that needs
+/// information the bytecode has thrown away. A function is never inlined into itself,
+/// which is what keeps recursion from expanding forever.
+pub fn inline_into(f: ir::Func, self_index: i64, funcs: List[Option[ir::Func]]) -> bool {
+    let mut changed = false;
+    let mut count = 0;
+    while count < MAX_INLINES_PER_FUNCTION {
+        count = count + 1;
+        match find_inline_site(f, self_index, funcs) {
+            Option::None => { count = MAX_INLINES_PER_FUNCTION; },
+            Option::Some(s) => {
+                inline_one(f, s.call, s.callee);
+                changed = true;
+            },
+        }
+    }
+    if changed { f.recompute_uses(); }
+    changed
+}
+
+/// The first call worth inlining.
+fn find_inline_site(
+    f: ir::Func, self_index: i64, funcs: List[Option[ir::Func]],
+) -> Option[Site] {
+    let mut bi = 0;
+    while bi < f.blocks.len() {
+        let b = f.blocks.at(bi);
+        bi = bi + 1;
+        let mut i = 0;
+        while i < b.instr.len() {
+            let v = b.instr.at(i);
+            i = i + 1;
+            if v.op != ir::OP_CALL || v.args.is_empty() { continue; }
+            let target = v.args.at(0);
+            if target.op != ir::OP_FUNC { continue; } // an indirect call: not known here
+            let idx = target.a;
+            if idx < 0 || idx >= funcs.len() || idx == self_index { continue; }
+            let entry = funcs.at(idx);
+            if entry.is_none() { continue; }
+            let callee = entry.expect("a built function");
+            if callee.captures > 0 { continue; }
+            if v.args.len() - 1 != callee.params { continue; } // arity: leave it to the call
+            if instruction_count(callee) > INLINE_BUDGET { continue; }
+            if has_inline_blocker(callee) { continue; }
+            return Option::Some(Site { call: v, callee: callee });
+        }
+    }
+    Option::None
+}
+
+fn instruction_count(f: ir::Func) -> i64 {
+    let mut n = 0;
+    let mut i = 0;
+    while i < f.blocks.len() {
+        let b = f.blocks.at(i);
+        n = n + b.phis.len() + b.instr.len() + 1;
+        i = i + 1;
+    }
+    n
+}
+
+/// Whether a callee contains something the splice cannot handle.
+fn has_inline_blocker(f: ir::Func) -> bool {
+    let all = f.values();
+    let mut i = 0;
+    while i < all.len() {
+        if all.at(i).op == ir::OP_CAPTURE { return true; }
+        i = i + 1;
+    }
+    false
+}
+
+/// A cloned `return`: which block it ended up in, and the terminator itself.
+struct ReturnSite {
+    pub block: ir::Block,
+    pub value: ir::Value,
+}
+
+/// Copies a callee's blocks and values into the caller.
+struct Cloner {
+    pub f: ir::Func,
+    pub call: ir::Value,
+    /// A parameter's position to the caller-side argument standing for it.
+    pub params: Map[i64, ir::Value],
+    /// A callee value's id to its caller-side clone.
+    pub values: Map[i64, ir::Value],
+    /// A callee block's id to its caller-side clone.
+    pub blocks: Map[i64, ir::Block],
+    pub returns: List[ReturnSite],
+}
+
+/// Splices a callee's body into the caller at one call site.
+///
+/// The caller's block is split at the call: what came before stays, what came after moves
+/// to a continuation block. The callee's blocks are cloned in, its parameters are replaced
+/// by the call's arguments, and each of its returns becomes a jump to the continuation.
+/// The call's value becomes a phi over the returned values.
+fn inline_one(f: ir::Func, call: ir::Value, callee: ir::Func) {
+    if call.block.is_none() { return; }
+    let site = call.block.expect("a call in a block");
+    let mut pos = 0 - 1;
+    let mut i = 0;
+    while i < site.instr.len() {
+        if ref_eq(site.instr.at(i), call) { pos = i; i = site.instr.len(); }
+        i = i + 1;
+    }
+    if pos < 0 { return; }
+
+    // The continuation takes everything after the call, and the site's terminator.
+    let cont = f.new_block();
+    cont.seal();
+    let after = no_values();
+    let mut k = pos + 1;
+    while k < site.instr.len() {
+        let v = site.instr.at(k);
+        after.push(v);
+        v.block = Option::Some(cont);
+        k = k + 1;
+    }
+    cont.instr = after;
+    let before = no_values();
+    let mut j = 0;
+    while j < pos {
+        before.push(site.instr.at(j));
+        j = j + 1;
+    }
+    site.instr = before;
+
+    // The continuation inherits the site's terminator and its outgoing edges. The
+    // successors' phi operands must stay where they are, so the predecessor is replaced in
+    // place rather than removed and re-added: a phi's operands are positional, and
+    // re-adding would shift every one after it onto the wrong edge.
+    let old_term = site.term;
+    let old_succs = no_blocks();
+    let mut s = 0;
+    while s < site.succs.len() {
+        old_succs.push(site.succs.at(s));
+        s = s + 1;
+    }
+    cont.term = old_term;
+    match old_term {
+        Option::Some(t) => { t.block = Option::Some(cont); },
+        Option::None => {},
+    }
+    cont.succs = old_succs;
+    let mut o = 0;
+    while o < old_succs.len() {
+        old_succs.at(o).replace_pred(site, cont);
+        o = o + 1;
+    }
+    site.succs = no_blocks();
+
+    // Clone the callee.
+    let c = Cloner {
+        f: f, call: call,
+        params: map::new[i64, ir::Value](),
+        values: map::new[i64, ir::Value](),
+        blocks: map::new[i64, ir::Block](),
+        returns: list::new[ReturnSite](),
+    };
+    let mut p = 1;
+    while p < call.args.len() {
+        c.params.insert(p - 1, call.args.at(p));
+        p = p + 1;
+    }
+    let entry = clone_blocks(c, callee);
+
+    // Control enters the callee, and each of its returns lands in the continuation.
+    f.set_terminator(site, f.new_value(ir::OP_JUMP, call.span, call.file, no_values()),
+        one_block(entry));
+
+    let result = f.new_value(ir::OP_PHI, call.span, call.file, no_values());
+    // The phi stands in for the call, so it holds what the call held -- including the
+    // static kind only the checker knew (ADR-0021).
+    result.kind = call.kind;
+    let mut r = 0;
+    while r < c.returns.len() {
+        let ret = c.returns.at(r);
+        r = r + 1;
+        let mut val = Option::None;
+        if !ret.value.args.is_empty() { val = Option::Some(ret.value.args.at(0)); }
+        let carried = match val {
+            Option::Some(x) => x,
+            Option::None => {
+                // A `return` that carries nothing still needs an operand, because a phi
+                // needs one per predecessor whether or not that predecessor can arrive.
+                // The backend must not read this one's kind as the phi's: see
+                // `internal/backend/kinds.go`, where letting it do so lost a root.
+                let u = f.new_value(ir::OP_UNIT, call.span, call.file, no_values());
+                u.block = Option::Some(ret.block);
+                ret.block.instr.push(u);
+                u
+            },
+        };
+        f.set_terminator(ret.block,
+            f.new_value(ir::OP_JUMP, call.span, call.file, no_values()), one_block(cont));
+        result.args.push(carried);
+    }
+
+    if result.args.len() == 1 {
+        f.replace_all_uses(call, result.args.at(0));
+    } else {
+        let phis = no_values();
+        phis.push(result);
+        let mut q = 0;
+        while q < cont.phis.len() {
+            phis.push(cont.phis.at(q));
+            q = q + 1;
+        }
+        cont.phis = phis;
+        result.block = Option::Some(cont);
+        f.replace_all_uses(call, result);
+    }
+    f.recompute_uses();
+}
+
+fn clone_blocks(c: Cloner, callee: ir::Func) -> ir::Block {
+    let mut i = 0;
+    while i < callee.blocks.len() {
+        let b = callee.blocks.at(i);
+        i = i + 1;
+        let nb = c.f.new_block();
+        nb.seal();
+        c.blocks.insert(b.id, nb);
+    }
+    // Values are created before edges, so a phi can refer to a value defined later.
+    let mut bi = 0;
+    while bi < callee.blocks.len() {
+        let b = callee.blocks.at(bi);
+        bi = bi + 1;
+        let nb = block_for(c, b);
+        let mut p = 0;
+        while p < b.phis.len() {
+            match clone_value(c, b.phis.at(p)) {
+                Option::Some(nv) => { nb.phis.push(nv); nv.block = Option::Some(nb); },
+                Option::None => {},
+            }
+            p = p + 1;
+        }
+        let mut k = 0;
+        while k < b.instr.len() {
+            match clone_value(c, b.instr.at(k)) {
+                Option::Some(nv) => { nb.instr.push(nv); nv.block = Option::Some(nb); },
+                Option::None => {},
+            }
+            k = k + 1;
+        }
+    }
+    // Now the operands and the edges.
+    let mut ci = 0;
+    while ci < callee.blocks.len() {
+        let b = callee.blocks.at(ci);
+        ci = ci + 1;
+        let nb = block_for(c, b);
+        let mut p = 0;
+        while p < nb.phis.len() { rewrite_args(c, nb.phis.at(p)); p = p + 1; }
+        let mut k = 0;
+        while k < nb.instr.len() { rewrite_args(c, nb.instr.at(k)); k = k + 1; }
+        if b.term.is_none() { continue; }
+        let t = b.term.expect("a terminator");
+        if t.op == ir::OP_RETURN {
+            let args = no_values();
+            let mut a = 0;
+            while a < t.args.len() {
+                args.push(map_value(c, t.args.at(a)));
+                a = a + 1;
+            }
+            let nt = c.f.new_value(ir::OP_RETURN, c.call.span, c.call.file, args);
+            nb.term = Option::Some(nt);
+            nt.block = Option::Some(nb);
+            c.returns.push(ReturnSite { block: nb, value: nt });
+        } else if t.op == ir::OP_JUMP {
+            c.f.set_terminator(nb,
+                c.f.new_value(ir::OP_JUMP, c.call.span, c.call.file, no_values()),
+                one_block(block_for(c, b.succs.at(0))));
+        } else if t.op == ir::OP_BRANCH {
+            let succs = no_blocks();
+            succs.push(block_for(c, b.succs.at(0)));
+            succs.push(block_for(c, b.succs.at(1)));
+            c.f.set_terminator(nb,
+                c.f.new_value(ir::OP_BRANCH, c.call.span, c.call.file,
+                    one_value(map_value(c, t.args.at(0)))),
+                succs);
+        }
+    }
+
+    // A phi's operands are positional: operand i is the value arriving from `preds[i]`.
+    // The phis above were cloned with their operands in the *callee's* pred order, but the
+    // edges were just created by walking the callee's blocks and appending to each
+    // successor's preds -- which is a different order whenever a block's predecessors do
+    // not happen to appear in that same sequence.
+    //
+    // So the pred lists are rebuilt from the originals, in the originals' order. The two
+    // lists hold the same edges either way, which is why nothing that only counts them
+    // ever noticed: a merge block whose two arms arrived the other way round silently
+    // swapped its two values.
+    let mut ri = 0;
+    while ri < callee.blocks.len() {
+        let b = callee.blocks.at(ri);
+        ri = ri + 1;
+        let nb = block_for(c, b);
+        let preds = no_blocks();
+        let mut p = 0;
+        while p < b.preds.len() {
+            preds.push(block_for(c, b.preds.at(p)));
+            p = p + 1;
+        }
+        nb.preds = preds;
+    }
+    block_for(c, callee.entry)
+}
+
+fn block_for(c: Cloner, b: ir::Block) -> ir::Block {
+    c.blocks.get(b.id).expect("this is a compiler bug: a callee block was never cloned")
+}
+
+/// Which line a cloned instruction reports if it traps.
+///
+/// The callee's own, because that is the line the trap is on and inlining is not allowed to
+/// change what a program prints: identical output at every level. Stamping the call site
+/// onto every cloned instruction moves a `divide by zero` inside a small helper onto the
+/// line that called the helper as soon as `-O2` inlines it, which is an optimization the
+/// program can see.
+///
+/// A span in the prelude is the exception, and not a special case so much as the same rule:
+/// an operation the prelude performs on the caller's behalf already reports the caller's
+/// line when it is *not* inlined, because both other engines walk out of the prelude to
+/// find one. Keeping the prelude's own span here would make `-O2` the level that names
+/// `<prelude>` in a message about the user's program.
+fn use_callee_span(callee_file: String, callee: ast::Span) -> bool {
+    callee.end > callee.start && callee_file != "" && callee_file != PRELUDE_NAME
+}
+
+/// Copies one value, or answers `None` for a parameter, which is replaced by the call's
+/// argument rather than cloned.
+fn clone_value(c: Cloner, v: ir::Value) -> Option[ir::Value] {
+    if v.op == ir::OP_PARAM {
+        match c.params.get(v.b) {
+            Option::Some(arg) => {
+                c.values.insert(v.id, arg);
+                return Option::None;
+            },
+            Option::None => {},
+        }
+    }
+    let mut span = c.call.span;
+    let mut file = c.call.file;
+    if use_callee_span(v.file, v.span) { span = v.span; file = v.file; }
+    // The clone starts out pointing at the callee's values; `rewrite_args` then maps each
+    // to its caller-side counterpart. Starting from an empty list instead loses every
+    // operand, which shows up as an instruction with no inputs rather than as a crash.
+    let args = no_values();
+    let mut i = 0;
+    while i < v.args.len() {
+        args.push(v.args.at(i));
+        i = i + 1;
+    }
+    let nv = c.f.new_value(v.op, span, file, no_values());
+    nv.args = args;
+    nv.a = v.a;
+    nv.b = v.b;
+    nv.kind = v.kind;
+    nv.operand_kind = v.operand_kind;
+    c.values.insert(v.id, nv);
+    Option::Some(nv)
+}
+
+fn rewrite_args(c: Cloner, v: ir::Value) {
+    let mut i = 0;
+    while i < v.args.len() {
+        v.args.set(i, map_value(c, v.args.at(i)));
+        i = i + 1;
+    }
+}
+
+/// The caller-side value standing for a callee-side one.
+fn map_value(c: Cloner, v: ir::Value) -> ir::Value {
+    match c.values.get(v.id) {
+        Option::Some(nv) => nv,
+        Option::None => v,
+    }
+}
+
+// --- The pipeline ------------------------------------------------------------------------
+
+/// Iterates the pipeline to a fixed point.
+fn run_passes(f: ir::Func, prog: bytecode::Program, level: i64) -> String {
+    let passes = pipeline();
+    let mut round = 0;
+    while round < MAX_ROUNDS {
+        round = round + 1;
+        let mut changed = false;
+        let mut i = 0;
+        while i < passes.len() {
+            let p = passes.at(i);
+            i = i + 1;
+            if p.min_level > level { continue; }
+            if (p.run)(f, prog) { changed = true; }
+            // A pass that leaves a phi disagreeing with its block's predecessors has
+            // miscompiled the program, and the symptom is a wrong *value* rather than a
+            // crash -- so it is checked here, after every pass, rather than left to
+            // whichever engine reads the result.
+            let bad = ir::check_phis(f);
+            if bad != "" {
+                return "this is a compiler bug: the \(p.name) pass \(bad)";
+            }
+        }
+        f.recompute_uses();
+        if !changed { return ""; }
+    }
+    "this is a compiler bug: the pipeline did not reach a fixed point in \(MAX_ROUNDS) rounds"
+}
+
+/// Builds every function into SSA and runs the pipeline over all of them.
+///
+/// Every function is built first because inlining needs the callee's IR while the caller is
+/// being rewritten. This is the one place the pipeline is defined, so that a dump and a run
+/// cannot disagree about what the optimizer did.
+pub fn optimize_all(prog: bytecode::Program, level: i64) -> Optimized {
+    let funcs = list::new[Option[ir::Func]]();
+    let mut i = 0;
+    while i < prog.fns.len() {
+        let fn_i = prog.fns.at(i);
+        i = i + 1;
+        if fn_i.code.is_empty() {
+            funcs.push(Option::None);
+            continue;
+        }
+        let b = irbuild::build(fn_i);
+        if b.error != "" {
+            return Optimized { funcs: funcs, error: "building \(fn_i.name): \(b.error)" };
+        }
+        funcs.push(Option::Some(b.f));
+    }
+
+    let mut k = 0;
+    while k < funcs.len() {
+        let entry = funcs.at(k);
+        let idx = k;
+        k = k + 1;
+        if entry.is_none() { continue; }
+        let f = entry.expect("a built function");
+        let e1 = run_passes(f, prog, level);
+        if e1 != "" { return Optimized { funcs: funcs, error: "optimizing \(f.name): \(e1)" }; }
+        if level >= O2 && inline_into(f, idx, funcs) {
+            // Inlining exposes constants across the call boundary, so the local passes run
+            // again on the enlarged function.
+            let e2 = run_passes(f, prog, level);
+            if e2 != "" {
+                return Optimized { funcs: funcs, error: "optimizing \(f.name) after inlining: \(e2)" };
+            }
+        }
+    }
+    Optimized { funcs: funcs, error: "" }
+}
+
+/// Every function's IR, or the first thing that went wrong building it.
+pub struct Optimized {
+    pub funcs: List[Option[ir::Func]],
+    pub error: String,
+}
+
+/// The IR of every function, optimized at `level`.
+///
+/// `-O0` is not this function's business: it holds every function's SSA at once, which
+/// `-O1` and `-O2` genuinely need -- inlining reads a callee's IR while the caller is
+/// being rewritten -- and which `-O0` does not. A caller that only wants the unoptimized
+/// IR builds and prints one function at a time, and stage1's own source is large enough
+/// that the difference is the difference between running and running out of memory.
+pub fn dump(prog: bytecode::Program, level: i64) -> Optimized {
+    optimize_all(prog, level)
+}

@@ -22,7 +22,15 @@ import (
 // a bug that only appears once a collection actually moves objects is otherwise reachable
 // only by allocating tens of megabytes, which no test in a five-minute suite can afford.
 // Nothing else ever assigns it.
-var heapSize int32 = 64 << 20
+//
+// 128 rather than the 64 it was through Phase 8, because the largest Origin program in
+// existence outgrew it: stage1 running its own optimizer over its own source holds every
+// function's SSA at once -- which is not a leak but what inlining needs, since it reads a
+// callee's IR while rewriting the caller -- and that is a live set a 64 MiB semispace
+// cannot hold. The collector is single-space and non-generational (ADR-0022), so the live
+// set has to fit in one semispace with room to allocate; 128 is the smallest power of two
+// that does, and the number will move again when stage1 grows a native backend.
+var heapSize int32 = 128 << 20
 
 const (
 	// rtBumpOff and rtEndOff are the runtime block's fields, addressed through r15.

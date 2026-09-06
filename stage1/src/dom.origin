@@ -1,0 +1,251 @@
+// The dominator tree and the natural loops built from it.
+//
+// A translation of `internal/ir/dom.go`. Block A dominates block B when every path from
+// the entry to B passes through A. Common-subexpression elimination needs it -- a value
+// may only be replaced by one that is guaranteed to have been computed already -- and so
+// does loop-invariant code motion, which needs to know which blocks a loop contains.
+
+use std::list;
+use std::map;
+
+use ir;
+
+/// A function's dominator tree.
+pub struct Dominators {
+    /// A block's immediate dominator, by block id. The entry has none, so it is absent
+    /// rather than mapped to anything: `Option` is what "no immediate dominator" is, and
+    /// the walks below stop on it.
+    pub mut idom: Map[i64, ir::Block],
+    /// The reverse-postorder numbering the algorithm walks in, and the blocks in it.
+    pub mut rpo: List[ir::Block],
+    pub mut order: Map[i64, i64],
+}
+
+/// One frame of the postorder walk: a block and how many of its successors have been
+/// entered.
+struct Frame {
+    pub block: ir::Block,
+    pub mut next: i64,
+}
+
+/// Builds the dominator tree with the iterative algorithm of Cooper, Harvey and Kennedy
+/// ("A Simple, Fast Dominance Algorithm"). It is chosen over Lengauer-Tarjan for the
+/// usual reason: on graphs this size it is as fast in practice and it fits on a page,
+/// which matters for something the whole optimizer trusts.
+pub fn compute(f: ir::Func) -> Dominators {
+    let d = Dominators {
+        idom: map::new[i64, ir::Block](),
+        rpo: list::new[ir::Block](),
+        order: map::new[i64, i64](),
+    };
+
+    // Postorder, iteratively rather than by recursion: the Go original recurses, and a
+    // chain of blocks as long as a compiled function's is not a depth to spend a stack
+    // on. The frame's `next` is exactly the loop variable the recursion would have had,
+    // so the order it produces is the same one.
+    let post = list::new[ir::Block]();
+    let seen = map::new[i64, bool]();
+    let stack = list::new[Frame]();
+    seen.insert(f.entry.id, true);
+    stack.push(Frame { block: f.entry, next: 0 });
+    while !stack.is_empty() {
+        let top = stack.at(stack.len() - 1);
+        if top.next < top.block.succs.len() {
+            let s = top.block.succs.at(top.next);
+            top.next = top.next + 1;
+            if !seen.contains(s.id) {
+                seen.insert(s.id, true);
+                stack.push(Frame { block: s, next: 0 });
+            }
+        } else {
+            stack.pop();
+            post.push(top.block);
+        }
+    }
+
+    let mut i = post.len() - 1;
+    while i >= 0 {
+        d.rpo.push(post.at(i));
+        i = i - 1;
+    }
+    let mut n = 0;
+    while n < d.rpo.len() {
+        d.order.insert(d.rpo.at(n).id, n);
+        n = n + 1;
+    }
+
+    // The entry is its own dominator for the duration of the fixed point, which is what
+    // stops `intersect`'s walk; it is taken back out at the end.
+    d.idom.insert(f.entry.id, f.entry);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut bi = 1;
+        while bi < d.rpo.len() {
+            let b = d.rpo.at(bi);
+            let mut new_idom = Option::None;
+            let mut pi = 0;
+            while pi < b.preds.len() {
+                let p = b.preds.at(pi);
+                pi = pi + 1;
+                if !d.idom.contains(p.id) { continue; }
+                match new_idom {
+                    Option::None => { new_idom = Option::Some(p); },
+                    Option::Some(cur) => { new_idom = Option::Some(intersect(d, p, cur)); },
+                }
+            }
+            match new_idom {
+                Option::Some(nd) => {
+                    let differs = match d.idom.get(b.id) {
+                        Option::Some(old) => old.id != nd.id,
+                        Option::None => true,
+                    };
+                    if differs {
+                        d.idom.insert(b.id, nd);
+                        changed = true;
+                    }
+                },
+                Option::None => {},
+            }
+            bi = bi + 1;
+        }
+    }
+    d.idom.remove(f.entry.id);
+    d
+}
+
+fn intersect(d: Dominators, first: ir::Block, second: ir::Block) -> ir::Block {
+    let mut a = first;
+    let mut b = second;
+    while a.id != b.id {
+        while order_of(d, a) > order_of(d, b) {
+            match d.idom.get(a.id) {
+                Option::Some(next) => { a = next; },
+                Option::None => { return b; },
+            }
+        }
+        while order_of(d, b) > order_of(d, a) {
+            match d.idom.get(b.id) {
+                Option::Some(next) => { b = next; },
+                Option::None => { return a; },
+            }
+        }
+    }
+    a
+}
+
+fn order_of(d: Dominators, b: ir::Block) -> i64 {
+    match d.order.get(b.id) {
+        Option::Some(n) => n,
+        Option::None => 0,
+    }
+}
+
+/// Whether `a` dominates `b`. A block dominates itself.
+pub fn dominates(d: Dominators, a: ir::Block, b: ir::Block) -> bool {
+    let mut cur = Option::Some(b);
+    while true {
+        match cur {
+            Option::Some(c) => {
+                if c.id == a.id { return true; }
+                cur = d.idom.get(c.id);
+            },
+            Option::None => { return false; },
+        }
+    }
+    false
+}
+
+/// Whether the definition of `a` is guaranteed to have run before the definition of `b`.
+/// Within one block, position decides; across blocks, dominance does.
+pub fn value_dominates(d: Dominators, a: ir::Value, b: ir::Value) -> bool {
+    if a.block.is_none() || b.block.is_none() { return false; }
+    let ab = a.block.expect("a value in a block");
+    let bb = b.block.expect("a value in a block");
+    if ab.id != bb.id { return dominates(d, ab, bb); }
+    // A phi is defined on entry to its block, so it precedes every instruction there.
+    if a.op == ir::OP_PHI {
+        if b.op != ir::OP_PHI { return true; }
+        return index_of(ab.phis, a) < index_of(ab.phis, b);
+    }
+    if b.op == ir::OP_PHI { return false; }
+    index_of(ab.instr, a) < index_of(ab.instr, b)
+}
+
+fn index_of(vals: List[ir::Value], v: ir::Value) -> i64 {
+    let mut i = 0;
+    while i < vals.len() {
+        if vals.at(i).id == v.id { return i; }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// A natural loop: a header block and the blocks that can reach its back edge without
+/// leaving the loop.
+pub struct Loop {
+    pub header: ir::Block,
+    /// The loop's blocks, by id.
+    pub mut blocks: Map[i64, ir::Block],
+    /// A block that dominates the header and is not in the loop, if there is exactly one
+    /// such predecessor. Hoisting needs somewhere to hoist to.
+    pub mut preheader: Option[ir::Block],
+}
+
+/// Whether a block is in the loop.
+pub fn in_loop(l: Loop, b: ir::Block) -> bool { l.blocks.contains(b.id) }
+
+/// The natural loops of a function: one per back edge, where a back edge is an edge whose
+/// target dominates its source.
+pub fn loops(f: ir::Func, d: Dominators) -> List[Loop] {
+    let out = list::new[Loop]();
+    let mut i = 0;
+    while i < f.blocks.len() {
+        let b = f.blocks.at(i);
+        let mut s = 0;
+        while s < b.succs.len() {
+            let target = b.succs.at(s);
+            s = s + 1;
+            if !dominates(d, target, b) { continue; }
+            out.push(build_loop(target, b));
+        }
+        i = i + 1;
+    }
+    out
+}
+
+fn build_loop(header: ir::Block, latch: ir::Block) -> Loop {
+    let l = Loop {
+        header: header,
+        blocks: map::new[i64, ir::Block](),
+        preheader: Option::None,
+    };
+    l.blocks.insert(header.id, header);
+    let stack = list::new[ir::Block]();
+    stack.push(latch);
+    while !stack.is_empty() {
+        let b = stack.at(stack.len() - 1);
+        stack.pop();
+        if l.blocks.contains(b.id) { continue; }
+        l.blocks.insert(b.id, b);
+        let mut p = 0;
+        while p < b.preds.len() {
+            stack.push(b.preds.at(p));
+            p = p + 1;
+        }
+    }
+
+    // The preheader is the loop's single entry from outside. Without one, there is
+    // nowhere a hoisted value would be guaranteed to run exactly once.
+    let outside = list::new[ir::Block]();
+    let mut i = 0;
+    while i < header.preds.len() {
+        let p = header.preds.at(i);
+        if !l.blocks.contains(p.id) { outside.push(p); }
+        i = i + 1;
+    }
+    if outside.len() == 1 && outside.at(0).succs.len() == 1 {
+        l.preheader = Option::Some(outside.at(0));
+    }
+    l
+}

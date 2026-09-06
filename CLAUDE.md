@@ -79,7 +79,8 @@ stage1/src/           from Phase 9: the compiler for Origin, written in Origin -
                       lex.origin, ast.origin, parse.origin, source.origin,
                       resolve.origin, types.origin, check.origin, mono.origin,
                       layout.origin, bytecode.origin, compile.origin, ir.origin,
-                      irbuild.origin and main.origin (its own command line) so far
+                      irbuild.origin, dom.origin, arith.origin, opt.origin and
+                      main.origin (its own command line) so far
 bootstrap/            from Phase 9: the last known-good stage1 binary
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```
@@ -186,14 +187,14 @@ This project outlasts any single context window.
 ## Status
 
 **Phase 9 is in progress.** Its scope is **self-hosting**: a compiler for Origin, written
-in Origin. What exists in `stage1/src/` is everything through **SSA construction** --
+in Origin. What exists in `stage1/src/` is everything through **the optimizer** --
 `lex.origin`, `ast.origin`, `parse.origin`, `source.origin`, `resolve.origin`,
 `types.origin`, `check.origin`, `mono.origin`, `layout.origin`, `bytecode.origin`,
-`compile.origin`, `ir.origin`, `irbuild.origin` -- and `main.origin`, which makes stage1 an
-actual command-line program (`stage1
-dump-tokens|dump-ast|parse|resolve|check|mono|dump-bytecode|dump-ir <file>...`, plus
-`--package <root>` for a whole package) shaped like `cmd/originc`'s. That is about 19,700
-lines of Origin, and every component is held to the Go one it replaces over this
+`compile.origin`, `ir.origin`, `irbuild.origin`, `dom.origin`, `arith.origin`,
+`opt.origin` -- and `main.origin`, which makes stage1 an actual command-line program
+(`stage1 dump-tokens|dump-ast|parse|resolve|check|mono|dump-bytecode|dump-ir [-O0|-O1|-O2]
+<file>...`, plus `--package <root>` for a whole package) shaped like `cmd/originc`'s. That
+is about 21,700 lines of Origin, and every component is held to the Go one it replaces over this
 repository's own ~400 `.origin` files, all in `tests/selfhost`: the token stream against
 `internal/lex`, the dumped syntax tree against `internal/ast`, the position mapping against
 `internal/source`, the *places* syntax errors are reported against `internal/lex` +
@@ -202,13 +203,13 @@ lines), inference against `internal/check` (399 packages, 1,647,768 trace lines)
 instantiation set against `internal/mono`, the bytecode against `internal/compile`, and the
 SSA against `internal/ir`.
 
-**stage1 compiles its own source to bytecode, byte for byte.** `stage1/src` as one package,
-with the prelude, gives **91,609 lines of bytecode identical to the Go compiler's** —
-every instruction, every operand, the constant pool and its order, every exact object
-layout (ADR-0019) and the static kind each instruction carries (ADR-0021) — and **86,986
-lines of SSA**, which is that bytecode built into the form the optimizer and the native
-backend work on. Both bytecode and SSA run on the virtual machine today; what stands
-between them and a self-hosted compiler is the optimizer and the native backend.
+**stage1 compiles and optimizes its own source, byte for byte.** `stage1/src` as one
+package, with the prelude, gives bytecode identical to the Go compiler's — every
+instruction, every operand, the constant pool and its order, every exact object layout
+(ADR-0019) and the static kind each instruction carries (ADR-0021) — and then **95,132
+lines of SSA at `-O0`, 80,816 at `-O1` and 102,586 at `-O2`, every one of them identical**.
+That is the whole compiler except the machine code: what stands between stage1 and a
+self-hosted binary is `internal/x86`, `internal/obj` and `internal/backend`.
 
 The language grew what a compiler cannot be written without: **the command line and the
 exit status** (`docs/spec/17-process.md`) — `args()` in the prelude over `env::arg_count`
@@ -237,10 +238,13 @@ which is where stage1 keeps what `internal/check` keeps in a map keyed by `ast.N
 rule `ast.origin` states — a slot arrives when a reader does — is why they landed in the
 same commit as the reader.
 
-**Next action: `internal/opt` (1,338 lines), then `internal/x86` (722), `internal/obj`
-(1,135) and `internal/backend` (7,064)**, with `arith`, `dwarf` and `codesign` (1,087
-between them) pulled in as their consumers need them — roughly 11,000 lines of Go still to
-translate. The lost root is fixed (below); nothing in the project is known-wrong.
+**Next action: `internal/ir/emit.go` (378 lines), then `internal/x86` (722),
+`internal/obj` (1,135) and `internal/backend` (7,064)**, with `dwarf` and `codesign` (782
+between them) pulled in as their consumers need them — roughly 10,000 lines of Go still to
+translate. `emit.go` comes first and is small: the optimizer works on SSA and the virtual
+machine runs bytecode, so turning optimized SSA back into bytecode is what makes a
+stage1-optimized program *runnable* without touching machine code at all. Nothing in the
+project is known-wrong.
 
 **The alternative worth weighing first**: a stage1 that ends at bytecode is already a
 compiler, if something runs the bytecode. Writing the *virtual machine* in Origin
@@ -274,6 +278,23 @@ every bug came from *running Origin*, not from reading Go.
   the first of a duplicated name wins. The degenerate input is the most valuable file in
   the corpus, and a fourth case of the same thing — `checkBodies` visiting an impl's methods
   in map order — was found the same way.
+- **The optimizer's first full run found one bug, and it was in the new code.** Folding
+  `-x` as `0.0 - x` answers `+0.0` for `-0.0`, and the two are different constants with
+  different bits, so stage1's CSE merged a `-0.0` into a `+0.0` that the Go compiler kept
+  apart. Negation flips the sign bit; subtraction from zero does not. Three corpus files
+  caught it and stage1's own twenty thousand lines caught none — which is the argument for
+  keeping the corpus row in the `-O2` differential even though the self-source row is the
+  more demanding one. **Breadth and depth catch different bugs.**
+- **stage1 optimizing itself outgrew the heap, and that was not a leak.** `-O1` and `-O2`
+  hold every function's SSA at once, because inlining reads a callee's IR while rewriting
+  its caller — so the live set is the whole program in SSA form, and a 64 MiB semispace
+  could not hold it (ADR-0022: single-space, non-generational, the live set must fit).
+  `heapSize` is 128 MiB now, with the reason written beside it. The same run also exposed
+  that `-O0` had no business going through that path at all: `report_ir` had started
+  building every function before printing any, where the Go compiler builds and prints one
+  at a time. Restoring the streaming form is what got `-O0` running again, and the general
+  shape is worth keeping: *a level that needs nothing should not pay for what another level
+  needs.*
 - **stage1 found a lost root, and finding it was a lesson about tools.** The φ that
   stands in for an inlined call took its kind from its first operand, and after inlining
   that operand can be a *placeholder* rather than a value: `internal/opt`'s inliner gives

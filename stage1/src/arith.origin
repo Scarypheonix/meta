@@ -1,0 +1,258 @@
+// Integer arithmetic at a declared width: one definition of what `+`, `/`,
+// `wrapping_add` and the rest mean for each of Origin's eight integer types.
+//
+// A translation of `internal/arith`, and it exists here for the reason it exists there
+// (process rule 5): the constant folder is only allowed to fold because folding is
+// unobservable, and a folder with its own arithmetic is a second definition of what
+// `255u8 + 1` means. `internal/arith`'s own doc records what happened the last time
+// there were two -- `-O1` folded that to 256 while `-O0` trapped.
+//
+// # Representation
+//
+// A value is a `u64` bit pattern, and its kind says how to read it. A signed value is
+// two's complement **sign-extended** to sixty-four bits; an unsigned one is
+// **zero-extended**. That is an invariant, not a convention: a value of an integer type
+// is always representable in that type, because an operation that would leave one that
+// is not traps instead. Every function here preserves it, and `wrap` is how an operation
+// that deliberately does not trap re-establishes it.
+//
+// Carrying `u64` rather than `i64` is what lets `u64` hold values above `i64::MAX` at
+// all: they are ordinary bit patterns here, and only the interpretation differs. Every
+// arithmetic step below is a `wrapping_` one for the same reason the Go original casts
+// through `uint64` -- an intermediate that overflows is the *question*, not an error, and
+// Origin's own `+` would trap before the answer could be read.
+
+use bytecode;
+
+/// The trap messages, spelled once. `docs/spec/04-expressions.md`'s trap table is the
+/// source, and every engine prints these bytes exactly.
+pub const OVERFLOW: String = "arithmetic overflow";
+pub const DIV_ZERO: String = "divide by zero";
+pub const REM_ZERO: String = "remainder by zero";
+pub const SHIFT_WIDE: String = "shift amount out of range";
+
+/// A result and the trap it would have caused, which is `""` when there is none.
+pub struct Answer {
+    pub value: u64,
+    pub trap: String,
+}
+
+fn ok(v: u64) -> Answer { Answer { value: v, trap: "" } }
+fn trapped(msg: String) -> Answer { Answer { value: 0u64, trap: msg } }
+
+/// The all-ones word. Written as a constant because `0u64 - 1u64` traps.
+pub const U64_MAX: u64 = 18446744073709551615u64;
+
+/// `1 << w` for `w` in 0..63, and 0 for 64 -- which is what a mask wants at full width.
+fn bit(w: i64) -> u64 {
+    if w >= 64 { return 0u64; }
+    1u64 << (w as u64)
+}
+
+/// The low `w` bits set.
+fn low_mask(w: i64) -> u64 {
+    if w >= 64 { return U64_MAX; }
+    bit(w) - 1u64
+}
+
+/// Re-reads `v` as a value of kind `k`: discards the bits above `k`'s width and extends
+/// what is left back to sixty-four bits, signed or unsigned as `k` says.
+///
+/// This is two's-complement wraparound, which is what `wrapping_add` means and what `as`
+/// does to a narrowing cast. Applying it to a value already in range leaves it unchanged,
+/// which is why it is safe to apply everywhere the invariant might be in doubt.
+pub fn wrap(k: i64, v: u64) -> u64 {
+    let w = bytecode::kind_bits(k);
+    if w == 64 { return v; }
+    let mask = low_mask(w);
+    let mut r = v & mask;
+    if bytecode::kind_is_signed(k) && (r & bit(w - 1)) != 0u64 {
+        r = r | (mask ^ U64_MAX);
+    }
+    r
+}
+
+/// Whether the exact value `v` -- read as a signed or unsigned 64-bit number according to
+/// `k` -- is representable in `k`.
+pub fn fits(k: i64, v: u64) -> bool { wrap(k, v) == v }
+
+/// The largest value of kind `k`, as its own bit pattern.
+pub fn max_of(k: i64) -> u64 {
+    let w = bytecode::kind_bits(k);
+    if bytecode::kind_is_signed(k) { return bit(w - 1) - 1u64; }
+    if w == 64 { return U64_MAX; }
+    bit(w) - 1u64
+}
+
+/// The smallest value of kind `k`: sign-extended for a signed kind, and zero for every
+/// unsigned one.
+pub fn min_of(k: i64) -> u64 {
+    if !bytecode::kind_is_signed(k) { return 0u64; }
+    wrap(k, bit(bytecode::kind_bits(k) - 1))
+}
+
+/// Compares two values of kind `k`, signed or unsigned as `k` says.
+pub fn less(k: i64, a: u64, b: u64) -> bool {
+    if bytecode::kind_is_signed(k) { return (a as i64) < (b as i64); }
+    a < b
+}
+
+fn nonneg(v: u64) -> bool { (v as i64) >= 0 }
+
+/// `add`, `sub` and `mul` answer the result and the trap message.
+///
+/// The arithmetic is done at full width and the *result* is checked against `k`, which is
+/// correct for every width because the operands are in range by the invariant: two values
+/// of a type narrower than 64 bits cannot make a 64-bit computation itself overflow.
+pub fn add(k: i64, a: u64, b: u64) -> Answer {
+    let s = a.wrapping_add(b);
+    if bytecode::kind_bits(k) == 64 {
+        if bytecode::kind_is_signed(k) {
+            if nonneg(a) == nonneg(b) && nonneg(s) != nonneg(a) { return trapped(OVERFLOW); }
+            return ok(s);
+        }
+        if s < a { return trapped(OVERFLOW); } // an unsigned carry out of the top bit
+        return ok(s);
+    }
+    if !fits(k, s) { return trapped(OVERFLOW); }
+    ok(s)
+}
+
+pub fn sub(k: i64, a: u64, b: u64) -> Answer {
+    let d = a.wrapping_sub(b);
+    if bytecode::kind_bits(k) == 64 {
+        if bytecode::kind_is_signed(k) {
+            if nonneg(a) != nonneg(b) && nonneg(d) != nonneg(a) { return trapped(OVERFLOW); }
+            return ok(d);
+        }
+        if b > a { return trapped(OVERFLOW); }
+        return ok(d);
+    }
+    if !fits(k, d) { return trapped(OVERFLOW); }
+    ok(d)
+}
+
+pub fn mul(k: i64, a: u64, b: u64) -> Answer {
+    if bytecode::kind_bits(k) == 64 {
+        if bytecode::kind_is_signed(k) {
+            let x = a as i64;
+            let y = b as i64;
+            let p = x.wrapping_mul(y);
+            if x != 0 && (p / x != y || (x == -1 && y == I64_MIN) || (y == -1 && x == I64_MIN)) {
+                return trapped(OVERFLOW);
+            }
+            return ok(p as u64);
+        }
+        if mul_hi(a, b) != 0u64 { return trapped(OVERFLOW); }
+        return ok(a.wrapping_mul(b));
+    }
+    // Narrower than the machine word, so the full product is exact in 64 bits and the
+    // only question is whether it fits in `k`.
+    let mut p = a.wrapping_mul(b);
+    if bytecode::kind_is_signed(k) { p = ((a as i64).wrapping_mul(b as i64)) as u64; }
+    if !fits(k, p) { return trapped(OVERFLOW); }
+    ok(p)
+}
+
+const I64_MIN: i64 = i64::MIN;
+
+/// The high sixty-four bits of the unsigned product `a * b`, by the schoolbook method on
+/// thirty-two-bit halves. It stands in for Go's `bits.Mul64`, which the machine has an
+/// instruction for and Origin has no way to name.
+fn mul_hi(a: u64, b: u64) -> u64 {
+    let lo_mask = 4294967295u64;
+    let a0 = a & lo_mask;
+    let a1 = a >> 32u64;
+    let b0 = b & lo_mask;
+    let b1 = b >> 32u64;
+
+    let p00 = a0.wrapping_mul(b0);
+    let p01 = a0.wrapping_mul(b1);
+    let p10 = a1.wrapping_mul(b0);
+    let p11 = a1.wrapping_mul(b1);
+
+    // The middle column, carried in a wider accumulator: (p00 >> 32) + low(p01) + low(p10)
+    // cannot overflow sixty-four bits, since each term is below 2^32 except the first.
+    let mid = (p00 >> 32u64)
+        .wrapping_add(p01 & lo_mask)
+        .wrapping_add(p10 & lo_mask);
+    p11.wrapping_add(p01 >> 32u64)
+        .wrapping_add(p10 >> 32u64)
+        .wrapping_add(mid >> 32u64)
+}
+
+/// `div` and `rem` truncate toward zero, so `a == (a/b)*b + (a%b)` holds whenever neither
+/// side traps. Division by zero traps, and so does the one signed division whose result is
+/// not representable: `MIN / -1`, at every width.
+pub fn div(k: i64, a: u64, b: u64) -> Answer {
+    if b == 0u64 { return trapped(DIV_ZERO); }
+    if !bytecode::kind_is_signed(k) { return ok(a / b); }
+    let x = a as i64;
+    let y = b as i64;
+    if (x as u64) == min_of(k) && y == -1 { return trapped(OVERFLOW); }
+    ok((x / y) as u64)
+}
+
+pub fn rem(k: i64, a: u64, b: u64) -> Answer {
+    if b == 0u64 { return trapped(REM_ZERO); }
+    if !bytecode::kind_is_signed(k) { return ok(a % b); }
+    let x = a as i64;
+    let y = b as i64;
+    if (x as u64) == min_of(k) && y == -1 { return trapped(OVERFLOW); }
+    ok((x % y) as u64)
+}
+
+/// Traps on the one operand whose negation is not representable, which is `k`'s minimum.
+/// It is *rejected* on an unsigned type long before it reaches here.
+pub fn neg(k: i64, a: u64) -> Answer {
+    if a == min_of(k) { return trapped(OVERFLOW); }
+    ok((0.wrapping_sub(a as i64)) as u64)
+}
+
+/// `shl` traps on an amount at or past `k`'s width, and on a result that does not fit in
+/// `k`. `shr` traps only on the amount: it can never overflow.
+///
+/// `>>` is arithmetic on a signed type and logical on an unsigned one, which is the same
+/// distinction `less` makes and the reason the kind has to be here at all.
+pub fn shl(k: i64, a: u64, amount: u64) -> Answer {
+    let w = bytecode::kind_bits(k);
+    if amount >= (w as u64) { return trapped(SHIFT_WIDE); }
+    let s = shl_raw(a, amount);
+    if w < 64 {
+        if !fits(k, s) { return trapped(OVERFLOW); }
+        return ok(s);
+    }
+    // At full width, the shift overflowed exactly when shifting back does not recover the
+    // operand -- which is the definition, and which works for both signednesses.
+    if bytecode::kind_is_signed(k) {
+        if ((s as i64) >> (amount as i64)) != (a as i64) { return trapped(OVERFLOW); }
+    } else {
+        if (s >> amount) != a { return trapped(OVERFLOW); }
+    }
+    ok(s)
+}
+
+pub fn shr(k: i64, a: u64, amount: u64) -> Answer {
+    let w = bytecode::kind_bits(k);
+    if amount >= (w as u64) { return trapped(SHIFT_WIDE); }
+    if bytecode::kind_is_signed(k) {
+        return ok(((a as i64) >> (amount as i64)) as u64);
+    }
+    ok(a >> amount)
+}
+
+/// `<<` on a `u64` traps in Origin when it loses bits (ADR-0005), and losing bits is
+/// exactly what the caller is asking about, so the shift is done on the two halves
+/// separately and reassembled -- neither of which can lose anything.
+fn shl_raw(a: u64, amount: u64) -> u64 {
+    if amount == 0u64 { return a; }
+    let keep = 64u64 - amount;
+    let kept = a & low_mask(keep as i64);
+    kept << amount
+}
+
+/// `and`, `or` and `xor` cannot overflow: every bit pattern they can produce is one the
+/// operands already had, so a value in range stays in range.
+pub fn and_of(k: i64, a: u64, b: u64) -> u64 { a & b }
+pub fn or_of(k: i64, a: u64, b: u64) -> u64 { a | b }
+pub fn xor_of(k: i64, a: u64, b: u64) -> u64 { a ^ b }

@@ -21,6 +21,7 @@ use check;
 use mono;
 use compile;
 use irbuild;
+use opt;
 
 const USAGE: String = "usage: stage1 <command> <file>...
 
@@ -38,7 +39,9 @@ commands:
   dump-bytecode compile each file after the first the same way and print the
                 bytecode, in `originc dump-bytecode`'s own format
   dump-ir       compile each file after the first the same way and print the SSA
-                the bytecode builds, in `originc dump-ir -O0`'s own format
+                the bytecode builds, in `originc dump-ir`'s own format. -O0
+                (the default) prints what the builder produced; -O1 and -O2 run
+                the optimizer over it first
 
 `resolve`, `check`, `mono`, `dump-bytecode` and `dump-ir` also take
 
@@ -61,7 +64,21 @@ struct Problem {
 }
 
 fn main() {
-    let argv = args();
+    let raw = args();
+    // `-O0`, `-O1` and `-O2` may appear anywhere, exactly as `originc dump-ir -O2 <file>`
+    // takes them, and only `dump-ir` reads the answer: it is the level the optimizer runs
+    // at, and every other command produces the same artefact at all three.
+    let mut level = opt::O0;
+    let argv = list::new[String]();
+    let mut ai = 0;
+    while ai < raw.len() {
+        let a = raw.at(ai);
+        ai = ai + 1;
+        if a == "-O0" { level = opt::O0; continue; }
+        if a == "-O1" { level = opt::O1; continue; }
+        if a == "-O2" { level = opt::O2; continue; }
+        argv.push(a);
+    }
     if argv.len() < 3 {
         io::println(USAGE);
         process::exit(2);
@@ -80,7 +97,7 @@ fn main() {
     // can be monomorphized before it is checked, and nothing can be lowered before that.
     if command == "resolve" || command == "check" || command == "mono"
         || command == "dump-bytecode" || command == "dump-ir" {
-        if !run_package(argv, command) {
+        if !run_package(argv, command, level) {
             process::exit(1);
         }
         return;
@@ -114,7 +131,7 @@ const PRELUDE_NAME: String = "<prelude>";
 /// `originc check <file>` compiles in and the shape the differential compares: two files
 /// that both declare `main` are not a package. The prelude is parsed once and shared,
 /// since resolution does not write into the tree.
-fn run_package(argv: List[String], command: String) -> bool {
+fn run_package(argv: List[String], command: String, level: i64) -> bool {
     let typed = typed_command(command);
     if argv.len() < 4 {
         io::println("stage1: this command takes the prelude and at least one file");
@@ -126,7 +143,7 @@ fn run_package(argv: List[String], command: String) -> bool {
             io::println("stage1: `--package` takes a source root and at least one file");
             return false;
         }
-        return run_one_package(argv, command, prelude_path);
+        return run_one_package(argv, command, prelude_path, level);
     }
     let mut prelude_tree = ast::File { uses: list::new[ast::Use](), items: list::new[ast::Item]() };
     match read_to_string(prelude_path) {
@@ -208,7 +225,7 @@ fn run_package(argv: List[String], command: String) -> bool {
                                         cunits.push(compile::Unit { file: path, tree: tree });
                                         if !report_lowered(
                                                 compile::program(resolved, checked, mo, cunits),
-                                                command) {
+                                                command, level) {
                                             ok = false;
                                         }
                                     }
@@ -232,7 +249,7 @@ fn run_package(argv: List[String], command: String) -> bool {
 // the module tree). The root is passed rather than discovered because listing a directory
 // is Phase 10 (docs/deferred.md); the caller already knows every file it wants.
 
-fn run_one_package(argv: List[String], command: String, prelude_path: String) -> bool {
+fn run_one_package(argv: List[String], command: String, prelude_path: String, level: i64) -> bool {
     let root = argv.at(4);
     let mut prelude_tree = ast::File { uses: list::new[ast::Use](), items: list::new[ast::Item]() };
     match read_to_string(prelude_path) {
@@ -330,7 +347,7 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String) ->
         cunits.push(compile::Unit { file: paths.at(b), tree: trees.at(b) });
         b = b + 1;
     }
-    report_lowered(compile::program(resolved, checked, mo, cunits), command)
+    report_lowered(compile::program(resolved, checked, mo, cunits), command, level)
 }
 
 fn typed_command(command: String) -> bool {
@@ -517,7 +534,7 @@ fn report_mono(out: mono::Result, with_trace: bool) -> bool {
 /// Prints the artefact a lowering command asks for -- the disassembled bytecode, or the
 /// SSA that bytecode builds -- in `originc`'s own format, so that the two compilers'
 /// output is comparable directly rather than through a trace invented for the purpose.
-fn report_lowered(out: compile::Lowered, command: String) -> bool {
+fn report_lowered(out: compile::Lowered, command: String, level: i64) -> bool {
     if !out.errors.is_empty() {
         let mut e = 0;
         while e < out.errors.len() {
@@ -533,7 +550,7 @@ fn report_lowered(out: compile::Lowered, command: String) -> bool {
         return true;
     }
     if command == "dump-ir" {
-        return report_ir(out.prog);
+        return report_ir(out.prog, level);
     }
     let parts = out.prog.disassemble();
     let mut i = 0;
@@ -546,23 +563,28 @@ fn report_lowered(out: compile::Lowered, command: String) -> bool {
 
 /// Prints every function's SSA, which is what `originc dump-ir -O0` prints: the IR the
 /// bytecode builds, before any optimizer has touched it.
-fn report_ir(prog: bytecode::Program) -> bool {
+fn report_ir(prog: bytecode::Program, level: i64) -> bool {
+    if level == opt::O0 {
+        return report_unoptimized_ir(prog);
+    }
+    let built = opt::dump(prog, level);
+    if built.error != "" {
+        io::println("stage1: \(built.error)");
+        return false;
+    }
     let mut i = 0;
-    while i < prog.fns.len() {
-        let f = prog.fns.at(i);
-        if !f.code.is_empty() {
-            let built = irbuild::build(f);
-            if built.error != "" {
-                io::println("stage1: building \(f.name): \(built.error)");
-                return false;
-            }
-            let parts = built.f.print(prog);
-            let mut k = 0;
-            while k < parts.len() {
-                io::print(parts.at(k));
-                k = k + 1;
-            }
-            io::print("\n");
+    while i < built.funcs.len() {
+        match built.funcs.at(i) {
+            Option::Some(f) => {
+                let parts = f.print(prog);
+                let mut k = 0;
+                while k < parts.len() {
+                    io::print(parts.at(k));
+                    k = k + 1;
+                }
+                io::print("\n");
+            },
+            Option::None => {},
         }
         i = i + 1;
     }
@@ -675,4 +697,33 @@ fn sort_problems(ps: List[Problem]) {
         }
         i = i + 1;
     }
+}
+
+/// `-O0`: build each function's SSA, print it, and let it go.
+///
+/// One at a time rather than all of them, which is what `opt::dump` does and has to do:
+/// the optimizer's own pipeline reads a callee's IR while rewriting its caller. Holding
+/// every function of a program the size of this compiler is worth a hundred megabytes of
+/// heap, and at `-O0` nothing needs it.
+fn report_unoptimized_ir(prog: bytecode::Program) -> bool {
+    let mut i = 0;
+    while i < prog.fns.len() {
+        let f = prog.fns.at(i);
+        if !f.code.is_empty() {
+            let built = irbuild::build(f);
+            if built.error != "" {
+                io::println("stage1: building \(f.name): \(built.error)");
+                return false;
+            }
+            let parts = built.f.print(prog);
+            let mut k = 0;
+            while k < parts.len() {
+                io::print(parts.at(k));
+                k = k + 1;
+            }
+            io::print("\n");
+        }
+        i = i + 1;
+    }
+    true
 }

@@ -293,11 +293,16 @@ func goProgramOf(t *testing.T, preludeSrc, srcRoot string, units []driver.Unit) 
 }
 
 // TestStage1BuildsItsOwnSSA is the same artefact oracle one pass further on: the SSA the
-// bytecode builds, which `originc dump-ir -O0` prints.
+// bytecode builds, which `originc dump-ir` prints.
 //
-// -O0 is the level that runs no optimizer at all, so what this compares is the builder --
-// Braun et al.'s on-demand construction, the stack-depth analysis every phi placement rests
-// on, and the value numbering that makes two runs comparable in the first place.
+// Two dimensions, and they are not the same one. `level` is how *stage1 itself* was
+// compiled; `dump` is the level stage1 is asked to optimize its input at. At dump -O0 what
+// this compares is the builder -- Braun et al.'s on-demand construction, the stack-depth
+// analysis every phi placement rests on, and the value numbering that makes two runs
+// comparable at all. At -O1 and -O2 it compares the optimizer on top of that: folding,
+// copy propagation, common subexpressions, loop-invariant code motion, escape analysis,
+// dead code, unreachable blocks, and -- at -O2 -- inlining, over the largest Origin
+// program that exists.
 func TestStage1BuildsItsOwnSSA(t *testing.T) {
 	root := testutil.RepoRoot(t)
 	const srcRoot = "stage1/src"
@@ -311,12 +316,17 @@ func TestStage1BuildsItsOwnSSA(t *testing.T) {
 		name   string
 		engine driver.Engine
 		level  opt.Level
+		// dump is the level stage1 is asked to optimize at, which is independent of the
+		// level stage1 itself was built at.
+		dump opt.Level
 		// skip names the phase and the reason, so a case that cannot run does not pass
 		// silently (process rule 8).
 		skip string
 	}{
-		{"native-O2", driver.Native, opt.O2, ""},
-		{"native-O0", driver.Native, opt.O0, ""},
+		{"native-O2", driver.Native, opt.O2, opt.O0, ""},
+		{"native-O2/dump-O1", driver.Native, opt.O2, opt.O1, ""},
+		{"native-O2/dump-O2", driver.Native, opt.O2, opt.O2, ""},
+		{"native-O0", driver.Native, opt.O0, opt.O0, ""},
 	}
 	for _, e := range engines {
 		t.Run(e.name, func(t *testing.T) {
@@ -337,6 +347,9 @@ func TestStage1BuildsItsOwnSSA(t *testing.T) {
 				t.Fatal(err)
 			}
 			args := []string{"dump-ir", preludePath, "--package", srcRoot}
+			if e.dump != opt.O0 {
+				args = []string{"dump-ir", levelFlag(e.dump), preludePath, "--package", srcRoot}
+			}
 			for _, u := range units {
 				args = append(args, u.File.Name)
 			}
@@ -348,7 +361,7 @@ func TestStage1BuildsItsOwnSSA(t *testing.T) {
 			}
 			got := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
 
-			want := goSSAPackage(t, string(pdata), srcRoot, units)
+			want := goSSAPackage(t, string(pdata), srcRoot, units, e.dump)
 			if len(got) != len(want) {
 				t.Errorf("stage1 printed %d lines, the Go compiler %d", len(got), len(want))
 			}
@@ -371,12 +384,12 @@ func TestStage1BuildsItsOwnSSA(t *testing.T) {
 	}
 }
 
-// goSSAPackage renders the Go compiler's -O0 SSA for one package, in stage1's own output
-// format.
-func goSSAPackage(t *testing.T, preludeSrc, srcRoot string, units []driver.Unit) []string {
+// goSSAPackage renders the Go compiler's SSA for one package at one level, in stage1's own
+// output format.
+func goSSAPackage(t *testing.T, preludeSrc, srcRoot string, units []driver.Unit, level opt.Level) []string {
 	t.Helper()
 	code := goProgramOf(t, preludeSrc, srcRoot, units)
-	text, err := opt.DumpIR(code, opt.O0)
+	text, err := opt.DumpIR(code, level)
 	if err != nil {
 		t.Fatalf("the Go compiler could not build the SSA of %s: %v", srcRoot, err)
 	}
@@ -385,7 +398,12 @@ func goSSAPackage(t *testing.T, preludeSrc, srcRoot string, units []driver.Unit)
 }
 
 // TestStage1BuildsTheSameSSAAsTheGoCompiler is the corpus half of the SSA differential:
-// every file that compiles on its own, built to -O0 SSA by both compilers.
+// every file that compiles on its own, built to SSA by both compilers.
+//
+// The `dump-O2` row is where breadth pays. stage1's own source exercises the optimizer
+// hard, but it is one program with one set of habits; the first bug this differential
+// found -- folding `-0.0` by subtracting from zero, which answers `+0.0` -- showed up in
+// three corpus files and in none of stage1's own twenty thousand lines.
 func TestStage1BuildsTheSameSSAAsTheGoCompiler(t *testing.T) {
 	root := testutil.RepoRoot(t)
 	all := relativeCorpus(t)
@@ -399,11 +417,13 @@ func TestStage1BuildsTheSameSSAAsTheGoCompiler(t *testing.T) {
 		name   string
 		engine driver.Engine
 		level  opt.Level
+		dump   opt.Level
 		stride int
 	}{
-		{"native-O0", driver.Native, opt.O0, 1},
-		{"vm-O2", driver.VM, opt.O2, 24},
-		{"interpreter", driver.Interpreter, opt.O0, 40},
+		{"native-O0", driver.Native, opt.O0, opt.O0, 1},
+		{"native-O0/dump-O2", driver.Native, opt.O0, opt.O2, 1},
+		{"vm-O2", driver.VM, opt.O2, opt.O0, 24},
+		{"interpreter", driver.Interpreter, opt.O0, opt.O0, 40},
 	}
 	for _, e := range engines {
 		t.Run(e.name, func(t *testing.T) {
@@ -421,7 +441,11 @@ func TestStage1BuildsTheSameSSAAsTheGoCompiler(t *testing.T) {
 			}
 			defer func() { _ = os.Chdir(wd) }()
 
-			args := append([]string{"dump-ir", preludePath}, files...)
+			head := []string{"dump-ir", preludePath}
+			if e.dump != opt.O0 {
+				head = []string{"dump-ir", levelFlag(e.dump), preludePath}
+			}
+			args := append(head, files...)
 			var stdout, stderr bytes.Buffer
 			code := runStage1(t, stage1Root, e.engine, e.level, &stdout, &stderr, args...)
 			if stderr.Len() > 0 {
@@ -437,7 +461,7 @@ func TestStage1BuildsTheSameSSAAsTheGoCompiler(t *testing.T) {
 			preludeTree := parse.FileWith(source.NewFile(prelude.Name, string(pdata)), diag.New(), ids)
 			at, total, bad := 0, 0, 0
 			for _, path := range files {
-				want := goSSA(t, ids, preludeTree, path)
+				want := goSSA(t, ids, preludeTree, path, e.dump)
 				total += len(want)
 				for i, w := range want {
 					if at+i >= len(got) {
@@ -466,8 +490,9 @@ func TestStage1BuildsTheSameSSAAsTheGoCompiler(t *testing.T) {
 	}
 }
 
-// goSSA renders the Go compiler's -O0 SSA for one file, in stage1's own output format.
-func goSSA(t *testing.T, ids *ast.IDGen, preludeTree *ast.File, path string) []string {
+// goSSA renders the Go compiler's SSA for one file at one level, in stage1's own output
+// format.
+func goSSA(t *testing.T, ids *ast.IDGen, preludeTree *ast.File, path string, level opt.Level) []string {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -502,9 +527,21 @@ func goSSA(t *testing.T, ids *ast.IDGen, preludeTree *ast.File, path string) []s
 	if cerr != nil {
 		t.Fatalf("%s: the Go compiler could not lower a checked program: %v", path, cerr)
 	}
-	text, derr := opt.DumpIR(code, opt.O0)
+	text, derr := opt.DumpIR(code, level)
 	if derr != nil {
 		t.Fatalf("%s: the Go compiler could not build its SSA: %v", path, derr)
 	}
 	return append(out, strings.Split(strings.TrimSuffix(text, "\n"), "\n")...)
+}
+
+// levelFlag is how stage1's own command line spells an optimization level, which is how
+// originc spells it.
+func levelFlag(level opt.Level) string {
+	switch level {
+	case opt.O1:
+		return "-O1"
+	case opt.O2:
+		return "-O2"
+	}
+	return "-O0"
 }

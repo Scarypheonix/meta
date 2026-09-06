@@ -894,7 +894,7 @@ fn sort_strings(l: List[String]) {
     }
 }
 
-fn str_before(a: String, b: String) -> bool {
+pub fn str_before(a: String, b: String) -> bool {
     let mut i = 0;
     while i < a.len() && i < b.len() {
         if a.byte_at(i) != b.byte_at(i) {
