@@ -4,8 +4,8 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Phases 0 through 8 are complete** (see `docs/phases/`). **Phase 9 is in progress** — see
-Status, at the bottom of this file, for what exists and what is next.
+**Phases 0 through 9 are complete** (see `docs/phases/`). **The compiler compiles itself.**
+See Status, at the bottom of this file, for what exists and what is next.
 
 ---
 
@@ -75,14 +75,12 @@ docs/spec/            THE language specification — normative; §13 collections
 docs/adr/             architecture decision records — every irreversible choice
 docs/phases/          N-complete.md, written at each phase gate
 docs/deferred.md      everything deliberately left out, each tagged with a phase
-stage1/src/           from Phase 9: the compiler for Origin, written in Origin --
-                      lex.origin, ast.origin, parse.origin, source.origin,
-                      resolve.origin, types.origin, check.origin, mono.origin,
-                      layout.origin, bytecode.origin, compile.origin, ir.origin,
-                      irbuild.origin, dom.origin, arith.origin, opt.origin,
-                      emit.origin, x86.origin, obj.origin and main.origin (its
-                      own command line) so far
-bootstrap/            from Phase 9: the last known-good stage1 binary
+stage1/src/           the compiler for Origin, written in Origin: thirty-six modules,
+                      one per Go package under internal/, plus main.origin (its own
+                      command line). 34,000 lines, and the largest body of Origin
+                      there is
+bootstrap/            the last known-good stage1 binary, and what it builds from
+                      stage1/src -- the same bytes (process rule 9)
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```
 
@@ -187,230 +185,81 @@ This project outlasts any single context window.
 
 ## Status
 
-**Phase 9 is in progress.** Its scope is **self-hosting**: a compiler for Origin, written
-in Origin. What exists in `stage1/src/` is everything except the machine code --
-`lex.origin`, `ast.origin`, `parse.origin`, `source.origin`, `resolve.origin`,
-`types.origin`, `check.origin`, `mono.origin`, `layout.origin`, `bytecode.origin`,
-`compile.origin`, `ir.origin`, `irbuild.origin`, `dom.origin`, `arith.origin`,
-`opt.origin`, `emit.origin`, `x86.origin`, `obj.origin` -- and `main.origin`, which makes stage1 an actual
-command-line program (`stage1
-dump-tokens|dump-ast|parse|resolve|check|mono|dump-bytecode|dump-ir [-O0|-O1|-O2]
-<file>...`, plus `--package <root>` for a whole package) shaped like `cmd/originc`'s. That
-is about 23,600 lines of Origin, and every component is held to the Go one it replaces over this
-repository's own ~400 `.origin` files, all in `tests/selfhost`: the token stream against
-`internal/lex`, the dumped syntax tree against `internal/ast`, the position mapping against
-`internal/source`, the *places* syntax errors are reported against `internal/lex` +
-`internal/parse`, resolution against `internal/resolve` (397 packages, 744,896 trace
-lines), inference against `internal/check` (399 packages, 1,647,768 trace lines), the
-instantiation set against `internal/mono`, the bytecode against `internal/compile`, and the
-SSA against `internal/ir`.
+**Phase 9 is complete** (`docs/phases/9-complete.md`). **The compiler compiles itself**, and the
+result is a fixed point:
 
-**stage1 compiles, optimizes and re-emits its own source, byte for byte.** `stage1/src` as
-one package, with the prelude, gives bytecode identical to the Go compiler's — every
-instruction, every operand, the constant pool and its order, every exact object layout
-(ADR-0019) and the static kind each instruction carries (ADR-0021) — then **95,132 lines
-of SSA at `-O0`, 80,816 at `-O1` and 102,586 at `-O2`**, and then that SSA back to
-**113,793, 178,173 and 192,181 lines of bytecode**. Every one of them identical.
+```
+originc build -O1 stage1/src        -> 4,541,555 bytes
+that binary, over the same source   -> the same bytes
+and again                           -> the same bytes
+```
 
-That is the whole compiler except the machine code, and it is a *complete* compiler at the
-bytecode level: what stage1 emits at `-O2` is what the virtual machine runs. What stands
-between it and a self-hosted **binary** is `internal/backend` (7,064 lines) and the
-Mach-O half of `internal/obj`. `internal/x86` is done, held to **5,118 bytes of encoded
-instructions**, and `internal/obj`'s ELF writer is done, held to **four executables, byte
-for byte** — both on all four engines.
+`bootstrap/stage1-linux-amd64` is that binary. `stage1/src` is thirty-six modules and 34,000
+lines of Origin -- one module per Go package under `internal/` -- and it is the largest body of
+Origin there is. It also writes the signed Mach-O the target machine runs, identical to
+`originc build --target macos`'s.
 
-The language grew what a compiler cannot be written without: **the command line and the
-exit status** (`docs/spec/17-process.md`) — `args()` in the prelude over `env::arg_count`
-and `env::arg_at`, and `process::exit`, which ends the *process* and not the thread on all
-three engines. `bootstrap/` is still empty; nothing has self-compiled yet.
+**Every component is held to the Go one it replaces**, over this repository's own ~430 `.origin`
+files, in `tests/selfhost`: the token stream against `internal/lex`, the dumped tree against
+`internal/ast`, the position mapping against `internal/source`, the *places* syntax errors are
+reported against `internal/lex` + `internal/parse`, resolution against `internal/resolve` (397
+packages, 744,896 trace lines), inference against `internal/check` (399 packages, 1,647,768
+trace lines), the instantiation set against `internal/mono`, the bytecode against
+`internal/compile`, the SSA against `internal/ir` at all three levels, the re-emitted bytecode
+against `internal/opt`, 5,118 bytes of encoded instructions against `internal/x86`, eight
+executables in two formats against `internal/obj`, 137 digests against Go's `crypto/sha256` --
+and, above all of them, **the executable itself**.
 
-**The trace oracle is the one thing that had to be invented,** and it is what every
-remaining component should reuse: side tables keyed by node id cannot be compared against a
-tree with no node ids, so both compilers emit **one line per event, in order**, and the
-*sequence* is what is compared. A line's position identifies the node; what it says
-identifies what the node became, naming a declaration by the `<file>:<offset>` of its own
-name so that two things called `x` are the same only if they were written in the same
-place. `internal/resolve/trace.go`, `internal/check/trace.go` and `internal/mono/trace.go`
-are the Go sides. It stops being needed at the bytecode: a compiled program is not a side
-table, so from `dump-bytecode` on, the artefact itself is the oracle. Two of them differ from the first in a way worth knowing before writing
-another. The checker's entries are rendered at the **end** of the run, not when they are
-made, because a type recorded mid-body is usually an unsolved variable that later
-unification binds and end-of-body defaulting resolves — printing at record time compares the
-checker's intermediate state instead of its answer. The monomorphizer's names a copy by the
-**number** it was created at rather than by its name, because a name is not an identity: two
-declarations in different modules may share one, and what the trace has to pin is that two
-call sites reaching the same copy say the same thing.
+**The oracle above the front end needed no invention, and each one subsumes the last.** Two
+files that are byte-identical are the same program. `tests/selfhost`'s build differential
+compares four end-to-end programs in two formats at three levels; the whole 102-case corpus
+agrees by hand sweep. Below the bytecode the *trace oracle* is what had to be invented, and
+`docs/phases/9-complete.md` records how it works and the two ways the checker's and the
+monomorphizer's differ from the resolver's.
 
-The tree also grew the two slots monomorphization reads (`Expr.inst`, `Expr.iter_inst`),
-which is where stage1 keeps what `internal/check` keeps in a map keyed by `ast.NodeID`. The
-rule `ast.origin` states — a slot arrives when a reader does — is why they landed in the
-same commit as the reader.
+**The suite is at 265s of its 300s ceiling**, and this phase spent that budget twice over
+before learning the rule: when it crosses, look for the question being asked more than once.
+Engine agreement was being asked once per pass, in seven differentials, and is asked twice now
+-- at `check` and at `dump-ir -O2`, which between them sit downstream of every pass. The corpus
+differentials run natively only, at full breadth, against the Go compiler. Cutting *coverage*
+to fit the budget is the wrong move and was not made.
 
-**Next action: `internal/backend` (7,064 lines)** — the last big one, and the only piece
-between stage1 and a binary of its own. Everything under it is in place and independently
-checked: the encoder byte for byte, the executable writer byte for byte, the optimizer and
-the emitter line for line. After it, `internal/obj`'s Mach-O writer with `dwarf` and
-`codesign` (782 lines between them), which is what makes a stage1 build runnable on the
-target machine rather than only in the container. Nothing in the project is known-wrong.
+**Next action: Phase 10, whose scope is the user's to set** (rule 7). What this phase left
+behind, in the order it will be missed:
 
-The oracle for the backend is the strongest one yet and needs no invention: `originc build`
-writes an executable, stage1 will write one, and **two files that are byte-identical are
-the same program**. It subsumes every differential below it.
+- **stage1's `build` prints hex, not a file.** A `String` is UTF-8 by construction
+  (spec/14-strings.md) and an executable is not text, so there is nothing to hand
+  `fs::write_file`. The oracle is unaffected -- two programs that print the same bytes wrote the
+  same executable -- but a self-hosted toolchain that can run `originc build` end to end wants
+  binary output, which wants a byte-oriented file API §15 does not have.
+- **No directory listing**, so `--package` takes its files on the command line.
+- Everything else in `docs/deferred.md` still tagged for a later phase: `match` as a linear
+  chain of arm tests, a struct or enum declared inside a function body, no associated functions,
+  a function that both escapes and is called directly losing its fast path (ADR-0020),
+  single-space non-generational collection (ADR-0022), `frame variable` (ADR-0023), no parallel
+  threads, unreclaimed channel/mutex/thread memory, and `?`'s error conversion via `Into`.
 
-**The alternative worth weighing first**: a stage1 that ends at bytecode is already a
-compiler, if something runs the bytecode. Writing the *virtual machine* in Origin
-(`internal/vm`, plus what `internal/gc` it needs) reaches a self-hosted `run` sooner than
-the native backend does, and `bootstrap/` wants a binary rather than an interpreter. Which
-comes first is a real choice, not an oversight — the phase's exit criterion is a compiler
-that compiles itself, and the native backend is what makes that a *binary*.
+**Before touching anything, read `docs/phases/9-complete.md`.** The three things most likely to
+matter:
 
-**What Phase 9 has found so far** — the same tell as Phase 8, and worth expecting again:
-every bug came from *running Origin*, not from reading Go.
-
-- Writing `main.origin` needed a multi-line string, which exposed that both lexers ended a
-  string literal at a newline while `docs/spec/01-lexical.md` had always said a literal may
-  span lines. The Go lexer's own error note said so too, beside the condition contradicting
-  it.
-- Running stage1's parser over the corpus as a *program* exposed that its interpolation
-  sub-parser threw its diagnostics away, so every syntax error inside `\(...)` vanished.
-- **`ast.Dump` was not a complete description of the tree**, which is the premise the whole
-  parse differential rests on. It printed a generic parameter's name and never its bounds,
-  never a `where` clause, never supertraits, never an assoc-type's bounds, never an impl's
-  generics, never a trait reference's type arguments, never an integer literal's overflow
-  flag, never a struct literal's type arguments, never a lambda's return type — and stage1's
-  parser had duly thrown every one of them away. **When the oracle has a hole, the thing it
-  is checking inherits it.** Both sides now carry them.
-- **Three lookups in the Go checker depended on a Go map's iteration order** — the trait
-  named by a builtin impl, the trait named in a "no method" note, and the prelude's
-  definitions by name. Every one is a scan for a *name*, and every one is deterministic
-  right up until a name is declared twice, which the corpus does exactly once: the entry
-  where the prelude is checked with itself as the prelude. Five runs of that file gave
-  three different outputs. `internal/check` now keeps declarations in declaration order and
-  the first of a duplicated name wins. The degenerate input is the most valuable file in
-  the corpus, and a fourth case of the same thing — `checkBodies` visiting an impl's methods
-  in map order — was found the same way.
-- **Writing the encoder found a register-allocator bug four phases old.** Liveness counted
-  `OpParam` and `OpCapture` as *definitions* of the block they appear in. They are not: a
-  parameter arrives with the frame, before the entry block runs, and the value is a name
-  for something already there. That is wrong exactly when the entry block is also a loop
-  header — `fn align(c: List[i64], n: i64) { while c.len() < n { c.push(0); } }` builds
-  precisely that shape, because the condition is the first thing in the function — and the
-  dataflow then concludes both parameters are dead at the end of the loop body, since they
-  are "defined" in the successor. The allocator hands their registers to something in the
-  body and the next iteration compares against whatever that left behind.
-
-  Native code only, and only at `-O0` and `-O1`: at `-O2` inlining reshapes the function
-  and it comes out right by accident, which is why every existing differential passed
-  through it. The tell was the same one Phase 8 recorded — **it turned up the moment
-  something real was written in Origin**, not from reading the allocator. An encoder pads
-  to an alignment boundary, `align` is that shape, and nothing else in twenty thousand
-  lines of Origin had happened to write a loop whose condition is a function's first
-  statement.
-
-- **The optimizer's first full run found one bug, and it was in the new code.** Folding
-  `-x` as `0.0 - x` answers `+0.0` for `-0.0`, and the two are different constants with
-  different bits, so stage1's CSE merged a `-0.0` into a `+0.0` that the Go compiler kept
-  apart. Negation flips the sign bit; subtraction from zero does not. Three corpus files
-  caught it and stage1's own twenty thousand lines caught none — which is the argument for
-  keeping the corpus row in the `-O2` differential even though the self-source row is the
-  more demanding one. **Breadth and depth catch different bugs.**
-- **stage1 optimizing itself outgrew the heap, and that was not a leak.** `-O1` and `-O2`
-  hold every function's SSA at once, because inlining reads a callee's IR while rewriting
-  its caller — so the live set is the whole program in SSA form, and a 64 MiB semispace
-  could not hold it (ADR-0022: single-space, non-generational, the live set must fit).
-  `heapSize` is 128 MiB now, with the reason written beside it. The same run also exposed
-  that `-O0` had no business going through that path at all: `report_ir` had started
-  building every function before printing any, where the Go compiler builds and prints one
-  at a time. Restoring the streaming form is what got `-O0` running again, and the general
-  shape is worth keeping: *a level that needs nothing should not pay for what another level
-  needs.*
-- **stage1 found a lost root, and finding it was a lesson about tools.** The φ that
-  stands in for an inlined call took its kind from its first operand, and after inlining
-  that operand can be a *placeholder* rather than a value: `internal/opt`'s inliner gives
-  the φ one operand per cloned `return`, and a `return` that carries nothing — the arm of
-  the callee that diverges, `Option::expect`'s `panic` — gets a synthetic `OpUnit`,
-  because a φ needs an operand for every predecessor whether or not that predecessor can
-  arrive. `internal/backend/kinds.go` let that unit answer for the whole φ, so a `Block`
-  merged with it became `KindUnit`: raw to the stack map, spilled to a raw slot, never
-  updated when a collection moved the object, and read back afterwards as whatever the
-  vacated semispace happened to hold. Only at `-O2`, only through inlining, and only when
-  a collection landed while the φ was live — which is why the heap window was so narrow,
-  correct at 48 MiB, wrong at 64, correct at 80.
-
-  **Three days of reading the code got the characterization wrong twice; three tools got
-  it in twenty minutes.** They are all still in the tree, and the next miscompilation
-  should reach for them first rather than for the source:
-  - `debugCollectEvery` (`internal/backend/runtime.go`) forces a collection every N
-    allocations. A lost root is a coincidence between one collection and one moment;
-    collecting constantly removes the coincidence. It turned "stage1 on the whole corpus
-    at exactly 64 MiB" into "stage1 on one small file, in three seconds".
-  - `debugStaleRefs` (`internal/backend/array.go`) makes the array primitives check that
-    the reference they were handed is inside the semispace the program is allocating out
-    of. It turned `index out of range`, seven thousand lines into a dump, into `stale
-    reference (forwarded) in rt_array_push` — which says in one line that the object was
-    copied and one reference to it was not updated.
-  - `opt.DebugSkip` and `opt.DebugInlineLimit` bisect the optimizer. Skipping one pass at
-    a time said `inline`; a binary search on the limit said inline **1843**, and the trace
-    named it: `Option::expect` into `irbuild`'s `translate_block`.
-
-  `checkPhiKinds` now asserts at build time that a φ's operands agree about being a
-  reference, the unit placeholder aside, and the old rule fires it on stage1 immediately.
-  `checkRootsAreDescribed` (`internal/backend/regalloc.go`) had missed this because it
-  only rejects a value with *no* kind; a wrong but definite kind looked fine to it, which
-  is the general shape of what an assertion over a derived fact cannot see.
-  `internal/backend/collect_test.go`'s `TestACollectionSurvivesAnInlinedDivergingArm`
-  fails on the code it replaced, and every collector case now builds at all three levels —
-  the optimizer and the collector had never been tested against each other at all, which
-  is why a bug this loud lived through four phases.
-
-  The two smaller lessons: a sweep that printed `FAIL` without separating `index out of
-  range` from an honest `out of memory` produced a wrong bisection, so **a bisection is
-  only as good as its predicate**; and both wrong characterizations came from reasoning
-  about which pass *could* be at fault instead of asking the program.
-- **Two tuples of the same arity could not coexist in one compiled program.** A
-  descriptor's *name* is its identity in the layout registry, and a tuple's was its arity
-  alone, so `(i64, bool)` and `(bool, String)` were the same type: the second registration
-  lost, and every read through it interpreted the wrong words — a reference read as an
-  integer, or the reverse, which is a heap the collector corrupts silently. The Go
-  compiler's own closure descriptors had been fixed for exactly this in Phase 5, with a
-  comment explaining why; tuples were never given the same treatment. It survived because
-  nothing executed it: `tests/conformance` compiles a tuple case only as far as the
-  checker's verdict, `originc run` defaults to the interpreter, which never builds a
-  descriptor at all, and no end-to-end program happened to build two same-arity tuples of
-  different shapes. Running a second compiler over the whole corpus found it on the third
-  file. `tests/e2e/cases/tuples_of_one_arity_differ_by_shape.origin` is the case that
-  fails on the code it replaced.
-- **The self-hosting suite was 92% of the five-minute budget**, and almost none of it was
-  work that needed doing twice. `driver.RunAt` compiles from source on every call, so
-  running stage1 twenty times across the differentials compiled 13,500 lines of Origin
-  twenty times — parsing, resolution, checking, monomorphization, the bytecode compiler,
-  the optimizer and the whole native backend — for a program whose source had not changed
-  between calls. And the lexer differential ran all four hundred corpus files on *every*
-  engine with no stride, on the strength of a comment saying the lexer was the largest
-  Origin program in the project, which had stopped being true three components earlier;
-  that one subtest was a third of the suite. `tests/selfhost/stage1_test.go` now compiles
-  each package once per engine and level; the hosted engines take a stride there like
-  everywhere else. 265s to 146s, with the same coverage.
-- **stage1 treated a warning as an error.** `check.origin` filed W0001 in the same list as
-  the errors with nothing to tell them apart, so `stage1 check` rejected a program
-  `originc check` accepts and the passes after checking never ran. Invisible to the check
-  differential, which compares the diagnostic *lines* and not the exit status — it only
-  surfaced when monomorphization was wired in behind the same test and one corpus file
-  stopped producing a trace. A diagnostic now carries its severity, and the reporter counts
-  errors rather than diagnostics, which is what `diag.Bag.HasErrors` has always done.
-- **A lambda passed as a call argument had no type in `ExprTypes`.** `inferArgs` checks
-  lambdas last, on purpose (ADR-0010: unifying the ordinary arguments first is what gives
-  `m.with(|v| v.get())` a known receiver), and that path called `inferLambdaExpecting`
-  directly instead of `infer` — so it went around the one place that records. Harmless only
-  because nothing downstream asks a lambda node for its own type; `typeOf` was answering
-  `Error` for it.
-- A **collector-era bug four phases old**: `equal_objects` compared a String's trailing
-  partial word whole, assuming the bytes above the last meaningful one were zero. True until
-  the first collection; false forever after, because every allocation then comes out of a
-  semispace that has been used before. Two strings of the same text could compare unequal —
-  only in native code, only after a collection, only for a length not a multiple of eight,
-  and only between strings built separately. A `Map` keyed by `String` has all four at once,
-  and the resolver stopped finding `std::chan` after the 131st package.
+- **The three debugging tools, before reading any code about a miscompilation.**
+  `debugCollectEvery` (`internal/backend/runtime.go`) forces a collection every N allocations, so
+  a lost root stops being a coincidence between one collection and one moment. `debugStaleRefs`
+  (`internal/backend/array.go`) makes the array primitives check that a reference is inside the
+  live semispace. `opt.DebugSkip` and `opt.DebugInlineLimit` bisect the optimizer. Three days of
+  reading the code got Phase 9's lost root wrong twice; these got it in twenty minutes.
+- **A slot on the AST arrives when a reader does.** The tree grew five this phase (`Expr.inst`,
+  `Expr.iter_inst`, `FnDecl.span`, `Arm.span`, and `Stmt::Let`'s own), each in the same commit as
+  the code that reads it, because a field nothing reads is the failure mode Phase 8 kept finding.
+  Three of the five were span bugs the *executable* differential found and nothing below it
+  could: the bytecode dump prints an instruction's operands and not where it came from, and the
+  DWARF line table is the only artefact in the project that renders a span.
+- **Process rule 9 now has something to protect.** `bootstrap/` holds a binary;
+  `tests/selfhost` rebuilds it from source and compares, and runs it over its own source to
+  check the fixed point still holds. When a change to the Go compiler, to `stage1/src` or to the
+  prelude alters it, regenerate it deliberately -- the command is in `bootstrap/README.md` -- and
+  say in the commit what about the compiler changed, because the diff itself says nothing a
+  reader can use.
 
 **Phase 8 is complete** (`docs/phases/8-complete.md`). Two halves. The first closed the
 three places `docs/spec/` and the implementation had drifted apart since Phase 5:
@@ -478,23 +327,22 @@ own output — there is no linker to do it), and the lesson recorded there about
 structurally", which had concealed the fact that every Mach-O the project produced was
 unrunnable.
 
-**Known-broken / deferred**, all recorded in `docs/deferred.md` with a phase: `match`
-compiles to a linear chain of arm tests; `%` on floats works on the interpreter and the VM
-and fails to build natively (SSE has no remainder instruction — Phase 9); a struct or enum
-declared inside a function body fails loudly in `internal/compile` rather than being
-checked; there are no associated functions, so a constructor is a free function in a `std::`
-module (`list::new`, `sync::mutex`); a function used both as a direct callee and as an
-escaping value loses its direct-call fast path for every use (ADR-0020); native collection
-is single-space, non-generational, with no write barrier (ADR-0022); DWARF is a line table
-and a symbol table only, so `frame variable` does not work (ADR-0023); no engine runs
-threads in parallel; the native runtime never reclaims what it maps for a channel, a mutex
-or a finished thread's stack; `std::fs` has no directory listing, metadata, rename, delete
-or streaming, and there is no `Path` type (ADR-0030); and error conversion in `?` via `Into`
-needs a blanket-impl story (`map_err` now exists, so the explicit form is real).
+**Known-broken / deferred**, all recorded in `docs/deferred.md` with a phase, and nothing in
+the project is known-*wrong*: `match` compiles to a linear chain of arm tests; a struct or enum
+declared inside a function body fails loudly in `internal/compile` rather than being checked;
+there are no associated functions, so a constructor is a free function in a `std::` module
+(`list::new`, `sync::mutex`); a function used both as a direct callee and as an escaping value
+loses its direct-call fast path for every use (ADR-0020); native collection is single-space,
+non-generational, with no write barrier (ADR-0022); DWARF is a line table and a symbol table
+only, so `frame variable` does not work (ADR-0023); no engine runs threads in parallel; the
+native runtime never reclaims what it maps for a channel, a mutex or a finished thread's stack;
+`std::fs` has no directory listing, metadata, rename, delete or streaming, and there is no
+`Path` type (ADR-0030); and error conversion in `?` via `Into` needs a blanket-impl story
+(`map_err` now exists, so the explicit form is real).
 
-**On Phase 9's scope:** rule 7 put the choice with the user, and the project's own arc
-pointed at self-hosting — what every phase so far has been building toward and what
-`bootstrap/` is reserved for. That is what Phase 9 is doing; see the top of this section.
+**On Phase 9's scope:** rule 7 put the choice with the user, and the project's own arc pointed
+at self-hosting — what every phase so far had been building toward and what `bootstrap/` was
+reserved for. It is done; the top of this section says what that means.
 
 **A note on the history:** the VM's concurrency runtime landed inside commit `6b073de`,
 whose message describes only ADR-0027 — the bug the VM work uncovered. The commit is
