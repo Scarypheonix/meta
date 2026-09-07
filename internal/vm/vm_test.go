@@ -2,8 +2,10 @@ package vm_test
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/check"
@@ -295,5 +297,60 @@ fn main() {
 	}
 	if !strings.Contains(stderr, "out of memory") && !strings.Contains(stderr, "stack overflow") {
 		t.Errorf("expected an `out of memory` or `stack overflow` trap, got:\n%s", stderr)
+	}
+}
+
+// Slicing a large string costs no more per slice than slicing a small one.
+//
+// A `slice` implemented as "read the whole object, then take the range" costs the
+// *source's* length per call rather than the result's. That is invisible in any test whose
+// strings are short, and quadratic in the one program that matters: a lexer, which cuts one
+// token at a time out of a whole file. It made this VM eight times slower than the
+// tree-walking interpreter it exists to beat -- 48 seconds over the self-hosting corpus
+// where native code took 0.4 -- and the fix was to read only the range (gc.BytesRange).
+//
+// The assertion is a ratio rather than a deadline, because the claim is about complexity
+// and only a ratio can state it: both halves take the same number of slices of the same
+// width, so the only thing that differs is the length of the string they come out of. A
+// hundred and twenty-eight times the source for the same work should cost the same; the
+// code this replaced cost about fifty times more.
+func TestSlicingCostDoesNotFollowTheSourcesLength(t *testing.T) {
+	elapsed := func(doublings int) time.Duration {
+		src := fmt.Sprintf(`use std::io;
+fn main() {
+    let mut s = "0123456789abcdef";
+    let mut k = 0;
+    while k < %d { s = s.concat(s); k = k + 1; }
+    let mut total = 0;
+    let mut i = 0;
+    while i < 4096 {
+        let at = (i * 3) %% (s.len() - 8);
+        total = total + s.slice(at, at + 8).len();
+        i = i + 1;
+    }
+    io::println("\(total)");
+}
+`, doublings)
+		p := build(t, src)
+		var stdout, stderr bytes.Buffer
+		m := vm.New(p.prog, vm.Config{}, &stdout, &stderr)
+		start := time.Now()
+		if code := m.Run(); code != 0 {
+			t.Fatalf("exit %d\n%s", code, stderr.String())
+		}
+		took := time.Since(start)
+		if got := strings.TrimSpace(stdout.String()); got != "32768" {
+			t.Fatalf("sliced %s bytes, want 32768", got)
+		}
+		return took
+	}
+
+	small := elapsed(6)  // a 1 KiB source
+	large := elapsed(13) // a 128 KiB source: the same slices out of 128 times the string
+
+	if large > 8*small {
+		t.Errorf("4096 slices out of 128 KiB took %v, out of 1 KiB %v: %.1fx.\n"+
+			"The per-slice cost is following the source's length, which makes lexing quadratic.",
+			large, small, float64(large)/float64(small))
 	}
 }

@@ -21,9 +21,11 @@ import (
 // String is a Go string) and neither does native code (`rt_str_byte_at` is two loads), so
 // this is also what keeps the three engines the same shape of fast.
 //
-// `slice` and `concat` are O(n) by nature and use `Bytes`. Their arguments are in `temps`,
-// which callBuiltin keeps as a root set, so a collection during either one cannot leave the
-// operands dangling.
+// `slice` and `concat` are O(n) by nature and read their bytes out of the heap. `slice`
+// reads only the range it returns (`heap.BytesRange`), for the same reason: reading the
+// whole object to take a piece of it is quadratic in a lexer, which cuts one token at a
+// time out of a whole file. Their arguments are in `temps`, which callBuiltin keeps as a
+// root set, so a collection during either one cannot leave the operands dangling.
 
 func (v *VM) strBuiltin(index int, args []Value, span diag.Span) (Value, bool) {
 	span = v.userSpan(span)
@@ -45,7 +47,7 @@ func (v *VM) strBuiltin(index int, args []Value, span diag.Span) (Value, bool) {
 		}
 		v.mustBeBoundary(r, a, span)
 		v.mustBeBoundary(r, b, span)
-		return refVal(v.newString(v.heap.Bytes(r)[a:b], span)), true
+		return refVal(v.newString(v.heap.BytesRange(r, uint64(a), uint64(b)), span)), true
 
 	case compile.BuiltinStrConcat:
 		a := v.strRef(args[0], span)

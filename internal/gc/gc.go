@@ -369,13 +369,32 @@ func (h *Heap) AllocBytes(t layout.TypeID, s string) layout.Ref {
 }
 
 // Bytes reads back a ByteArray object.
-func (h *Heap) Bytes(r layout.Ref) string {
+func (h *Heap) Bytes(r layout.Ref) string { return h.BytesRange(r, 0, h.Get(r, 0)) }
+
+// BytesRange reads back bytes [lo, hi) of a ByteArray object without materializing the
+// rest of it.
+//
+// It exists because reading the whole object to take a piece of it is quadratic in the
+// caller that does it per piece: the virtual machine's `slice` copied a whole source file
+// for every token the lexer cut out of it, which made lexing a file O(tokens × bytes) and
+// left the bytecode VM eight times slower than the tree-walking interpreter it is supposed
+// to beat. The interpreter never had the problem (its String is a Go string, and a Go slice
+// is free) and neither does native code (`rt_str_slice_into` copies the result's own bytes
+// and no more) -- the same asymmetry internal/vm/strings.go's own head comment records for
+// `byte_at`, one call site later.
+//
+// A range outside the object is the caller's bug, not a case this resolves: the operations
+// above it bounds-check first, so this asserts rather than clamping.
+func (h *Heap) BytesRange(r layout.Ref, lo, hi uint64) string {
 	n := h.Get(r, 0)
-	out := make([]byte, n)
-	for i := uint64(0); i < n; i++ {
+	if lo > hi || hi > n {
+		panic("gc: byte range outside the object")
+	}
+	out := make([]byte, hi-lo)
+	for i := lo; i < hi; i++ {
 		w := 1 + i/8
 		shift := uint((i % 8) * 8)
-		out[i] = byte(h.Get(r, w) >> shift)
+		out[i-lo] = byte(h.Get(r, w) >> shift)
 	}
 	return string(out)
 }

@@ -412,3 +412,51 @@ func TestCollectionWithoutRootsPanics(t *testing.T) {
 	}()
 	h.MinorCollect()
 }
+
+// BytesRange reads exactly the bytes asked for, at every alignment.
+//
+// The word-shift decode is the part worth testing: a range that starts or ends inside a
+// word must not pick up its neighbours, and the last word of an object holds bytes above
+// the length that mean nothing at all (the allocator writes only what it was given, and
+// after the first collection the space it bump-allocates from has been used before).
+func TestBytesRangeReadsExactlyItsRange(t *testing.T) {
+	h, _, _, bytes := testHeap(t, DefaultConfig())
+	var roots rootSet
+	h.SetRoots(roots.visitor())
+
+	const text = "the quick brown fox jumps over the lazy dog"
+	r := h.AllocBytes(bytes, text)
+	if r == layout.Nil {
+		t.Fatal("allocation failed on an empty heap")
+	}
+	if got := h.Bytes(r); got != text {
+		t.Fatalf("Bytes read back %q", got)
+	}
+	for lo := 0; lo <= len(text); lo++ {
+		for hi := lo; hi <= len(text); hi++ {
+			if got := h.BytesRange(r, uint64(lo), uint64(hi)); got != text[lo:hi] {
+				t.Fatalf("BytesRange(%d, %d) = %q, want %q", lo, hi, got, text[lo:hi])
+			}
+		}
+	}
+}
+
+// A range outside the object stops rather than returning bytes that are not part of the
+// value. Every caller bounds-checks first, so reaching this is a bug upstream.
+func TestBytesRangeRefusesToReadPastTheLength(t *testing.T) {
+	h, _, _, bytes := testHeap(t, DefaultConfig())
+	var roots rootSet
+	h.SetRoots(roots.visitor())
+	r := h.AllocBytes(bytes, "abc")
+
+	for _, c := range []struct{ lo, hi uint64 }{{0, 4}, {2, 1}, {4, 4}} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("BytesRange(%d, %d) on a 3-byte object did not stop", c.lo, c.hi)
+				}
+			}()
+			h.BytesRange(r, c.lo, c.hi)
+		}()
+	}
+}

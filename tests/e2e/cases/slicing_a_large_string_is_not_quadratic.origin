@@ -1,0 +1,41 @@
+// Cutting many small pieces out of one large string.
+//
+// This is what a lexer does: the source is one String, and every token is a slice of it.
+// A `slice` implemented as "read the whole object, then take the range" costs the *source's*
+// length per call rather than the result's, so a file of n bytes yielding n/k tokens costs
+// n^2/k -- and the cost is invisible in any test whose strings are short.
+//
+// The virtual machine had exactly that, and it made the VM eight times slower than the
+// tree-walking interpreter it exists to beat: 48 seconds where native code took 0.4. The
+// interpreter never had it (its String is a Go string, and a Go slice is free) and neither
+// does native code (`rt_str_slice_into` copies the result's own bytes and no more).
+//
+// This case is here for the *answer* -- three engines, three levels, the same 65,536 bytes
+// sliced out -- and for the cost pressure: 8,192 slices of eight bytes is 64 KiB of copying
+// when the cost follows the result, and a gigabyte of byte-at-a-time reads when it follows
+// the source, which is thirty-five times slower on the virtual machine. The complexity
+// itself is asserted where it can actually fail a test rather than merely slow one down:
+// `internal/vm`'s TestSlicingCostDoesNotFollowTheSourcesLength compares the per-slice cost
+// out of a 1 KiB string against the same slices out of a 128 KiB one.
+use std::io;
+
+fn main() {
+    // 128 KiB, built by doubling so that the construction itself is linear-ish.
+    let mut s = "0123456789abcdef";
+    let mut k = 0;
+    while k < 13 {
+        s = s.concat(s);
+        k = k + 1;
+    }
+    io::println("\(s.len())");
+
+    // Eight bytes at a time, from every part of it.
+    let mut total = 0;
+    let mut i = 0;
+    while i < 8192 {
+        let at = (i * 16) % (s.len() - 8);
+        total = total + s.slice(at, at + 8).len();
+        i = i + 1;
+    }
+    io::println("\(total)");
+}
