@@ -14,23 +14,23 @@ import (
 // beyond that it pushes. Origin code never calls them directly; lowering does.
 
 // heapSize is the size of each of the two semispaces the runtime asks mmap for at
-// start-up (ADR-0022): one is "current" (rtBumpOff/rtEndOff bound it) and the other is
-// where the next collection copies live objects into. Total mapped memory is therefore
-// 2*heapSize, trivial against the 8 GiB target machine.
+// start-up (ADR-0022): one is "current" and the other is where the next collection copies
+// live objects into. Total mapped memory is therefore 2*heapSize, trivial against the
+// 8 GiB target machine -- and mapped is not resident, since an anonymous mapping's pages
+// arrive only when they are touched.
 //
-// It is a variable only so that collect_test.go can shrink it around a single build:
-// a bug that only appears once a collection actually moves objects is otherwise reachable
-// only by allocating tens of megabytes, which no test in a five-minute suite can afford.
-// Nothing else ever assigns it.
+// 512 MiB rather than the 64 it was through Phase 8 or the 128 it was for most of Phase 9,
+// because the largest Origin program in existence keeps outgrowing it: stage1 compiling its
+// own source *to machine code* holds the bytecode, every function's SSA at once (which is
+// not a leak but what inlining needs, since it reads a callee's IR while rewriting the
+// caller) and the emitted image, all live together. 256 MiB is not enough for that and
+// 384 is; this is the next round number above it, because the program is still growing.
 //
-// 128 rather than the 64 it was through Phase 8, because the largest Origin program in
-// existence outgrew it: stage1 running its own optimizer over its own source holds every
-// function's SSA at once -- which is not a leak but what inlining needs, since it reads a
-// callee's IR while rewriting the caller -- and that is a live set a 64 MiB semispace
-// cannot hold. The collector is single-space and non-generational (ADR-0022), so the live
-// set has to fit in one semispace with room to allocate; 128 is the smallest power of two
-// that does, and the number will move again when stage1 grows a native backend.
-var heapSize int32 = 128 << 20
+// The collector is single-space and non-generational, so the live set has to fit in one
+// semispace with room to allocate. A larger semispace also means rarer collections, which
+// is why internal/backend/collect_test.go shrinks this around a build rather than relying
+// on a real program to reach one.
+var heapSize int32 = 512 << 20
 
 const (
 	// rtBumpOff and rtEndOff are the runtime block's fields, addressed through r15.

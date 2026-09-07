@@ -303,6 +303,21 @@ pub fn program(res: resolve::Resolved, tys: check::Checked, mo: mono::Result,
 }
 
 impl Compiler {
+    /// Compiles a constant's value expression, which was written in the module that declared
+    /// the constant rather than in the one using it.
+    ///
+    /// The file has to travel with it. An instruction records a span as a byte offset and a
+    /// file name separately, and the offsets in `cd.value` index the *declaring* file -- so
+    /// leaving `self.file` alone gives every instruction of an imported constant a valid-
+    /// looking location in the wrong file. `internal/compile` cannot have this bug: its span
+    /// carries a `*source.File` of its own, so the pair can never come apart.
+    fn const_value(self, cd: ast::ConstDecl, declared_in: String) {
+        let outer = self.file;
+        self.file = declared_in;
+        self.expr(cd.value);
+        self.file = outer;
+    }
+
     /// Records that lowering could not continue. It is a compiler bug rather than a
     /// program the language rejects, so it says what was not handled (process rule 8).
     fn unsupported(self, what: String, at: ast::Span) {
@@ -1541,7 +1556,7 @@ impl Compiler {
         }
         if r.kind == resolve::K_CONST {
             match r.const_decl {
-                Option::Some(cd) => self.expr(cd.value),
+                Option::Some(cd) => self.const_value(cd, r.file),
                 Option::None => self.unsupported("a constant with no value", e.span),
             }
             return;
@@ -2386,7 +2401,7 @@ impl Compiler {
                         Option::None => self.unsupported("this pattern", p.span),
                         Option::Some(cd) => {
                             self.emit_a(bytecode::OP_LOAD, slot, p.span);
-                            self.expr(cd.value);
+                            self.const_value(cd, r.file);
                             if self.failed() {
                                 return;
                             }
