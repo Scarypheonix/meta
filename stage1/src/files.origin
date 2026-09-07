@@ -1,0 +1,376 @@
+// The file operations, in machine code (spec/15-files.md).
+//
+// A translation of `internal/backend/files.go`.
+//
+// Four routines, each a system call or two around a String. What makes them longer than they
+// sound is the two things a system call needs that Origin values are not: a path has to be a
+// NUL-terminated run of bytes somewhere the kernel can read, and a file's size has to be
+// known before a String can be allocated to hold it.
+//
+// The size comes from `lseek` to the end and back rather than from `fstat`, whose result
+// struct is one of the few things Linux and macOS genuinely disagree about. Seeking is
+// portable arithmetic, and it costs two extra system calls on a path that already makes
+// three.
+//
+// A read's bytes are handed to the caller through the running thread's own TCB slot -- the
+// one `rt_chan_taken` uses -- rather than returned, because the operation has to return a
+// *status* and there is nowhere else to put a second value that the collector already scans.
+// §12's `recv` splits itself the same way, for the same reason.
+
+use compile;
+use emitter;
+use layout;
+use sched;
+use strings;
+use thread;
+use x86;
+
+/// How long a path this compiles for. It is a stack buffer in each routine's own frame, so
+/// the cost of the limit is one frame rather than a fixed allocation.
+const PATH_MAX: i64 = 4096;
+
+/// The `open` flags and `lseek` whences that are the same on both systems.
+const OPEN_READ_ONLY: i64 = 0;
+const SEEK_SET: i64 = 0;
+const SEEK_END: i64 = 2;
+const WRITE_MODE: i64 = 420; // 0o644
+
+/// Where each routine's path buffer sits in its own frame: below the four callee-saved
+/// registers `runtime_prologue` pushes.
+const PATH_BUF_OFF: i64 = 0 - 40 - PATH_MAX;
+
+/// Writes `rt_fs_copy_path(path rdi, dst rsi) -> status rax`: the String's bytes into a
+/// NUL-terminated buffer. A leaf.
+///
+/// A path holding a NUL byte is refused rather than silently truncated, which is what the
+/// kernel would otherwise do with it -- and a truncated path names a different file.
+pub fn emit_fs_copy_path(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.fs_copy_path);
+
+    let too_long = a.new_label("path_refused");
+    let loop_head = a.new_label("path_loop");
+    let done = a.new_label("path_done");
+
+    a.mov_rm(x86::RCX, x86::at(x86::RDI, strings::STR_LEN_OFF));
+    a.cmp_ri(x86::RCX, PATH_MAX - 1);
+    a.jcc(x86::ABOVE_EQUAL, too_long);
+
+    a.add_ri(x86::RDI, emitter::STR_BYTES_OFF);
+    a.xor_rr(x86::R8, x86::R8); // i
+    a.bind(loop_head);
+    a.cmp_rr(x86::R8, x86::RCX);
+    a.jcc(x86::ABOVE_EQUAL, done);
+    a.mov_rr(x86::RAX, x86::RDI);
+    a.add_rr(x86::RAX, x86::R8);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.mov_rm8(x86::RDX, x86::at(x86::RAX, 0));
+    a.test_rr(x86::RDX, x86::RDX);
+    a.jcc(x86::EQUAL, too_long); // an interior NUL
+    a.mov_rr(x86::RAX, x86::RSI);
+    a.add_rr(x86::RAX, x86::R8);
+    a.mov_mr8(x86::at(x86::RAX, 0), x86::RDX);
+    a.add_ri(x86::R8, 1);
+    a.jmp(loop_head);
+
+    a.bind(done);
+    a.mov_rr(x86::RAX, x86::RSI);
+    a.add_rr(x86::RAX, x86::RCX);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.mov_mr8(x86::at(x86::RAX, 0), x86::RDX); // the terminating NUL
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.ret();
+
+    a.bind(too_long);
+    a.mov_ri(x86::RAX, compile::IO_OTHER as u64);
+    a.ret();
+}
+
+/// Turns a failed system call's result in rax -- which both systems report as -errno -- into
+/// one of spec/15-files.md's statuses, leaving it in rax.
+fn fs_classify(e: emitter::Emitter) {
+    let a = e.a;
+    let not_found = a.new_label("errno_not_found");
+    let denied = a.new_label("errno_denied");
+    let done = a.new_label("errno_done");
+
+    a.neg_r(x86::RAX);
+    a.cmp_ri(x86::RAX, e.target.err_not_found);
+    a.jcc(x86::EQUAL, not_found);
+    a.cmp_ri(x86::RAX, e.target.err_permission);
+    a.jcc(x86::EQUAL, denied);
+    a.mov_ri(x86::RAX, compile::IO_OTHER as u64);
+    a.jmp(done);
+    a.bind(not_found);
+    a.mov_ri(x86::RAX, compile::IO_NOT_FOUND as u64);
+    a.jmp(done);
+    a.bind(denied);
+    a.mov_ri(x86::RAX, compile::IO_PERMISSION as u64);
+    a.bind(done);
+}
+
+/// Writes `rt_fs_read(path rdi) -> status rax`, leaving the bytes in this thread's TCB slot
+/// for `rt_fs_taken` to collect.
+pub fn emit_fs_read(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.fs_read);
+
+    sched::runtime_prologue(e);
+    a.sub_ri(x86::RSP, PATH_MAX + 8); // +8 keeps rsp 16-byte aligned for the call below
+
+    let bad_path = a.new_label("read_bad_path");
+    let open_failed = a.new_label("read_open_failed");
+    let read_loop = a.new_label("read_loop");
+    let read_done = a.new_label("read_done");
+    let fail = a.new_label("read_fail");
+
+    a.lea(x86::RSI, x86::at(x86::RBP, PATH_BUF_OFF));
+    a.call(e.rt.fs_copy_path);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, bad_path);
+
+    // open(path, O_RDONLY, 0)
+    a.mov_ri(x86::RAX, e.target.sys_open as u64);
+    a.lea(x86::RDI, x86::at(x86::RBP, PATH_BUF_OFF));
+    a.mov_ri(x86::RSI, OPEN_READ_ONLY as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.syscall();
+    a.cmp_ri(x86::RAX, 0);
+    a.jcc(x86::LESS, open_failed);
+    a.mov_rr(x86::RBX, x86::RAX); // fd
+
+    // size = lseek(fd, 0, SEEK_END), then rewind.
+    a.mov_ri(x86::RAX, e.target.sys_lseek as u64);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.xor_rr(x86::RSI, x86::RSI);
+    a.mov_ri(x86::RDX, SEEK_END as u64);
+    a.syscall();
+    a.cmp_ri(x86::RAX, 0);
+    a.jcc(x86::LESS, fail);
+    // A size no String can hold is refused rather than allocated for. It is also how a
+    // *directory* is caught: `open` on one succeeds on Linux, and seeking to its end answers
+    // i64::MAX -- which would otherwise become an allocation that traps `out of memory` where
+    // the other two engines return an error value.
+    a.mov_ri(x86::RCX, layout::MAX_STRING_BYTES as u64);
+    a.cmp_rr(x86::RAX, x86::RCX);
+    a.jcc(x86::GREATER, fail);
+    a.mov_rr(x86::R13, x86::RAX); // size
+
+    a.mov_ri(x86::RAX, e.target.sys_lseek as u64);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.xor_rr(x86::RSI, x86::RSI);
+    a.mov_ri(x86::RDX, SEEK_SET as u64);
+    a.syscall();
+
+    // The String to read into. Nothing after this allocates, so holding it in r14 -- which
+    // the collector does not scan for a frame with no stack map -- is safe.
+    a.mov_rr(x86::RDI, x86::R13);
+    a.call(e.rt.str_alloc);
+    a.mov_rr(x86::R14, x86::RAX);
+    a.xor_rr(x86::R12, x86::R12); // bytes read so far
+
+    a.bind(read_loop);
+    a.mov_rr(x86::RDX, x86::R13);
+    a.sub_rr(x86::RDX, x86::R12);
+    a.test_rr(x86::RDX, x86::RDX);
+    a.jcc(x86::EQUAL, read_done);
+    a.mov_ri(x86::RAX, e.target.sys_read as u64);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.mov_rr(x86::RSI, x86::R14);
+    a.add_ri(x86::RSI, emitter::STR_BYTES_OFF);
+    a.add_rr(x86::RSI, x86::R12);
+    a.syscall();
+    a.cmp_ri(x86::RAX, 0);
+    a.jcc(x86::LESS, fail);       // the read itself failed, which is not end of file
+    a.jcc(x86::EQUAL, read_done); // end of file, before the size the seek promised
+    a.add_rr(x86::R12, x86::RAX);
+    a.jmp(read_loop);
+
+    a.bind(read_done);
+    // A file that grew shorter between the seek and the read leaves the object longer than
+    // what was actually read, so the length is what came back rather than what the seek
+    // promised. The room above it is free of meaning, exactly as an array's is.
+    a.mov_mr(x86::at(x86::R14, strings::STR_LEN_OFF), x86::R12);
+
+    a.mov_ri(x86::RAX, e.target.sys_close as u64);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.syscall();
+
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_CURRENT_OFF));
+    a.mov_mr(x86::at(x86::RCX, thread::TCB_TAKEN_OFF), x86::R14);
+    a.mov_mi(x86::at(x86::RCX, thread::TCB_TAKEN_IS_REF_OFF), 1);
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.add_ri(x86::RSP, PATH_MAX + 8);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(fail);
+    // The file opened and something after it did not. Close it before giving up: a descriptor
+    // Origin cannot close by hand is exactly what §15 has no handles for.
+    a.mov_ri(x86::RAX, e.target.sys_close as u64);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.syscall();
+    a.mov_ri(x86::RAX, compile::IO_OTHER as u64);
+    a.add_ri(x86::RSP, PATH_MAX + 8);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(open_failed);
+    fs_classify(e);
+    a.add_ri(x86::RSP, PATH_MAX + 8);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(bad_path);
+    a.mov_ri(x86::RAX, compile::IO_OTHER as u64);
+    a.add_ri(x86::RSP, PATH_MAX + 8);
+    sched::runtime_epilogue(e);
+    a.ret();
+}
+
+/// Writes `rt_fs_write(path rdi, contents rsi) -> status rax`.
+pub fn emit_fs_write(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.fs_write);
+
+    sched::runtime_prologue(e);
+    a.sub_ri(x86::RSP, PATH_MAX + 8);
+
+    let bad_path = a.new_label("write_bad_path");
+    let open_failed = a.new_label("write_open_failed");
+    let write_loop = a.new_label("write_loop");
+    let write_done = a.new_label("write_done");
+    let fail = a.new_label("write_fail");
+
+    a.mov_rr(x86::R14, x86::RSI); // the contents, across everything below
+    a.lea(x86::RSI, x86::at(x86::RBP, PATH_BUF_OFF));
+    a.call(e.rt.fs_copy_path);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, bad_path);
+
+    // open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644)
+    a.mov_ri(x86::RAX, e.target.sys_open as u64);
+    a.lea(x86::RDI, x86::at(x86::RBP, PATH_BUF_OFF));
+    a.mov_ri(x86::RSI, e.target.open_write_flags as u64);
+    a.mov_ri(x86::RDX, WRITE_MODE as u64);
+    a.syscall();
+    a.cmp_ri(x86::RAX, 0);
+    a.jcc(x86::LESS, open_failed);
+    a.mov_rr(x86::RBX, x86::RAX); // fd
+
+    a.mov_rm(x86::R13, x86::at(x86::R14, strings::STR_LEN_OFF)); // how many bytes to write
+    a.xor_rr(x86::R12, x86::R12);                                // written so far
+
+    a.bind(write_loop);
+    a.mov_rr(x86::RDX, x86::R13);
+    a.sub_rr(x86::RDX, x86::R12);
+    a.test_rr(x86::RDX, x86::RDX);
+    a.jcc(x86::EQUAL, write_done);
+    a.mov_ri(x86::RAX, e.target.sys_write as u64);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.mov_rr(x86::RSI, x86::R14);
+    a.add_ri(x86::RSI, emitter::STR_BYTES_OFF);
+    a.add_rr(x86::RSI, x86::R12);
+    a.syscall();
+    a.cmp_ri(x86::RAX, 0);
+    a.jcc(x86::LESS_EQUAL, fail); // a short write that made no progress is a failure
+    a.add_rr(x86::R12, x86::RAX);
+    a.jmp(write_loop);
+
+    a.bind(write_done);
+    a.mov_ri(x86::RAX, e.target.sys_close as u64);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.syscall();
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.add_ri(x86::RSP, PATH_MAX + 8);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(fail);
+    a.mov_ri(x86::RAX, e.target.sys_close as u64);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.syscall();
+    a.mov_ri(x86::RAX, compile::IO_OTHER as u64);
+    a.add_ri(x86::RSP, PATH_MAX + 8);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(open_failed);
+    fs_classify(e);
+    a.add_ri(x86::RSP, PATH_MAX + 8);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(bad_path);
+    a.mov_ri(x86::RAX, compile::IO_OTHER as u64);
+    a.add_ri(x86::RSP, PATH_MAX + 8);
+    sched::runtime_epilogue(e);
+    a.ret();
+}
+
+/// Writes `rt_fs_exists(path rdi) -> rax`: 1 when the path can be opened for reading, 0
+/// otherwise. Never an error, because a path that cannot be read is exactly what the answer
+/// `false` means (spec/15-files.md).
+pub fn emit_fs_exists(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.fs_exists);
+
+    sched::runtime_prologue(e);
+    a.sub_ri(x86::RSP, PATH_MAX + 8);
+
+    let no = a.new_label("exists_no");
+
+    a.lea(x86::RSI, x86::at(x86::RBP, PATH_BUF_OFF));
+    a.call(e.rt.fs_copy_path);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, no);
+
+    a.mov_ri(x86::RAX, e.target.sys_open as u64);
+    a.lea(x86::RDI, x86::at(x86::RBP, PATH_BUF_OFF));
+    a.mov_ri(x86::RSI, OPEN_READ_ONLY as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.syscall();
+    a.cmp_ri(x86::RAX, 0);
+    a.jcc(x86::LESS, no);
+
+    a.mov_rr(x86::RBX, x86::RAX);
+    a.mov_ri(x86::RAX, e.target.sys_close as u64);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.syscall();
+    a.mov_ri(x86::RAX, 1u64);
+    a.add_ri(x86::RSP, PATH_MAX + 8);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(no);
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.add_ri(x86::RSP, PATH_MAX + 8);
+    sched::runtime_epilogue(e);
+    a.ret();
+}
+
+/// Writes `rt_fs_taken() -> rax`: the String the last `rt_fs_read` on this thread produced,
+/// and the empty string when there is none. A leaf.
+pub fn emit_fs_taken(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.fs_taken);
+
+    let have = a.new_label("taken_have");
+
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_CURRENT_OFF));
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, thread::TCB_TAKEN_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, have);
+    a.mov_ri(x86::RAX, emitter::string_literal(e, "").addr as u64);
+    a.ret();
+
+    a.bind(have);
+    a.mov_mi(x86::at(x86::RCX, thread::TCB_TAKEN_OFF), 0);
+    a.mov_mi(x86::at(x86::RCX, thread::TCB_TAKEN_IS_REF_OFF), 0);
+    a.ret();
+}

@@ -1,0 +1,492 @@
+// The string operations, in machine code (spec/14-strings.md).
+//
+// A translation of `internal/backend/strings.go`.
+//
+// A `String` is one object of `layout`'s `BYTE_ARRAY` shape: a header, then the length in
+// bytes, then the bytes themselves. That layout has been the same since Phase 2 -- it is
+// what `io::println`, `==`, ordering and the specified hash already read -- so nothing here
+// introduces a representation, only operations over the one that exists.
+//
+// Two of the six allocate (`slice` and `concat`) and therefore have frames the collector can
+// walk; the other four are leaves. Every one of them returns a *status* rather than trapping
+// itself, because a trap's text names a source location and a runtime routine has none of
+// its own: the line a programmer wants is the one that called the prelude's method, and
+// `spans.origin` resolves it by walking the stack (the same arrangement §12 and §13 use).
+//
+// The status codes are the difference from the array operations, which need only one: a
+// string index can fail in two distinguishable ways, and spec/14-strings.md gives them two
+// different messages.
+
+use emitter;
+use sched;
+use x86;
+
+pub const STR_OK: i64 = 0;
+/// An index outside the string. `STR_NOT_BOUNDARY` is one inside it that would split a
+/// character. They are separate because §14 gives them separate messages, and because they
+/// mean different things: one is arithmetic the caller got wrong, the other is a byte index
+/// used where a character index was meant.
+pub const STR_OUT_OF_RANGE: i64 = 1;
+pub const STR_NOT_BOUNDARY: i64 = 2;
+
+/// The payload word holding the length in bytes. The bytes begin at `emitter::STR_BYTES_OFF`,
+/// one word past it.
+pub const STR_LEN_OFF: i64 = emitter::OBJ_HEADER_SIZE;
+
+/// Writes `rt_str_len(s rdi) -> rax`. A leaf.
+pub fn emit_str_len(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.str_len);
+    a.mov_rm(x86::RAX, x86::at(x86::RDI, STR_LEN_OFF));
+    a.ret();
+}
+
+/// Leaves the address of byte rsi of the string in rdi in `dst`. It assumes the index has
+/// already been checked.
+fn str_byte_addr(e: emitter::Emitter, dst: i64) {
+    let a = e.a;
+    a.mov_rr(dst, x86::RDI);
+    a.add_ri(dst, emitter::STR_BYTES_OFF);
+    a.add_rr(dst, x86::RSI);
+}
+
+/// Jumps to `refused` unless rsi names a byte that exists in the string in rdi. The
+/// comparison is unsigned, so a negative index is a very large one and fails the same test.
+/// `len` itself is not a byte that exists: a slice may end there, nothing can be read there.
+fn str_read_index_check(e: emitter::Emitter, refused: x86::Label) {
+    let a = e.a;
+    a.mov_rm(x86::RCX, x86::at(x86::RDI, STR_LEN_OFF));
+    a.cmp_rr(x86::RSI, x86::RCX);
+    a.jcc(x86::ABOVE_EQUAL, refused);
+}
+
+/// Jumps to `refused` when byte rsi of the string in rdi is a UTF-8 continuation byte
+/// (10xxxxxx), which is the only thing that is not a character boundary. An index equal to
+/// the length is a boundary and is left alone, which is what makes the empty slice at the
+/// end legal.
+fn str_boundary_check(e: emitter::Emitter, refused: x86::Label) {
+    let a = e.a;
+    let at_end = a.new_label("str_boundary_at_end");
+    a.mov_rm(x86::RCX, x86::at(x86::RDI, STR_LEN_OFF));
+    a.cmp_rr(x86::RSI, x86::RCX);
+    a.jcc(x86::EQUAL, at_end);
+    str_byte_addr(e, x86::RCX);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.mov_rm8(x86::RDX, x86::at(x86::RCX, 0));
+    a.and_ri(x86::RDX, 192);
+    a.cmp_ri(x86::RDX, 128);
+    a.jcc(x86::EQUAL, refused);
+    a.bind(at_end);
+}
+
+/// Writes `rt_str_byte_at(s rdi, i rsi) -> status rax, byte rdx`. A leaf.
+pub fn emit_str_byte_at(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.str_byte_at);
+
+    let refused = a.new_label("str_byte_at_refused");
+    str_read_index_check(e, refused);
+    str_byte_addr(e, x86::RCX);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.mov_rm8(x86::RDX, x86::at(x86::RCX, 0));
+    a.mov_ri(x86::RAX, STR_OK as u64);
+    a.ret();
+
+    a.bind(refused);
+    a.mov_ri(x86::RAX, STR_OUT_OF_RANGE as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.ret();
+}
+
+/// Leaves in `dst` how many bytes the character at byte rsi of the string in rdi occupies,
+/// from the lead byte alone. The index must already be a checked boundary.
+///
+/// The widths are spec/14-strings.md's table: 0xxxxxxx is 1, 110xxxxx is 2, 1110xxxx is 3,
+/// 11110xxx is 4. A continuation byte cannot reach here, because a boundary check rejected
+/// it first.
+///
+/// `dst` may not be rcx or r8, which are the scratch this uses.
+fn str_decode_width(e: emitter::Emitter, dst: i64) {
+    let a = e.a;
+    let done = a.new_label("str_width_done");
+    let two = a.new_label("str_width_two");
+    let three = a.new_label("str_width_three");
+
+    str_byte_addr(e, x86::RCX);
+    a.xor_rr(x86::R8, x86::R8);
+    a.mov_rm8(x86::R8, x86::at(x86::RCX, 0));
+
+    a.mov_ri(dst, 1u64);
+    a.mov_rr(x86::RCX, x86::R8);
+    a.and_ri(x86::RCX, 128);
+    a.cmp_ri(x86::RCX, 0);
+    a.jcc(x86::EQUAL, done);
+
+    a.mov_rr(x86::RCX, x86::R8);
+    a.and_ri(x86::RCX, 224);
+    a.cmp_ri(x86::RCX, 192);
+    a.jcc(x86::EQUAL, two);
+
+    a.mov_rr(x86::RCX, x86::R8);
+    a.and_ri(x86::RCX, 240);
+    a.cmp_ri(x86::RCX, 224);
+    a.jcc(x86::EQUAL, three);
+
+    a.mov_ri(dst, 4u64);
+    a.jmp(done);
+    a.bind(three);
+    a.mov_ri(dst, 3u64);
+    a.jmp(done);
+    a.bind(two);
+    a.mov_ri(dst, 2u64);
+    a.bind(done);
+}
+
+/// Multiplies `dst` by six in place, which is how many bits one UTF-8 continuation byte
+/// carries. It clobbers r8.
+fn times_six(e: emitter::Emitter, dst: i64) {
+    e.a.mov_ri(x86::R8, 6u64);
+    e.a.imul_rr(dst, x86::R8);
+}
+
+/// Writes `rt_str_char_width(s rdi, i rsi) -> status rax, width rdx`. A leaf.
+pub fn emit_str_char_width(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.str_char_width);
+
+    let out_of_range = a.new_label("str_char_width_range");
+    let not_boundary = a.new_label("str_char_width_boundary");
+
+    str_read_index_check(e, out_of_range);
+    str_boundary_check(e, not_boundary);
+    str_decode_width(e, x86::RDX);
+    a.mov_ri(x86::RAX, STR_OK as u64);
+    a.ret();
+
+    a.bind(out_of_range);
+    a.mov_ri(x86::RAX, STR_OUT_OF_RANGE as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.ret();
+
+    a.bind(not_boundary);
+    a.mov_ri(x86::RAX, STR_NOT_BOUNDARY as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.ret();
+}
+
+/// Writes `rt_str_char_at(s rdi, i rsi) -> status rax, scalar rdx`: the Unicode scalar value
+/// whose encoding begins at byte i. A leaf.
+///
+/// The decode is spec/14-strings.md's table read the other way: the lead byte contributes
+/// its low bits, and each continuation byte six more.
+pub fn emit_str_char_at(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.str_char_at);
+
+    let out_of_range = a.new_label("str_char_at_range");
+    let not_boundary = a.new_label("str_char_at_boundary");
+    let loop_head = a.new_label("str_char_at_loop");
+    let done = a.new_label("str_char_at_done");
+
+    str_read_index_check(e, out_of_range);
+    str_boundary_check(e, not_boundary);
+    str_decode_width(e, x86::R9); // r9 = the width
+
+    // The lead byte's payload: all 7 bits for a 1-byte character, and 7 - width bits
+    // otherwise -- 5 for two bytes, 4 for three, 3 for four. Masking with
+    // 0x7F >> (width - 1) produces exactly that in every case, and leaves a 1-byte
+    // character's own value untouched.
+    str_byte_addr(e, x86::RCX);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.mov_rm8(x86::RDX, x86::at(x86::RCX, 0));
+    a.mov_ri(x86::R8, 127u64);
+    a.mov_rr(x86::RAX, x86::R9);
+    a.sub_ri(x86::RAX, 1);
+    shift_right_by(e, x86::R8, x86::RAX);
+    a.and_rr(x86::RDX, x86::R8);
+
+    // Each continuation byte contributes its low six bits, most significant first.
+    a.mov_ri(x86::R10, 1u64); // r10 = which byte of the character
+    a.bind(loop_head);
+    a.cmp_rr(x86::R10, x86::R9);
+    a.jcc(x86::ABOVE_EQUAL, done);
+    a.mov_rr(x86::RCX, x86::RDI);
+    a.add_ri(x86::RCX, emitter::STR_BYTES_OFF);
+    a.add_rr(x86::RCX, x86::RSI);
+    a.add_rr(x86::RCX, x86::R10);
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.mov_rm8(x86::RAX, x86::at(x86::RCX, 0));
+    a.and_ri(x86::RAX, 63);
+    a.shl_i(x86::RDX, 6);
+    a.or_rr(x86::RDX, x86::RAX);
+    a.add_ri(x86::R10, 1);
+    a.jmp(loop_head);
+
+    a.bind(done);
+    a.mov_ri(x86::RAX, STR_OK as u64);
+    a.ret();
+
+    a.bind(out_of_range);
+    a.mov_ri(x86::RAX, STR_OUT_OF_RANGE as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.ret();
+
+    a.bind(not_boundary);
+    a.mov_ri(x86::RAX, STR_NOT_BOUNDARY as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.ret();
+}
+
+/// Shifts `dst` right by the count in `amount`, which may be any register: the instruction
+/// itself only takes cl, so the count moves there first.
+fn shift_right_by(e: emitter::Emitter, dst: i64, amount: i64) {
+    let a = e.a;
+    a.mov_rr(x86::RCX, amount);
+    a.shr_cl(dst);
+}
+
+/// Writes `rt_str_alloc(len rdi) -> rax`: a String object with room for len bytes and its
+/// length word already set. The bytes are whatever the allocator left there, so every caller
+/// writes all of them.
+///
+/// It allocates, so it has a frame the collector can walk. It takes no reference argument,
+/// which is what makes it safe to call with a string operand parked anywhere: there is
+/// nothing of the caller's for a collection to move out from under it.
+pub fn emit_str_alloc(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.str_alloc);
+
+    sched::runtime_prologue(e);
+    a.mov_rr(x86::RBX, x86::RDI); // the length in bytes, across the allocation
+
+    // words = 1 length word + ceil(len / 8) byte words.
+    a.add_ri(x86::RDI, 7);
+    a.shr_i(x86::RDI, 3);
+    a.add_ri(x86::RDI, 1);
+    a.mov_ri(x86::RSI, e.string_type as u64);
+    a.call(e.rt.alloc);
+    a.mov_mr(x86::at(x86::RAX, STR_LEN_OFF), x86::RBX);
+
+    sched::runtime_epilogue(e);
+    a.ret();
+}
+
+/// Copies rcx bytes from the address in rsi to the address in rdi, one at a time. There is
+/// no alignment to exploit: either end can start mid-word.
+pub fn str_copy_bytes(e: emitter::Emitter) {
+    let a = e.a;
+    let loop_head = a.new_label("str_copy_loop");
+    let done = a.new_label("str_copy_done");
+    a.bind(loop_head);
+    a.test_rr(x86::RCX, x86::RCX);
+    a.jcc(x86::EQUAL, done);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.mov_rm8(x86::RDX, x86::at(x86::RSI, 0));
+    a.mov_mr8(x86::at(x86::RDI, 0), x86::RDX);
+    a.add_ri(x86::RSI, 1);
+    a.add_ri(x86::RDI, 1);
+    a.sub_ri(x86::RCX, 1);
+    a.jmp(loop_head);
+    a.bind(done);
+}
+
+/// Writes `rt_str_slice_check(s rdi, start rsi, end rdx) -> status rax, length rdx`:
+/// everything spec/14-strings.md says a slice's two indices must satisfy, and how many bytes
+/// the result will hold. A leaf.
+///
+/// It is separate from the copy because of where the allocation between them has to happen.
+/// A runtime routine that held the source string across its own allocation would be holding
+/// it somewhere the collector does not look: the root walk substitutes a synthetic
+/// all-saved, no-roots-of-its-own entry for any frame with no stack map, so a reference
+/// parked in one of its callee-saved registers is never updated when a collection moves the
+/// object. Splitting the work leaves the allocation at an ordinary call site in user code,
+/// where `record_call` writes a real entry and the register allocator has already given every
+/// operand of that call a home the collector walks -- which is exactly what `construct`
+/// relies on for a struct's fields.
+pub fn emit_str_slice_check(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.str_slice_check);
+
+    let out_of_range = a.new_label("str_slice_range");
+    let not_boundary = a.new_label("str_slice_boundary");
+
+    // start <= end <= len, with start >= 0. Signed comparisons, because a negative index
+    // must fail rather than wrap into a very large one -- `end` is compared against the
+    // length, which an unsigned test would let a negative `start` slip past.
+    a.cmp_ri(x86::RSI, 0);
+    a.jcc(x86::LESS, out_of_range);
+    a.cmp_rr(x86::RSI, x86::RDX);
+    a.jcc(x86::GREATER, out_of_range);
+    a.mov_rm(x86::R9, x86::at(x86::RDI, STR_LEN_OFF));
+    a.cmp_rr(x86::RDX, x86::R9);
+    a.jcc(x86::GREATER, out_of_range);
+
+    // Both endpoints must fall between characters, not inside one. `str_boundary_check`
+    // reads the index from rsi, so `end` is moved there and `start` put back afterwards.
+    a.mov_rr(x86::R9, x86::RDX); // end
+    str_boundary_check(e, not_boundary);
+    a.mov_rr(x86::R10, x86::RSI); // start
+    a.mov_rr(x86::RSI, x86::R9);
+    str_boundary_check(e, not_boundary);
+
+    a.mov_rr(x86::RDX, x86::R9);
+    a.sub_rr(x86::RDX, x86::R10); // end - start
+    a.mov_ri(x86::RAX, STR_OK as u64);
+    a.ret();
+
+    a.bind(out_of_range);
+    a.mov_ri(x86::RAX, STR_OUT_OF_RANGE as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.ret();
+
+    a.bind(not_boundary);
+    a.mov_ri(x86::RAX, STR_NOT_BOUNDARY as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.ret();
+}
+
+/// Writes `rt_str_slice_into(dst rdi, s rsi, start rdx)`: copy the bytes into a String the
+/// caller has already allocated, taking the count from the destination's own length word. A
+/// leaf -- it allocates nothing, so neither operand can move under it.
+pub fn emit_str_slice_into(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.str_slice_into);
+
+    a.mov_rm(x86::RCX, x86::at(x86::RDI, STR_LEN_OFF));
+    a.add_ri(x86::RDI, emitter::STR_BYTES_OFF);
+    a.add_ri(x86::RSI, emitter::STR_BYTES_OFF);
+    a.add_rr(x86::RSI, x86::RDX);
+    str_copy_bytes(e);
+    a.ret();
+}
+
+/// Writes `rt_str_concat_into(dst rdi, a rsi, b rdx)`: both operands' bytes, in order, into a
+/// String the caller has already allocated. A leaf, for the reason `emit_str_slice_check`
+/// explains.
+pub fn emit_str_concat_into(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.str_concat_into);
+
+    a.mov_rm(x86::R8, x86::at(x86::RSI, STR_LEN_OFF)); // len(a)
+    a.mov_rm(x86::R9, x86::at(x86::RDX, STR_LEN_OFF)); // len(b)
+
+    a.mov_rr(x86::R10, x86::RDI); // the destination's base, kept for the second copy
+    a.mov_rr(x86::R11, x86::RDX); // b
+
+    a.add_ri(x86::RDI, emitter::STR_BYTES_OFF);
+    a.add_ri(x86::RSI, emitter::STR_BYTES_OFF);
+    a.mov_rr(x86::RCX, x86::R8);
+    str_copy_bytes(e);
+
+    a.mov_rr(x86::RDI, x86::R10);
+    a.add_ri(x86::RDI, emitter::STR_BYTES_OFF);
+    a.add_rr(x86::RDI, x86::R8);
+    a.mov_rr(x86::RSI, x86::R11);
+    a.add_ri(x86::RSI, emitter::STR_BYTES_OFF);
+    a.mov_rr(x86::RCX, x86::R9);
+    str_copy_bytes(e);
+    a.ret();
+}
+
+/// Writes `rt_char_to_str(scalar rdi) -> rax`: the UTF-8 encoding of one Unicode scalar
+/// value, as a fresh String.
+///
+/// It is the inverse of `rt_str_char_at`, and it is here rather than in `runtime.origin`
+/// because it is the same table read the same way: the width comes from the value's
+/// magnitude, the lead byte carries the high bits under its own prefix, and every
+/// continuation byte carries six more under 10xxxxxx.
+///
+/// A `char` is a Unicode scalar value by construction (§03 excludes surrogates, and the only
+/// ways to make one are a literal and `char_at`), so there is no invalid input to reject.
+pub fn emit_char_to_str(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.char_to_str);
+
+    sched::runtime_prologue(e);
+
+    let two = a.new_label("char_to_str_two");
+    let three = a.new_label("char_to_str_three");
+    let four = a.new_label("char_to_str_four");
+    let alloc = a.new_label("char_to_str_alloc");
+    let tail = a.new_label("char_to_str_tail");
+    let tail_done = a.new_label("char_to_str_tail_done");
+
+    a.mov_rr(x86::RBX, x86::RDI); // the scalar
+    a.mov_ri(x86::R12, 1u64);     // the width
+    a.mov_ri(x86::R13, 0u64);     // the lead byte's prefix
+    a.mov_ri(x86::R14, 127u64);   // the lead byte's payload mask
+
+    a.cmp_ri(x86::RBX, 128);
+    a.jcc(x86::LESS, alloc);
+    a.cmp_ri(x86::RBX, 2048);
+    a.jcc(x86::LESS, two);
+    a.cmp_ri(x86::RBX, 65536);
+    a.jcc(x86::LESS, three);
+
+    a.bind(four);
+    a.mov_ri(x86::R12, 4u64);
+    a.mov_ri(x86::R13, 240u64);
+    a.mov_ri(x86::R14, 7u64);
+    a.jmp(alloc);
+
+    a.bind(three);
+    a.mov_ri(x86::R12, 3u64);
+    a.mov_ri(x86::R13, 224u64);
+    a.mov_ri(x86::R14, 15u64);
+    a.jmp(alloc);
+
+    a.bind(two);
+    a.mov_ri(x86::R12, 2u64);
+    a.mov_ri(x86::R13, 192u64);
+    a.mov_ri(x86::R14, 31u64);
+
+    a.bind(alloc);
+    a.mov_rr(x86::RDI, x86::R12);
+    a.call(e.rt.str_alloc);
+
+    // The lead byte: the scalar's high bits, shifted down past the continuation bytes,
+    // masked to what the prefix leaves room for, then the prefix itself.
+    a.mov_rr(x86::RDX, x86::RBX);
+    a.mov_rr(x86::RCX, x86::R12);
+    a.sub_ri(x86::RCX, 1);
+    times_six(e, x86::RCX); // the bits the continuation bytes will carry
+    a.shr_cl(x86::RDX);
+    a.and_rr(x86::RDX, x86::R14);
+    a.or_rr(x86::RDX, x86::R13);
+    a.mov_rr(x86::RDI, x86::RAX);
+    a.add_ri(x86::RDI, emitter::STR_BYTES_OFF);
+    a.mov_mr8(x86::at(x86::RDI, 0), x86::RDX);
+
+    // Then one continuation byte per remaining position, most significant first.
+    a.mov_ri(x86::R9, 1u64);
+    a.bind(tail);
+    a.cmp_rr(x86::R9, x86::R12);
+    a.jcc(x86::ABOVE_EQUAL, tail_done);
+    a.mov_rr(x86::RCX, x86::R12);
+    a.sub_rr(x86::RCX, x86::R9);
+    a.sub_ri(x86::RCX, 1);
+    times_six(e, x86::RCX);
+    a.mov_rr(x86::RDX, x86::RBX);
+    a.shr_cl(x86::RDX);
+    a.and_ri(x86::RDX, 63);
+    a.or_ri(x86::RDX, 128);
+    a.mov_rr(x86::RDI, x86::RAX);
+    a.add_ri(x86::RDI, emitter::STR_BYTES_OFF);
+    a.add_rr(x86::RDI, x86::R9);
+    a.mov_mr8(x86::at(x86::RDI, 0), x86::RDX);
+    a.add_ri(x86::R9, 1);
+    a.jmp(tail);
+    a.bind(tail_done);
+
+    sched::runtime_epilogue(e);
+    a.ret();
+}

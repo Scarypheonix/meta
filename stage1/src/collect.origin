@@ -1,0 +1,904 @@
+// The native collector (ADR-0022): a single-space, stop-the-world, semispace copy.
+//
+// A translation of `internal/backend/collect.go`, with `gcEvacuateMutexes` -- which lives
+// beside the mutex block in Go -- brought here beside the channel walk it is the twin of, so
+// that both read this module's own frame slots instead of exporting them.
+//
+// Four routines, each a leaf-ish subroutine callable in isolation:
+//
+//   - `rt_lookup_stack_map`: binary search over the stack-map table.
+//   - `rt_evacuate`: Cheney's per-object step -- copy once, forward every reference to it
+//     afterward.
+//   - `rt_scan_object`: evacuate every reference an already-copied object holds, reading its
+//     shape from the same per-type table `equal.origin` built.
+//   - `rt_collect`: the root walk up the rbp chain (ADR-0022's "The collector's root walk")
+//     followed by Cheney's scan loop over the destination space.
+//
+// None of the first three ever touches rbx/r12/r13/r14: `rt_collect` uses those four physical
+// registers to carry a live root through for as long as no frame between it and the
+// register's true owner has spilled it (ADR-0022's saved mask), and a routine it calls must
+// leave them exactly as it found them for that to hold. `rt_scan_object` is the one exception
+// with a real reason to use them anyway -- it pushes and pops all four in a standard
+// callee-saved prologue and epilogue, which preserves `rt_collect`'s tracked values across
+// the call exactly as the ABI already guarantees for any properly-behaved callee.
+
+use std::list;
+
+use chan;
+use emitter;
+use equal;
+use layout;
+use mutex;
+use thread;
+use x86;
+
+// The offsets `rt_collect` keeps in its own frame, relative to its own rbp.
+
+/// The frame currently being walked, one of rbp0, rbp1, ...
+const GC_WALK_RBP_OFF: i64 = 0 - 8;
+/// That frame's return address -- the stack map's search key.
+const GC_WALK_RET_OFF: i64 = 0 - 16;
+/// The looked-up entry's address in the table.
+const GC_ENTRY_OFF: i64 = 0 - 24;
+// Where each of rbx/r12/r13/r14's *original owner's* value currently lives: 0 means "still
+// the physical register", any other value is the address of the frame save-slot it was found
+// in (ADR-0022's saved-mask case).
+const GC_LOC_OFF_0: i64 = 0 - 32; // rbx
+const GC_LOC_OFF_1: i64 = 0 - 40; // r12
+const GC_LOC_OFF_2: i64 = 0 - 48; // r13
+const GC_LOC_OFF_3: i64 = 0 - 56; // r14
+/// The Cheney scan pointer, into the destination space.
+const GC_SCAN_OFF: i64 = 0 - 64;
+// The next frame's rbp and return address once read from the current frame, but not yet
+// installed as `GC_WALK_RBP_OFF`/`GC_WALK_RET_OFF`: `gc_transition_locs` still needs the
+// *current* frame's rbp (to compute its own save-slot addresses) and clobbers rcx/rdx/r8/r9
+// doing so, so the pending values cannot simply ride in registers across that call the way a
+// real callee's return value would.
+const GC_PENDING_RBP_OFF: i64 = 0 - 72;
+const GC_PENDING_RET_OFF: i64 = 0 - 80;
+/// The thread whose stack the walk is currently on, or 0 while it is on the running thread's
+/// own. With more than one green thread every other thread's frames hold live references too,
+/// so the walk runs once per thread rather than once (spec/12-concurrency.md).
+const GC_THREAD_OFF: i64 = 0 - 88;
+// The cursor the walks over raw runtime memory share -- the channel list and then the mutex
+// list, one after the other: which block, and how far into it. Both live in the frame rather
+// than in registers because every step of such a walk is a call to `rt_evacuate`.
+const GC_RAW_CURSOR_OFF: i64 = 0 - 96;
+const GC_RAW_INDEX_OFF: i64 = 0 - 104;
+/// A multiple of 16: the ABI wants rsp aligned at every call.
+const GC_LOCALS_SZ: i64 = 112;
+
+/// `rt_collect`'s own root-tracking registers, in the register mask's bit order, paired with
+/// the frame slot that tracks where each one's current value lives, and with the offset into
+/// `rt_switch`'s pushed block where a parked thread's copy sits.
+struct Tracked {
+    reg: i64,
+    bit: i64,
+    loc_off: i64,
+    switch_off: i64,
+}
+
+fn tracked_regs() -> List[Tracked] {
+    let out = list::new[Tracked]();
+    out.push(Tracked { reg: x86::RBX, bit: 0, loc_off: GC_LOC_OFF_0, switch_off: thread::SWITCH_RBX_OFF });
+    out.push(Tracked { reg: x86::R12, bit: 1, loc_off: GC_LOC_OFF_1, switch_off: thread::SWITCH_R12_OFF });
+    out.push(Tracked { reg: x86::R13, bit: 2, loc_off: GC_LOC_OFF_2, switch_off: thread::SWITCH_R13_OFF });
+    out.push(Tracked { reg: x86::R14, bit: 3, loc_off: GC_LOC_OFF_3, switch_off: thread::SWITCH_R14_OFF });
+    out
+}
+
+/// Every tracked bit set: the saved mask's value for a frame that unconditionally pushes all
+/// four callee-saved registers, which every hand-written runtime routine with a full prologue
+/// does, unlike a compiled Origin function's own prologue (only the callee-saved registers its
+/// own register allocator actually assigned, ADR-0021).
+const ALL_CALLEE_SAVED_MASK: i64 = 15;
+
+/// The two halves of the header's forwarding bit, as immediates.
+const FORWARD_BIT: u64 = 9223372036854775808u64;
+const NOT_FORWARD_BIT: u64 = 9223372036854775807u64;
+
+/// Lays out the synthetic stack-map entry the root walk substitutes when
+/// `rt_lookup_stack_map` finds nothing: register mask 0 (a runtime routine never holds an
+/// Origin-level reference of its own -- ADR-0021's own documented scope), saved mask
+/// `ALL_CALLEE_SAVED_MASK` (every runtime routine with a full prologue always pushes all four,
+/// in the fixed order, so the walk can still correctly recover *that frame's caller's*
+/// original register values from its known save-slot layout), ref count 0 (no Origin-level
+/// spill-slot convention applies to a hand-written routine's own locals). Only the fields
+/// `gc_process_reg_root`, `gc_process_ref_slots` and `gc_transition_locs` actually read are
+/// meaningful; the return address is never looked up for this row, so it is left zero.
+pub fn emit_gc_runtime_frame_entry(e: emitter::Emitter) {
+    e.gc_runtime_entry_addr = e.ro_data_addr + e.ro_data.len();
+    let mut i = 0;
+    while i < layout::STACK_MAP_ENTRY_SIZE {
+        if i == 17 { e.ro_data.push(ALL_CALLEE_SAVED_MASK); } else { e.ro_data.push(0); }
+        i = i + 1;
+    }
+}
+
+/// Writes `rt_lookup_stack_map`: rdi = a return address, result in rax is the matching entry's
+/// address in the table, or 0 if none matches (a defensive case: every user-code call site has
+/// an entry, so reaching it is a compiler bug, not a program the language rejects).
+///
+/// A leaf: it calls nothing, uses only caller-saved scratch, and never touches rdi (the search
+/// key stays valid throughout without needing to be re-loaded).
+pub fn emit_lookup_stack_map(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.lookup_stack_map);
+
+    a.mov_rm(x86::R8, x86::at(x86::R15, emitter::RT_STACK_MAP_OFF));
+    a.mov_rm(x86::R9, x86::at(x86::R15, emitter::RT_STACK_MAP_COUNT_OFF));
+    a.xor_rr(x86::RCX, x86::RCX); // lo = 0
+    a.mov_rr(x86::RDX, x86::R9);  // hi = count
+
+    let loop_head = a.new_label("lookup_loop");
+    let not_found = a.new_label("lookup_not_found");
+    let found = a.new_label("lookup_found");
+    a.bind(loop_head);
+    a.cmp_rr(x86::RCX, x86::RDX);
+    a.jcc(x86::ABOVE_EQUAL, not_found);
+
+    a.mov_rr(x86::RAX, x86::RDX);
+    a.add_rr(x86::RAX, x86::RCX);
+    a.shr_i(x86::RAX, 1); // mid = (lo+hi)/2
+
+    a.mov_rr(x86::R10, x86::RAX);
+    a.mov_ri(x86::R11, layout::STACK_MAP_ENTRY_SIZE as u64);
+    a.imul_rr(x86::R10, x86::R11);
+    a.add_rr(x86::R10, x86::R8); // r10 = &table[mid]
+
+    a.mov_rm(x86::R11, x86::at(x86::R10, 0)); // entry.return_addr
+    a.cmp_rr(x86::R11, x86::RDI);
+    a.jcc(x86::EQUAL, found);
+
+    let go_right = a.new_label("lookup_go_right");
+    a.jcc(x86::BELOW, go_right);
+    // entry.return_addr > target: hi = mid
+    a.mov_rr(x86::RDX, x86::RAX);
+    a.jmp(loop_head);
+    a.bind(go_right);
+    // entry.return_addr < target: lo = mid+1
+    a.mov_rr(x86::RCX, x86::RAX);
+    a.add_ri(x86::RCX, 1);
+    a.jmp(loop_head);
+
+    a.bind(found);
+    a.mov_rr(x86::RAX, x86::R10);
+    a.ret();
+
+    a.bind(not_found);
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.ret();
+}
+
+/// Writes `rt_evacuate`: rdi = a reference (possibly nil), result in rax is where it now
+/// lives.
+///
+/// Cheney's per-object step: nil passes through; an object already forwarded (its header's top
+/// bit set) returns the forwarding address; anything else is copied word for word to the
+/// destination space's current bump position (`RT_GC_NEXT_OFF`, which this advances), and the
+/// source's header is overwritten with a forwarding header pointing at the copy. A single
+/// generation needs no "already in the destination space" check: every live reference, at the
+/// start of a native collection, is necessarily still in the one space being collected out of,
+/// so the forwarding check alone is exactly the "already evacuated this cycle" test.
+///
+/// One reference is *not* in the space being collected out of, and would be a wild write if it
+/// were treated as though it were: a string literal, which the emitter puts in read-only data
+/// as a complete String object so that a literal is a pointer rather than an allocation.
+/// Copying it is pointless -- it is immortal and never moves -- and forwarding it means writing
+/// a forwarding header into a page mapped read-only, which is a SIGSEGV rather than a wrong
+/// answer. So anything outside the current semispace is returned unchanged. The hosted
+/// collectors need no such test because the interpreter and the VM intern a literal into the
+/// heap like any other object; only native code has objects the collector does not own.
+///
+/// A leaf: it calls nothing and uses only rax, rcx, rdx, rdi, r8, r9, r10, r11 -- never
+/// rbx/r12/r13/r14, which is what lets `rt_collect` call it freely while using those four to
+/// carry a live root through untouched.
+pub fn emit_evacuate(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.evacuate);
+
+    let is_nil = a.new_label("evac_nil");
+    let immortal = a.new_label("evac_immortal");
+    let not_forwarded = a.new_label("evac_not_forwarded");
+    let copy_done = a.new_label("evac_copy_done");
+    let copy_loop = a.new_label("evac_copy_loop");
+
+    a.test_rr(x86::RDI, x86::RDI);
+    a.jcc(x86::EQUAL, is_nil);
+
+    // The from-space is the semispace `alloc` just failed out of: [end - HEAP_SIZE, end). Its
+    // start needs no field of its own, since the heap size is a compile-time constant.
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_END_OFF));
+    a.cmp_rr(x86::RDI, x86::RCX);
+    a.jcc(x86::ABOVE_EQUAL, immortal);
+    a.sub_ri(x86::RCX, emitter::HEAP_SIZE);
+    a.cmp_rr(x86::RDI, x86::RCX);
+    a.jcc(x86::BELOW, immortal);
+
+    a.mov_rm(x86::RAX, x86::at(x86::RDI, 0)); // header
+    a.mov_rr(x86::RCX, x86::RAX);
+    a.shr_i(x86::RCX, 63);
+    a.test_rr(x86::RCX, x86::RCX);
+    a.jcc(x86::EQUAL, not_forwarded);
+
+    // Forwarded: rax is the header with the forward bit set; clear it to get the destination
+    // address.
+    a.mov_ri(x86::RCX, NOT_FORWARD_BIT);
+    a.and_rr(x86::RAX, x86::RCX);
+    a.ret();
+
+    a.bind(not_forwarded);
+    // rax is still the (unforwarded) header. words = header >> 32; size = (words+1)*8.
+    a.mov_rr(x86::RCX, x86::RAX);
+    a.shr_i(x86::RCX, 32);
+    a.add_ri(x86::RCX, 1);
+    a.shl_i(x86::RCX, 3); // rcx = byte size
+
+    a.mov_rm(x86::R9, x86::at(x86::R15, emitter::RT_GC_NEXT_OFF)); // dst
+    a.xor_rr(x86::R10, x86::R10);                                  // i = 0
+    a.bind(copy_loop);
+    a.cmp_rr(x86::R10, x86::RCX);
+    a.jcc(x86::ABOVE_EQUAL, copy_done);
+    a.mov_rr(x86::RAX, x86::RDI);
+    a.add_rr(x86::RAX, x86::R10);
+    a.mov_rm(x86::R11, x86::at(x86::RAX, 0));
+    a.mov_rr(x86::RAX, x86::R9);
+    a.add_rr(x86::RAX, x86::R10);
+    a.mov_mr(x86::at(x86::RAX, 0), x86::R11);
+    a.add_ri(x86::R10, 8);
+    a.jmp(copy_loop);
+
+    a.bind(copy_done);
+    a.mov_rr(x86::RAX, x86::R9);
+    a.add_rr(x86::RAX, x86::RCX);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_GC_NEXT_OFF), x86::RAX); // next += size
+
+    // Forward the source: the destination address with the forward bit set.
+    a.mov_rr(x86::RAX, x86::R9);
+    a.mov_ri(x86::RCX, FORWARD_BIT);
+    a.or_rr(x86::RAX, x86::RCX);
+    a.mov_mr(x86::at(x86::RDI, 0), x86::RAX);
+
+    a.mov_rr(x86::RAX, x86::R9);
+    a.ret();
+
+    a.bind(is_nil);
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.ret();
+
+    a.bind(immortal);
+    a.mov_rr(x86::RAX, x86::RDI);
+    a.ret();
+}
+
+/// Writes `rt_scan_object`: rdi = an object already copied into the destination space, result
+/// in rax is its total size in bytes (header included), which is also how far `rt_collect`'s
+/// own Cheney loop advances its scan pointer.
+///
+/// A byte array (a String) holds no references and is skipped entirely; a fixed object's kinds
+/// array (`equal.origin`'s per-type table, the same one structural equality reads) says which
+/// payload words are references, and each one is evacuated in place.
+pub fn emit_scan_object(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.scan_object);
+
+    let epilogue = a.new_label("scan_epilogue");
+
+    a.push(x86::RBP);
+    a.mov_rr(x86::RBP, x86::RSP);
+    a.push(x86::RBX);
+    a.push(x86::R12);
+    a.push(x86::R13);
+    a.push(x86::R14);
+
+    a.mov_rr(x86::RBX, x86::RDI); // rbx = the object
+
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, 0)); // header
+    equal::mask_low32(e, x86::RAX, x86::R8);  // rax = type id
+    a.mov_rr(x86::RCX, x86::RAX);
+    a.shl_i(x86::RCX, equal::TYPE_TABLE_ROW_SHIFT);
+    a.mov_ri(x86::R9, e.type_table_addr as u64);
+    a.add_rr(x86::RCX, x86::R9); // rcx = this type id's table row
+
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, 0)); // shape
+    let bytes_case = a.new_label("scan_bytes");
+    let ref_array_case = a.new_label("scan_ref_array");
+    a.cmp_ri(x86::RAX, layout::BYTE_ARRAY);
+    a.jcc(x86::EQUAL, bytes_case);
+    a.cmp_ri(x86::RAX, layout::RAW_ARRAY);
+    a.jcc(x86::EQUAL, bytes_case); // an array of non-references holds none, like a String
+    a.cmp_ri(x86::RAX, layout::REF_ARRAY);
+    a.jcc(x86::EQUAL, ref_array_case);
+
+    // Fixed shape: recurse over each reference-kind word.
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, 0)); // header again (rax was clobbered)
+    a.shr_i(x86::RAX, 32);
+    a.mov_rr(x86::R13, x86::RAX);              // r13 = words
+    a.mov_rm(x86::R14, x86::at(x86::RCX, 16)); // r14 = the kinds address
+
+    a.xor_rr(x86::R12, x86::R12); // i = 0
+    let field_loop = a.new_label("scan_field_loop");
+    let fields_done = a.new_label("scan_fields_done");
+    let not_ref = a.new_label("scan_not_ref");
+    a.bind(field_loop);
+    a.cmp_rr(x86::R12, x86::R13);
+    a.jcc(x86::GREATER_EQUAL, fields_done);
+
+    a.mov_rr(x86::RAX, x86::R14);
+    a.add_rr(x86::RAX, x86::R12);
+    a.xor_rr(x86::RCX, x86::RCX);
+    a.mov_rm8(x86::RCX, x86::at(x86::RAX, 0)); // this word's kind
+    a.cmp_ri(x86::RCX, layout::WORD_REF);
+    a.jcc(x86::NOT_EQUAL, not_ref);
+
+    a.mov_rr(x86::RAX, x86::R12);
+    a.shl_i(x86::RAX, 3);
+    a.add_ri(x86::RAX, emitter::OBJ_HEADER_SIZE);
+    a.add_rr(x86::RAX, x86::RBX); // rax = the field's address
+    a.mov_rm(x86::RDI, x86::at(x86::RAX, 0));
+    a.push(x86::RAX); // preserve the field's address across the call
+    a.call(e.rt.evacuate);
+    a.pop(x86::RCX);
+    a.mov_mr(x86::at(x86::RCX, 0), x86::RAX);
+
+    a.bind(not_ref);
+    a.add_ri(x86::R12, 1);
+    a.jmp(field_loop);
+
+    a.bind(fields_done);
+    a.mov_rr(x86::RAX, x86::R13);
+    a.add_ri(x86::RAX, 1);
+    a.shl_i(x86::RAX, 3); // (words+1)*8
+    a.jmp(epilogue);
+
+    // A reference array (ADR-0028): payload word 0 is the length, and that many references
+    // follow it. The room above the length holds nothing -- a push writes the element before it
+    // grows the length -- so tracing exactly the length is both correct and all that is
+    // correct: a word above it may still hold a reference an earlier truncate abandoned, and
+    // evacuating that would resurrect it.
+    a.bind(ref_array_case);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, 0));
+    a.shr_i(x86::RAX, 32);
+    a.mov_rr(x86::R13, x86::RAX); // r13 = words, for the size below
+    a.mov_rm(x86::R14, x86::at(x86::RBX, emitter::OBJ_HEADER_SIZE)); // r14 = the length
+    a.xor_rr(x86::R12, x86::R12);                                    // i = 0
+
+    let elem_loop = a.new_label("scan_elem_loop");
+    a.bind(elem_loop);
+    a.cmp_rr(x86::R12, x86::R14);
+    a.jcc(x86::GREATER_EQUAL, fields_done);
+    a.mov_rr(x86::RAX, x86::R12);
+    a.shl_i(x86::RAX, 3);
+    // past the header and the length word
+    a.add_ri(x86::RAX, emitter::OBJ_HEADER_SIZE + emitter::WORD_SIZE);
+    a.add_rr(x86::RAX, x86::RBX);
+    a.mov_rm(x86::RDI, x86::at(x86::RAX, 0));
+    a.push(x86::RAX);
+    a.call(e.rt.evacuate);
+    a.pop(x86::RCX);
+    a.mov_mr(x86::at(x86::RCX, 0), x86::RAX);
+    a.add_ri(x86::R12, 1);
+    a.jmp(elem_loop);
+
+    a.bind(bytes_case);
+    // A String holds no references; its total size is (words+1)*8 exactly like a fixed
+    // object's, since both the read-only literal and `rt_int_to_str` set the header's own
+    // words field to 1 (the length word) plus the byte payload's word count.
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, 0));
+    a.shr_i(x86::RAX, 32);
+    a.add_ri(x86::RAX, 1);
+    a.shl_i(x86::RAX, 3);
+
+    a.bind(epilogue);
+    a.pop(x86::R14);
+    a.pop(x86::R13);
+    a.pop(x86::R12);
+    a.pop(x86::RBX);
+    a.pop(x86::RBP);
+    a.ret();
+}
+
+/// Writes `rt_collect`: r9 = the return address of the call in `alloc`'s own caller (the first
+/// frame to walk), rbp = that same caller's own rbp -- both exactly as `emit_alloc` left them,
+/// since neither it nor anything before this call touched either.
+///
+/// See this module's own head comment for the root-walk algorithm and ADR-0022 for why it is
+/// correct: the saved mask tells a live-but-untouched register (still the physical register)
+/// from one a frame spilled to its own fixed prologue slot (the frame that called it, and so
+/// needs recovering from there instead).
+pub fn emit_collect(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.collect);
+
+    a.push(x86::RBP);
+    a.mov_rr(x86::RBP, x86::RSP);
+    a.sub_ri(x86::RSP, GC_LOCALS_SZ);
+
+    // walk_rbp = the value our own `push rbp` just saved -- frame 0's rbp, since alloc touched
+    // neither rbp nor rdi/rsi's stack cell before this call.
+    a.mov_rm(x86::RAX, x86::at(x86::RBP, 0));
+    a.mov_mr(x86::at(x86::RBP, GC_WALK_RBP_OFF), x86::RAX);
+    a.mov_mr(x86::at(x86::RBP, GC_WALK_RET_OFF), x86::R9);
+
+    let tracked = tracked_regs();
+    let mut t = 0;
+    while t < tracked.len() {
+        // 0 = "still the physical register"
+        a.mov_mi(x86::at(x86::RBP, tracked.at(t).loc_off), 0);
+        t = t + 1;
+    }
+    // The walk starts on the running thread's own stack; `GC_THREAD_OFF` advances through
+    // every other thread once that one is exhausted (spec/12-concurrency.md).
+    a.mov_mi(x86::at(x86::RBP, GC_THREAD_OFF), 0);
+
+    // The destination space is the one alloc's own bump/end did not just fail out of.
+    a.mov_rm(x86::RAX, x86::at(x86::R15, emitter::RT_OTHER_START_OFF));
+    a.mov_mr(x86::at(x86::R15, emitter::RT_GC_NEXT_OFF), x86::RAX);
+    a.mov_mr(x86::at(x86::RBP, GC_SCAN_OFF), x86::RAX);
+
+    let walk_loop = a.new_label("gc_walk_loop");
+    let walk_done = a.new_label("gc_walk_done");
+    a.bind(walk_loop);
+
+    let have_entry = a.new_label("gc_have_entry");
+    a.mov_rm(x86::RDI, x86::at(x86::RBP, GC_WALK_RET_OFF));
+    a.call(e.rt.lookup_stack_map);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, have_entry);
+    // No real entry: this frame is one of the runtime's own routines, allocating internally but
+    // never wired into `record_call` (ADR-0021's own documented scope). Substitute the
+    // synthetic all-saved, no-roots-of-its-own entry so the walk still correctly recovers this
+    // frame's *caller's* original register values, rather than treating a routine the compiler
+    // itself wrote as a stack-map gap.
+    a.mov_ri(x86::RAX, e.gc_runtime_entry_addr as u64);
+    a.bind(have_entry);
+    a.mov_mr(x86::at(x86::RBP, GC_ENTRY_OFF), x86::RAX);
+
+    let mut r = 0;
+    while r < tracked.len() {
+        let tr = tracked.at(r);
+        gc_process_reg_root(e, tr.reg, tr.bit, tr.loc_off);
+        r = r + 1;
+    }
+    gc_process_ref_slots(e);
+
+    // Whether there is a caller frame to walk to next must be decided before touching any
+    // tracked register's loc: `gc_transition_locs`'s whole point is recovering *that caller's*
+    // original register values from this frame's own save slots, and running it when this is
+    // the outermost frame (main's own, its own caller-rbp zero) would overwrite a
+    // still-physical, still-correct loc with an address that names nothing this walk will ever
+    // use again -- corrupting a physical register frame 0 itself still needs untouched when it
+    // resumes.
+    //
+    // The caller's rbp and return address are stashed in memory, not left riding in rcx/rdx,
+    // because `gc_transition_locs` needs the *current* frame's rbp -- still in
+    // `GC_WALK_RBP_OFF` at this point -- to compute its own save-slot addresses, and its own
+    // body freely clobbers rcx/rdx/r8/r9 doing so; only after it returns are the walk's own two
+    // slots overwritten.
+    a.mov_rm(x86::RAX, x86::at(x86::RBP, GC_WALK_RBP_OFF));
+    a.mov_rm(x86::RCX, x86::at(x86::RAX, 0)); // caller's rbp
+    a.mov_rm(x86::RDX, x86::at(x86::RAX, 8)); // caller's return address
+    a.test_rr(x86::RCX, x86::RCX);
+    a.jcc(x86::EQUAL, walk_done);
+    a.mov_mr(x86::at(x86::RBP, GC_PENDING_RBP_OFF), x86::RCX);
+    a.mov_mr(x86::at(x86::RBP, GC_PENDING_RET_OFF), x86::RDX);
+
+    gc_transition_locs(e, tracked);
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_PENDING_RBP_OFF));
+    a.mov_rm(x86::RDX, x86::at(x86::RBP, GC_PENDING_RET_OFF));
+    a.mov_mr(x86::at(x86::RBP, GC_WALK_RBP_OFF), x86::RCX);
+    a.mov_mr(x86::at(x86::RBP, GC_WALK_RET_OFF), x86::RDX);
+    a.jmp(walk_loop);
+
+    a.bind(walk_done);
+    gc_next_thread_stack(e, tracked, walk_loop);
+    gc_evacuate_channels(e);
+    gc_evacuate_mutexes(e);
+
+    // Cheney's scan: walk the destination space from its own start to its own (growing) bump
+    // position, evacuating every reference each already-copied object holds.
+    let scan_loop = a.new_label("gc_scan_loop");
+    let scan_done = a.new_label("gc_scan_done");
+    a.bind(scan_loop);
+    a.mov_rm(x86::RAX, x86::at(x86::RBP, GC_SCAN_OFF));
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_GC_NEXT_OFF));
+    a.cmp_rr(x86::RAX, x86::RCX);
+    a.jcc(x86::ABOVE_EQUAL, scan_done);
+    a.mov_rr(x86::RDI, x86::RAX);
+    a.call(e.rt.scan_object); // rax = this object's size in bytes
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_SCAN_OFF));
+    a.add_rr(x86::RCX, x86::RAX);
+    a.mov_mr(x86::at(x86::RBP, GC_SCAN_OFF), x86::RCX);
+    a.jmp(scan_loop);
+    a.bind(scan_done);
+
+    // The collection is over: the destination space is now current, with its bump pointer
+    // wherever the Cheney scan's own copying left the gc-next field. The space just vacated --
+    // its start recovered from the old end field, still intact here -- becomes the destination
+    // for next time.
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_END_OFF));
+    a.sub_ri(x86::RCX, emitter::HEAP_SIZE); // the space just collected out of, its own start
+
+    // the space just collected into
+    a.mov_rm(x86::RAX, x86::at(x86::R15, emitter::RT_OTHER_START_OFF));
+    a.mov_rr(x86::RDX, x86::RAX);
+    a.add_ri(x86::RDX, emitter::HEAP_SIZE);
+
+    a.mov_rm(x86::R8, x86::at(x86::R15, emitter::RT_GC_NEXT_OFF)); // the new bump pointer
+
+    a.mov_mr(x86::at(x86::R15, emitter::RT_BUMP_OFF), x86::R8);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_END_OFF), x86::RDX);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_OTHER_START_OFF), x86::RCX);
+
+    // Nothing further restores the physical registers here: whichever of them frame 0's own
+    // register mask claimed as a root was already evacuated and written directly back into the
+    // physical register during iteration 0's own `gc_process_reg_root` call, at that point
+    // unconditionally still "physical" (nothing has transitioned yet in iteration 0 of any
+    // walk). A register frame 0 also happens to have saved but never claimed as its own root is
+    // deliberately never touched again: that save slot holds frame 0's *caller's* value,
+    // already correctly updated in place -- by whichever later frame's own
+    // `gc_process_reg_root` found it there via the transitioned loc -- and frame 0's own
+    // ordinary epilogue `pop` is what will carry it back into the register when frame 0 itself
+    // eventually returns, not this collector. Reading a transitioned slot back into the
+    // physical register here would overwrite frame 0's own live use of that register (its own
+    // local, however unrelated to any reference) with a value that was never frame 0's to see
+    // in the first place.
+
+    a.add_ri(x86::RSP, GC_LOCALS_SZ);
+    a.pop(x86::RBP);
+    a.ret();
+}
+
+/// Emits the code for one tracked register's root at the current walk frame: if the looked-up
+/// entry's register mask names it, evacuate its current value (read from wherever `loc_off`
+/// says it lives) and write the result back to that same place.
+fn gc_process_reg_root(e: emitter::Emitter, reg: i64, bit: i64, loc_off: i64) {
+    let a = e.a;
+    let skip = a.new_label("gc_root_skip");
+    let in_mem = a.new_label("gc_root_mem");
+
+    a.mov_rm(x86::RAX, x86::at(x86::RBP, GC_ENTRY_OFF));
+    a.xor_rr(x86::RCX, x86::RCX);
+    a.mov_rm8(x86::RCX, x86::at(x86::RAX, 16)); // the register mask
+    a.and_ri(x86::RCX, 1 << bit);
+    a.test_rr(x86::RCX, x86::RCX);
+    a.jcc(x86::EQUAL, skip);
+
+    a.mov_rm(x86::RAX, x86::at(x86::RBP, loc_off));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, in_mem);
+
+    a.mov_rr(x86::RDI, reg);
+    a.call(e.rt.evacuate);
+    a.mov_rr(reg, x86::RAX);
+    a.jmp(skip);
+
+    a.bind(in_mem);
+    a.mov_rm(x86::RDI, x86::at(x86::RAX, 0));
+    a.push(x86::RAX); // preserve the slot's address across the call
+    a.call(e.rt.evacuate);
+    a.pop(x86::RCX);
+    a.mov_mr(x86::at(x86::RCX, 0), x86::RAX);
+
+    a.bind(skip);
+}
+
+/// Evacuates every one of the current frame's own reference-kind spill slots: `ref_count`
+/// consecutive words starting at `walk_rbp - ref_offset` (the register allocator's own
+/// contiguous placement, ADR-0021), each read fresh from the looked-up entry.
+fn gc_process_ref_slots(e: emitter::Emitter) {
+    let a = e.a;
+    let loop_head = a.new_label("gc_refslot_loop");
+    let done = a.new_label("gc_refslot_done");
+
+    a.mov_rm(x86::RAX, x86::at(x86::RBP, GC_ENTRY_OFF));
+    // packs the ref offset (low 32) and the ref count (high 32)
+    a.mov_rm(x86::RCX, x86::at(x86::RAX, 8));
+    a.mov_rr(x86::RDX, x86::RCX);
+    equal::mask_low32(e, x86::RDX, x86::R8); // rdx = ref offset
+    a.shr_i(x86::RCX, 32);                   // rcx = ref count
+
+    a.xor_rr(x86::R8, x86::R8); // j = 0
+    a.bind(loop_head);
+    a.cmp_rr(x86::R8, x86::RCX);
+    a.jcc(x86::ABOVE_EQUAL, done);
+
+    a.mov_rm(x86::RAX, x86::at(x86::RBP, GC_WALK_RBP_OFF));
+    a.sub_rr(x86::RAX, x86::RDX);
+    a.mov_rr(x86::R9, x86::R8);
+    a.shl_i(x86::R9, 3);
+    a.sub_rr(x86::RAX, x86::R9); // rax = the slot's address
+
+    a.push(x86::RCX);
+    a.push(x86::RDX);
+    a.push(x86::R8);
+    a.push(x86::RAX);
+    a.mov_rm(x86::RDI, x86::at(x86::RAX, 0));
+    a.call(e.rt.evacuate);
+    a.pop(x86::R9); // the slot's address, popped back
+    a.mov_mr(x86::at(x86::R9, 0), x86::RAX);
+    a.pop(x86::R8);
+    a.pop(x86::RDX);
+    a.pop(x86::RCX);
+
+    a.add_ri(x86::R8, 1);
+    a.jmp(loop_head);
+    a.bind(done);
+}
+
+/// Updates every tracked register's loc for the next frame the walk visits, per the current
+/// entry's saved mask: a register this frame's own prologue pushed has its next owner's
+/// original value sitting at a fixed, computable slot in this frame (ADR-0022); one it never
+/// touched keeps whatever loc already says (still physical, or an even earlier frame's slot).
+fn gc_transition_locs(e: emitter::Emitter, tracked: List[Tracked]) {
+    let a = e.a;
+    a.mov_rm(x86::RAX, x86::at(x86::RBP, GC_ENTRY_OFF));
+    a.xor_rr(x86::RCX, x86::RCX);
+    a.mov_rm8(x86::RCX, x86::at(x86::RAX, 17)); // the saved mask
+    a.xor_rr(x86::RDX, x86::RDX);               // rank = 0
+
+    let mut i = 0;
+    while i < tracked.len() {
+        let tr = tracked.at(i);
+        i = i + 1;
+        let skip = a.new_label("gc_saved_skip");
+        a.mov_rr(x86::R9, x86::RCX);
+        a.and_ri(x86::R9, 1 << tr.bit);
+        a.test_rr(x86::R9, x86::R9);
+        a.jcc(x86::EQUAL, skip);
+
+        // slot = walk_rbp - 8*(rank+1)
+        a.mov_rm(x86::RAX, x86::at(x86::RBP, GC_WALK_RBP_OFF));
+        a.mov_rr(x86::R8, x86::RDX);
+        a.add_ri(x86::R8, 1);
+        a.shl_i(x86::R8, 3);
+        a.sub_rr(x86::RAX, x86::R8);
+        a.mov_mr(x86::at(x86::RBP, tr.loc_off), x86::RAX);
+        a.add_ri(x86::RDX, 1);
+
+        a.bind(skip);
+    }
+}
+
+/// Advances the root walk to the next green thread's stack, jumping back to `walk_loop` when it
+/// finds one and falling through when every thread has been walked.
+///
+/// A single-threaded program never enters the loop below: the thread list is empty, so this is
+/// one load and one branch, which is what a program that never spawns should pay.
+///
+/// The cursor lives in memory rather than a register throughout. `rt_collect` deliberately does
+/// not preserve rbx/r12/r13/r14 -- they hold frame 0's own live roots, which
+/// `gc_process_reg_root` updates in place -- so holding anything in one of them here would
+/// destroy a root the collector is in the middle of forwarding. The caller-saved registers are
+/// no better, since every evacuation below is a call.
+///
+/// The three states mean three different things, and confusing them corrupts the heap rather
+/// than merely missing an object:
+///
+///   - `ready`: never run, so its stack is six primed zero words and a trampoline address, not
+///     a frame chain. Walking it would read those zeros as frames. Only its closure is a root.
+///   - `parked`: stopped inside `rt_switch`, so its chain is real and begins at the rbp that
+///     switch saved -- and its four tracked registers are in switch's own pushed slots, which is
+///     where the locs must start rather than "physical" (a parked thread owns no physical
+///     register).
+///   - `done`: no stack worth walking; the result it left behind is the root, and only when the
+///     compiler said that result is a reference.
+fn gc_next_thread_stack(e: emitter::Emitter, tracked: List[Tracked], walk_loop: x86::Label) {
+    let a = e.a;
+    let advance = a.new_label("gc_thread_advance");
+    let consider = a.new_label("gc_thread_consider");
+    let finished = a.new_label("gc_threads_done");
+
+    // The first pass starts at the head of the list; later ones continue from the cursor.
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_THREAD_OFF));
+    a.test_rr(x86::RCX, x86::RCX);
+    a.jcc(x86::NOT_EQUAL, advance);
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_THREADS_OFF));
+    a.jmp(consider);
+
+    a.bind(advance);
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_THREAD_OFF));
+    a.mov_rm(x86::RCX, x86::at(x86::RCX, thread::TCB_NEXT_OFF));
+
+    a.bind(consider);
+    a.test_rr(x86::RCX, x86::RCX);
+    a.jcc(x86::EQUAL, finished);
+    a.mov_mr(x86::at(x86::RBP, GC_THREAD_OFF), x86::RCX);
+
+    // Whatever its state, the closure it was handed is reachable from the control block alone
+    // until the thread has run it.
+    gc_evacuate_tcb_slot(e, thread::TCB_CLOSURE_OFF);
+
+    // A result, if the compiler said it is a reference. The runtime cannot tell a reference
+    // from an integer -- that is what the stack map does elsewhere -- so `spawn` records the
+    // answer for its own T.
+    let skip_result = a.new_label("gc_thread_no_result");
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_THREAD_OFF));
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, thread::TCB_RESULT_IS_REF_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, skip_result);
+    gc_evacuate_tcb_slot(e, thread::TCB_RESULT_OFF);
+    a.bind(skip_result);
+
+    // A value a receive took but the program has not read back yet (`chan.origin`): 2 means it
+    // is a reference, 1 that it is raw, 0 that the slot holds nothing at all.
+    let skip_taken = a.new_label("gc_thread_no_taken");
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_THREAD_OFF));
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, thread::TCB_TAKEN_IS_REF_OFF));
+    a.cmp_ri(x86::RAX, 2);
+    a.jcc(x86::NOT_EQUAL, skip_taken);
+    gc_evacuate_tcb_slot(e, thread::TCB_TAKEN_OFF);
+    a.bind(skip_taken);
+
+    // The running thread's stack was walked first, from its live registers. Walking it again
+    // through a control block that describes where it last parked would evacuate stale copies
+    // of roots this collection has already moved. Its control block's own slots above are
+    // visited all the same: they are roots wherever the thread is, and evacuating one twice is
+    // what the forwarding pointer is for.
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_THREAD_OFF));
+    a.mov_rm(x86::RAX, x86::at(x86::R15, emitter::RT_CURRENT_OFF));
+    a.cmp_rr(x86::RCX, x86::RAX);
+    a.jcc(x86::EQUAL, advance);
+
+    // Only a parked thread has a frame chain to walk.
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_THREAD_OFF));
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, thread::TCB_STATE_OFF));
+    a.cmp_ri(x86::RAX, thread::THREAD_PARKED);
+    a.jcc(x86::NOT_EQUAL, advance);
+
+    // Its tracked registers live in `rt_switch`'s own pushed slots, addressed from the stack
+    // pointer switch saved.
+    a.mov_rm(x86::RDX, x86::at(x86::RCX, thread::TCB_RSP_OFF));
+    let mut i = 0;
+    while i < tracked.len() {
+        let tr = tracked.at(i);
+        i = i + 1;
+        a.mov_rr(x86::RAX, x86::RDX);
+        a.add_ri(x86::RAX, tr.switch_off);
+        a.mov_mr(x86::at(x86::RBP, tr.loc_off), x86::RAX);
+    }
+
+    // Frame 0 of this thread is whoever called `rt_switch`: the rbp switch saved, and the
+    // return address sitting above its six pushed registers.
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, thread::TCB_RBP_OFF));
+    a.mov_mr(x86::at(x86::RBP, GC_WALK_RBP_OFF), x86::RAX);
+    a.mov_rm(x86::RAX, x86::at(x86::RDX, thread::SWITCH_RET_OFF));
+    a.mov_mr(x86::at(x86::RBP, GC_WALK_RET_OFF), x86::RAX);
+    a.jmp(walk_loop);
+
+    a.bind(finished);
+}
+
+/// Evacuates one reference held in the thread control block the cursor names, and writes the
+/// forwarded address back. The block is raw mapped memory rather than a heap object, so nothing
+/// else will ever visit it.
+fn gc_evacuate_tcb_slot(e: emitter::Emitter, off: i64) {
+    let a = e.a;
+    let skip = a.new_label("gc_tcb_slot_skip");
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_THREAD_OFF));
+    a.mov_rm(x86::RDI, x86::at(x86::RCX, off));
+    a.test_rr(x86::RDI, x86::RDI);
+    a.jcc(x86::EQUAL, skip);
+    a.call(e.rt.evacuate);
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_THREAD_OFF));
+    a.mov_mr(x86::at(x86::RCX, off), x86::RAX);
+    a.bind(skip);
+}
+
+/// Visits what is sitting in every channel's queue.
+///
+/// A value crossing a channel is an ordinary reference into the collected heap
+/// (spec/12-concurrency.md: values cross by reference, like every aggregate), but a channel is
+/// raw mapped memory with no stack map over it and no object header to read a shape from. So
+/// the queue is walked from the outside: the compiler wrote down whether this channel's element
+/// type is a reference, and the ring's own head and length say which slots are occupied.
+///
+/// A channel nothing refers to any more is still walked. Its queue would keep dead objects
+/// alive, which is a leak rather than a corruption, and closing that gap needs the collector to
+/// trace the channel objects themselves -- which it cannot, since the handle a program holds is
+/// an integer, not a reference (the prelude's own `Sender[T]`). `docs/deferred.md`.
+fn gc_evacuate_channels(e: emitter::Emitter) {
+    let a = e.a;
+    let loop_head = a.new_label("gc_chan_loop");
+    let next = a.new_label("gc_chan_next");
+    let done = a.new_label("gc_chan_done");
+    let inner = a.new_label("gc_chan_slot_loop");
+    let inner_done = a.new_label("gc_chan_slot_done");
+    let no_wrap = a.new_label("gc_chan_no_wrap");
+
+    a.mov_rm(x86::RAX, x86::at(x86::R15, emitter::RT_CHANNELS_OFF));
+    a.mov_mr(x86::at(x86::RBP, GC_RAW_CURSOR_OFF), x86::RAX);
+
+    a.bind(loop_head);
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_RAW_CURSOR_OFF));
+    a.test_rr(x86::RCX, x86::RCX);
+    a.jcc(x86::EQUAL, done);
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, chan::CHAN_ELEM_IS_REF_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, next);
+    a.mov_mi(x86::at(x86::RBP, GC_RAW_INDEX_OFF), 0);
+
+    a.bind(inner);
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_RAW_CURSOR_OFF));
+    a.mov_rm(x86::RAX, x86::at(x86::RBP, GC_RAW_INDEX_OFF));
+    a.mov_rm(x86::RDX, x86::at(x86::RCX, chan::CHAN_LEN_OFF));
+    a.cmp_rr(x86::RAX, x86::RDX);
+    a.jcc(x86::ABOVE_EQUAL, inner_done);
+
+    // The occupied slots run from head, wrapping once at the end of the ring.
+    a.mov_rm(x86::R8, x86::at(x86::RCX, chan::CHAN_HEAD_OFF));
+    a.add_rr(x86::R8, x86::RAX);
+    a.mov_rm(x86::R9, x86::at(x86::RCX, chan::CHAN_SLOTS_OFF));
+    a.cmp_rr(x86::R8, x86::R9);
+    a.jcc(x86::BELOW, no_wrap);
+    a.sub_rr(x86::R8, x86::R9);
+    a.bind(no_wrap);
+    a.shl_i(x86::R8, 3);
+    a.add_ri(x86::R8, chan::CHAN_QUEUE_OFF);
+    a.add_rr(x86::R8, x86::RCX); // the slot's address
+
+    a.mov_rm(x86::RDI, x86::at(x86::R8, 0));
+    a.push(x86::R8);
+    a.push(x86::R8); // twice, so rsp keeps the alignment the call wants
+    a.call(e.rt.evacuate);
+    a.pop(x86::RCX);
+    a.pop(x86::RCX);
+    a.mov_mr(x86::at(x86::RCX, 0), x86::RAX);
+
+    a.mov_rm(x86::RAX, x86::at(x86::RBP, GC_RAW_INDEX_OFF));
+    a.add_ri(x86::RAX, 1);
+    a.mov_mr(x86::at(x86::RBP, GC_RAW_INDEX_OFF), x86::RAX);
+    a.jmp(inner);
+
+    a.bind(inner_done);
+    a.bind(next);
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_RAW_CURSOR_OFF));
+    a.mov_rm(x86::RCX, x86::at(x86::RCX, chan::CHAN_NEXT_OFF));
+    a.mov_mr(x86::at(x86::RBP, GC_RAW_CURSOR_OFF), x86::RCX);
+    a.jmp(loop_head);
+
+    a.bind(done);
+}
+
+/// Visits the value each mutex guards.
+///
+/// While a thread holds the lock the value is also its body's argument, and rooted there like
+/// any other parameter; between calls this block is the only thing that names it. Whether it is
+/// a reference at all is the compiler's answer, for the same reason a channel's queue needs
+/// one: no header, no stack map, nothing to read a shape from.
+fn gc_evacuate_mutexes(e: emitter::Emitter) {
+    let a = e.a;
+    let loop_head = a.new_label("gc_mutex_loop");
+    let next = a.new_label("gc_mutex_next");
+    let done = a.new_label("gc_mutex_done");
+
+    a.mov_rm(x86::RAX, x86::at(x86::R15, emitter::RT_MUTEXES_OFF));
+    a.mov_mr(x86::at(x86::RBP, GC_RAW_CURSOR_OFF), x86::RAX);
+
+    a.bind(loop_head);
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_RAW_CURSOR_OFF));
+    a.test_rr(x86::RCX, x86::RCX);
+    a.jcc(x86::EQUAL, done);
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, mutex::MUTEX_IS_REF_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, next);
+
+    a.mov_rm(x86::RDI, x86::at(x86::RCX, mutex::MUTEX_VALUE_OFF));
+    a.test_rr(x86::RDI, x86::RDI);
+    a.jcc(x86::EQUAL, next);
+    a.call(e.rt.evacuate);
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_RAW_CURSOR_OFF));
+    a.mov_mr(x86::at(x86::RCX, mutex::MUTEX_VALUE_OFF), x86::RAX);
+
+    a.bind(next);
+    a.mov_rm(x86::RCX, x86::at(x86::RBP, GC_RAW_CURSOR_OFF));
+    a.mov_rm(x86::RCX, x86::at(x86::RCX, mutex::MUTEX_NEXT_OFF));
+    a.mov_mr(x86::at(x86::RBP, GC_RAW_CURSOR_OFF), x86::RCX);
+    a.jmp(loop_head);
+
+    a.bind(done);
+}

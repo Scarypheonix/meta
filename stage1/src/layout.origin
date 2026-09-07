@@ -1,9 +1,9 @@
 // Object layout: what the garbage collector and the code generator must agree on.
 //
-// A translation of `internal/layout`, and of the part of it a compiler needs: the
-// descriptor of an object shape, and the registry that hands each shape an id. The
-// collector's half -- headers, forwarding pointers, stack maps -- belongs to whichever
-// runtime is doing the collecting, and stage1 does not have one yet.
+// A translation of `internal/layout`: the descriptor of an object shape, the registry that
+// hands each shape an id, and the stack-map entry the code generator writes and the
+// collector reads back. Forwarding pointers belong to the running collector rather than to
+// the compiler that emits it, so they are `collect.origin`'s, not this module's.
 //
 // Process rule 5 puts this agreement in exactly one module for a reason worth repeating
 // here: a heap where the collector and the code generator disagree about which word is a
@@ -53,6 +53,15 @@ pub const OBJ_CLOSURE: i64 = 3;
 pub const OBJ_BYTES: i64 = 4;
 /// An `Array[T]` (spec/13-collections.md).
 pub const OBJ_ARRAY: i64 = 5;
+
+/// The longest run of bytes one String object can hold: the header's own 24-bit size field,
+/// less the length word, times eight bytes to the word.
+///
+/// It is here rather than in whichever subsystem happened to need it first because it is a
+/// fact about the header this module owns, and because three engines have to agree on it:
+/// spec/15-files.md makes a file too large for a `String` an `Err(Other)` rather than a trap
+/// on one engine and a success on another.
+pub const MAX_STRING_BYTES: i64 = 134217712;
 
 // --- WordKind ------------------------------------------------------------------------
 //
@@ -204,4 +213,78 @@ fn same_shape(a: Descriptor, b: Descriptor) -> bool {
         i = i + 1;
     }
     true
+}
+
+// --- Stack maps ------------------------------------------------------------------------
+//
+// One call site's frame for spec/11-codegen.md's "Safepoints and stack maps": which frame
+// slots and which registers hold a live reference at the instant the call returns. This is
+// the one place the shape lives (process rule 5): `stackmap.origin` builds a program's table
+// with `encode_stack_map`, and `rt_lookup_stack_map` reads one back in machine code; neither
+// derives the frame's shape independently.
+
+/// One encoded entry's width: return address (8) + ref offset (4) + ref count (4) + register
+/// mask (1) + saved mask (1), padded so that every entry's return address stays 8-byte
+/// aligned and a binary search can index the table with a plain multiply.
+pub const STACK_MAP_ENTRY_SIZE: i64 = 24;
+
+pub struct StackMapEntry {
+    /// The call's own return address -- the table's search key.
+    pub mut return_addr: i64,
+    /// The byte offset, subtracted from rbp, of the first (lowest-addressed) reference-kind
+    /// spill slot. A function's own linear-scan register allocator places every one of them
+    /// in one contiguous run below the raw slots, so `ref_count` consecutive words starting
+    /// at `rbp - ref_offset` are every reference this frame's own spill slots hold.
+    pub ref_offset: i64,
+    /// How many consecutive reference-kind spill slots start at `ref_offset`.
+    pub ref_count: i64,
+    /// Which of the four callee-saved registers hold a live reference at this call site: bit
+    /// 0 = rbx, bit 1 = r12, bit 2 = r13, bit 3 = r14 -- the fixed order the register
+    /// allocator's own callee-saved list never varies. A live reference is never in a
+    /// caller-saved register at a call site (ADR-0018's own allocation invariant: an interval
+    /// spanning a call always gets a callee-saved register or spills), which is why four bits
+    /// are enough.
+    pub reg_mask: i64,
+    /// Which of the four callee-saved registers this call site's own function pushed in its
+    /// prologue, in the same bit order as `reg_mask`. It is a per-function fact, not a
+    /// per-call-site one, but it travels on every entry of the function's own call sites
+    /// because nothing else names "the current function" in this table. A collector walking
+    /// the rbp chain (ADR-0022) needs it to tell which of a caller's live registers survived a
+    /// callee's body untouched (still the live CPU register) from which were spilled to a
+    /// fixed rbp-relative slot in the callee's own prologue (the callee's caller's original
+    /// value, recovered from that slot instead): for register i, if bit i is set, the saved
+    /// copy sits at the callee's own rbp minus 8 times (1 + the number of lower-indexed set
+    /// bits) -- the same fixed push order the prologue already uses, so a set bit's rank among
+    /// the set bits below it is its push position.
+    pub saved_mask: i64,
+}
+
+/// Serializes entries into the fixed-width, binary-searchable table spec/11-codegen.md
+/// describes: sorted by return address, in read-only data, reachable from the runtime block.
+/// The entries must already be sorted; this does not re-sort them, so that the caller's own
+/// sort is the one place order is decided.
+pub fn encode_stack_map(entries: List[StackMapEntry]) -> List[i64] {
+    let out = list::new[i64]();
+    let mut i = 0;
+    while i < entries.len() {
+        let e = entries.at(i);
+        put_le(out, e.return_addr, 8);
+        put_le(out, e.ref_offset, 4);
+        put_le(out, e.ref_count, 4);
+        out.push(e.reg_mask & 255);
+        out.push(e.saved_mask & 255);
+        let mut pad = 6;
+        while pad > 0 { out.push(0); pad = pad - 1; }
+        i = i + 1;
+    }
+    out
+}
+
+/// Appends `n` little-endian bytes of `v`.
+fn put_le(out: List[i64], v: i64, n: i64) {
+    let mut i = 0;
+    while i < n {
+        out.push((v >> (i * 8)) & 255);
+        i = i + 1;
+    }
 }

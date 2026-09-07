@@ -1,0 +1,275 @@
+// The specified hash, in machine code (spec/13-collections.md's "Hashing").
+//
+// A translation of `internal/backend/hash.go`.
+//
+// 64-bit FNV-1a over an encoding the specification fixes, because `hash::of` returns a
+// number a program can print and the three engines have to agree on it down to the bit. The
+// walk is `rt_equal_objects`' walk with one operand instead of two: the same per-type table,
+// the same shape dispatch, the same recursion into a reference.
+//
+// A composite folds each part's *own* hash in as eight little-endian bytes, so a value
+// hashes the same wherever it sits. That is why this is two routines rather than one:
+// `rt_hash_word` takes a raw word and its kind, and `rt_hash_object` takes a reference.
+
+use bytecode;
+use emitter;
+use equal;
+use layout;
+use sched;
+use x86;
+
+/// FNV-1a's 64-bit offset basis. It does not fit in an `i64`, which is why every other
+/// constant here is one and this one is not.
+pub const FNV_OFFSET_BASIS: u64 = 14695981039346656037u64;
+/// FNV-1a's 64-bit prime.
+pub const FNV_PRIME: i64 = 1099511628211;
+
+/// The mask that clears a float's sign bit: every bit but the top one.
+const NOT_SIGN_BIT: i64 = 9223372036854775807;
+
+/// Writes `rt_hash_mix(h rdi, word rsi) -> rax`: fold eight little-endian bytes into a
+/// running hash. A leaf.
+pub fn emit_hash_mix(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.hash_mix);
+
+    let loop_head = a.new_label("hash_mix_loop");
+    let done = a.new_label("hash_mix_done");
+
+    a.mov_rr(x86::RAX, x86::RDI);
+    a.xor_rr(x86::R8, x86::R8); // byte index
+    a.bind(loop_head);
+    a.cmp_ri(x86::R8, 8);
+    a.jcc(x86::ABOVE_EQUAL, done);
+
+    // The low byte of the word shifted down by the index, xored in and multiplied.
+    a.mov_rr(x86::RCX, x86::R8);
+    a.shl_i(x86::RCX, 3); // bit offset
+    a.mov_rr(x86::RDX, x86::RSI);
+    a.shr_cl(x86::RDX);
+    a.and_ri(x86::RDX, 255);
+    a.xor_rr(x86::RAX, x86::RDX);
+    a.mov_ri(x86::R9, FNV_PRIME as u64);
+    a.imul_rr(x86::RAX, x86::R9);
+
+    a.add_ri(x86::R8, 1);
+    a.jmp(loop_head);
+    a.bind(done);
+    a.ret();
+}
+
+/// Writes `rt_hash_word(word rdi, kind rsi) -> rax`: one value's own hash, given its raw
+/// word and its word kind.
+///
+/// A float normalizes `-0.0` to `0.0` before hashing, because the two compare equal and a
+/// hash may not disagree with `==` (spec/13-collections.md). Unit hashes to the bare offset
+/// basis: nothing at all is fed in.
+pub fn emit_hash_word(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.hash_word);
+
+    sched::runtime_prologue(e);
+
+    let is_ref = a.new_label("hash_word_ref");
+    let is_float = a.new_label("hash_word_float");
+    let is_unit = a.new_label("hash_word_unit");
+    let mix = a.new_label("hash_word_mix");
+
+    a.mov_rr(x86::RBX, x86::RDI); // the word
+    a.cmp_ri(x86::RSI, layout::WORD_REF);
+    a.jcc(x86::EQUAL, is_ref);
+    a.cmp_ri(x86::RSI, layout::WORD_FLOAT);
+    a.jcc(x86::EQUAL, is_float);
+    a.cmp_ri(x86::RSI, layout::WORD_UNIT);
+    a.jcc(x86::EQUAL, is_unit);
+
+    a.bind(mix);
+    a.mov_ri(x86::RDI, FNV_OFFSET_BASIS);
+    a.mov_rr(x86::RSI, x86::RBX);
+    a.call(e.rt.hash_mix);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(is_ref);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.call(e.rt.hash_object);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(is_float);
+    // Zero and negative zero compare equal, so they hash equally. A float is one of the two
+    // exactly when every bit but the sign is clear, which makes the normalization a test on
+    // the bits rather than a comparison -- and keeps NaN, whose bits are its own business,
+    // out of it.
+    let not_zero = a.new_label("hash_word_not_zero");
+    a.mov_rr(x86::RAX, x86::RBX);
+    a.mov_ri(x86::R9, NOT_SIGN_BIT as u64);
+    a.and_rr(x86::RAX, x86::R9);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, not_zero);
+    a.xor_rr(x86::RBX, x86::RBX);
+    a.bind(not_zero);
+    a.jmp(mix);
+
+    a.bind(is_unit);
+    a.mov_ri(x86::RAX, FNV_OFFSET_BASIS);
+    sched::runtime_epilogue(e);
+    a.ret();
+}
+
+/// Writes `rt_hash_object(ref rdi) -> rax`: one heap object's own hash.
+///
+/// A `String` hashes over its bytes; an array over its elements' own hashes; anything else
+/// over its fields' own hashes, by the per-word kinds the type table holds. Nil hashes as a
+/// zero word, which is what the other two engines do with a reference that is not there.
+pub fn emit_hash_object(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.hash_object);
+
+    sched::runtime_prologue(e);
+    a.sub_ri(x86::RSP, 16); // one slot for the running hash, one to keep rsp aligned
+
+    let hash_slot = x86::at(x86::RBP, 0 - 40);
+
+    let is_nil = a.new_label("hash_obj_nil");
+    let bytes_case = a.new_label("hash_obj_bytes");
+    let array_case = a.new_label("hash_obj_array");
+    let fixed_case = a.new_label("hash_obj_fixed");
+    let epilogue = a.new_label("hash_obj_epilogue");
+
+    a.test_rr(x86::RDI, x86::RDI);
+    a.jcc(x86::EQUAL, is_nil);
+
+    a.mov_rr(x86::RBX, x86::RDI); // the object
+    a.mov_ri(x86::RAX, FNV_OFFSET_BASIS);
+    a.mov_mr(hash_slot, x86::RAX);
+
+    // The type table row, exactly as `equal.origin` and the collector read it.
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, 0));
+    equal::mask_low32(e, x86::RAX, x86::R8);
+    a.shl_i(x86::RAX, equal::TYPE_TABLE_ROW_SHIFT);
+    a.mov_ri(x86::R9, e.type_table_addr as u64);
+    a.add_rr(x86::RAX, x86::R9);
+    a.mov_rr(x86::R12, x86::RAX); // r12 = the row
+
+    a.mov_rm(x86::RAX, x86::at(x86::R12, 0)); // shape
+    a.cmp_ri(x86::RAX, layout::BYTE_ARRAY);
+    a.jcc(x86::EQUAL, bytes_case);
+    a.cmp_ri(x86::RAX, layout::REF_ARRAY);
+    a.jcc(x86::EQUAL, array_case);
+    a.cmp_ri(x86::RAX, layout::RAW_ARRAY);
+    a.jcc(x86::EQUAL, array_case);
+    a.jmp(fixed_case);
+
+    // A struct, tuple, variant or closure: each field's own hash, in order.
+    a.bind(fixed_case);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, 0));
+    a.shr_i(x86::RAX, 32);
+    a.mov_rr(x86::R13, x86::RAX);              // words
+    a.mov_rm(x86::R14, x86::at(x86::R12, 16)); // the kinds address
+    a.xor_rr(x86::R12, x86::R12);              // i = 0
+
+    let field_loop = a.new_label("hash_obj_field_loop");
+    a.bind(field_loop);
+    a.cmp_rr(x86::R12, x86::R13);
+    a.jcc(x86::GREATER_EQUAL, epilogue);
+
+    a.mov_rr(x86::RAX, x86::R14);
+    a.add_rr(x86::RAX, x86::R12);
+    a.xor_rr(x86::RSI, x86::RSI);
+    a.mov_rm8(x86::RSI, x86::at(x86::RAX, 0)); // this word's kind
+    a.mov_rr(x86::RAX, x86::R12);
+    a.shl_i(x86::RAX, 3);
+    a.add_ri(x86::RAX, emitter::OBJ_HEADER_SIZE);
+    a.add_rr(x86::RAX, x86::RBX);
+    a.mov_rm(x86::RDI, x86::at(x86::RAX, 0));
+    a.call(e.rt.hash_word);
+
+    a.mov_rm(x86::RDI, hash_slot);
+    a.mov_rr(x86::RSI, x86::RAX);
+    a.call(e.rt.hash_mix);
+    a.mov_mr(hash_slot, x86::RAX);
+
+    a.add_ri(x86::R12, 1);
+    a.jmp(field_loop);
+
+    // An array: its length's worth of elements, each by the row's single element kind.
+    a.bind(array_case);
+    a.mov_rm(x86::R13, x86::at(x86::RBX, emitter::OBJ_HEADER_SIZE)); // the length
+    a.mov_rm(x86::R14, x86::at(x86::R12, 24));                       // the element kind
+    a.xor_rr(x86::R12, x86::R12);
+
+    let elem_loop = a.new_label("hash_obj_elem_loop");
+    a.bind(elem_loop);
+    a.cmp_rr(x86::R12, x86::R13);
+    a.jcc(x86::GREATER_EQUAL, epilogue);
+
+    a.mov_rr(x86::RAX, x86::R12);
+    a.shl_i(x86::RAX, 3);
+    a.add_ri(x86::RAX, emitter::OBJ_HEADER_SIZE + emitter::WORD_SIZE);
+    a.add_rr(x86::RAX, x86::RBX);
+    a.mov_rm(x86::RDI, x86::at(x86::RAX, 0));
+    a.mov_rr(x86::RSI, x86::R14);
+    a.call(e.rt.hash_word);
+
+    a.mov_rm(x86::RDI, hash_slot);
+    a.mov_rr(x86::RSI, x86::RAX);
+    a.call(e.rt.hash_mix);
+    a.mov_mr(hash_slot, x86::RAX);
+
+    a.add_ri(x86::R12, 1);
+    a.jmp(elem_loop);
+
+    // A String: its bytes, one at a time, in order.
+    a.bind(bytes_case);
+    a.mov_rm(x86::R13, x86::at(x86::RBX, emitter::OBJ_HEADER_SIZE)); // the length in bytes
+    a.xor_rr(x86::R12, x86::R12);
+
+    let byte_loop = a.new_label("hash_obj_byte_loop");
+    a.bind(byte_loop);
+    a.cmp_rr(x86::R12, x86::R13);
+    a.jcc(x86::GREATER_EQUAL, epilogue);
+
+    a.mov_rr(x86::RAX, x86::RBX);
+    a.add_ri(x86::RAX, emitter::STR_BYTES_OFF);
+    a.add_rr(x86::RAX, x86::R12);
+    a.xor_rr(x86::RCX, x86::RCX);
+    a.mov_rm8(x86::RCX, x86::at(x86::RAX, 0));
+    a.mov_rm(x86::RAX, hash_slot);
+    a.xor_rr(x86::RAX, x86::RCX);
+    a.mov_ri(x86::R9, FNV_PRIME as u64);
+    a.imul_rr(x86::RAX, x86::R9);
+    a.mov_mr(hash_slot, x86::RAX);
+
+    a.add_ri(x86::R12, 1);
+    a.jmp(byte_loop);
+
+    a.bind(epilogue);
+    a.mov_rm(x86::RAX, hash_slot);
+    a.add_ri(x86::RSP, 16);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(is_nil);
+    a.mov_ri(x86::RDI, FNV_OFFSET_BASIS);
+    a.xor_rr(x86::RSI, x86::RSI);
+    a.call(e.rt.hash_mix);
+    a.add_ri(x86::RSP, 16);
+    sched::runtime_epilogue(e);
+    a.ret();
+}
+
+/// Maps a value's static kind to the word kind `rt_hash_word` dispatches on. The two
+/// vocabularies say the same thing about a word -- what it holds -- from either side of the
+/// bytecode boundary (ADR-0021).
+pub fn hash_kind_of(k: i64) -> i64 {
+    if k == bytecode::KIND_REF || k == bytecode::KIND_STRING { return layout::WORD_REF; }
+    if k == bytecode::KIND_FLOAT { return layout::WORD_FLOAT; }
+    if k == bytecode::KIND_BOOL { return layout::WORD_BOOL; }
+    if k == bytecode::KIND_CHAR { return layout::WORD_CHAR; }
+    if k == bytecode::KIND_UNIT { return layout::WORD_UNIT; }
+    layout::WORD_INT
+}

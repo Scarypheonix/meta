@@ -1,0 +1,140 @@
+// Mutex in native code (spec/12-concurrency.md, ADR-0014).
+//
+// A translation of `internal/backend/mutex.go`, less its `gcEvacuateMutexes`: the walk that
+// visits what each mutex guards reads the collector's own frame slots, and lives in
+// `collect.origin` beside the channel walk it is the twin of, rather than importing a
+// constant back out of the module that calls it.
+//
+// The lock is one word naming the thread that holds it, and the loop that waits for it is
+// the same one every channel operation uses. What makes it a mutex rather than a flag is
+// where the unlock happens: §12 gives no `lock()` returning a guard, because a guard would
+// have to be released by a destructor and Origin has none (ADR-0006 left no unwinding to
+// hang one on). `with` takes a closure, and a closure has an end -- so the acquire, the call
+// and the release are all emitted at the one call site (`lower.origin`), and there is no path
+// between them a program can leave by. A panic inside the body ends the process (ADR-0026),
+// which is the only other way out and needs no lock released.
+//
+// Re-entering traps rather than deadlocking. The thread that already holds the lock is the
+// one asking for it again, so no thread can ever release it, and a hang would be a defined
+// but useless answer where a trap names the bug at the moment it happens.
+
+use chan;
+use emitter;
+use runtime;
+use sched;
+use x86;
+
+pub const MUTEX_VALUE_OFF: i64 = 0;
+/// The control block of the thread holding the lock, or 0.
+pub const MUTEX_OWNER_OFF: i64 = 8;
+/// The compiler's answer, as a channel's is: raw memory carries no stack map, so the
+/// collector is told whether the guarded value is a reference.
+pub const MUTEX_IS_REF_OFF: i64 = 16;
+pub const MUTEX_NEXT_OFF: i64 = 24;
+const MUTEX_SIZE: i64 = 32;
+
+/// Writes `rt_mutex_new(value rdi, is_ref rsi) -> mutex rax`.
+///
+/// One mapping per mutex, in memory the collector does not move, for the same reason a
+/// channel gets one: the guarded value is reachable through this block while no thread holds
+/// the lock, and the block cannot move underneath a thread parked on it.
+pub fn emit_mutex_new(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.mutex_new);
+
+    sched::runtime_prologue(e);
+    a.mov_rr(x86::RBX, x86::RDI);
+    a.mov_rr(x86::R12, x86::RSI);
+
+    let ok = a.new_label("mutex_new_mapped");
+    a.mov_ri(x86::RAX, e.target.sys_mmap as u64);
+    a.xor_rr(x86::RDI, x86::RDI);
+    a.mov_ri(x86::RSI, MUTEX_SIZE as u64);
+    a.mov_ri(x86::RDX, 3u64);
+    a.mov_ri(x86::R10, e.target.map_anon_private as u64);
+    a.mov_ri(x86::R8, runtime::U64_ALL_ONES);
+    a.xor_rr(x86::R9, x86::R9);
+    a.syscall();
+    a.cmp_ri(x86::RAX, 4096);
+    a.jcc(x86::ABOVE_EQUAL, ok);
+    runtime::trap_with(e, e.out_of_memory_msg);
+    a.bind(ok);
+
+    a.mov_mr(x86::at(x86::RAX, MUTEX_VALUE_OFF), x86::RBX);
+    a.mov_mi(x86::at(x86::RAX, MUTEX_OWNER_OFF), 0);
+    a.mov_mr(x86::at(x86::RAX, MUTEX_IS_REF_OFF), x86::R12);
+
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_MUTEXES_OFF));
+    a.mov_mr(x86::at(x86::RAX, MUTEX_NEXT_OFF), x86::RCX);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_MUTEXES_OFF), x86::RAX);
+
+    sched::runtime_epilogue(e);
+    a.ret();
+}
+
+/// Writes `rt_mutex_lock(mutex rdi) -> status rax, guarded rdx`.
+///
+/// The guarded value is read after the lock is taken, never before: a collection while this
+/// thread was parked will have moved it, and the collector rewrites the mutex's own slot
+/// rather than any copy this routine made on the way in.
+pub fn emit_mutex_lock(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.mutex_lock);
+
+    sched::runtime_prologue(e);
+    a.mov_rr(x86::RBX, x86::RDI);
+    a.mov_rm(x86::R13, x86::at(x86::R15, emitter::RT_CURRENT_OFF));
+
+    let refused = a.new_label("mutex_refused");
+    let stuck = a.new_label("mutex_stuck");
+    let wait = a.new_label("mutex_wait");
+    let acquire = a.new_label("mutex_acquire");
+
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, MUTEX_OWNER_OFF));
+    a.cmp_rr(x86::RAX, x86::R13);
+    a.jcc(x86::EQUAL, refused);
+
+    a.bind(wait);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, MUTEX_OWNER_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, acquire);
+    chan::block_and_park(e, x86::R13, stuck);
+    a.jmp(wait);
+
+    a.bind(acquire);
+    a.mov_mr(x86::at(x86::RBX, MUTEX_OWNER_OFF), x86::R13);
+    a.mov_rm(x86::RDX, x86::at(x86::RBX, MUTEX_VALUE_OFF));
+    a.xor_rr(x86::RAX, x86::RAX);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(refused);
+    a.mov_ri(x86::RAX, sched::REFUSED as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(stuck);
+    a.mov_ri(x86::RAX, sched::DEADLOCK as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    sched::runtime_epilogue(e);
+    a.ret();
+}
+
+/// Writes `rt_mutex_unlock(mutex rdi)`.
+///
+/// It cannot allocate and cannot park -- it drops the owner and broadcasts -- which is what
+/// lets the call site hold the body's result on the stack across it (`lower.origin`).
+pub fn emit_mutex_unlock(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.mutex_unlock);
+
+    sched::runtime_prologue(e);
+    a.mov_mi(x86::at(x86::RDI, MUTEX_OWNER_OFF), 0);
+    a.call(e.rt.sched_wake_all);
+    sched::runtime_epilogue(e);
+    a.ret();
+}

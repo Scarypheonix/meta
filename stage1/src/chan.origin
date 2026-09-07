@@ -1,0 +1,409 @@
+// Channels in native code (spec/12-concurrency.md).
+//
+// A translation of `internal/backend/chan.go`.
+//
+// A channel is a ring of `capacity` slots with a length and a head, plus the two bits every
+// operation turns on: whether it has been closed, and how many receivers are waiting on it
+// right now. The waiting count exists only for rendezvous, where a send must not complete
+// until a receive is there to take the value -- with a queue there is nothing to
+// synchronise, and the length alone decides who blocks.
+//
+// Every blocking operation is the same loop: check the condition, and if it does not hold,
+// mark this thread blocked and park (`sched.origin`). A wake is a broadcast, so coming back
+// proves nothing and the loop re-checks. That is exactly the shape the virtual machine's own
+// `w.wait(ready)` has, deliberately: the two engines must agree on which programs deadlock
+// and which do not, and the surest way to get that is to make the conditions literally the
+// same expressions.
+//
+// The channel lives in memory the collector does not own -- one mmap per channel, like a
+// thread control block -- because the collector moves objects and the scheduler holds a raw
+// pointer to a channel across a switch. What it holds *for* the program is another matter: a
+// queued value may be a reference, and then the collector must find and rewrite it, which is
+// what the channel list (`RT_CHANNELS_OFF`) and the compiler-supplied `elem_is_ref` are for.
+
+use emitter;
+use runtime;
+use sched;
+use thread;
+use x86;
+
+pub const CHAN_CAP_OFF: i64 = 0;
+pub const CHAN_LEN_OFF: i64 = 8;
+pub const CHAN_HEAD_OFF: i64 = 16;
+pub const CHAN_CLOSED_OFF: i64 = 24;
+/// The compiler's answer to a question the runtime cannot ask: are the words in this queue
+/// references? Raw memory carries no stack map, and only the checker knew the channel's T.
+pub const CHAN_ELEM_IS_REF_OFF: i64 = 32;
+/// Counts receivers parked on this channel, which is what makes a rendezvous send wait for
+/// one rather than queueing and returning.
+pub const CHAN_RECV_WAIT_OFF: i64 = 40;
+/// Chains every channel the program has made, so the collector can visit what is sitting in
+/// their queues.
+pub const CHAN_NEXT_OFF: i64 = 48;
+/// The ring's length: the capacity, or one for a rendezvous channel, which needs somewhere
+/// to put the value it is handing over.
+pub const CHAN_SLOTS_OFF: i64 = 56;
+pub const CHAN_QUEUE_OFF: i64 = 64;
+
+/// Bounds what a program may ask for, so that the size arithmetic below cannot overflow into
+/// a small mapping that later writes past its end. A capacity this large is out of memory in
+/// any case, and saying so is better than wrapping.
+const CHAN_MAX_SLOTS: i64 = 268435456;
+
+/// Writes `rt_chan_new(capacity rdi, elem_is_ref rsi) -> status rax, channel rdx`.
+///
+/// A negative capacity is refused rather than trapped here (§12 names the user's line for it,
+/// and only the caller has that).
+pub fn emit_chan_new(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.chan_new);
+
+    sched::runtime_prologue(e);
+
+    let refused = a.new_label("chan_new_refused");
+    let sized = a.new_label("chan_new_sized");
+    let ok = a.new_label("chan_new_mapped");
+
+    a.cmp_ri(x86::RDI, 0);
+    a.jcc(x86::LESS, refused);
+    a.mov_ri(x86::RAX, CHAN_MAX_SLOTS as u64);
+    a.cmp_rr(x86::RDI, x86::RAX);
+    a.jcc(x86::ABOVE_EQUAL, refused);
+
+    a.mov_rr(x86::RBX, x86::RDI); // capacity
+    a.mov_rr(x86::R12, x86::RSI); // elem_is_ref
+
+    // A rendezvous channel still needs one slot: the value crosses through the ring even
+    // though it is never queued in the sense of waiting there.
+    a.mov_rr(x86::R13, x86::RBX);
+    a.test_rr(x86::R13, x86::R13);
+    a.jcc(x86::NOT_EQUAL, sized);
+    a.mov_ri(x86::R13, 1u64);
+    a.bind(sized);
+
+    a.mov_rr(x86::RSI, x86::R13);
+    a.shl_i(x86::RSI, 3);
+    a.add_ri(x86::RSI, CHAN_QUEUE_OFF);
+    a.mov_ri(x86::RAX, e.target.sys_mmap as u64);
+    a.xor_rr(x86::RDI, x86::RDI);
+    a.mov_ri(x86::RDX, 3u64);
+    a.mov_ri(x86::R10, e.target.map_anon_private as u64);
+    a.mov_ri(x86::R8, runtime::U64_ALL_ONES);
+    a.xor_rr(x86::R9, x86::R9);
+    a.syscall();
+    a.cmp_ri(x86::RAX, 4096);
+    a.jcc(x86::ABOVE_EQUAL, ok);
+    runtime::trap_with(e, e.out_of_memory_msg);
+    a.bind(ok);
+
+    a.mov_mr(x86::at(x86::RAX, CHAN_CAP_OFF), x86::RBX);
+    a.mov_mi(x86::at(x86::RAX, CHAN_LEN_OFF), 0);
+    a.mov_mi(x86::at(x86::RAX, CHAN_HEAD_OFF), 0);
+    a.mov_mi(x86::at(x86::RAX, CHAN_CLOSED_OFF), 0);
+    a.mov_mr(x86::at(x86::RAX, CHAN_ELEM_IS_REF_OFF), x86::R12);
+    a.mov_mi(x86::at(x86::RAX, CHAN_RECV_WAIT_OFF), 0);
+    a.mov_mr(x86::at(x86::RAX, CHAN_SLOTS_OFF), x86::R13);
+
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_CHANNELS_OFF));
+    a.mov_mr(x86::at(x86::RAX, CHAN_NEXT_OFF), x86::RCX);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_CHANNELS_OFF), x86::RAX);
+
+    a.mov_rr(x86::RDX, x86::RAX);
+    a.xor_rr(x86::RAX, x86::RAX);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(refused);
+    a.mov_ri(x86::RAX, sched::REFUSED as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    sched::runtime_epilogue(e);
+    a.ret();
+}
+
+/// Writes `rt_chan_send(channel rdi, value rsi) -> status rax`.
+///
+/// Two shapes, exactly as the virtual machine has them. A buffered send waits for room and
+/// leaves the value in the queue. A rendezvous send waits for a receiver to be parked *and*
+/// the ring to be empty, hands the value over, and then waits again until it has been taken
+/// -- which is what makes the send complete only when the receive does, rather than merely
+/// when a receiver exists.
+///
+/// A closed channel refuses at every one of those points, including after a wait: closing
+/// while a sender is blocked is a real ordering, and returning as though the value had been
+/// delivered would lose it silently (§12 makes sending on a closed channel a programming
+/// error, like dividing by zero).
+pub fn emit_chan_send(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.chan_send);
+
+    sched::runtime_prologue(e);
+    a.mov_rr(x86::RBX, x86::RDI);                                    // the channel
+    a.mov_rr(x86::R12, x86::RSI);                                    // the value
+    a.mov_rm(x86::R13, x86::at(x86::R15, emitter::RT_CURRENT_OFF));  // this thread
+
+    let refused = a.new_label("send_refused");
+    let stuck = a.new_label("send_stuck");
+    let buffered = a.new_label("send_buffered");
+    let rendezvous = a.new_label("send_rendezvous");
+    let hand_over = a.new_label("send_hand_over");
+    let wait_taken = a.new_label("send_wait_taken");
+    let done = a.new_label("send_done");
+
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_CAP_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, rendezvous);
+
+    // Buffered: wait for room.
+    a.bind(buffered);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_CLOSED_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, refused);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_LEN_OFF));
+    a.mov_rm(x86::RCX, x86::at(x86::RBX, CHAN_CAP_OFF));
+    a.cmp_rr(x86::RAX, x86::RCX);
+    a.jcc(x86::LESS, hand_over);
+    block_and_park(e, x86::R13, stuck);
+    a.jmp(buffered);
+
+    // Rendezvous: wait for a receiver that has nothing to take yet.
+    let wait_recv = a.new_label("send_wait_receiver");
+    a.bind(rendezvous);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_CLOSED_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, refused);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_RECV_WAIT_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, wait_recv);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_LEN_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, hand_over);
+    a.bind(wait_recv);
+    block_and_park(e, x86::R13, stuck);
+    a.jmp(rendezvous);
+
+    a.bind(hand_over);
+    chan_enqueue(e, x86::RBX, x86::R12);
+    a.call(e.rt.sched_wake_all);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_CAP_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, done);
+
+    // Rendezvous only: not delivered until the receiver has taken it. A close counts as
+    // delivered-or-gone; the value stays queued for whoever drains the channel.
+    a.bind(wait_taken);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_LEN_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, done);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_CLOSED_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, done);
+    block_and_park(e, x86::R13, stuck);
+    a.jmp(wait_taken);
+
+    a.bind(done);
+    a.xor_rr(x86::RAX, x86::RAX);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(refused);
+    a.mov_ri(x86::RAX, sched::REFUSED as u64);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(stuck);
+    a.mov_ri(x86::RAX, sched::DEADLOCK as u64);
+    sched::runtime_epilogue(e);
+    a.ret();
+}
+
+/// Marks this thread as waiting and gives up the processor, jumping to `stuck` when the
+/// scheduler reports that nothing else can run (§12's total deadlock).
+pub fn block_and_park(e: emitter::Emitter, t: i64, stuck: x86::Label) {
+    let a = e.a;
+    a.mov_mi(x86::at(t, thread::TCB_BLOCKED_OFF), 1);
+    a.call(e.rt.sched_park);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, stuck);
+}
+
+/// Writes one value into the ring at head+len and lengthens it. The index wraps by
+/// subtraction rather than division: head is below slots and len is at most slots, so their
+/// sum is below twice it.
+fn chan_enqueue(e: emitter::Emitter, ch: i64, value: i64) {
+    let a = e.a;
+    let no_wrap = a.new_label("enqueue_no_wrap");
+
+    a.mov_rm(x86::RAX, x86::at(ch, CHAN_HEAD_OFF));
+    a.mov_rm(x86::RCX, x86::at(ch, CHAN_LEN_OFF));
+    a.add_rr(x86::RAX, x86::RCX);
+    a.mov_rm(x86::RCX, x86::at(ch, CHAN_SLOTS_OFF));
+    a.cmp_rr(x86::RAX, x86::RCX);
+    a.jcc(x86::BELOW, no_wrap);
+    a.sub_rr(x86::RAX, x86::RCX);
+    a.bind(no_wrap);
+
+    a.shl_i(x86::RAX, 3);
+    a.add_ri(x86::RAX, CHAN_QUEUE_OFF);
+    a.add_rr(x86::RAX, ch);
+    a.mov_mr(x86::at(x86::RAX, 0), value);
+
+    a.mov_rm(x86::RCX, x86::at(ch, CHAN_LEN_OFF));
+    a.add_ri(x86::RCX, 1);
+    a.mov_mr(x86::at(ch, CHAN_LEN_OFF), x86::RCX);
+}
+
+/// Takes the oldest value out of the ring, leaving it in rax.
+fn chan_dequeue(e: emitter::Emitter, ch: i64) {
+    let a = e.a;
+    let no_wrap = a.new_label("dequeue_no_wrap");
+
+    a.mov_rm(x86::RCX, x86::at(ch, CHAN_HEAD_OFF));
+    a.mov_rr(x86::RAX, x86::RCX);
+    a.shl_i(x86::RAX, 3);
+    a.add_ri(x86::RAX, CHAN_QUEUE_OFF);
+    a.add_rr(x86::RAX, ch);
+    a.mov_rm(x86::RAX, x86::at(x86::RAX, 0)); // the value
+
+    a.add_ri(x86::RCX, 1);
+    a.mov_rm(x86::RDX, x86::at(ch, CHAN_SLOTS_OFF));
+    a.cmp_rr(x86::RCX, x86::RDX);
+    a.jcc(x86::BELOW, no_wrap);
+    a.xor_rr(x86::RCX, x86::RCX);
+    a.bind(no_wrap);
+    a.mov_mr(x86::at(ch, CHAN_HEAD_OFF), x86::RCX);
+
+    a.mov_rm(x86::RCX, x86::at(ch, CHAN_LEN_OFF));
+    a.sub_ri(x86::RCX, 1);
+    a.mov_mr(x86::at(ch, CHAN_LEN_OFF), x86::RCX);
+}
+
+/// Writes `rt_chan_recv(channel rdi) -> status rax, got rdx`.
+///
+/// The value itself does not come back in a register. §12's `recv` is two operations in
+/// Origin -- "was there one?" and "give it to me" -- so that the prelude can build the
+/// `Option` the caller sees without the runtime knowing what an `Option` is, and asking twice
+/// would be a race between two receivers. So the value is taken here, under nobody else's
+/// nose, and held on this thread until `rt_chan_taken` reads it.
+///
+/// The waiting count goes up before the wait and down after it, and a wake follows it up: a
+/// rendezvous sender is waiting for exactly this.
+pub fn emit_chan_recv(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.chan_recv);
+
+    sched::runtime_prologue(e);
+    a.mov_rr(x86::RBX, x86::RDI);
+    a.mov_rm(x86::R13, x86::at(x86::R15, emitter::RT_CURRENT_OFF));
+
+    let wait = a.new_label("recv_wait");
+    let take = a.new_label("recv_take");
+    let empty = a.new_label("recv_empty");
+    let stuck = a.new_label("recv_stuck");
+
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_RECV_WAIT_OFF));
+    a.add_ri(x86::RAX, 1);
+    a.mov_mr(x86::at(x86::RBX, CHAN_RECV_WAIT_OFF), x86::RAX);
+    a.call(e.rt.sched_wake_all);
+
+    a.bind(wait);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_LEN_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, take);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_CLOSED_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, empty);
+    block_and_park(e, x86::R13, stuck);
+    a.jmp(wait);
+
+    a.bind(take);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_RECV_WAIT_OFF));
+    a.sub_ri(x86::RAX, 1);
+    a.mov_mr(x86::at(x86::RBX, CHAN_RECV_WAIT_OFF), x86::RAX);
+
+    chan_dequeue(e, x86::RBX);
+    a.mov_mr(x86::at(x86::R13, thread::TCB_TAKEN_OFF), x86::RAX);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_ELEM_IS_REF_OFF));
+    a.add_ri(x86::RAX, 1); // 1 = a raw value is held, 2 = a reference is
+    a.mov_mr(x86::at(x86::R13, thread::TCB_TAKEN_IS_REF_OFF), x86::RAX);
+    a.call(e.rt.sched_wake_all);
+
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.mov_ri(x86::RDX, 1u64);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(empty);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_RECV_WAIT_OFF));
+    a.sub_ri(x86::RAX, 1);
+    a.mov_mr(x86::at(x86::RBX, CHAN_RECV_WAIT_OFF), x86::RAX);
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.xor_rr(x86::RDX, x86::RDX);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(stuck);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, CHAN_RECV_WAIT_OFF));
+    a.sub_ri(x86::RAX, 1);
+    a.mov_mr(x86::at(x86::RBX, CHAN_RECV_WAIT_OFF), x86::RAX);
+    a.mov_ri(x86::RAX, sched::DEADLOCK as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    sched::runtime_epilogue(e);
+    a.ret();
+}
+
+/// Writes `rt_chan_taken() -> status rax, value rdx`: the value this thread's own last
+/// receive took. It is cleared on the way out, so the slot never keeps a reference alive past
+/// the moment the program reads it.
+pub fn emit_chan_taken(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.chan_taken);
+
+    let refused = a.new_label("taken_refused");
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_CURRENT_OFF));
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, thread::TCB_TAKEN_IS_REF_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, refused);
+
+    a.mov_rm(x86::RDX, x86::at(x86::RCX, thread::TCB_TAKEN_OFF));
+    a.mov_mi(x86::at(x86::RCX, thread::TCB_TAKEN_OFF), 0);
+    a.mov_mi(x86::at(x86::RCX, thread::TCB_TAKEN_IS_REF_OFF), 0);
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.ret();
+
+    a.bind(refused);
+    a.mov_ri(x86::RAX, sched::REFUSED as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.ret();
+}
+
+/// Writes `rt_chan_close(channel rdi) -> status rax`.
+///
+/// Queued values stay receivable; what closing ends is the possibility of more (§12). Only a
+/// sender may close, which the type system enforces rather than this: `close` is a method on
+/// `Sender[T]`, and a receiver has no way to name it.
+pub fn emit_chan_close(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.chan_close);
+
+    sched::runtime_prologue(e);
+    let refused = a.new_label("close_refused");
+
+    a.mov_rm(x86::RAX, x86::at(x86::RDI, CHAN_CLOSED_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, refused);
+    a.mov_mi(x86::at(x86::RDI, CHAN_CLOSED_OFF), 1);
+    a.call(e.rt.sched_wake_all);
+    a.xor_rr(x86::RAX, x86::RAX);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(refused);
+    a.mov_ri(x86::RAX, sched::REFUSED as u64);
+    sched::runtime_epilogue(e);
+    a.ret();
+}

@@ -1,0 +1,77 @@
+// The argument vector, in machine code (spec/17-process.md).
+//
+// A translation of `internal/backend/process.go`.
+
+use emitter;
+use sched;
+use strings;
+use x86;
+
+/// Writes `rt_arg_at(i rdi) -> status rax, string rdx`: the i'th word of the argument vector
+/// the kernel left on the stack, copied into a fresh String, and `sched::REFUSED` when i is
+/// not one the process was given.
+///
+/// The vector itself is at `[r15+RT_ARGV_OFF]`, saved by `_start` before it aligned the stack
+/// away from it. Its first word is the count and the words after it are NUL-terminated C
+/// strings -- there is no libc to have measured them, so this does.
+///
+/// It allocates, and it holds a pointer across that allocation. That pointer is into the
+/// kernel's own stack region, which the collector neither scans nor moves, so the frame needs
+/// no stack map of its own: there is nothing of anybody's here for a collection to invalidate.
+pub fn emit_arg_at(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.arg_at);
+
+    sched::runtime_prologue(e);
+    let refused = a.new_label("arg_at_refused");
+
+    a.mov_rm(x86::R12, x86::at(x86::R15, emitter::RT_ARGV_OFF)); // argc, then the pointers
+    a.mov_rm(x86::RAX, x86::at(x86::R12, 0));                    // argc
+    a.cmp_ri(x86::RDI, 0);
+    a.jcc(x86::LESS, refused);
+    a.cmp_rr(x86::RDI, x86::RAX);
+    a.jcc(x86::GREATER_EQUAL, refused);
+
+    // r13 = argv[i], the C string itself.
+    a.mov_rr(x86::R13, x86::RDI);
+    a.shl_i(x86::R13, 3);
+    a.add_rr(x86::R13, x86::R12);
+    a.mov_rm(x86::R13, x86::at(x86::R13, emitter::WORD_SIZE));
+
+    // r14 = its length, found by walking to the NUL.
+    a.xor_rr(x86::R14, x86::R14);
+    a.mov_rr(x86::RAX, x86::R13);
+    let measure = a.new_label("arg_at_measure");
+    let measured = a.new_label("arg_at_measured");
+    a.bind(measure);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.mov_rm8(x86::RDX, x86::at(x86::RAX, 0));
+    a.test_rr(x86::RDX, x86::RDX);
+    a.jcc(x86::EQUAL, measured);
+    a.add_ri(x86::RAX, 1);
+    a.add_ri(x86::R14, 1);
+    a.jmp(measure);
+    a.bind(measured);
+
+    a.mov_rr(x86::RDI, x86::R14);
+    a.call(e.rt.str_alloc);
+    a.mov_rr(x86::RBX, x86::RAX); // the String, across the copy: it clobbers rdx
+
+    a.mov_rr(x86::RDI, x86::RAX);
+    a.add_ri(x86::RDI, emitter::STR_BYTES_OFF);
+    a.mov_rr(x86::RSI, x86::R13);
+    a.mov_rr(x86::RCX, x86::R14);
+    strings::str_copy_bytes(e);
+
+    a.mov_rr(x86::RDX, x86::RBX);
+    a.xor_rr(x86::RAX, x86::RAX);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(refused);
+    a.mov_ri(x86::RAX, sched::REFUSED as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    sched::runtime_epilogue(e);
+    a.ret();
+}

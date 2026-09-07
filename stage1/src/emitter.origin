@@ -177,6 +177,9 @@ pub struct Emitter {
     pub const_str: Map[i64, StaticStr],
     /// The fully formatted trap messages, deduplicated.
     pub trap_msg: Map[String, StaticStr],
+    /// Every String object built for a literal the emitter needed by its text rather than by
+    /// its constant-pool index, keyed by that text so one run of bytes is written once.
+    pub literals: Map[String, StaticStr],
 
     /// The base of the per-type layout table structural equality reads.
     pub mut type_table_addr: i64,
@@ -221,6 +224,24 @@ pub fn string_const(e: Emitter, idx: i64) -> StaticStr {
     let out = StaticStr { addr: e.ro_data_addr + e.ro_data.len(), length: text.len() };
     put_string_object(e.ro_data, text, e.string_type);
     e.const_str.insert(idx, out);
+    out
+}
+
+/// A complete String object for one run of text, in read-only data, deduplicated by the text
+/// itself.
+///
+/// `string_const` is the same thing keyed by a constant-pool index. Both exist because the
+/// emitter needs literals the program never wrote -- the empty string a failed read answers
+/// with, a trap's location -- and those have no index to be found by.
+pub fn string_literal(e: Emitter, s: String) -> StaticStr {
+    match e.literals.get(s) {
+        Option::Some(got) => { return got; },
+        Option::None => {},
+    }
+    while e.ro_data.len() % WORD_SIZE != 0 { e.ro_data.push(0); }
+    let out = StaticStr { addr: e.ro_data_addr + e.ro_data.len(), length: s.len() };
+    put_string_object(e.ro_data, s, e.string_type);
+    e.literals.insert(s, out);
     out
 }
 

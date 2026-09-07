@@ -44,7 +44,7 @@ fn mmap_heap(e: emitter::Emitter) {
 }
 
 /// The all-ones word, which `0u64 - 1u64` cannot produce because it traps.
-const U64_ALL_ONES: u64 = 18446744073709551615u64;
+pub const U64_ALL_ONES: u64 = 18446744073709551615u64;
 
 /// The program's entry point: claim a heap, call `main`, exit cleanly.
 pub fn emit_start(e: emitter::Emitter, main_label: x86::Label) {
