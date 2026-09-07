@@ -94,6 +94,11 @@ func TestStage1CheckerMatchesTheGoChecker(t *testing.T) {
 	}{
 		{"native-O2", driver.Native, opt.O2, 1},
 		{"native-O0", driver.Native, opt.O0, 1},
+		// One of the two places the hosted engines run at all (the other is the SSA
+		// differential, at -O2). This one is downstream of lexing, parsing and resolution and
+		// is where a program that will be rejected produces its diagnostics, so between the
+		// two every pass in the compiler has an artefact compared on all three engines --
+		// without asking the same question once per pass, which was half of this package.
 		{"vm-O2", driver.VM, opt.O2, 24},
 		{"interpreter", driver.Interpreter, opt.O0, 40},
 	}

@@ -295,8 +295,14 @@ func TestStage1LexerMatchesTheGoLexer(t *testing.T) {
 	}{
 		{"native-O2", driver.Native, opt.O2, 1},
 		{"native-O0", driver.Native, opt.O0, 1},
-		{"vm-O2", driver.VM, opt.O2, 12},
-		{"interpreter", driver.Interpreter, opt.O0, 12},
+		// The hosted engines do not run this differential. Engine agreement is one property,
+		// not one per pass: if stage1 on the interpreter produces the same artefact as stage1
+		// in native code at a *downstream* stage, the two agreed at every stage before it. It
+		// is checked twice, at the two points that between them cover the whole pipeline --
+		// `check` (which is downstream of lexing, parsing and resolution, and is where a
+		// program that is going to be rejected produces its diagnostics) and `dump-ir -O2`
+		// (downstream of monomorphization, lowering, SSA construction and the optimizer). Paid
+		// seven times it was half of this package.
 	}
 	for _, e := range engines {
 		t.Run(e.name, func(t *testing.T) {

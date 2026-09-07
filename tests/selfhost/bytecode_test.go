@@ -69,9 +69,21 @@ func TestStage1BytecodeMatchesTheGoCompiler(t *testing.T) {
 	}{
 		{"native-O2", driver.Native, opt.O2, opt.O0, 1},
 		{"native-O2/dump-O2", driver.Native, opt.O2, opt.O2, 1},
-		{"native-O0", driver.Native, opt.O0, opt.O0, 1},
-		{"vm-O2", driver.VM, opt.O2, opt.O0, 24},
-		{"interpreter", driver.Interpreter, opt.O0, opt.O0, 40},
+		// A sample rather than the whole corpus. This row differs from the first only in
+		// which *build* of stage1 ran it, so what it is for is a backend bug that shows at
+		// one optimization level and not another -- and such a bug is systematic, not
+		// input-dependent: the register-allocator bug Phase 9 found was in every function
+		// whose entry block is a loop header, not in one file of four hundred. Breadth is
+		// the first row's job.
+		{"native-O0", driver.Native, opt.O0, opt.O0, 8},
+		// The hosted engines do not run this differential. Engine agreement is one property,
+		// not one per pass: if stage1 on the interpreter produces the same artefact as stage1
+		// in native code at a *downstream* stage, the two agreed at every stage before it. It
+		// is checked twice, at the two points that between them cover the whole pipeline --
+		// `check` (which is downstream of lexing, parsing and resolution, and is where a
+		// program that is going to be rejected produces its diagnostics) and `dump-ir -O2`
+		// (downstream of monomorphization, lowering, SSA construction and the optimizer). Paid
+		// seven times it was half of this package.
 	}
 	for _, e := range engines {
 		t.Run(e.name, func(t *testing.T) {
@@ -167,10 +179,13 @@ func TestStage1CompilesItsOwnSourceToBytecode(t *testing.T) {
 		level  opt.Level
 		dump   opt.Level
 	}{
-		{"native-O2", driver.Native, opt.O2, opt.O0},
-		{"native-O2/dump-O1", driver.Native, opt.O2, opt.O1},
+		// One row, not four. `TestStage1CompilesItself` runs stage1 over this same source
+		// all the way to a *binary* at -O1 and demands the exact bytes, which is downstream
+		// of the bytecode at -O0 and of the bytecode the optimizer emits back at -O1 -- so
+		// those three rows proved nothing that test does not prove more strongly. What it
+		// does not reach is -O2, the most aggressive form of the optimizer on the largest
+		// program there is, so that is what stays.
 		{"native-O2/dump-O2", driver.Native, opt.O2, opt.O2},
-		{"native-O0", driver.Native, opt.O0, opt.O0},
 	}
 	for _, e := range engines {
 		t.Run(e.name, func(t *testing.T) {
@@ -355,8 +370,9 @@ func TestStage1BuildsItsOwnSSA(t *testing.T) {
 		// silently (process rule 8).
 		skip string
 	}{
-		{"native-O2", driver.Native, opt.O2, opt.O0, ""},
-		{"native-O2/dump-O1", driver.Native, opt.O2, opt.O1, ""},
+		// One row, for the reason the bytecode differential's own self-source test gives:
+		// the binary `TestStage1CompilesItself` demands is downstream of the SSA at -O0 and
+		// -O1, and -O2 is what it does not reach.
 		{"native-O2/dump-O2", driver.Native, opt.O2, opt.O2, ""},
 		{"native-O0", driver.Native, opt.O0, opt.O0, ""},
 	}
@@ -456,8 +472,12 @@ func TestStage1BuildsTheSameSSAAsTheGoCompiler(t *testing.T) {
 	}{
 		{"native-O0", driver.Native, opt.O0, opt.O0, 1},
 		{"native-O0/dump-O2", driver.Native, opt.O0, opt.O2, 1},
-		{"vm-O2", driver.VM, opt.O2, opt.O0, 24},
-		{"interpreter", driver.Interpreter, opt.O0, opt.O0, 40},
+		// The hosted engines run here and in the checker differential and nowhere else, and
+		// they dump at -O2: between the two, one artefact downstream of every pass in the
+		// compiler is compared on all three engines. Engine agreement is one property, and
+		// asking it once per pass was half of this package's time.
+		{"vm-O2", driver.VM, opt.O2, opt.O2, 24},
+		{"interpreter", driver.Interpreter, opt.O0, opt.O2, 40},
 	}
 	for _, e := range engines {
 		t.Run(e.name, func(t *testing.T) {
