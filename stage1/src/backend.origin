@@ -55,7 +55,8 @@ pub struct Built {
 /// for, so the native path gets the optimizer for free and shares its lowering with the virtual
 /// machine -- which is what makes comparing the two a real test rather than a comparison of two
 /// unrelated compilers.
-pub fn build(prog: bytecode::Program, target: obj::Target, srcs: Map[String, source::File]) -> Built {
+pub fn build(prog: bytecode::Program, target: obj::Target, srcs: Map[String, source::File],
+             identifier: String) -> Built {
     let funcs = build_ir(prog);
     if funcs.error != "" { return failed(funcs.error); }
 
@@ -95,6 +96,7 @@ pub fn build(prog: bytecode::Program, target: obj::Target, srcs: Map[String, sou
         debug_info: final_.debug_info,
         debug_line: final_.debug_line,
         funcs: final_.funcs,
+        identifier: identifier,
     };
     let bad = obj::validate(img);
     if bad != "" { return failed(bad); }
@@ -111,7 +113,7 @@ fn empty_image() -> obj::Image {
         text: list::new[i64](), ro_data: list::new[i64](), data: list::new[i64](),
         bss: 0, entry: 0, text_addr: 0, ro_data_addr: 0, data_addr: 0,
         debug_abbrev: list::new[i64](), debug_info: list::new[i64](),
-        debug_line: list::new[i64](), funcs: list::new[obj::Func](),
+        debug_line: list::new[i64](), funcs: list::new[obj::Func](), identifier: "",
     }
 }
 

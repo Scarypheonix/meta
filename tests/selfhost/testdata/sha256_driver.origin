@@ -1,0 +1,69 @@
+// The hash differential's stage1 half: digest a set of inputs and print them as hex.
+//
+// A compiler that signs its own executables needs a hash of its own (ADR-0024), and Origin has
+// no cryptographic library to borrow one from. `tests/selfhost/sha256_test.go` computes the
+// same digests with Go's `crypto/sha256`.
+//
+// The inputs are chosen for the places a block-based hash goes wrong: the empty message, whose
+// whole content is padding; a message one byte short of a block, where the length field no
+// longer fits and a second block is needed for it alone; the exact block boundary; and a range
+// out of the middle of a longer buffer, which is how a signature hashes one page of a file.
+
+use std::io;
+use std::list;
+use std::str;
+
+use sha256;
+
+fn main() {
+    // Lengths around the 64-byte block and the 56-byte point where the length field stops
+    // fitting.
+    let lengths = list::new[i64]();
+    let mut n = 0;
+    while n <= 130 { lengths.push(n); n = n + 1; }
+    lengths.push(1000);
+    lengths.push(4096);
+    lengths.push(4097);
+
+    let mut i = 0;
+    while i < lengths.len() {
+        let len = lengths.at(i);
+        i = i + 1;
+        let b = bytes(len);
+        io::println("\(len) \(hex(sha256::sum(b, 0, b.len())))");
+    }
+
+    // Ranges out of one buffer, which is what a code signature does page by page.
+    let big = bytes(9000);
+    let mut lo = 0;
+    while lo < 9000 {
+        let mut hi = lo + 4096;
+        if hi > 9000 { hi = 9000; }
+        io::println("\(lo)..\(hi) \(hex(sha256::sum(big, lo, hi)))");
+        lo = lo + 4096;
+    }
+}
+
+/// Bytes that depend on their position, so that a hash reading the wrong ones shows up.
+fn bytes(n: i64) -> List[i64] {
+    let out = list::new[i64]();
+    let mut i = 0;
+    while i < n {
+        out.push((i * 37 + 11) % 251);
+        i = i + 1;
+    }
+    out
+}
+
+const HEX: String = "0123456789abcdef";
+
+fn hex(bytes: List[i64]) -> String {
+    let mut s = "";
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes.at(i);
+        s = "\(s)\(HEX.slice(b >> 4, (b >> 4) + 1))\(HEX.slice(b & 15, (b & 15) + 1))";
+        i = i + 1;
+    }
+    s
+}

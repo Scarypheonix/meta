@@ -1,0 +1,215 @@
+// The ad-hoc code signature a macOS executable must carry to run at all (ADR-0024).
+//
+// A translation of `internal/codesign`.
+//
+// Since macOS 11 the kernel SIGKILLs any executable with no valid signature. Nothing about that
+// is Gatekeeper or the quarantine bit: it is unconditional, and the reason it usually goes
+// unnoticed is that Apple's linker ad-hoc signs its own output. Origin has no linker (ADR-0017),
+// so it signs its own executables here.
+//
+// "Ad hoc" means the signature asserts the binary's identity by content hash alone: no
+// certificate, no key, no CMS payload, and so nothing in this module beyond SHA-256 and exact
+// byte layout. It is what `codesign --sign -` produces, and it is exactly enough for the kernel
+// to run the program.
+//
+// This module produces bytes; `obj.origin` decides where in the file they sit and how
+// `__LINKEDIT` and the code-signature load command describe them (process rule 5, the same
+// split as `dwarf.origin`).
+
+use std::list;
+
+use sha256;
+
+/// The granularity the signature hashes code at. Apple fixes it at 4 KiB for every architecture
+/// this project targets, independent of the kernel's own page size.
+pub const PAGE_SIZE: i64 = 4096;
+
+// Blob magic numbers (the same constants `cs_blobs.h` names). Every field in every blob here is
+// big-endian, unlike the rest of the Mach-O file around it.
+const MAGIC_EMBEDDED_SIGNATURE: i64 = 0xfade0cc0; // the superblob wrapping everything below
+const MAGIC_CODE_DIRECTORY: i64 = 0xfade0c02;
+
+// Slot numbers within the superblob's index.
+const SLOT_CODE_DIRECTORY: i64 = 0;
+const SLOT_REQUIREMENTS: i64 = 2;
+const SLOT_CMS_SIGNATURE: i64 = 0x10000;
+
+/// The first version that carries the executable-segment fields, which is how a signature says
+/// which part of the file is the executable segment. Apple's own tooling emits it, and the
+/// kernel reads those fields.
+const CD_VERSION: i64 = 0x20400;
+/// Marks a signature that claims no signing authority.
+const CD_FLAG_ADHOC: i64 = 0x00000002;
+/// ADR-0024 emits only SHA-256: the SHA-1 directory Apple also emits exists for macOS versions
+/// predating SHA-256 support.
+const CD_HASH_TYPE_SHA256: i64 = 2;
+const CD_HASH_SIZE: i64 = 32;
+
+/// Marks the executable segment of a main program, as opposed to a library loaded into someone
+/// else's process.
+const EXEC_SEG_MAIN_BINARY: i64 = 0x1;
+
+/// The fixed part of a version-0x20400 code directory, before the identifier string and the hash
+/// slots that follow it.
+const CD_HEADER_SIZE: i64 = 88;
+
+/// How many negative-indexed slots precede the code hashes. Two exist here: slot 1 (an
+/// Info.plist, which a bare executable has none of, so its hash is zero) and slot 2 (the
+/// requirement set below).
+const N_SPECIAL_SLOTS: i64 = 2;
+
+/// An empty requirement set: magic, length, and a count of zero. A real ad-hoc signature carries
+/// one, and the code directory hashes it into special slot 2.
+fn requirements_blob() -> List[i64] {
+    let b = list::new[i64]();
+    b.push(0xfa); b.push(0xde); b.push(0x0c); b.push(0x01); // magic
+    b.push(0x00); b.push(0x00); b.push(0x00); b.push(0x0c); // length: 12, the whole blob
+    b.push(0x00); b.push(0x00); b.push(0x00); b.push(0x00); // count: no requirements
+    b
+}
+
+/// An empty CMS wrapper: an ad-hoc signature has no cryptographic signature to put in it, but
+/// the slot is present because that is the shape every consumer expects.
+fn cms_blob() -> List[i64] {
+    let b = list::new[i64]();
+    b.push(0xfa); b.push(0xde); b.push(0x0b); b.push(0x01); // magic
+    b.push(0x00); b.push(0x00); b.push(0x00); b.push(0x08); // length: 8, a header and nothing else
+    b
+}
+
+/// How many bytes `build` will produce for a signature covering `code_limit` bytes of file under
+/// the given identifier.
+///
+/// It is exact, and it is computable before the file it signs exists, which is what keeps the
+/// layout non-circular: `__LINKEDIT`'s own size and the code-signature load command both name
+/// the signature's size and both sit inside the region the signature hashes, so the size has to
+/// be known before a single byte is written (ADR-0024, and the same rule `obj::plan` follows for
+/// addresses).
+pub fn size_of(identifier: String, code_limit: i64) -> i64 {
+    super_blob_size(identifier, code_slots(code_limit))
+}
+
+/// The signature blob for a file whose bytes up to `code_limit` are given.
+///
+/// `file` must be the finished executable up to (not including) the point the signature itself
+/// will be written at, with every header field -- including the ones naming this signature's own
+/// offset and size -- already final. `identifier` names the code the signature covers;
+/// `exec_seg_base` and `exec_seg_limit` bound the executable segment.
+pub fn build(file: List[i64], identifier: String, code_limit: i64,
+             exec_seg_base: i64, exec_seg_limit: i64) -> List[i64] {
+    let cd = build_code_directory(file, identifier, code_limit, exec_seg_base, exec_seg_limit);
+    let req = requirements_blob();
+    let cms = cms_blob();
+
+    // The superblob: a header, an index naming each blob's slot and offset, then the blobs
+    // themselves in the same order.
+    let index_size = 12 + 8 * 3;
+    let total = index_size + cd.len() + req.len() + cms.len();
+
+    let out = list::new[i64]();
+    put_be32(out, MAGIC_EMBEDDED_SIGNATURE);
+    put_be32(out, total);
+    put_be32(out, 3);
+
+    let mut off = index_size;
+    put_be32(out, SLOT_CODE_DIRECTORY);
+    put_be32(out, off);
+    off = off + cd.len();
+    put_be32(out, SLOT_REQUIREMENTS);
+    put_be32(out, off);
+    off = off + req.len();
+    put_be32(out, SLOT_CMS_SIGNATURE);
+    put_be32(out, off);
+
+    append(out, cd);
+    append(out, req);
+    append(out, cms);
+    out
+}
+
+/// The code directory itself: the fixed header, the identifier, the special slot hashes, and one
+/// SHA-256 per 4 KiB page of the signed range.
+fn build_code_directory(file: List[i64], identifier: String, code_limit: i64,
+                        exec_seg_base: i64, exec_seg_limit: i64) -> List[i64] {
+    let n_code = code_slots(code_limit);
+
+    let ident_offset = CD_HEADER_SIZE;
+    // The special slots sit between the identifier and the code hashes, in reverse index order
+    // (slot 2 first, then slot 1), so that the hash offset can point at code slot zero and a
+    // special slot is read at a negative offset from it.
+    let hash_offset = ident_offset + identifier.len() + 1 + N_SPECIAL_SLOTS * CD_HASH_SIZE;
+
+    let out = list::new[i64]();
+    put_be32(out, MAGIC_CODE_DIRECTORY);
+    put_be32(out, cd_blob_size(identifier, n_code));
+    put_be32(out, CD_VERSION);
+    put_be32(out, CD_FLAG_ADHOC);
+    put_be32(out, hash_offset);
+    put_be32(out, ident_offset);
+    put_be32(out, N_SPECIAL_SLOTS);
+    put_be32(out, n_code);
+    put_be32(out, code_limit);
+    out.push(CD_HASH_SIZE);
+    out.push(CD_HASH_TYPE_SHA256);
+    out.push(0);  // platform: not a platform binary
+    out.push(12); // log2(PAGE_SIZE)
+    put_be32(out, 0); // spare2
+    put_be32(out, 0); // no scatter vector
+    put_be32(out, 0); // no team identifier
+    put_be32(out, 0); // spare3
+    put_be64(out, 0); // a 64-bit code limit: only for files past 4 GiB
+    put_be64(out, exec_seg_base);
+    put_be64(out, exec_seg_limit);
+    put_be64(out, EXEC_SEG_MAIN_BINARY);
+
+    let mut i = 0;
+    while i < identifier.len() { out.push(identifier.byte_at(i)); i = i + 1; }
+    out.push(0);
+
+    // Special slot 2: the requirement set. Slot 1 (an Info.plist) is all zeros, since a bare
+    // executable has none. Reverse order, so slot 2 is written first.
+    let req = requirements_blob();
+    append(out, sha256::sum(req, 0, req.len()));
+    let mut z = 0;
+    while z < CD_HASH_SIZE { out.push(0); z = z + 1; }
+
+    // One hash per page of the signed range, the last one short if the code limit is not a
+    // multiple of the page size.
+    let mut p = 0;
+    while p < n_code {
+        let start = p * PAGE_SIZE;
+        let mut end = start + PAGE_SIZE;
+        if end > code_limit { end = code_limit; }
+        append(out, sha256::sum(file, start, end));
+        p = p + 1;
+    }
+    out
+}
+
+/// How many page hashes cover `code_limit` bytes.
+fn code_slots(code_limit: i64) -> i64 { (code_limit + PAGE_SIZE - 1) / PAGE_SIZE }
+
+fn cd_blob_size(identifier: String, n_code: i64) -> i64 {
+    CD_HEADER_SIZE + identifier.len() + 1 + (N_SPECIAL_SLOTS + n_code) * CD_HASH_SIZE
+}
+
+fn super_blob_size(identifier: String, n_code: i64) -> i64 {
+    12 + 8 * 3 + cd_blob_size(identifier, n_code)
+        + requirements_blob().len() + cms_blob().len()
+}
+
+/// Big-endian, unlike everything else in a Mach-O.
+fn put_be32(out: List[i64], v: i64) {
+    let mut i = 3;
+    while i >= 0 { out.push((v >> (i * 8)) & 255); i = i - 1; }
+}
+
+fn put_be64(out: List[i64], v: i64) {
+    let mut i = 7;
+    while i >= 0 { out.push((v >> (i * 8)) & 255); i = i - 1; }
+}
+
+fn append(dst: List[i64], src: List[i64]) {
+    let mut i = 0;
+    while i < src.len() { dst.push(src.at(i)); i = i + 1; }
+}

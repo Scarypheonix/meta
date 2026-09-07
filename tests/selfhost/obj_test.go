@@ -26,14 +26,16 @@ import (
 // the appended sections begin, which is a case the writer has a branch for and nothing else
 // would reach.
 //
-// Mach-O is not part of this yet: stage1 does not write one (docs/deferred.md), and its
-// `write` says so rather than producing something that is not a Mach-O.
+// Both formats. Mach-O adds what ELF has no analogue of -- a __LINKEDIT that must be the
+// file's last segment, and an ad-hoc signature over everything before it (ADR-0024) -- so these
+// rows also hold stage1's own SHA-256 and its signer to Go's, since a signature is a content
+// hash and a wrong hash is a wrong file.
 
 // goImages is the Go compiler's answer: the four executables, as the driver prints them.
 func goImages(t *testing.T) []string {
 	t.Helper()
 	var out []string
-	for _, c := range []struct {
+	shapes := []struct {
 		text, ro, data, bss int
 		withFuncs           bool
 	}{
@@ -41,8 +43,30 @@ func goImages(t *testing.T) []string {
 		{64, 32, 16, 4096, true},
 		{1, 1, 0, 0, true},
 		{4000, 200, 300, 65536, true},
-	} {
-		target := obj.Linux
+	}
+	type format struct {
+		target     obj.Target
+		identifier string
+	}
+	var cases []struct {
+		text, ro, data, bss int
+		withFuncs           bool
+		format
+	}
+	// Both formats, the same four shapes. Mach-O is the one with a mandatory __LINKEDIT and an
+	// ad-hoc code signature over every byte before it (ADR-0024), so these rows also hold
+	// stage1's own SHA-256 and its signer to crypto/sha256 and internal/codesign.
+	for _, f := range []format{{obj.Linux, ""}, {obj.MacOS, "driver"}} {
+		for _, sh := range shapes {
+			cases = append(cases, struct {
+				text, ro, data, bss int
+				withFuncs           bool
+				format
+			}{sh.text, sh.ro, sh.data, sh.bss, sh.withFuncs, f})
+		}
+	}
+	for _, c := range cases {
+		target := c.target
 		l := obj.Plan(target, uint64(c.text), uint64(c.ro), uint64(c.data))
 		img := l.Image(pattern(c.text, 1), pattern(c.ro, 2), pattern(c.data, 3),
 			uint64(c.bss), l.TextAddr)
@@ -59,6 +83,7 @@ func goImages(t *testing.T) []string {
 			img.DebugInfo = counted(23, 100)
 			img.DebugLine = counted(37, 200)
 		}
+		img.Identifier = c.identifier
 		var buf bytes.Buffer
 		if err := img.Write(&buf); err != nil {
 			t.Fatalf("the Go writer refused an image of %d/%d/%d bytes: %v",
@@ -132,7 +157,7 @@ func TestStage1WritesTheSameExecutableAsTheGoWriter(t *testing.T) {
 				t.Errorf("... and %d more lines differ", bad-8)
 			}
 			if bad == 0 && len(got) == len(want) {
-				t.Logf("4 executables, %d lines of bytes identical", len(want))
+				t.Logf("8 executables in two formats, %d lines of bytes identical", len(want))
 			}
 		})
 	}
@@ -147,12 +172,17 @@ func writeObjPackage(t *testing.T, dir string) {
 		t.Fatal(err)
 	}
 	root := testutil.RepoRoot(t)
-	data, err := os.ReadFile(filepath.Join(root, "stage1", "src", "obj.origin"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(src, "obj.origin"), data, 0o644); err != nil {
-		t.Fatal(err)
+	// obj.origin needs its signer, and the signer needs a hash: a Mach-O carries an ad-hoc
+	// signature over its own bytes (ADR-0024), and Origin has no cryptographic library to
+	// borrow one from.
+	for _, name := range []string{"obj.origin", "codesign.origin", "sha256.origin"} {
+		data, err := os.ReadFile(filepath.Join(root, "stage1", "src", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(src, name), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	main, err := os.ReadFile(filepath.Join(root, "tests", "selfhost", "testdata", "obj_driver.origin"))
 	if err != nil {

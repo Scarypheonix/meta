@@ -40,6 +40,43 @@ import (
 // inlines nothing at all.
 var buildLevels = []opt.Level{opt.O0, opt.O1, opt.O2}
 
+// buildIdentifier names the code a Mach-O's ad-hoc signature covers (ADR-0024). `originc build`
+// takes it from its own `-o`; stage1 has no `-o`, because a `String` is UTF-8 by construction
+// and an executable is not text, so both sides are told the same name here.
+const buildIdentifier = "case"
+
+// buildTargets is every (level, container) pair. Mach-O is not a fourth spelling of the same
+// file: it is based at 0x100000000 rather than 0x400000, so every address in the code differs,
+// and it carries an ad-hoc SHA-256 signature over its own bytes that ELF has no analogue of.
+var buildTargets = func() []struct {
+	name   string
+	level  opt.Level
+	target obj.Target
+	flag   string
+} {
+	var out []struct {
+		name   string
+		level  opt.Level
+		target obj.Target
+		flag   string
+	}
+	for _, level := range buildLevels {
+		out = append(out, struct {
+			name   string
+			level  opt.Level
+			target obj.Target
+			flag   string
+		}{fmt.Sprintf("linux-O%d", level), level, obj.Linux, "linux"})
+		out = append(out, struct {
+			name   string
+			level  opt.Level
+			target obj.Target
+			flag   string
+		}{fmt.Sprintf("macos-O%d", level), level, obj.MacOS, "macos"})
+	}
+	return out
+}()
+
 // TestStage1WritesTheSameExecutable compiles a sample of the end-to-end corpus with both
 // compilers and compares the files.
 //
@@ -59,18 +96,20 @@ func TestStage1WritesTheSameExecutable(t *testing.T) {
 	}
 	defer func() { _ = os.Chdir(wd) }()
 
-	for _, level := range buildLevels {
-		t.Run(fmt.Sprintf("O%d", level), func(t *testing.T) {
+	for _, tc := range buildTargets {
+		t.Run(tc.name, func(t *testing.T) {
+			level := tc.level
 			var want, args []string
 			for _, c := range cases {
-				want = append(want, goExecutable(t, c, level)...)
+				want = append(want, goExecutable(t, c, level, tc.target)...)
 				args = append(args, c)
 			}
 
 			// Native only. stage1 running its own backend over four programs is minutes of
 			// work on the two hosted engines, and what this row is for is the *artefact*:
 			// the engines are already held to each other everywhere below it.
-			head := []string{"build", levelFlag(level), "--target", "linux",
+			head := []string{"build", levelFlag(level), "--target", tc.flag,
+				"--identifier", buildIdentifier,
 				filepath.Join("internal", "prelude", "prelude.origin")}
 			var stdout, stderr bytes.Buffer
 			code := runStage1(t, stage1Root, driver.Native, opt.O2, &stdout, &stderr,
@@ -144,7 +183,7 @@ func buildCases(t *testing.T, root string) []string {
 
 // goExecutable is the Go compiler's answer for one program: the file `originc build` writes,
 // as the same hex lines stage1 prints.
-func goExecutable(t *testing.T, path string, level opt.Level) []string {
+func goExecutable(t *testing.T, path string, level opt.Level, target obj.Target) []string {
 	t.Helper()
 	units, err := driver.LoadUnits(path)
 	if err != nil {
@@ -162,10 +201,11 @@ func goExecutable(t *testing.T, path string, level opt.Level) []string {
 	if err := opt.Run(code, level); err != nil {
 		t.Fatalf("optimizing %s: %v", path, err)
 	}
-	img, err := backend.Build(code, obj.Linux)
+	img, err := backend.Build(code, target)
 	if err != nil {
 		t.Fatalf("building %s: %v", path, err)
 	}
+	img.Identifier = buildIdentifier
 	var buf bytes.Buffer
 	if err := img.Write(&buf); err != nil {
 		t.Fatalf("writing %s: %v", path, err)

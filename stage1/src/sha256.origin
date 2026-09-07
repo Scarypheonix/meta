@@ -1,0 +1,165 @@
+// SHA-256, over a list of bytes.
+//
+// It exists for exactly one reason: macOS will not run an unsigned executable (ADR-0024), an
+// ad-hoc signature is a content hash and nothing else, and Origin has no cryptographic library
+// to borrow one from. `internal/codesign` reaches for Go's `crypto/sha256`; a compiler written
+// in Origin has to have its own.
+//
+// FIPS 180-4 §6.2. Everything is computed in `i64` and masked to thirty-two bits rather than in
+// `u32`, because Origin's `+` traps on overflow at the operand's declared width
+// (spec/04-expressions.md, ADR-0005) and SHA-256 is defined in terms of addition that wraps.
+// Masking after a 64-bit add is the same answer with none of the traps, and it keeps the
+// rotations -- which are the one place a width is load-bearing -- explicit.
+
+use std::list;
+
+/// The mask that keeps a value inside thirty-two bits.
+const M32: i64 = 4294967295;
+
+/// The digest's length in bytes.
+pub const DIGEST_SIZE: i64 = 32;
+
+/// The first thirty-two bits of the fractional parts of the cube roots of the first
+/// sixty-four primes (FIPS 180-4 §4.2.2).
+fn round_constants() -> List[i64] {
+    let k = list::new[i64]();
+    k.push(1116352408); k.push(1899447441); k.push(3049323471); k.push(3921009573);
+    k.push(961987163);  k.push(1508970993); k.push(2453635748); k.push(2870763221);
+    k.push(3624381080); k.push(310598401);  k.push(607225278);  k.push(1426881987);
+    k.push(1925078388); k.push(2162078206); k.push(2614888103); k.push(3248222580);
+    k.push(3835390401); k.push(4022224774); k.push(264347078);  k.push(604807628);
+    k.push(770255983);  k.push(1249150122); k.push(1555081692); k.push(1996064986);
+    k.push(2554220882); k.push(2821834349); k.push(2952996808); k.push(3210313671);
+    k.push(3336571891); k.push(3584528711); k.push(113926993);  k.push(338241895);
+    k.push(666307205);  k.push(773529912);  k.push(1294757372); k.push(1396182291);
+    k.push(1695183700); k.push(1986661051); k.push(2177026350); k.push(2456956037);
+    k.push(2730485921); k.push(2820302411); k.push(3259730800); k.push(3345764771);
+    k.push(3516065817); k.push(3600352804); k.push(4094571909); k.push(275423344);
+    k.push(430227734);  k.push(506948616);  k.push(659060556);  k.push(883997877);
+    k.push(958139571);  k.push(1322822218); k.push(1537002063); k.push(1747873779);
+    k.push(1955562222); k.push(2024104815); k.push(2227730452); k.push(2361852424);
+    k.push(2428436474); k.push(2756734187); k.push(3204031479); k.push(3329325298);
+    k
+}
+
+/// The first thirty-two bits of the fractional parts of the square roots of the first eight
+/// primes (FIPS 180-4 §5.3.3).
+fn initial_state() -> List[i64] {
+    let h = list::new[i64]();
+    h.push(1779033703); h.push(3144134277); h.push(1013904242); h.push(2773480762);
+    h.push(1359893119); h.push(2600822924); h.push(528734635);  h.push(1541459225);
+    h
+}
+
+/// Rotates a thirty-two-bit value right by `n`.
+fn rotr(x: i64, n: i64) -> i64 { ((x >> n) | (x << (32 - n))) & M32 }
+
+/// The digest of `data[start..end)`, as thirty-two bytes.
+///
+/// The range is taken rather than a whole list because the signature hashes the file one 4 KiB
+/// page at a time, and copying each page out first would be a second copy of the executable for
+/// nothing.
+pub fn sum(data: List[i64], start: i64, end: i64) -> List[i64] {
+    let k = round_constants();
+    let h = initial_state();
+    let n = end - start;
+
+    // The message, padded: a 0x80 byte, zeros up to eight short of a multiple of sixty-four,
+    // then the length in *bits* as a big-endian sixty-four-bit number (FIPS 180-4 §5.1.1).
+    // Only the tail is materialized; the body is read from `data` in place.
+    let tail = list::new[i64]();
+    let body_blocks = n / 64;
+    let mut i = body_blocks * 64;
+    while i < n { tail.push(data.at(start + i)); i = i + 1; }
+    tail.push(128);
+    while tail.len() % 64 != 56 { tail.push(0); }
+    let bits = n * 8;
+    let mut b = 7;
+    while b >= 0 { tail.push((bits >> (b * 8)) & 255); b = b - 1; }
+
+    let w = list::new[i64]();
+    let mut z = 0;
+    while z < 64 { w.push(0); z = z + 1; }
+
+    let mut blk = 0;
+    while blk < body_blocks {
+        block(h, k, w, data, start + blk * 64);
+        blk = blk + 1;
+    }
+    let mut t = 0;
+    while t < tail.len() {
+        block(h, k, w, tail, t);
+        t = t + 64;
+    }
+
+    let out = list::new[i64]();
+    let mut j = 0;
+    while j < 8 {
+        let v = h.at(j);
+        let mut s = 3;
+        while s >= 0 { out.push((v >> (s * 8)) & 255); s = s - 1; }
+        j = j + 1;
+    }
+    out
+}
+
+/// One sixty-four-byte block, compressed into `h` in place (FIPS 180-4 §6.2.2).
+///
+/// `w` is the caller's scratch rather than a fresh list per block: a signature over a
+/// four-megabyte executable is sixty-five thousand blocks, and sixty-five thousand
+/// sixty-four-element allocations is a collection this does not need to cause.
+fn block(h: List[i64], k: List[i64], w: List[i64], src: List[i64], at: i64) {
+    let mut i = 0;
+    while i < 16 {
+        let o = at + i * 4;
+        w.set(i, ((src.at(o) << 24) | (src.at(o + 1) << 16)
+                  | (src.at(o + 2) << 8) | src.at(o + 3)) & M32);
+        i = i + 1;
+    }
+    while i < 64 {
+        let x = w.at(i - 15);
+        let y = w.at(i - 2);
+        let s0 = rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3);
+        let s1 = rotr(y, 17) ^ rotr(y, 19) ^ (y >> 10);
+        w.set(i, (w.at(i - 16) + s0 + w.at(i - 7) + s1) & M32);
+        i = i + 1;
+    }
+
+    let mut a = h.at(0);
+    let mut b = h.at(1);
+    let mut c = h.at(2);
+    let mut d = h.at(3);
+    let mut e = h.at(4);
+    let mut f = h.at(5);
+    let mut g = h.at(6);
+    let mut hh = h.at(7);
+
+    let mut r = 0;
+    while r < 64 {
+        let s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        let ch = (e & f) ^ ((e ^ M32) & g);
+        let t1 = (hh + s1 + ch + k.at(r) + w.at(r)) & M32;
+        let s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = (s0 + maj) & M32;
+
+        hh = g;
+        g = f;
+        f = e;
+        e = (d + t1) & M32;
+        d = c;
+        c = b;
+        b = a;
+        a = (t1 + t2) & M32;
+        r = r + 1;
+    }
+
+    h.set(0, (h.at(0) + a) & M32);
+    h.set(1, (h.at(1) + b) & M32);
+    h.set(2, (h.at(2) + c) & M32);
+    h.set(3, (h.at(3) + d) & M32);
+    h.set(4, (h.at(4) + e) & M32);
+    h.set(5, (h.at(5) + f) & M32);
+    h.set(6, (h.at(6) + g) & M32);
+    h.set(7, (h.at(7) + hh) & M32);
+}

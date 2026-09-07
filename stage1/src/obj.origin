@@ -19,6 +19,8 @@
 use std::list;
 use std::str;
 
+use codesign;
+
 /// The Linux format, and the one this module writes.
 pub const ELF: i64 = 0;
 /// The macOS format, and the one Origin ships.
@@ -166,6 +168,10 @@ pub struct Image {
     pub debug_line: List[i64],
     /// One entry per compiled function, for the symbol table.
     pub funcs: List[Func],
+    /// Names the code a Mach-O's ad-hoc signature covers (ADR-0024). Empty means `origin`;
+    /// `originc build` passes the output file's own base name, which is what `codesign -dv`
+    /// prints back.
+    pub mut identifier: String,
 }
 
 /// Decides where each segment will be mapped, before any code exists.
@@ -229,6 +235,20 @@ const STB_GLOBAL: i64 = 1;
 /// ELF's program-header region never grows for debug info, since the section header table,
 /// symbol table and DWARF sections all live past the loadable segments.
 fn header_size(t: Target) -> i64 {
+    if t.format == MACHO {
+        // Every load command a Mach-O can carry is reserved unconditionally, whether or not
+        // this image turns out to have debug information: the header sits below the text, and
+        // the text's address is decided before there is any code to say what the file needs.
+        return MACHO_HEADER_SIZE
+            + MACHO_SEGMENT_CMD_SIZE                        // __PAGEZERO
+            + MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE   // __TEXT with __text
+            + MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE   // __DATA with __data
+            + MACHO_UNIXTHREAD_CMD_SIZE
+            + MACHO_SEGMENT_CMD_SIZE + 3 * MACHO_SECTION_SIZE // __DWARF (ADR-0023)
+            + MACHO_SYMTAB_CMD_SIZE
+            + MACHO_SEGMENT_CMD_SIZE                        // __LINKEDIT (ADR-0024)
+            + MACHO_CODE_SIG_CMD_SIZE;
+    }
     ELF_HEADER_SIZE + 2 * ELF_PROG_HEADER_SIZE
 }
 
@@ -276,6 +296,7 @@ pub fn write(img: Image) -> Written {
     let bad = validate(img);
     if bad != "" { return Written { bytes: list::new[i64](), error: bad }; }
     if img.target.format == ELF { return write_elf(img); }
+    if img.target.format == MACHO { return write_macho(img); }
     Written {
         bytes: list::new[i64](),
         error: "unimplemented: writing \(format_name(img.target.format))",
@@ -349,6 +370,20 @@ impl Buf {
             return;
         }
         self.pad(off - self.bytes.len());
+    }
+
+    /// A name in a fixed-width, zero-padded field, which is how Mach-O carries a segment's or
+    /// a section's. A name too long for its field is a compiler bug rather than a condition to
+    /// handle, but a panic in a self-hosting compiler is worse than an error that names itself.
+    fn put_name(self, s: String, width: i64) {
+        if s.len() > width {
+            if self.error == "" {
+                self.error = "this is a compiler bug: the name `\(s)` does not fit \(width) bytes";
+            }
+            return;
+        }
+        self.put_str(s);
+        self.pad(width - s.len());
     }
 
     fn len(self) -> i64 { self.bytes.len() }
@@ -661,4 +696,401 @@ fn build_sections(img: Image, text_off: i64, ro_data_off: i64, data_off: i64) ->
         table_off: table_off, num_sections: NUM_SECTIONS, shstrndx: SEC_SHSTRTAB,
         content: content.bytes, table: table.bytes,
     }
+}
+
+// --- Mach-O ------------------------------------------------------------------------------
+//
+// Spelled out rather than derived, for the same reason the ELF constants are: the test reads
+// the result back with an independently written parser, and a constant wrong in both the writer
+// and the reader would cancel out.
+
+const MACHO_HEADER_SIZE: i64 = 32;
+const MACHO_SEGMENT_CMD_SIZE: i64 = 72;
+const MACHO_SECTION_SIZE: i64 = 80;
+const MACHO_UNIXTHREAD_CMD_SIZE: i64 = 184; // 8 + 4 + 4 + 21*8
+
+const MH_MAGIC_64: i64 = 0xFEEDFACF;
+const MH_EXECUTE: i64 = 2;
+const MH_NOUNDEFS: i64 = 0x1;
+
+const CPU_TYPE_X86_64: i64 = 0x01000007;
+const CPU_SUBTYPE_X86_64: i64 = 3;
+
+const LC_SEGMENT_64: i64 = 0x19;
+const LC_UNIXTHREAD: i64 = 0x5;
+const LC_SYMTAB: i64 = 0x2;
+const LC_CODE_SIGNATURE: i64 = 0x1d;
+
+/// `symtab_command`: cmd, cmdsize, symoff, nsyms, stroff, strsize.
+const MACHO_SYMTAB_CMD_SIZE: i64 = 24;
+/// `nlist_64`: n_strx, n_type, n_sect, n_desc, n_value.
+const MACHO_SYM_SIZE: i64 = 16;
+/// `linkedit_data_command`: cmd, cmdsize, dataoff, datasize.
+const MACHO_CODE_SIG_CMD_SIZE: i64 = 16;
+
+/// Marks a symbol as defined in a section (`n_sect` names which one, 1-based across every
+/// section in the file); `N_EXT` marks it externally visible, the `nlist_64` convention `nm` and
+/// lldb expect for a symbol naming a function.
+const N_SECT: i64 = 0x0e;
+const N_EXT: i64 = 0x01;
+
+const VM_PROT_NONE: i64 = 0;
+const VM_PROT_READ: i64 = 1;
+const VM_PROT_WRITE: i64 = 2;
+const VM_PROT_EXECUTE: i64 = 4;
+
+/// `x86_THREAD_STATE64`, counted in 32-bit words as the kernel counts it.
+const X86_THREAD_STATE64: i64 = 4;
+const X86_THREAD_STATE64_COUNT: i64 = 42;
+/// Where the instruction pointer sits in `x86_thread_state64_t`, counted in 64-bit fields:
+/// rax rbx rcx rdx rdi rsi rbp rsp r8..r15 rip.
+const RIP_INDEX: i64 = 16;
+
+const S_SECTION_REGULAR: i64 = 0x0;
+const S_ATTR_PURE_INSTR: i64 = 0x80000000;
+const S_ATTR_SOME_INSTR: i64 = 0x00000400;
+
+/// The file layout past `__DATA`: the optional `__DWARF` segment (ADR-0023) and the mandatory
+/// `__LINKEDIT` one (ADR-0024).
+///
+/// It is computed up front, before a single byte of the file is written, the same way the three
+/// segment offsets already are -- every size here is known from the image alone, and the load
+/// commands naming these offsets are written long before the bytes they point at exist.
+///
+/// Each region is page-aligned, and each segment's address keeps this module's own convention
+/// that a segment's address is the base plus its file offset: monotonic offsets therefore give
+/// monotonic, non-overlapping addresses for free.
+struct Trailer {
+    /// `__DWARF`, absent (all zero) when the image carries no debug information.
+    pub mut dwarf_off: i64,
+    pub mut dwarf_size: i64,
+    pub mut abbrev_off: i64,
+    pub mut info_off: i64,
+    pub mut line_off: i64,
+    pub dwarf_content: List[i64],
+
+    /// `__LINKEDIT`: the symbol table, the string table, then the code signature.
+    pub mut linkedit_off: i64,
+    pub mut linkedit_size: i64,
+    pub mut sym_off: i64,
+    pub mut str_off: i64,
+    pub mut str_size: i64,
+    pub mut sig_off: i64,
+    pub mut sig_size: i64,
+    pub linkedit_content: List[i64],
+}
+
+/// Lays out the `nlist_64` symbol table (one global per function, naming the same addresses the
+/// ELF symbol table does), the three sections `dwarf.origin` built, and the ad-hoc code
+/// signature -- everything that follows the two loadable segments.
+fn build_trailer(img: Image, after_in: i64) -> Trailer {
+    let t = img.target;
+    let tr = Trailer {
+        dwarf_off: 0, dwarf_size: 0, abbrev_off: 0, info_off: 0, line_off: 0,
+        dwarf_content: list::new[i64](),
+        linkedit_off: 0, linkedit_size: 0, sym_off: 0, str_off: 0, str_size: 0,
+        sig_off: 0, sig_size: 0, linkedit_content: list::new[i64](),
+    };
+    let mut after = after_in;
+
+    if !img.debug_abbrev.is_empty() {
+        tr.dwarf_off = align_to(after, t.page_size);
+        tr.abbrev_off = tr.dwarf_off;
+        tr.info_off = tr.abbrev_off + img.debug_abbrev.len();
+        tr.line_off = tr.info_off + img.debug_info.len();
+        tr.dwarf_size = img.debug_abbrev.len() + img.debug_info.len() + img.debug_line.len();
+
+        append_bytes(tr.dwarf_content, img.debug_abbrev);
+        append_bytes(tr.dwarf_content, img.debug_info);
+        append_bytes(tr.dwarf_content, img.debug_line);
+        after = tr.dwarf_off + tr.dwarf_size;
+    }
+
+    // `nlist_64`'s string table uses the same convention ELF's own does: index 0 is the
+    // mandatory empty string.
+    let strtab = list::new[i64]();
+    strtab.push(0);
+    let symtab = new_buf();
+    let mut i = 0;
+    while i < img.funcs.len() {
+        let fn_ = img.funcs.at(i);
+        i = i + 1;
+        let name_off = strtab.len();
+        let mut c = 0;
+        while c < fn_.name.len() { strtab.push(fn_.name.byte_at(c)); c = c + 1; }
+        strtab.push(0);
+
+        symtab.u32(name_off);
+        symtab.u8(N_SECT | N_EXT); // n_type
+        symtab.u8(1);              // n_sect: __text is always section 1
+        symtab.u16(0);             // n_desc: unused
+        symtab.u64(fn_.address);
+    }
+
+    tr.linkedit_off = align_to(after, t.page_size);
+    tr.sym_off = tr.linkedit_off;
+    tr.str_off = tr.sym_off + symtab.len();
+    tr.str_size = strtab.len();
+    append_bytes(tr.linkedit_content, symtab.bytes);
+    append_bytes(tr.linkedit_content, strtab);
+
+    // The signature covers everything before it and is the last thing in the file (ADR-0024), so
+    // its own start is its code limit. Its size follows from that and the identifier alone,
+    // which is what lets `__LINKEDIT`'s size and the code-signature load command -- both written
+    // into the header, inside the region the signature hashes -- be final before any hashing
+    // happens.
+    tr.sig_off = align_to(tr.linkedit_off + tr.linkedit_content.len(), 16);
+    tr.sig_size = codesign::size_of(identifier(img), tr.sig_off);
+    tr.linkedit_size = tr.sig_off + tr.sig_size - tr.linkedit_off;
+    tr
+}
+
+/// The name the ad-hoc signature gives the code it covers (ADR-0024).
+fn identifier(img: Image) -> String {
+    if img.identifier == "" { return "origin"; }
+    img.identifier
+}
+
+/// Writes a static `MH_EXECUTE`.
+///
+/// The entry point is declared with `LC_UNIXTHREAD` rather than `LC_MAIN`. `LC_MAIN` is an
+/// offset that the dynamic loader jumps to after it has set a program up; this executable has no
+/// dynamic loader (ADR-0017), so it declares the initial thread state directly and the kernel
+/// starts it with rip already pointing at the entry stub.
+///
+/// Every Mach-O also carries a `__LINKEDIT` segment, and it MUST be the file's final segment:
+/// macOS's own loader and every signing implementation assume it (ADR-0024). It holds the symbol
+/// table, the string table, and the ad-hoc code signature -- which is not optional either, since
+/// macOS 11 the kernel SIGKILLs any executable with no valid signature at all, and a
+/// hand-written executable gets none for free the way one built through a linker does.
+///
+/// When the image carries ADR-0023's debug information, a `__DWARF` segment holds the three
+/// sections `dwarf.origin` produced. Unlike a `.o` file's own `__DWARF`, this one takes a real,
+/// non-overlapping address range like every other segment here: a second segment claiming
+/// address 0 collides with `__PAGEZERO`'s own claim on the low 4 GiB, which macOS's `codesign`
+/// rejects outright.
+fn write_macho(img: Image) -> Written {
+    let t = img.target;
+    let text_off = img.text_addr - t.base;
+    let ro_data_off = img.ro_data_addr - t.base;
+    let data_off = img.data_addr - t.base;
+
+    let text_seg_file_size = align_to(ro_data_off + img.ro_data.len(), t.page_size);
+    let data_seg_file_size = img.data.len();
+    let data_seg_vm_size = align_to(data_seg_file_size + img.bss, t.page_size);
+
+    let tr = build_trailer(img, data_off + data_seg_file_size);
+
+    let f = new_buf();
+
+    // __PAGEZERO, __TEXT, __DATA, __LINKEDIT, LC_SYMTAB, LC_UNIXTHREAD.
+    let mut ncmds = 6;
+    let mut sizeofcmds = MACHO_SEGMENT_CMD_SIZE                           // __PAGEZERO
+        + MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE                     // __TEXT
+        + MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE                     // __DATA
+        + MACHO_SEGMENT_CMD_SIZE                                          // __LINKEDIT
+        + MACHO_SYMTAB_CMD_SIZE
+        + MACHO_UNIXTHREAD_CMD_SIZE;
+    if tr.dwarf_size > 0 {
+        ncmds = ncmds + 1;
+        sizeofcmds = sizeofcmds + MACHO_SEGMENT_CMD_SIZE + 3 * MACHO_SECTION_SIZE;
+    }
+    if tr.sig_size > 0 {
+        ncmds = ncmds + 1;
+        sizeofcmds = sizeofcmds + MACHO_CODE_SIG_CMD_SIZE;
+    }
+
+    f.u32(MH_MAGIC_64);
+    f.u32(CPU_TYPE_X86_64);
+    f.u32(CPU_SUBTYPE_X86_64);
+    f.u32(MH_EXECUTE);
+    f.u32(ncmds);
+    f.u32(sizeofcmds);
+    f.u32(MH_NOUNDEFS);
+    f.u32(0); // reserved
+
+    // __PAGEZERO: macOS requires the whole low 4 GiB to be unmapped in a 64-bit executable,
+    // which is why a Mach-O build is based at 0x100000000 and an ELF one at 0x400000. It is the
+    // one place the two files' *addresses* differ, and the reason the code generator must know
+    // its target before emitting a byte.
+    macho_segment(f, Segment {
+        name: "__PAGEZERO", vmaddr: 0, vmsize: t.base, fileoff: 0, filesize: 0,
+        maxprot: VM_PROT_NONE, initprot: VM_PROT_NONE, nsects: 0,
+    });
+
+    // __TEXT covers the headers, the code and the constants, mapped read+execute.
+    macho_segment(f, Segment {
+        name: "__TEXT", vmaddr: t.base, vmsize: text_seg_file_size, fileoff: 0,
+        filesize: text_seg_file_size,
+        maxprot: VM_PROT_READ | VM_PROT_EXECUTE, initprot: VM_PROT_READ | VM_PROT_EXECUTE,
+        nsects: 1,
+    });
+    macho_section(f, Section {
+        sect: "__text", seg: "__TEXT", addr: img.text_addr, size: img.text.len(),
+        offset: text_off, align_pow: 4,
+        flags: S_SECTION_REGULAR | S_ATTR_PURE_INSTR | S_ATTR_SOME_INSTR,
+    });
+
+    // __DATA is the runtime block and the static buffers.
+    macho_segment(f, Segment {
+        name: "__DATA", vmaddr: img.data_addr, vmsize: data_seg_vm_size, fileoff: data_off,
+        filesize: data_seg_file_size,
+        maxprot: VM_PROT_READ | VM_PROT_WRITE, initprot: VM_PROT_READ | VM_PROT_WRITE,
+        nsects: 1,
+    });
+    macho_section(f, Section {
+        sect: "__data", seg: "__DATA", addr: img.data_addr, size: data_seg_file_size,
+        offset: data_off, align_pow: 3, flags: S_SECTION_REGULAR,
+    });
+
+    if tr.dwarf_size > 0 {
+        macho_segment(f, Segment {
+            name: "__DWARF", vmaddr: t.base + tr.dwarf_off,
+            vmsize: align_to(tr.dwarf_size, t.page_size),
+            fileoff: tr.dwarf_off, filesize: tr.dwarf_size,
+            maxprot: VM_PROT_READ, initprot: VM_PROT_READ, nsects: 3,
+        });
+        macho_section(f, Section {
+            sect: "__debug_abbrev", seg: "__DWARF", addr: t.base + tr.abbrev_off,
+            size: img.debug_abbrev.len(), offset: tr.abbrev_off, align_pow: 0,
+            flags: S_SECTION_REGULAR,
+        });
+        macho_section(f, Section {
+            sect: "__debug_info", seg: "__DWARF", addr: t.base + tr.info_off,
+            size: img.debug_info.len(), offset: tr.info_off, align_pow: 0,
+            flags: S_SECTION_REGULAR,
+        });
+        macho_section(f, Section {
+            sect: "__debug_line", seg: "__DWARF", addr: t.base + tr.line_off,
+            size: img.debug_line.len(), offset: tr.line_off, align_pow: 0,
+            flags: S_SECTION_REGULAR,
+        });
+    }
+
+    // __LINKEDIT must be the final segment of any Mach-O (ADR-0024). It carries no sections: the
+    // symbol table and the code signature inside it are described by their own load commands'
+    // file offsets, not by section headers.
+    macho_segment(f, Segment {
+        name: "__LINKEDIT", vmaddr: t.base + tr.linkedit_off,
+        vmsize: align_to(tr.linkedit_size, t.page_size),
+        fileoff: tr.linkedit_off, filesize: tr.linkedit_size,
+        maxprot: VM_PROT_READ, initprot: VM_PROT_READ, nsects: 0,
+    });
+
+    f.u32(LC_SYMTAB);
+    f.u32(MACHO_SYMTAB_CMD_SIZE);
+    f.u32(tr.sym_off);
+    f.u32(img.funcs.len());
+    f.u32(tr.str_off);
+    f.u32(tr.str_size);
+
+    if tr.sig_size > 0 {
+        // A `linkedit_data_command`: where inside `__LINKEDIT` the ad-hoc signature blob sits.
+        f.u32(LC_CODE_SIGNATURE);
+        f.u32(MACHO_CODE_SIG_CMD_SIZE);
+        f.u32(tr.sig_off);
+        f.u32(tr.sig_size);
+    }
+
+    // LC_UNIXTHREAD: the initial register state. Everything is zero except rip.
+    f.u32(LC_UNIXTHREAD);
+    f.u32(MACHO_UNIXTHREAD_CMD_SIZE);
+    f.u32(X86_THREAD_STATE64);
+    f.u32(X86_THREAD_STATE64_COUNT);
+    let mut r = 0;
+    while r < 21 {
+        if r == RIP_INDEX { f.u64(img.entry); } else { f.u64(0); }
+        r = r + 1;
+    }
+
+    f.pad_to(text_off);
+    f.put_all(img.text);
+    f.pad_to(ro_data_off);
+    f.put_all(img.ro_data);
+    if data_seg_file_size > 0 {
+        f.pad_to(data_off);
+        f.put_all(img.data);
+    }
+    if tr.dwarf_size > 0 {
+        f.pad_to(tr.dwarf_off);
+        f.put_all(tr.dwarf_content);
+    }
+    f.pad_to(tr.linkedit_off);
+    f.put_all(tr.linkedit_content);
+
+    // The signature goes last, over a file whose every other byte -- including the header fields
+    // naming this signature's own offset and size -- is already final.
+    f.pad_to(tr.sig_off);
+    if f.error != "" { return Written { bytes: list::new[i64](), error: f.error }; }
+    let sig = codesign::build(f.bytes, identifier(img), tr.sig_off, 0, text_seg_file_size);
+    if sig.len() != tr.sig_size {
+        return Written {
+            bytes: list::new[i64](),
+            error: "this is a compiler bug: the code signature is \(sig.len()) bytes but the layout reserved \(tr.sig_size); `size_of` must agree with `build` exactly, since the reservation is baked into the header the signature itself covers",
+        };
+    }
+    f.put_all(sig);
+
+    if f.error != "" { return Written { bytes: list::new[i64](), error: f.error }; }
+    Written { bytes: f.bytes, error: "" }
+}
+
+/// One `LC_SEGMENT_64`'s own fields, bundled because the native backend passes at most six
+/// arguments in registers (docs/spec/11-codegen.md) and a segment command has nine. It is the
+/// same reason `ProgHeader` exists on the ELF side, and stage1 found it the way it found that
+/// one: by refusing to compile itself.
+struct Segment {
+    pub name: String,
+    pub vmaddr: i64,
+    pub vmsize: i64,
+    pub fileoff: i64,
+    pub filesize: i64,
+    pub maxprot: i64,
+    pub initprot: i64,
+    pub nsects: i64,
+}
+
+fn macho_segment(f: Buf, sg: Segment) {
+    f.u32(LC_SEGMENT_64);
+    f.u32(MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE * sg.nsects);
+    f.put_name(sg.name, 16);
+    f.u64(sg.vmaddr);
+    f.u64(sg.vmsize);
+    f.u64(sg.fileoff);
+    f.u64(sg.filesize);
+    f.u32(sg.maxprot);
+    f.u32(sg.initprot);
+    f.u32(sg.nsects);
+    f.u32(0); // no segment flags
+}
+
+/// One section header inside a segment, bundled for the same reason.
+struct Section {
+    pub sect: String,
+    pub seg: String,
+    pub addr: i64,
+    pub size: i64,
+    pub offset: i64,
+    pub align_pow: i64,
+    pub flags: i64,
+}
+
+fn macho_section(f: Buf, sc: Section) {
+    f.put_name(sc.sect, 16);
+    f.put_name(sc.seg, 16);
+    f.u64(sc.addr);
+    f.u64(sc.size);
+    f.u32(sc.offset);
+    f.u32(sc.align_pow);
+    f.u32(0); // no relocations: every address is already resolved (ADR-0017)
+    f.u32(0);
+    f.u32(sc.flags);
+    f.u32(0);
+    f.u32(0);
+    f.u32(0);
+}
+
+fn append_bytes(dst: List[i64], src: List[i64]) {
+    let mut i = 0;
+    while i < src.len() { dst.push(src.at(i)); i = i + 1; }
 }

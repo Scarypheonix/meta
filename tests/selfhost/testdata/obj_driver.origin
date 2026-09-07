@@ -19,10 +19,21 @@ use std::str;
 use obj;
 
 fn main() {
-    dump(build(64, 32, 16, 0, false));
-    dump(build(64, 32, 16, 4096, true));
-    dump(build(1, 1, 0, 0, true));
-    dump(build(4000, 200, 300, 65536, true));
+    // The same four shapes in both formats. Mach-O adds what ELF has no analogue of: a
+    // `__LINKEDIT` that must be the file's last segment, and an ad-hoc code signature over
+    // every byte before it (ADR-0024) -- which means this also holds `sha256.origin` and
+    // `codesign.origin` to Go's `crypto/sha256` and `internal/codesign`, since a signature is
+    // a content hash and a wrong hash is a wrong file.
+    let mut fmt = 0;
+    while fmt < 2 {
+        let mut ident = "";
+        if fmt == 1 { ident = "driver"; }
+        dump(build(fmt, ident, Shape { text: 64, ro: 32, data: 16, bss: 0, with_funcs: false }));
+        dump(build(fmt, ident, Shape { text: 64, ro: 32, data: 16, bss: 4096, with_funcs: true }));
+        dump(build(fmt, ident, Shape { text: 1, ro: 1, data: 0, bss: 0, with_funcs: true }));
+        dump(build(fmt, ident, Shape { text: 4000, ro: 200, data: 300, bss: 65536, with_funcs: true }));
+        fmt = fmt + 1;
+    }
 }
 
 /// Bytes that depend on their position, so that a writer putting a segment at the wrong
@@ -37,11 +48,22 @@ fn pattern(n: i64, seed: i64) -> List[i64] {
     out
 }
 
-fn build(text: i64, ro: i64, data: i64, bss: i64, with_funcs: bool) -> obj::Image {
-    let t = obj::linux();
-    let l = obj::plan(t, text, ro, data);
+/// The four sizes and the two flags, bundled: the native backend passes at most six arguments
+/// in registers (docs/spec/11-codegen.md), and this needs eight.
+struct Shape {
+    pub text: i64,
+    pub ro: i64,
+    pub data: i64,
+    pub bss: i64,
+    pub with_funcs: bool,
+}
+
+fn build(fmt: i64, ident: String, sh: Shape) -> obj::Image {
+    let mut t = obj::linux();
+    if fmt == 1 { t = obj::macos(); }
+    let l = obj::plan(t, sh.text, sh.ro, sh.data);
     let funcs = list::new[obj::Func]();
-    if with_funcs {
+    if sh.with_funcs {
         funcs.push(obj::Func { name: "main", address: l.text_addr, size: 16 });
         funcs.push(obj::Func { name: "a_rather_longer_function_name", address: l.text_addr + 16, size: 24 });
         funcs.push(obj::Func { name: "f", address: l.text_addr + 40, size: 1 });
@@ -49,9 +71,10 @@ fn build(text: i64, ro: i64, data: i64, bss: i64, with_funcs: bool) -> obj::Imag
     let abbrev = list::new[i64]();
     let info = list::new[i64]();
     let line = list::new[i64]();
-    if with_funcs {
+    if sh.with_funcs {
         // Stand-ins for the three DWARF sections: this differential is about where the
-        // bytes land, not what they mean, and internal/dwarf is not translated yet.
+        // bytes land, not what they mean. `dwarf.origin` is held to `internal/dwarf` by the
+        // executables `tests/selfhost`'s build differential compares.
         let mut i = 0;
         while i < 11 { abbrev.push(i + 1); i = i + 1; }
         let mut j = 0;
@@ -61,10 +84,10 @@ fn build(text: i64, ro: i64, data: i64, bss: i64, with_funcs: bool) -> obj::Imag
     }
     obj::Image {
         target: t,
-        text: pattern(text, 1),
-        ro_data: pattern(ro, 2),
-        data: pattern(data, 3),
-        bss: bss,
+        text: pattern(sh.text, 1),
+        ro_data: pattern(sh.ro, 2),
+        data: pattern(sh.data, 3),
+        bss: sh.bss,
         entry: l.text_addr,
         text_addr: l.text_addr,
         ro_data_addr: l.ro_data_addr,
@@ -73,6 +96,7 @@ fn build(text: i64, ro: i64, data: i64, bss: i64, with_funcs: bool) -> obj::Imag
         debug_info: info,
         debug_line: line,
         funcs: funcs,
+        identifier: ident,
     }
 }
 
