@@ -1427,7 +1427,7 @@ impl Resolver {
 
     fn resolve_stmt(self, s: ast::Stmt) {
         match s {
-            ast::Stmt::Let(mutable, pat, ty, value) => {
+            ast::Stmt::Let(_, mutable, pat, ty, value) => {
                 match ty {
                     Option::Some(t) => self.resolve_type(t),
                     Option::None => {}

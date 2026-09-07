@@ -13,6 +13,7 @@ use std::str;
 
 use ast;
 use bytecode;
+use dwarf;
 use layout;
 use obj;
 use source;
@@ -147,6 +148,81 @@ pub struct RuntimeLabels {
     pub mut fs_taken: x86::Label,
 }
 
+/// A `RuntimeLabels` with every field the same placeholder, for an emitter that has not named
+/// its runtime routines yet.
+///
+/// Origin has no zero value (ADR-0007), so the struct cannot be left partly built: the caller
+/// overwrites every field before emitting a single instruction, and label 0 belongs to nothing
+/// until it does.
+pub fn no_labels() -> RuntimeLabels {
+    let none = x86::Label { id: 0 };
+    RuntimeLabels {
+        start: none,
+        alloc: none,
+        write: none,
+        trap: none,
+        int_to_str: none,
+        print: none,
+        println: none,
+        panic: none,
+        equal_objects: none,
+        compare_bytes: none,
+        collect: none,
+        lookup_stack_map: none,
+        evacuate: none,
+        scan_object: none,
+        thread_switch: none,
+        thread_new: none,
+        thread_entry: none,
+        thread_spawn: none,
+        thread_join: none,
+        thread_main: none,
+        sched_next: none,
+        sched_wake_all: none,
+        sched_park: none,
+        sched_drain: none,
+        trap_span: none,
+        span_here: none,
+        arg_at: none,
+        panic_span: none,
+        span_lookup: none,
+        chan_new: none,
+        chan_send: none,
+        chan_recv: none,
+        chan_taken: none,
+        chan_close: none,
+        mutex_new: none,
+        mutex_lock: none,
+        mutex_unlock: none,
+        preempt: none,
+        array_new: none,
+        array_len: none,
+        array_cap: none,
+        array_at: none,
+        array_set: none,
+        array_push: none,
+        array_truncate: none,
+        hash_mix: none,
+        hash_word: none,
+        hash_object: none,
+        str_len: none,
+        str_byte_at: none,
+        str_slice_check: none,
+        str_slice_into: none,
+        str_concat_into: none,
+        str_char_at: none,
+        str_char_width: none,
+        str_alloc: none,
+        char_to_str: none,
+        fs_copy_path: none,
+        fs_read: none,
+        fs_write: none,
+        fs_exists: none,
+        fs_taken: none,
+    }
+}
+
+
 
 /// The emitter's state for one pass over the whole program.
 pub struct Emitter {
@@ -202,6 +278,11 @@ pub struct Emitter {
     pub mut gc_runtime_entry_addr: i64,
 
     pub mut fn_labels: List[x86::Label],
+    /// One row per source-line boundary crossed while emitting, across every function
+    /// (ADR-0023), and one entry per emitted function for the symbol table a backtrace names
+    /// a frame from.
+    pub mut debug_lines: List[dwarf::Line],
+    pub mut debug_funcs: List[obj::Func],
     /// This program can have more than one thread, so its loops carry a preemption check.
     /// It is a whole-program property because a program that never spawns has nothing to be
     /// preempted for, and the check is not free: it makes every back edge a call site.

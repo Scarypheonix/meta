@@ -35,6 +35,15 @@ pub struct Span {
     pub end: i64,
 }
 
+/// Whether a span names a real range of a real file.
+///
+/// An *empty* span is valid: `end == start` is a zero-width position, which is what a node
+/// the parser recovered rather than read carries, and it still names a place. Demanding
+/// `end > start` instead made the inliner substitute the call site's span for a callee's
+/// zero-width one where the Go compiler kept the callee's -- visible only in the debug line
+/// table's column, four levels below anything either compiler prints.
+pub fn span_valid(s: Span) -> bool { s.start >= 0 && s.end >= s.start }
+
 /// One identifier occurrence: its text and where it was written.
 ///
 /// `res` is where name resolution files its answer: an index into the resolver's own list
@@ -161,6 +170,11 @@ pub struct LambdaParam {
 }
 
 pub struct Arm {
+    /// The whole arm, pattern through body. `internal/parse` puts it on the arm's own `Base`;
+    /// it is a slot here because a reader arrived for it -- the jump the lowering emits at the
+    /// end of an arm carries this span, and using the body's instead put the debug-line row
+    /// nineteen columns to the right, on the arm's `{` rather than on its pattern.
+    pub span: Span,
     pub pat: Pat,
     pub guard: Option[Expr],
     pub body: Expr,
@@ -240,8 +254,13 @@ pub fn expr(span: Span, node: ExprKind) -> Expr {
 // --- Statements ----------------------------------------------------------------------
 
 pub enum Stmt {
-    /// `let mut p: T = v;`
-    Let(bool, Pat, Option[Type], Expr),
+    /// `let mut p: T = v;`, and the whole statement's own span.
+    ///
+    /// `internal/parse` puts it on the statement's `Base`; it is a payload here because a
+    /// reader arrived for it -- the store the lowering emits carries this span, and using the
+    /// *pattern's* instead put the debug-line row on the `(` of `let (a, b) = ...` rather than
+    /// on the `let`.
+    Let(Span, bool, Pat, Option[Type], Expr),
     /// An expression statement, and whether it ended with `;`.
     ExprStmt(Expr, bool),
     ItemStmt(Item),
@@ -256,6 +275,12 @@ pub struct Param {
 }
 
 pub struct FnDecl {
+    /// The whole declaration, `pub`/`fn` through the closing brace of its body (or the
+    /// semicolon of a trait's required method). It is the location a trap with nowhere better
+    /// to point falls back to, and the first debug-line row a compiled function gets -- which
+    /// is the reader that made it a slot: naming the function's *name* instead put the
+    /// breakpoint three columns to the right of where `internal/parse` puts it.
+    pub mut span: Span,
     /// Which file it was declared in, stamped by the checker as it walks each one. A
     /// call site names the callee by where it was written, and a span is only an offset.
     pub mut file: String,
@@ -785,7 +810,7 @@ fn dump_type(out: List[String], t: Type, depth: i64) {
 
 fn dump_stmt(out: List[String], s: Stmt, depth: i64) {
     match s {
-        Stmt::Let(mutable, pat, ty, value) => {
+        Stmt::Let(_, mutable, pat, ty, value) => {
             emit(out, depth, "let\(mut_mark(mutable))");
             dump_pat(out, pat, depth + 1);
             match ty {

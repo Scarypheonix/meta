@@ -10,6 +10,7 @@
 
 use std::io;
 use std::list;
+use std::map;
 use std::process;
 use source;
 use lex;
@@ -22,6 +23,8 @@ use mono;
 use compile;
 use irbuild;
 use opt;
+use backend;
+use obj;
 
 const USAGE: String = "usage: stage1 <command> <file>...
 
@@ -43,8 +46,12 @@ commands:
                 the bytecode builds, in `originc dump-ir`'s own format. -O0
                 (the default) prints what the builder produced; -O1 and -O2 run
                 the optimizer over it first
+  build         compile each file after the first all the way to machine code
+                and print the executable's bytes as hex, 32 to a line, under a
+                `== <n> bytes` header. `--target linux` (the default) or
+                `--target macos` picks the container format
 
-`resolve`, `check`, `mono`, `dump-bytecode` and `dump-ir` also take
+`resolve`, `check`, `mono`, `dump-bytecode`, `dump-ir` and `build` also take
 
   <prelude> --package <root> <file>...
 
@@ -70,6 +77,7 @@ fn main() {
     // takes them, and only `dump-ir` reads the answer: it is the level the optimizer runs
     // at, and every other command produces the same artefact at all three.
     let mut level = opt::O0;
+    let mut target = "linux";
     let argv = list::new[String]();
     let mut ai = 0;
     while ai < raw.len() {
@@ -78,6 +86,15 @@ fn main() {
         if a == "-O0" { level = opt::O0; continue; }
         if a == "-O1" { level = opt::O1; continue; }
         if a == "-O2" { level = opt::O2; continue; }
+        if a == "--target" {
+            if ai >= raw.len() {
+                io::println("stage1: `--target` takes `linux` or `macos`");
+                process::exit(2);
+            }
+            target = raw.at(ai);
+            ai = ai + 1;
+            continue;
+        }
         argv.push(a);
     }
     if argv.len() < 3 {
@@ -87,7 +104,7 @@ fn main() {
     let command = argv.at(1);
     if command != "dump-tokens" && command != "dump-ast" && command != "parse"
         && command != "resolve" && command != "check" && command != "mono"
-        && command != "dump-bytecode" && command != "dump-ir" {
+        && command != "dump-bytecode" && command != "dump-ir" && command != "build" {
         io::println("stage1: unknown command `\(command)`");
         io::println(USAGE);
         process::exit(2);
@@ -97,8 +114,8 @@ fn main() {
     // imports (spec/07-modules.md), nothing can be checked before it is resolved, nothing
     // can be monomorphized before it is checked, and nothing can be lowered before that.
     if command == "resolve" || command == "check" || command == "mono"
-        || command == "dump-bytecode" || command == "dump-ir" {
-        if !run_package(argv, command, level) {
+        || command == "dump-bytecode" || command == "dump-ir" || command == "build" {
+        if !run_package(argv, command, level, target) {
             process::exit(1);
         }
         return;
@@ -124,7 +141,7 @@ fn main() {
 /// `originc check <file>` compiles in and the shape the differential compares: two files
 /// that both declare `main` are not a package. The prelude is parsed once and shared,
 /// since resolution does not write into the tree.
-fn run_package(argv: List[String], command: String, level: i64) -> bool {
+fn run_package(argv: List[String], command: String, level: i64, target: String) -> bool {
     let typed = typed_command(command);
     if argv.len() < 4 {
         io::println("stage1: this command takes the prelude and at least one file");
@@ -136,9 +153,11 @@ fn run_package(argv: List[String], command: String, level: i64) -> bool {
             io::println("stage1: `--package` takes a source root and at least one file");
             return false;
         }
-        return run_one_package(argv, command, prelude_path, level);
+        return run_one_package(argv, command, prelude_path, level, target);
     }
     let mut prelude_tree = ast::File { uses: list::new[ast::Use](), items: list::new[ast::Item]() };
+    // The backend turns a span back into `file:line:col`, which only the file itself can do.
+    let srcs = map::new[String, source::File]();
     match read_to_string(prelude_path) {
         Result::Err(e) => {
             io::println("stage1: cannot read \(prelude_path): \(e.to_str())");
@@ -146,6 +165,7 @@ fn run_package(argv: List[String], command: String, level: i64) -> bool {
         }
         Result::Ok(src) => {
             prelude_tree = parse::parse(lex::lex(src).tokens).file;
+            srcs.insert(source::PRELUDE_NAME, source::file(source::PRELUDE_NAME, src));
         }
     }
 
@@ -160,6 +180,7 @@ fn run_package(argv: List[String], command: String, level: i64) -> bool {
             }
             Result::Ok(src) => {
                 io::println("== \(path)");
+                srcs.insert(path, source::file(path, src));
                 let lexed = lex::lex(src);
                 let parsed = parse::parse(lexed.tokens);
                 let tree = parsed.file;
@@ -218,7 +239,7 @@ fn run_package(argv: List[String], command: String, level: i64) -> bool {
                                         cunits.push(compile::Unit { file: path, tree: tree });
                                         if !report_lowered(
                                                 compile::program(resolved, checked, mo, cunits),
-                                                command, level) {
+                                                command, level, target, srcs) {
                                             ok = false;
                                         }
                                     }
@@ -242,9 +263,11 @@ fn run_package(argv: List[String], command: String, level: i64) -> bool {
 // the module tree). The root is passed rather than discovered because listing a directory
 // is Phase 10 (docs/deferred.md); the caller already knows every file it wants.
 
-fn run_one_package(argv: List[String], command: String, prelude_path: String, level: i64) -> bool {
+fn run_one_package(argv: List[String], command: String, prelude_path: String,
+                   level: i64, target: String) -> bool {
     let root = argv.at(4);
     let mut prelude_tree = ast::File { uses: list::new[ast::Use](), items: list::new[ast::Item]() };
+    let srcs = map::new[String, source::File]();
     match read_to_string(prelude_path) {
         Result::Err(e) => {
             io::println("stage1: cannot read \(prelude_path): \(e.to_str())");
@@ -252,6 +275,7 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String, le
         }
         Result::Ok(src) => {
             prelude_tree = parse::parse(lex::lex(src).tokens).file;
+            srcs.insert(source::PRELUDE_NAME, source::file(source::PRELUDE_NAME, src));
         }
     }
 
@@ -281,6 +305,7 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String, le
                 return false;
             }
             Result::Ok(src) => {
+                srcs.insert(paths.at(u), source::file(paths.at(u), src));
                 let lexed = lex::lex(src);
                 let parsed = parse::parse(lexed.tokens);
                 if lowered_command(command)
@@ -340,7 +365,7 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String, le
         cunits.push(compile::Unit { file: paths.at(b), tree: trees.at(b) });
         b = b + 1;
     }
-    report_lowered(compile::program(resolved, checked, mo, cunits), command, level)
+    report_lowered(compile::program(resolved, checked, mo, cunits), command, level, target, srcs)
 }
 
 fn typed_command(command: String) -> bool {
@@ -354,7 +379,7 @@ fn mono_command(command: String) -> bool {
 
 /// Whether a command needs the bytecode.
 fn lowered_command(command: String) -> bool {
-    command == "dump-bytecode" || command == "dump-ir"
+    command == "dump-bytecode" || command == "dump-ir" || command == "build"
 }
 
 /// A path under the source root becomes a module path: `resolve.origin` is `resolve`,
@@ -527,7 +552,8 @@ fn report_mono(out: mono::Result, with_trace: bool) -> bool {
 /// Prints the artefact a lowering command asks for -- the disassembled bytecode, or the
 /// SSA that bytecode builds -- in `originc`'s own format, so that the two compilers'
 /// output is comparable directly rather than through a trace invented for the purpose.
-fn report_lowered(out: compile::Lowered, command: String, level: i64) -> bool {
+fn report_lowered(out: compile::Lowered, command: String, level: i64, target: String,
+                  srcs: Map[String, source::File]) -> bool {
     if !out.errors.is_empty() {
         let mut e = 0;
         while e < out.errors.len() {
@@ -545,6 +571,9 @@ fn report_lowered(out: compile::Lowered, command: String, level: i64) -> bool {
     if command == "dump-ir" {
         return report_ir(out.prog, level);
     }
+    if command == "build" {
+        return report_build(out.prog, level, target, srcs);
+    }
     // At -O1 and -O2 what `dump-bytecode` prints is the bytecode the optimizer emitted
     // back, which is the only place the SSA-to-bytecode direction is visible at all.
     let oerr = opt::run(out.prog, level);
@@ -559,6 +588,55 @@ fn report_lowered(out: compile::Lowered, command: String, level: i64) -> bool {
         i = i + 1;
     }
     true
+}
+
+/// Compiles all the way to machine code and prints the executable's bytes.
+///
+/// Hex rather than the file itself, for the same reason the encoder's and the writer's own
+/// differentials print hex: a `String` is UTF-8 by construction (spec/14-strings.md) and an
+/// executable is not text, so there is nothing to hand `fs::write_file`. The oracle is
+/// unaffected -- two programs that print the same bytes wrote the same executable -- and this
+/// is exactly the shape `tests/selfhost/obj_test.go` already compares.
+fn report_build(prog: bytecode::Program, level: i64, target: String,
+                srcs: Map[String, source::File]) -> bool {
+    let oerr = opt::run(prog, level);
+    if oerr != "" {
+        io::println("stage1: \(oerr)");
+        return false;
+    }
+    let built = backend::build(prog, obj::target_for(target), srcs);
+    if built.error != "" {
+        io::println("stage1: \(built.error)");
+        return false;
+    }
+    let out = obj::write(built.img);
+    if out.error != "" {
+        io::println("stage1: \(out.error)");
+        return false;
+    }
+    io::println("== \(out.bytes.len()) bytes");
+    print_hex(out.bytes);
+    true
+}
+
+const HEX: String = "0123456789abcdef";
+
+/// The bytes as lowercase hex, thirty-two to a line.
+fn print_hex(code: List[i64]) {
+    let mut line = "";
+    let mut i = 0;
+    while i < code.len() {
+        let b = code.at(i);
+        line = "\(line)\(HEX.slice(b >> 4, (b >> 4) + 1))\(HEX.slice(b & 15, (b & 15) + 1))";
+        i = i + 1;
+        if i % 32 == 0 {
+            io::println(line);
+            line = "";
+        }
+    }
+    if line != "" {
+        io::println(line);
+    }
 }
 
 /// Prints every function's SSA, which is what `originc dump-ir -O0` prints: the IR the

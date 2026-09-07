@@ -1496,16 +1496,6 @@ func (e *emitter) fitsCheck(v *ir.Value) error {
 	return nil
 }
 
-// allocPreludeVariant allocates one variant of a prelude enum, by the index the compiler
-// recorded. The payload, if any, is the caller's to write.
-func (e *emitter) allocPreludeVariant(v *ir.Value, idx int) {
-	info := e.prog.Types.Get(e.prog.Variants[idx].Type)
-	e.a.MovRI(x86.RDI, info.Words)
-	e.a.MovRI(x86.RSI, uint64(e.prog.Variants[idx].Type))
-	e.a.Call(e.rt.alloc)
-	e.recordCall(v)
-}
-
 // saturatingArith lowers `saturating_add`, `saturating_sub` and `saturating_mul`: the same
 // instruction again, with overflow clamped to the end of the range it ran off.
 //

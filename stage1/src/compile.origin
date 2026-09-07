@@ -271,7 +271,7 @@ pub fn program(res: resolve::Resolved, tys: check::Checked, mo: mono::Result,
         }
         let bf = bytecode::new_fn(inst.name);
         bf.params = params;
-        bf.span = decl_span(inst.decl);
+        bf.span = inst.decl.span;
         bf.file = inst.decl.file;
         c.prog.fns.push(bf);
         c.inst_index.push(c.prog.fns.len() - 1);
@@ -300,15 +300,6 @@ pub fn program(res: resolve::Resolved, tys: check::Checked, mo: mono::Result,
         k = k + 1;
     }
     Lowered { prog: c.prog, errors: c.errors, has_entry: true }
-}
-
-/// A function declaration's own span: its name through the end of its body, which is the
-/// location a trap with nowhere better to point falls back to.
-fn decl_span(decl: ast::FnDecl) -> ast::Span {
-    match decl.body {
-        Option::Some(b) => ast::Span { start: decl.name.start, end: b.span.end },
-        Option::None => ast::Span { start: decl.name.start, end: decl.name.end },
-    }
 }
 
 impl Compiler {
@@ -1264,12 +1255,12 @@ impl Compiler {
 
     fn stmt(self, s: ast::Stmt) {
         match s {
-            ast::Stmt::Let(_, p, _, value) => {
+            ast::Stmt::Let(at, _, p, _, value) => {
                 self.expr(value);
                 if self.failed() {
                     return;
                 }
-                self.bind_irrefutable(p, p.span);
+                self.bind_irrefutable(p, at);
             }
             ast::Stmt::ExprStmt(x, _) => {
                 self.expr(x);
@@ -2333,7 +2324,7 @@ impl Compiler {
             if self.failed() {
                 return;
             }
-            to_end.push(self.emit_a(bytecode::OP_JUMP, 0, arm.body.span));
+            to_end.push(self.emit_a(bytecode::OP_JUMP, 0, arm.span));
             let mut f = 0;
             while f < fails.len() {
                 self.patch(fails.at(f));

@@ -344,7 +344,7 @@ impl Parser {
         let start = self.pos;
         let public = self.eat(lex::K_PUB);
         let k = self.cur().kind;
-        if k == lex::K_FN { return ast::Item::Fn(self.fn_decl(public)); }
+        if k == lex::K_FN { return ast::Item::Fn(self.fn_decl(start, public)); }
         if k == lex::K_STRUCT { return ast::Item::Struct(self.struct_decl(public)); }
         if k == lex::K_ENUM { return ast::Item::Enum(self.enum_decl(public)); }
         if k == lex::K_TRAIT { return ast::Item::Trait(self.trait_decl(public)); }
@@ -449,7 +449,7 @@ impl Parser {
         out
     }
 
-    fn fn_decl(self, public: bool) -> ast::FnDecl {
+    fn fn_decl(self, start: i64, public: bool) -> ast::FnDecl {
         self.advance();
         let name = self.decl_name();
         let generics = self.generics();
@@ -466,6 +466,7 @@ impl Parser {
 
         if self.eat(lex::K_SEMI) {
             return ast::FnDecl {
+                span: self.span_from(start),
                 file: "", info: ast::UNRESOLVED, public: public, name: name, generics: generics, where_preds: where_preds,
                 self_param: self_param, params: params, ret: ret, body: Option::None,
             };
@@ -478,6 +479,7 @@ impl Parser {
             self.sync_item();
         }
         ast::FnDecl {
+            span: self.span_from(start),
             file: "", info: ast::UNRESOLVED, public: public, name: name, generics: generics, where_preds: where_preds,
             self_param: self_param, params: params, ret: ret, body: body,
         }
@@ -656,7 +658,7 @@ impl Parser {
                 assoc.push(ast::AssocType { name: aname, bounds: bounds, ty: Option::None });
             } else {
                 if self.at(lex::K_FN) {
-                    methods.push(self.fn_decl(false));
+                    methods.push(self.fn_decl(self.pos, false));
                 } else {
                     self.error_expected("`fn` or `type` in a trait body");
                     self.sync_stmt();
@@ -719,7 +721,7 @@ impl Parser {
                 });
             } else {
                 if self.at(lex::K_FN) {
-                    methods.push(self.fn_decl(public));
+                    methods.push(self.fn_decl(before, public));
                 } else {
                     self.error_expected("`fn` or `type` in an impl body");
                     self.sync_stmt();
@@ -976,12 +978,12 @@ impl Parser {
         }
         if !self.expect(lex::K_ASSIGN) {
             self.sync_stmt();
-            return ast::Stmt::Let(mutable, pat, ty,
+            return ast::Stmt::Let(self.span_from(start), mutable, pat, ty,
                                   self.mk_expr(start, ast::ExprKind::ErrorExpr));
         }
         let value = self.expr();
         self.expect(lex::K_SEMI);
-        ast::Stmt::Let(mutable, pat, ty, value)
+        ast::Stmt::Let(self.span_from(start), mutable, pat, ty, value)
     }
 }
 
@@ -1423,7 +1425,9 @@ impl Parser {
                 }
             } else {
                 let body = self.expr();
-                arms.push(ast::Arm { pat: pat, guard: guard, body: body });
+                arms.push(ast::Arm {
+                    span: self.span_from(before), pat: pat, guard: guard, body: body,
+                });
                 // A brace-bodied arm may omit its comma; any other needs one unless last.
                 if !self.eat(lex::K_COMMA) && !is_block_expr(body) && !self.at(lex::K_RBRACE) {
                     self.error_expected("`,` after this match arm");

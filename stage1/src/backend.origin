@@ -1,0 +1,674 @@
+// Turning the optimized SSA IR into an executable.
+//
+// A translation of `internal/backend/backend.go`, and the last stage: `ir.origin` decides what
+// the program computes, `x86.origin` decides what bytes an instruction is, `obj.origin` decides
+// what a file looks like, and this decides which instructions to emit and where everything
+// lives.
+//
+// Two passes over the whole program, not one. ADR-0017's freestanding executables have no
+// relocations, so an instruction naming an address must know it while being encoded -- but the
+// addresses depend on how much code there is. The first pass emits against a provisional
+// layout to measure; the second emits against the real one. Every instruction the encoder
+// produces has a length independent of its operands' values, so the two passes agree byte for
+// byte on size, and the build fails loudly if they ever do not.
+
+use std::list;
+use std::map;
+
+use array;
+use bytecode;
+use chan;
+use closures;
+use collect;
+use compile;
+use dwarf;
+use emitter;
+use equal;
+use files;
+use hash;
+use ir;
+use irbuild;
+use kinds;
+use lower;
+use mutex;
+use obj;
+use process;
+use regalloc;
+use runtime;
+use sched;
+use source;
+use spans;
+use stackmap;
+use strings;
+use thread;
+use x86;
+
+/// A built program, or the first thing that went wrong.
+pub struct Built {
+    pub mut img: obj::Image,
+    pub mut error: String,
+}
+
+/// Compiles a program to an executable image for a target.
+///
+/// The bytecode it is given has already been through the optimizer at whatever level was asked
+/// for, so the native path gets the optimizer for free and shares its lowering with the virtual
+/// machine -- which is what makes comparing the two a real test rather than a comparison of two
+/// unrelated compilers.
+pub fn build(prog: bytecode::Program, target: obj::Target, srcs: Map[String, source::File]) -> Built {
+    let funcs = build_ir(prog);
+    if funcs.error != "" { return failed(funcs.error); }
+
+    // Pass one measures. Its addresses are wrong and its code is thrown away.
+    let probe = obj::plan(target, 0, 0, emitter::RT_BLOCK_SIZE);
+    let first = emit_program(prog, funcs.fns, target, probe, srcs);
+    if first.error != "" { return failed(first.error); }
+
+    // Pass two emits against the layout the measurement implies.
+    let plan = obj::plan(target, first.text.len(), first.ro_data.len(), emitter::RT_BLOCK_SIZE);
+    let final_ = emit_program(prog, funcs.fns, target, plan, srcs);
+    if final_.error != "" { return failed(final_.error); }
+
+    if final_.text.len() != first.text.len() || final_.ro_data.len() != first.ro_data.len() {
+        return failed("this is a compiler bug: the two layout passes disagree (\(first.text.len())/\(final_.text.len()) bytes of code, \(first.ro_data.len())/\(final_.ro_data.len()) of data); an instruction's length must not depend on the value of an address");
+    }
+    // The debug-info sections are built entirely from addresses inside `.text` (ADR-0023),
+    // which pass one and pass two already agree on byte for byte -- the text's own address
+    // space starts at the same place and every instruction's length is pass-invariant by
+    // construction (the check above). This asserts that invariant held rather than silently
+    // trusting it, the same way the text and data check does.
+    if final_.debug_line.len() != first.debug_line.len() {
+        return failed("this is a compiler bug: the two layout passes' debug line tables disagree (\(first.debug_line.len())/\(final_.debug_line.len()) bytes)");
+    }
+
+    let img = obj::Image {
+        target: target,
+        text: final_.text,
+        ro_data: final_.ro_data,
+        data: final_.data,
+        bss: 0,
+        entry: final_.entry,
+        text_addr: plan.text_addr,
+        ro_data_addr: plan.ro_data_addr,
+        data_addr: plan.data_addr,
+        debug_abbrev: final_.debug_abbrev,
+        debug_info: final_.debug_info,
+        debug_line: final_.debug_line,
+        funcs: final_.funcs,
+    };
+    let bad = obj::validate(img);
+    if bad != "" { return failed(bad); }
+    Built { img: img, error: "" }
+}
+
+fn failed(msg: String) -> Built {
+    Built { img: empty_image(), error: msg }
+}
+
+fn empty_image() -> obj::Image {
+    obj::Image {
+        target: obj::linux(),
+        text: list::new[i64](), ro_data: list::new[i64](), data: list::new[i64](),
+        bss: 0, entry: 0, text_addr: 0, ro_data_addr: 0, data_addr: 0,
+        debug_abbrev: list::new[i64](), debug_info: list::new[i64](),
+        debug_line: list::new[i64](), funcs: list::new[obj::Func](),
+    }
+}
+
+/// Every function lowered to SSA, or the first failure.
+struct BuiltIR {
+    pub fns: List[Option[ir::Func]],
+    pub mut error: String,
+}
+
+/// Lowers every function to SSA. A function with no code is a declaration the program never
+/// defined -- a compiler-provided impl, say -- and has nothing to emit.
+fn build_ir(prog: bytecode::Program) -> BuiltIR {
+    let out = list::new[Option[ir::Func]]();
+    let mut i = 0;
+    while i < prog.fns.len() {
+        let fn_ = prog.fns.at(i);
+        i = i + 1;
+        if fn_.code.is_empty() { out.push(Option::None); continue; }
+        let built = irbuild::build(fn_);
+        if built.error != "" {
+            return BuiltIR { fns: out, error: "building \(fn_.name): \(built.error)" };
+        }
+        closures::resolve_closure_calls(built.f);
+        let bad = kinds::propagate_kinds(built.f, prog);
+        if bad != "" { return BuiltIR { fns: out, error: bad }; }
+        out.push(Option::Some(built.f));
+    }
+    BuiltIR { fns: out, error: "" }
+}
+
+/// Whether the program contains a `spawn` at all.
+///
+/// A program that never spawns has exactly one thread for its whole life, so nothing can ever
+/// want the processor while a loop of its own is running, and the preemption check every back
+/// edge would otherwise carry is pure cost -- not just the two instructions, but the call site
+/// it makes of every back edge, which pushes each loop-carried value into one of four
+/// callee-saved registers or onto the stack. The virtual machine draws the same line at run
+/// time; here it is a static property of the program, so the loops of a single-threaded one are
+/// exactly what they were before Phase 6.
+fn can_spawn(funcs: List[Option[ir::Func]]) -> bool {
+    let mut i = 0;
+    while i < funcs.len() {
+        let slot = funcs.at(i);
+        i = i + 1;
+        match slot {
+            Option::None => { continue; },
+            Option::Some(f) => {
+                let vals = f.values();
+                let mut j = 0;
+                while j < vals.len() {
+                    let v = vals.at(j);
+                    j = j + 1;
+                    if v.op == ir::OP_CALL_BUILTIN && v.a == compile::BUILTIN_SPAWN { return true; }
+                }
+            },
+        }
+    }
+    false
+}
+
+/// One pass's output.
+struct Pass {
+    pub mut text: List[i64],
+    pub mut ro_data: List[i64],
+    pub mut data: List[i64],
+    pub mut entry: i64,
+    /// ADR-0023's DWARF sections; `funcs` is the symbol-table data a backtrace names a frame
+    /// from.
+    pub mut debug_abbrev: List[i64],
+    pub mut debug_info: List[i64],
+    pub mut debug_line: List[i64],
+    pub mut funcs: List[obj::Func],
+    pub mut error: String,
+}
+
+fn failed_pass(msg: String) -> Pass {
+    Pass {
+        text: list::new[i64](), ro_data: list::new[i64](), data: list::new[i64](),
+        entry: 0, debug_abbrev: list::new[i64](), debug_info: list::new[i64](),
+        debug_line: list::new[i64](), funcs: list::new[obj::Func](), error: msg,
+    }
+}
+
+fn emit_program(prog: bytecode::Program, funcs: List[Option[ir::Func]], target: obj::Target,
+                plan: obj::Layout, srcs: Map[String, source::File]) -> Pass {
+    let e = new_emitter(prog, funcs, target, plan, srcs);
+
+    // The two constants the runtime itself needs come first, so their addresses do not move
+    // when a program's own strings change.
+    e.newline_addr = e.ro_data_addr + e.ro_data.len();
+    e.ro_data.push(10);
+    e.out_of_memory_msg = emitter::raw_string(e, "origin: out of memory at <runtime>\n");
+    // A trap the runtime raises rather than a lowered instruction has no span of its own, and
+    // the stack walk finds the user's line for it. These two are what is left when even that
+    // finds nothing: the deadlock the drain loop detects after `main` has returned, which no
+    // user frame is on the stack for, and the location a walk that matched no call site prints.
+    e.deadlock_msg = emitter::raw_string(e, "origin: all threads are blocked at <runtime>\n");
+    e.runtime_loc_msg = emitter::raw_string(e, "<runtime>");
+    e.panic_prefix = emitter::raw_string(e, "origin: ");
+    e.at_msg = emitter::raw_string(e, " at ");
+    equal::emit_type_table(e);
+    collect::emit_gc_runtime_frame_entry(e);
+
+    if prog.entry < 0 || prog.entry >= funcs.len() {
+        return failed_pass("the program has no `main` to start at");
+    }
+    match funcs.at(prog.entry) {
+        Option::None => { return failed_pass("the program has no `main` to start at"); },
+        Option::Some(f) => {},
+    }
+
+    let mut i = 0;
+    while i < funcs.len() {
+        let mut name = prog.fns.at(i).name;
+        match funcs.at(i) {
+            Option::None => { name = "\(name) (no body)"; },
+            Option::Some(f) => {},
+        }
+        e.fn_labels.push(e.a.new_label("fn\(i) \(name)"));
+        i = i + 1;
+    }
+
+    emit_runtime(e, e.fn_labels.at(prog.entry));
+
+    let mut j = 0;
+    while j < funcs.len() {
+        match funcs.at(j) {
+            Option::None => {},
+            Option::Some(f) => { function(e, j, f); },
+        }
+        if e.error != "" { return failed_pass(e.error); }
+        j = j + 1;
+    }
+
+    let map_table = stackmap::build_stack_map(e);
+    let span_table = spans::build_span_table(e);
+
+    let data = list::new[i64]();
+    let mut d = 0;
+    while d < emitter::RT_BLOCK_SIZE { data.push(0); d = d + 1; }
+    poke_u64(data, emitter::RT_STACK_MAP_OFF, map_table.addr);
+    poke_u64(data, emitter::RT_STACK_MAP_COUNT_OFF, map_table.count);
+    poke_u64(data, emitter::RT_SPAN_TABLE_OFF, span_table.addr);
+    poke_u64(data, emitter::RT_SPAN_COUNT_OFF, span_table.count);
+    // The countdown a back edge decrements. Zero would work -- the first check would wrap to
+    // -1 and fire -- but starting it where every later reset starts it means the first thread
+    // is not preempted on its first loop iteration for no reason.
+    poke_u64(data, emitter::RT_BUDGET_OFF, sched::PREEMPT_BUDGET);
+
+    e.a.finish();
+    if e.a.error != "" { return failed_pass(e.a.error); }
+    let text = e.a.code;
+    // The compile-unit DIE's own address range covers the whole of `.text` (there is exactly
+    // one compile unit, ADR-0023), not just where user code happens to start -- the plan's own
+    // text address is where the assembler was seeded, so this needs nothing it does not
+    // already expose.
+    let low_pc = plan.text_addr;
+    let high_pc = low_pc + text.len();
+    // The compile unit is named for the file `main` is written in, which is what a debugger
+    // shows and what `breakpoint set --file` is matched against. It is not the first line row's
+    // file: rows are in address order, and the lowest address belongs to whichever function was
+    // emitted first -- a prelude one, as soon as the prelude contributes a function with no
+    // generic parameters of its own.
+    let secs = dwarf::build(main_file(prog), e.debug_lines, low_pc, high_pc);
+
+    Pass {
+        text: text,
+        ro_data: e.ro_data,
+        data: data,
+        entry: e.a.addr(e.rt.start),
+        debug_abbrev: secs.abbrev,
+        debug_info: secs.info,
+        debug_line: secs.line,
+        funcs: e.debug_funcs,
+        error: "",
+    }
+}
+
+/// Writes a little-endian 64-bit value over eight bytes already in `data`.
+fn poke_u64(data: List[i64], at: i64, v: i64) {
+    let mut i = 0;
+    while i < 8 {
+        data.set(at + i, (v >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+/// The source file `main` is declared in, or `""` when the program has no usable entry (which
+/// `emit_program` has already rejected by the time this runs).
+fn main_file(prog: bytecode::Program) -> String {
+    if prog.entry < 0 || prog.entry >= prog.fns.len() { return ""; }
+    prog.fns.at(prog.entry).file
+}
+
+/// A fresh emitter for one pass.
+fn new_emitter(prog: bytecode::Program, funcs: List[Option[ir::Func]], target: obj::Target,
+               plan: obj::Layout, srcs: Map[String, source::File]) -> emitter::Emitter {
+    let empty = emitter::StaticStr { addr: 0, length: 0 };
+    emitter::Emitter {
+        prog: prog,
+        target: target,
+        a: x86::new_asm(plan.text_addr),
+        rt: emitter::no_labels(),
+        ro_data_addr: plan.ro_data_addr,
+        data_addr: plan.data_addr,
+        ro_data: list::new[i64](),
+        string_type: prog.string_type,
+        newline_addr: 0,
+        out_of_memory_msg: empty,
+        deadlock_msg: empty,
+        runtime_loc_msg: empty,
+        panic_prefix: empty,
+        at_msg: empty,
+        const_str: map::new[i64, emitter::StaticStr](),
+        trap_msg: map::new[String, emitter::StaticStr](),
+        literals: map::new[String, emitter::StaticStr](),
+        files: srcs,
+        safepoints: list::new[emitter::PendingSafepoint](),
+        user_spans: list::new[emitter::PendingUserSpan](),
+        type_table_addr: 0,
+        gc_runtime_entry_addr: 0,
+        fn_labels: list::new[x86::Label](),
+        preempts: can_spawn(funcs),
+        debug_lines: list::new[dwarf::Line](),
+        debug_funcs: list::new[obj::Func](),
+        error: "",
+    }
+}
+
+/// Names every runtime routine and then emits them all.
+///
+/// The labels are all created before any body is emitted because the routines call each other
+/// freely -- the collector calls evacuate, evacuate is called from every allocation site -- and
+/// a label has to exist before the first instruction that names it.
+fn emit_runtime(e: emitter::Emitter, main_label: x86::Label) {
+    let a = e.a;
+    e.rt.start = a.new_label("_start");
+    e.rt.alloc = a.new_label("rt_alloc");
+    e.rt.write = a.new_label("rt_write");
+    e.rt.trap = a.new_label("rt_trap");
+    e.rt.int_to_str = a.new_label("rt_int_to_str");
+    e.rt.print = a.new_label("rt_print");
+    e.rt.println = a.new_label("rt_println");
+    e.rt.panic = a.new_label("rt_panic");
+    e.rt.equal_objects = a.new_label("rt_equal_objects");
+    e.rt.compare_bytes = a.new_label("rt_compare_bytes");
+    e.rt.collect = a.new_label("rt_collect");
+    e.rt.lookup_stack_map = a.new_label("rt_lookup_stack_map");
+    e.rt.evacuate = a.new_label("rt_evacuate");
+    e.rt.scan_object = a.new_label("rt_scan_object");
+    e.rt.thread_switch = a.new_label("rt_switch");
+    e.rt.thread_new = a.new_label("rt_thread_new");
+    e.rt.thread_entry = a.new_label("rt_thread_entry");
+    e.rt.thread_spawn = a.new_label("rt_spawn");
+    e.rt.thread_join = a.new_label("rt_join");
+    e.rt.thread_main = a.new_label("rt_main_thread");
+    e.rt.sched_next = a.new_label("rt_sched_next");
+    e.rt.sched_wake_all = a.new_label("rt_wake_all");
+    e.rt.sched_park = a.new_label("rt_park");
+    e.rt.sched_drain = a.new_label("rt_drain");
+    e.rt.trap_span = a.new_label("rt_trap_span");
+    e.rt.span_here = a.new_label("rt_span_here");
+    e.rt.arg_at = a.new_label("rt_arg_at");
+    e.rt.panic_span = a.new_label("rt_panic_span");
+    e.rt.span_lookup = a.new_label("rt_span_lookup");
+    e.rt.chan_new = a.new_label("rt_chan_new");
+    e.rt.chan_send = a.new_label("rt_chan_send");
+    e.rt.chan_recv = a.new_label("rt_chan_recv");
+    e.rt.chan_taken = a.new_label("rt_chan_taken");
+    e.rt.chan_close = a.new_label("rt_chan_close");
+    e.rt.mutex_new = a.new_label("rt_mutex_new");
+    e.rt.mutex_lock = a.new_label("rt_mutex_lock");
+    e.rt.mutex_unlock = a.new_label("rt_mutex_unlock");
+    e.rt.preempt = a.new_label("rt_preempt");
+    e.rt.array_new = a.new_label("rt_array_new");
+    e.rt.array_len = a.new_label("rt_array_len");
+    e.rt.array_cap = a.new_label("rt_array_cap");
+    e.rt.array_at = a.new_label("rt_array_at");
+    e.rt.array_set = a.new_label("rt_array_set");
+    e.rt.array_push = a.new_label("rt_array_push");
+    e.rt.array_truncate = a.new_label("rt_array_truncate");
+    e.rt.hash_mix = a.new_label("rt_hash_mix");
+    e.rt.hash_word = a.new_label("rt_hash_word");
+    e.rt.hash_object = a.new_label("rt_hash_object");
+    e.rt.str_len = a.new_label("rt_str_len");
+    e.rt.str_byte_at = a.new_label("rt_str_byte_at");
+    e.rt.str_slice_check = a.new_label("rt_str_slice_check");
+    e.rt.str_slice_into = a.new_label("rt_str_slice_into");
+    e.rt.str_concat_into = a.new_label("rt_str_concat_into");
+    e.rt.str_char_at = a.new_label("rt_str_char_at");
+    e.rt.str_char_width = a.new_label("rt_str_char_width");
+    e.rt.str_alloc = a.new_label("rt_str_alloc");
+    e.rt.char_to_str = a.new_label("rt_char_to_str");
+    e.rt.fs_copy_path = a.new_label("rt_fs_copy_path");
+    e.rt.fs_read = a.new_label("rt_fs_read");
+    e.rt.fs_write = a.new_label("rt_fs_write");
+    e.rt.fs_exists = a.new_label("rt_fs_exists");
+    e.rt.fs_taken = a.new_label("rt_fs_taken");
+
+    runtime::emit_start(e, main_label);
+    runtime::emit_alloc(e);
+    runtime::emit_write(e);
+    runtime::emit_trap(e);
+    runtime::emit_int_to_str(e);
+    runtime::emit_print(e);
+    runtime::emit_panic(e);
+    equal::emit_equal_objects(e);
+    equal::emit_compare_bytes(e);
+    collect::emit_lookup_stack_map(e);
+    collect::emit_evacuate(e);
+    collect::emit_scan_object(e);
+    thread::emit_thread_switch(e);
+    thread::emit_thread_new(e);
+    thread::emit_thread_entry(e);
+    thread::emit_thread_spawn(e);
+    thread::emit_thread_join(e);
+    thread::emit_main_thread(e);
+    sched::emit_sched_next(e);
+    sched::emit_sched_wake_all(e);
+    sched::emit_sched_park(e);
+    sched::emit_sched_drain(e);
+    spans::emit_span_lookup(e);
+    spans::emit_span_here(e);
+    process::emit_arg_at(e);
+    spans::emit_trap_span(e);
+    spans::emit_panic_span(e);
+    chan::emit_chan_new(e);
+    chan::emit_chan_send(e);
+    chan::emit_chan_recv(e);
+    chan::emit_chan_taken(e);
+    chan::emit_chan_close(e);
+    mutex::emit_mutex_new(e);
+    mutex::emit_mutex_lock(e);
+    mutex::emit_mutex_unlock(e);
+    sched::emit_preempt(e);
+    array::emit_array_new(e);
+    array::emit_array_len(e);
+    array::emit_array_cap(e);
+    array::emit_array_at(e);
+    array::emit_array_set(e);
+    array::emit_array_push(e);
+    array::emit_array_truncate(e);
+    hash::emit_hash_mix(e);
+    hash::emit_hash_word(e);
+    hash::emit_hash_object(e);
+    strings::emit_str_len(e);
+    strings::emit_str_byte_at(e);
+    strings::emit_str_char_width(e);
+    strings::emit_str_char_at(e);
+    strings::emit_str_alloc(e);
+    strings::emit_str_slice_check(e);
+    strings::emit_str_slice_into(e);
+    strings::emit_str_concat_into(e);
+    strings::emit_char_to_str(e);
+    files::emit_fs_copy_path(e);
+    files::emit_fs_read(e);
+    files::emit_fs_write(e);
+    files::emit_fs_exists(e);
+    files::emit_fs_taken(e);
+    collect::emit_collect(e);
+}
+
+/// Emits one function: prologue, blocks in reverse postorder, epilogue.
+fn function(e: emitter::Emitter, index: i64, f: ir::Func) {
+    let a = e.a;
+    let regs = regalloc::allocate(f, e.preempts);
+    if regs.error != "" { emitter::fail(e, regs.error); return; }
+
+    let fs = stackmap::FnState {
+        func: f,
+        regs: regs,
+        slot_base: 8 * regs.used.len(),
+        frame: 0,
+        block_lbl: map::new[i64, x86::Label](),
+        epilogue: a.new_label("fn\(index) epilogue"),
+        pending: list::new[stackmap::Edge](),
+        // A fresh function always gets a debug-line row for its own first instruction, even if
+        // it happens to share a file and line with whatever the previous function's last row
+        // named -- the dedupe is otherwise global across the whole program.
+        last_debug_file: "",
+        last_debug_line: 0,
+    };
+
+    // The frame keeps rsp 16-byte aligned at every call. Entering the body, rsp is aligned;
+    // `push rbp` and the saved registers move it, and this makes up the difference so that a
+    // `call` lands on a boundary.
+    fs.frame = align_to(8 * regs.slots, 16) + (fs.slot_base % 16);
+
+    let regs_in = lower::arg_regs();
+    if f.params > regs_in.len() {
+        emitter::fail(e, "unimplemented: a function of \(f.params) parameters, past the \(regs_in.len()) the registers carry (docs/spec/11-codegen.md leaves the rest on the stack)");
+        return;
+    }
+    a.align(16);
+    a.bind(e.fn_labels.at(index));
+    let start_addr = a.pc();
+    a.push(x86::RBP);
+    a.mov_rr(x86::RBP, x86::RSP);
+    let mut s = 0;
+    while s < regs.used.len() { a.push(regs.used.at(s)); s = s + 1; }
+    if fs.frame > 0 { a.sub_ri(x86::RSP, fs.frame); }
+
+    // A reference-kind spill slot is reserved for the whole function body the moment its
+    // owning value is ever spilled (the allocator gives every spilled interval a permanent
+    // slot, never reused across non-overlapping ones), but a stack map's reference count --
+    // fixed per function, not narrowed to what is actually live at each call site -- covers
+    // every one of them at every safepoint, including a call that executes before the slot's
+    // own value is ever computed (a branch that skips its definition, or a call textually
+    // earlier in the function). Zeroing every reference slot here, before anything can be
+    // spilled into one, means a collector (ADR-0022) that visits one before its value exists
+    // reads nil rather than whatever an earlier stack frame happened to leave there -- a
+    // defensive read, not a value real Origin code can ever observe (ADR-0007: no null).
+    let mut r = 1;
+    while r <= regs.ref_slots {
+        a.mov_mi(lower::mem(fs, regalloc::in_slot(r)), 0);
+        r = r + 1;
+    }
+
+    // A closure body's own object arrives just above the return address. Copying it into the
+    // slot the allocator reserved is what makes it a root the collector can find and update;
+    // every capture read takes it from there afterwards.
+    if regs.closure_slot != 0 {
+        a.mov_rm(regalloc::SCRATCH_A, x86::at(x86::RBP, 16));
+        a.mov_mr(lower::mem(fs, regalloc::in_slot(regs.closure_slot)), regalloc::SCRATCH_A);
+    }
+
+    let blocks = regalloc::order(f);
+    let mut b = 0;
+    while b < blocks.len() {
+        fs.block_lbl.insert(blocks.at(b).id, a.new_label("fn\(index) b\(blocks.at(b).id)"));
+        b = b + 1;
+    }
+
+    // Parameters arrive in argument registers and have to reach wherever the allocator put
+    // them -- which may be another argument register still holding a parameter not moved yet.
+    // Pushing every incoming value and popping it into its destination performs the whole
+    // permutation without needing to know which moves conflict.
+    let params = list::new[Option[ir::Value]]();
+    let mut p = 0;
+    while p < f.params {
+        let found = param_value(fs, f, p);
+        params.push(found);
+        match found {
+            Option::Some(x) => { a.push(regs_in.at(p)); },
+            Option::None => {},
+        }
+        p = p + 1;
+    }
+    let mut q = params.len() - 1;
+    while q >= 0 {
+        match params.at(q) {
+            // The parameter is never read, so it needs no home.
+            Option::None => {},
+            Option::Some(pv) => {
+                a.pop(regalloc::SCRATCH_A);
+                match regs.where_of.get(pv.id) {
+                    Option::Some(l) => { lower::store(e, fs, regalloc::SCRATCH_A, l); },
+                    Option::None => {},
+                }
+            },
+        }
+        q = q - 1;
+    }
+
+    let mut i = 0;
+    while i < blocks.len() {
+        let blk = blocks.at(i);
+        i = i + 1;
+        a.bind(fs.block_lbl.get(blk.id).expect("a block was lowered with no label"));
+        let mut k = 0;
+        while k < blk.instr.len() {
+            let v = blk.instr.at(k);
+            k = k + 1;
+            record_line(e, fs, v);
+            lower::instr(e, fs, v);
+            if e.error != "" { return; }
+        }
+        match blk.term {
+            Option::Some(t) => { record_line(e, fs, t); },
+            Option::None => {},
+        }
+        lower::terminator(e, fs, blk);
+        if e.error != "" { return; }
+    }
+
+    // The phi landing pads a branch needed. Emitting one can create another, because a pad
+    // ends in a jump to a block whose own edges were already resolved, so this drains rather
+    // than iterating once.
+    while !fs.pending.is_empty() {
+        let batch = fs.pending;
+        fs.pending = list::new[stackmap::Edge]();
+        let mut d = 0;
+        while d < batch.len() {
+            let ed = batch.at(d);
+            d = d + 1;
+            a.bind(ed.label);
+            lower::phi_copies(e, fs, ed.from, ed.to);
+            a.jmp(fs.block_lbl.get(ed.to.id).expect("a block was lowered with no label"));
+        }
+    }
+
+    a.bind(fs.epilogue);
+    if fs.frame > 0 { a.add_ri(x86::RSP, fs.frame); }
+    let mut u = regs.used.len() - 1;
+    while u >= 0 { a.pop(regs.used.at(u)); u = u - 1; }
+    a.pop(x86::RBP);
+    a.ret();
+
+    e.debug_funcs.push(obj::Func {
+        name: e.prog.fns.at(index).name,
+        address: start_addr,
+        size: a.pc() - start_addr,
+    });
+}
+
+/// Appends a debug-line row for a value's own source position, but only when it names a
+/// different file and line than the previous instruction's did (ADR-0023): a row exists to mark
+/// where a line *begins*, not one per instruction, and the row a copy opcode commits is what a
+/// breakpoint or a step resolves against, not every address in between.
+fn record_line(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    match e.files.get(v.file) {
+        Option::None => {},
+        Option::Some(f) => {
+            let pos = f.position(v.span.start);
+            if v.file == fs.last_debug_file && pos.line == fs.last_debug_line { return; }
+            fs.last_debug_file = v.file;
+            fs.last_debug_line = pos.line;
+            e.debug_lines.push(dwarf::Line {
+                address: e.a.pc(), file: v.file, line: pos.line, col: pos.col,
+            });
+        },
+    }
+}
+
+/// The parameter value for one parameter index, if anything reads it.
+fn param_value(fs: stackmap::FnState, f: ir::Func, index: i64) -> Option[ir::Value] {
+    let vals = f.values();
+    let mut found = Option::None[ir::Value];
+    let mut i = 0;
+    while i < vals.len() {
+        let v = vals.at(i);
+        i = i + 1;
+        if v.op == ir::OP_PARAM && v.b == index { found = Option::Some(v); }
+    }
+    match found {
+        Option::None => Option::None[ir::Value],
+        Option::Some(v) => {
+            if fs.regs.where_of.get(v.id).is_some() {
+                Option::Some(v)
+            } else {
+                Option::None[ir::Value]
+            }
+        },
+    }
+}
+
+fn align_to(v: i64, to: i64) -> i64 {
+    if to == 0 { return v; }
+    (v + to - 1) / to * to
+}

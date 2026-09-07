@@ -1121,7 +1121,7 @@ fn block_for(c: Cloner, b: ir::Block) -> ir::Block {
 /// find one. Keeping the prelude's own span here would make `-O2` the level that names
 /// `<prelude>` in a message about the user's program.
 fn use_callee_span(callee_file: String, callee: ast::Span) -> bool {
-    callee.end > callee.start && callee_file != "" && callee_file != PRELUDE_NAME
+    ast::span_valid(callee) && callee_file != "" && callee_file != PRELUDE_NAME
 }
 
 /// Copies one value, or answers `None` for a parameter, which is replaced by the call's

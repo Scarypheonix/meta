@@ -1,0 +1,1791 @@
+// Lowering: one routine per IR operation, working through two scratch registers.
+//
+// A translation of `internal/backend/lower.go`.
+//
+// An operand may be in a register or in a frame slot, and an instruction cannot take two
+// memory operands, so the pattern throughout is: bring the operands into scratch registers,
+// compute, and store the result wherever the allocator put it. That costs a move the
+// allocator's assignment sometimes makes unnecessary; it is also why no lowering rule has to
+// reason about whether a register happens to be free.
+
+use std::list;
+
+use arith;
+use bytecode;
+use compile;
+use emitter;
+use equal;
+use hash;
+use ir;
+use layout;
+use regalloc;
+use runtime;
+use sched;
+use spans;
+use stackmap;
+use strings;
+use x86;
+
+/// The integer argument sequence of the platform ABI (docs/spec/11-codegen.md).
+pub fn arg_regs() -> List[i64] {
+    let l = list::new[i64]();
+    l.push(x86::RDI);
+    l.push(x86::RSI);
+    l.push(x86::RDX);
+    l.push(x86::RCX);
+    l.push(x86::R8);
+    l.push(x86::R9);
+    l
+}
+
+/// A spilled value's address. Slots sit below the saved callee-saved registers, which is why
+/// this needs the function's own state and not only the location.
+pub fn mem(fs: stackmap::FnState, l: regalloc::Loc) -> x86::Mem {
+    x86::at(x86::RBP, 0 - (fs.slot_base + 8 * l.slot))
+}
+
+/// Brings a value into the given register.
+pub fn load(e: emitter::Emitter, fs: stackmap::FnState, dst: i64, v: ir::Value) {
+    match fs.regs.where_of.get(v.id) {
+        Option::Some(l) => {
+            if regalloc::spilled(l) { e.a.mov_rm(dst, mem(fs, l)); } else { e.a.mov_rr(dst, l.reg); }
+        },
+        // A value nothing uses was never allocated. Reaching it means the lowering rule read
+        // an operand the allocator did not see, which is a bug here, not a recoverable
+        // condition.
+        Option::None => {
+            panic("this is a compiler bug: \(ir::value_name(v)) has no location");
+        },
+    }
+}
+
+/// Puts a register's contents where a value lives.
+pub fn store(e: emitter::Emitter, fs: stackmap::FnState, src: i64, l: regalloc::Loc) {
+    if regalloc::spilled(l) { e.a.mov_mr(mem(fs, l), src); } else { e.a.mov_rr(l.reg, src); }
+}
+
+/// Stores a computed result into the value's location, if anything reads it.
+pub fn def(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value, src: i64) {
+    match fs.regs.where_of.get(v.id) {
+        // A dead value: the allocator gave it nowhere, so there is nothing to keep.
+        Option::None => {},
+        Option::Some(l) => { store(e, fs, src, l); },
+    }
+}
+
+/// Where payload word i sits, relative to an object reference (which points at the header,
+/// spec/11-codegen.md's "Object layout in native code").
+pub fn field_offset(i: i64) -> i64 { emitter::OBJ_HEADER_SIZE + emitter::WORD_SIZE * i }
+
+/// Lowers one instruction.
+pub fn instr(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    let op = v.op;
+
+    if op == ir::OP_CONST { constant(e, fs, v); return; }
+
+    if op == ir::OP_UNIT {
+        // Unit carries no information; zero is as good a bit pattern as any, and
+        // spec/11-codegen.md says a caller must not read it.
+        a.xor_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if op == ir::OP_TRUE {
+        a.mov_ri(regalloc::SCRATCH_A, 1u64);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if op == ir::OP_FALSE {
+        a.xor_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    // Parameters were moved into place in the prologue.
+    if op == ir::OP_PARAM { return; }
+
+    if op == ir::OP_ADD || op == ir::OP_SUB || op == ir::OP_MUL {
+        trapping_arith(e, fs, v);
+        return;
+    }
+    if op == ir::OP_WRAP_ADD || op == ir::OP_WRAP_SUB || op == ir::OP_WRAP_MUL {
+        wrapping_arith(e, fs, v);
+        return;
+    }
+    if op == ir::OP_DIV || op == ir::OP_REM { division(e, fs, v); return; }
+
+    if op == ir::OP_NEG {
+        // Negation overflows on exactly one operand: the type's most negative value.
+        // `neg`'s own overflow flag answers that at sixty-four bits and not below it, so a
+        // narrow kind checks the result instead -- `-(-128i8)` is 128, which is not an `i8`.
+        let k = v.a;
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        a.neg_r(regalloc::SCRATCH_A);
+        if bytecode::kind_is_integer(k) && bytecode::kind_bits(k) < 64 {
+            trap_unless_fits(e, fs, k, regalloc::SCRATCH_A, v);
+        } else {
+            trap_if(e, x86::OVERFLOW, "arithmetic overflow", v);
+        }
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if op == ir::OP_NOT {
+        // `!` on a bool: flip the low bit rather than every bit, so the result stays 0 or 1
+        // and can be compared and stored like any other bool.
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        a.xor_ri(regalloc::SCRATCH_A, 1);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+
+    if op == ir::OP_ADDF || op == ir::OP_SUBF || op == ir::OP_MULF || op == ir::OP_DIVF {
+        float_arith(e, fs, v);
+        return;
+    }
+    if op == ir::OP_REMF {
+        // Float remainder is not an SSE instruction; x87's `fprem` is the only hardware form
+        // and pulling in the x87 stack for one operation is not worth it.
+        emitter::fail(e, "unimplemented: float remainder in native code");
+        return;
+    }
+    if op == ir::OP_NEGF {
+        // Negating a float flips its sign bit, which is a raw-word operation: -0.0 and NaN
+        // keep their payloads, which arithmetic negation would not guarantee.
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        a.mov_ri(x86::RAX, SIGN_BIT);
+        a.xor_rr(regalloc::SCRATCH_A, x86::RAX);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+
+    if op == ir::OP_CAST { cast(e, fs, v); return; }
+    if op == ir::OP_AND || op == ir::OP_OR || op == ir::OP_XOR { bitwise(e, fs, v); return; }
+    if op == ir::OP_SHL || op == ir::OP_SHR { shift(e, fs, v); return; }
+    if op == ir::OP_EQ || op == ir::OP_NE || op == ir::OP_LT
+        || op == ir::OP_LE || op == ir::OP_GT || op == ir::OP_GE {
+        compare(e, fs, v);
+        return;
+    }
+
+    if op == ir::OP_FUNC {
+        // A function value is its entry address. `closures.origin`'s resolution has already
+        // guaranteed that if this value is ever used as anything other than a call's own
+        // immediate callee, it was wrapped in a box instead -- so every use reaching this
+        // case still wants exactly the raw address.
+        if v.a < 0 || v.a >= e.fn_labels.len() {
+            emitter::fail(e, "this is a compiler bug: function index \(v.a) is out of range");
+            return;
+        }
+        a.lea_label(regalloc::SCRATCH_A, e.fn_labels.at(v.a));
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if op == ir::OP_BOX_FN {
+        // A one-word closure object whose only field is the argument's raw address: the same
+        // shape the virtual machine gives a bare function value written into a
+        // reference-shaped field, built the same way any other single-field object is.
+        construct(e, fs, v, e.prog.fn_box_type);
+        return;
+    }
+    if op == ir::OP_CLOSURE { closure(e, fs, v); return; }
+    if op == ir::OP_CAPTURE { capture(e, fs, v); return; }
+    if op == ir::OP_CALL { call(e, fs, v); return; }
+    if op == ir::OP_CALL_CLOSURE { call_closure(e, fs, v); return; }
+    if op == ir::OP_CALL_BUILTIN { builtin(e, fs, v); return; }
+    if op == ir::OP_TO_STR { to_str(e, fs, v); return; }
+
+    if op == ir::OP_TRAP {
+        let msg = e.prog.consts.at(v.a).text;
+        runtime_trap(e, emitter::trap_message(e, msg, emitter::span_text(e, v.file, v.span)));
+        return;
+    }
+
+    if op == ir::OP_STRUCT {
+        if v.a < 0 || v.a >= e.prog.structs.len() {
+            emitter::fail(e, "this is a compiler bug: struct index \(v.a) is out of range");
+            return;
+        }
+        construct(e, fs, v, e.prog.structs.at(v.a));
+        return;
+    }
+    if op == ir::OP_TUPLE { construct(e, fs, v, v.a); return; }
+    if op == ir::OP_VARIANT {
+        if v.a < 0 || v.a >= e.prog.variants.len() {
+            emitter::fail(e, "this is a compiler bug: variant index \(v.a) is out of range");
+            return;
+        }
+        construct(e, fs, v, e.prog.variants.at(v.a).ty);
+        return;
+    }
+
+    if op == ir::OP_GET_FIELD {
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        a.mov_rm(regalloc::SCRATCH_B, x86::at(regalloc::SCRATCH_A, field_offset(v.a)));
+        def(e, fs, v, regalloc::SCRATCH_B);
+        return;
+    }
+    if op == ir::OP_SET_FIELD {
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        load(e, fs, regalloc::SCRATCH_B, v.args.at(1));
+        a.mov_mr(x86::at(regalloc::SCRATCH_A, field_offset(v.a)), regalloc::SCRATCH_B);
+        return;
+    }
+    if op == ir::OP_IS_VARIANT {
+        if v.a < 0 || v.a >= e.prog.variants.len() {
+            emitter::fail(e, "this is a compiler bug: variant index \(v.a) is out of range");
+            return;
+        }
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        a.mov_rm(regalloc::SCRATCH_B, x86::at(regalloc::SCRATCH_A, 0)); // the header word
+        // The low 32 bits are the object's type id; an AND with a 32-bit immediate
+        // sign-extends over a 64-bit operand, which would leave the high bits untouched for a
+        // mask like this one, so the mask is built in a register instead.
+        equal::mask_low32(e, regalloc::SCRATCH_B, x86::RAX);
+        a.mov_ri(x86::RAX, e.prog.variants.at(v.a).ty as u64);
+        a.cmp_rr(regalloc::SCRATCH_B, x86::RAX);
+        a.setcc(x86::EQUAL, x86::RAX);
+        a.movzx8(x86::RAX, x86::RAX);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+
+    emitter::fail(e, "unimplemented: the native backend does not lower op \(op) yet");
+}
+
+/// A float's sign bit, as an immediate.
+const SIGN_BIT: u64 = 9223372036854775808u64;
+
+/// Emits a trap whose whole message is already in read-only data.
+fn runtime_trap(e: emitter::Emitter, msg: emitter::StaticStr) {
+    e.a.mov_ri(x86::RDI, msg.addr as u64);
+    e.a.mov_ri(x86::RSI, msg.length as u64);
+    e.a.call(e.rt.trap);
+    e.a.ud2();
+}
+
+fn constant(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    if v.a < 0 || v.a >= e.prog.consts.len() {
+        emitter::fail(e, "this is a compiler bug: constant index \(v.a) is out of range");
+        return;
+    }
+    let c = e.prog.consts.at(v.a);
+    if c.kind == bytecode::CONST_INT || c.kind == bytecode::CONST_CHAR
+        || c.kind == bytecode::CONST_FLOAT {
+        // Integers, chars and floats are all one word: the float's IEEE bits travel in a
+        // general-purpose register and move to SSE only for arithmetic.
+        e.a.mov_ri(regalloc::SCRATCH_A, c.bits);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if c.kind == bytecode::CONST_STRING {
+        // A literal is a String object already built in read-only data, so it costs a pointer
+        // rather than an allocation.
+        e.a.mov_ri(regalloc::SCRATCH_A, emitter::string_const(e, v.a).addr as u64);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    emitter::fail(e, "unimplemented: a constant of kind \(c.kind) in native code");
+}
+
+/// Lowers `+`, `-` and `*`, which stop the program on overflow at every optimization level
+/// (ADR-0005), at the operand type's own width.
+fn trapping_arith(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let k = v.a;
+    if !bytecode::kind_is_integer(k) {
+        emitter::fail(e, "this is a compiler bug: op \(v.op) reached the backend with no integer kind");
+        return;
+    }
+    let bad = e.a.new_label("arith_overflow");
+    let past = e.a.new_label("arith_ok");
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    load(e, fs, regalloc::SCRATCH_B, v.args.at(1));
+    arith_into(e, k, arith_op_of(v.op), bad);
+    e.a.jmp(past);
+    e.a.bind(bad);
+    runtime_trap(e, emitter::trap_message(e, "arithmetic overflow",
+        emitter::span_text(e, v.file, v.span)));
+    e.a.bind(past);
+    def(e, fs, v, regalloc::SCRATCH_A);
+}
+
+/// The three arithmetic operations the checked, saturating and trapping forms share.
+pub const AR_ADD: i64 = 0;
+pub const AR_SUB: i64 = 1;
+pub const AR_MUL: i64 = 2;
+
+/// Computes `SCRATCH_A op SCRATCH_B` at kind k, leaving the result in `SCRATCH_A` and jumping
+/// to `bad` when it overflows. It is the one place the three forms of `+ - *` -- trapping,
+/// checked and saturating -- agree about what overflow means.
+///
+/// At sixty-four bits the hardware answers: the overflow flag for signed, the carry flag for
+/// an unsigned add or subtract, and a non-zero high half for an unsigned multiply (`imul`'s
+/// own overflow flag answers the signed question instead). Below that the flags say nothing
+/// useful -- `255u8 + 1` sets neither, because 256 fits a register perfectly well -- so the
+/// check is on the result: every operand is in range by spec/04-expressions.md's invariant, so
+/// a narrow operation cannot overflow the register it is computed in, and "did it fit" is all
+/// that is left.
+fn arith_into(e: emitter::Emitter, k: i64, op: i64, bad: x86::Label) {
+    let a = e.a;
+    if bytecode::kind_bits(k) == 64 && op == AR_MUL && !bytecode::kind_is_signed(k) {
+        a.mov_rr(x86::RAX, regalloc::SCRATCH_A);
+        a.mul_r(regalloc::SCRATCH_B);
+        a.mov_rr(regalloc::SCRATCH_A, x86::RAX);
+        a.test_rr(x86::RDX, x86::RDX);
+        a.jcc(x86::NOT_EQUAL, bad);
+        return;
+    }
+    if op == AR_ADD {
+        a.add_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B);
+    } else if op == AR_SUB {
+        a.sub_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B);
+    } else {
+        a.imul_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B);
+    }
+    if bytecode::kind_bits(k) < 64 {
+        jump_unless_fits(e, k, regalloc::SCRATCH_A, bad);
+        return;
+    }
+    if bytecode::kind_is_signed(k) { a.jcc(x86::OVERFLOW, bad); return; }
+    a.jcc(x86::CARRY, bad);
+}
+
+/// Names which of the three operations an IR opcode is.
+fn arith_op_of(op: i64) -> i64 {
+    if op == ir::OP_ADD || op == ir::OP_WRAP_ADD { return AR_ADD; }
+    if op == ir::OP_SUB || op == ir::OP_WRAP_SUB { return AR_SUB; }
+    AR_MUL
+}
+
+/// Jumps to `bad` unless the value in `reg` is representable in k.
+fn jump_unless_fits(e: emitter::Emitter, k: i64, reg: i64, bad: x86::Label) {
+    e.a.mov_rr(x86::RAX, reg);
+    wrap_to(e, k, x86::RAX);
+    e.a.cmp_rr(x86::RAX, reg);
+    e.a.jcc(x86::NOT_EQUAL, bad);
+}
+
+/// Traps unless the value in `reg` is representable in k, which is only asked of a kind
+/// narrower than the machine word.
+///
+/// It is "wrap and compare": re-reading the low bits as a value of k and checking that nothing
+/// changed is the definition of "it fits", and it is two instructions plus a comparison
+/// whichever signedness k has. rax is the scratch, which the register allocator never hands
+/// out and nothing here holds across a call.
+fn trap_unless_fits(e: emitter::Emitter, fs: stackmap::FnState, k: i64, reg: i64, v: ir::Value) {
+    e.a.mov_rr(x86::RAX, reg);
+    wrap_to(e, k, x86::RAX);
+    e.a.cmp_rr(x86::RAX, reg);
+    trap_if(e, x86::NOT_EQUAL, "arithmetic overflow", v);
+}
+
+/// Truncates `reg` to k's width and extends it back, which is two's-complement wraparound
+/// (`arith::wrap`, in machine code).
+fn wrap_to(e: emitter::Emitter, k: i64, reg: i64) {
+    let w = bytecode::kind_bits(k);
+    if w == 64 { return; }
+    // Shift the unwanted bits off the top and back down: arithmetically for a signed kind, so
+    // the sign comes back, and logically for an unsigned one, so it does not.
+    e.a.shl_i(reg, 64 - w);
+    if bytecode::kind_is_signed(k) { e.a.sar_i(reg, 64 - w); } else { e.a.shr_i(reg, 64 - w); }
+}
+
+/// Lowers the explicit `wrapping_*` methods, which are the same instructions with no check.
+fn wrapping_arith(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    let k = v.a;
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    load(e, fs, regalloc::SCRATCH_B, v.args.at(1));
+    if v.op == ir::OP_WRAP_ADD {
+        a.add_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B);
+    } else if v.op == ir::OP_WRAP_SUB {
+        a.sub_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B);
+    } else if v.op == ir::OP_WRAP_MUL {
+        a.imul_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B);
+    }
+    // Wrapping at the operand's own width: `255u8.wrapping_add(1)` is 0, not 256. At
+    // sixty-four bits the register has already done it, and `wrap_to` is a no-op.
+    if bytecode::kind_is_integer(k) { wrap_to(e, k, regalloc::SCRATCH_A); }
+    def(e, fs, v, regalloc::SCRATCH_A);
+}
+
+/// Lowers `/` and `%`.
+///
+/// Both checks are mandatory and neither is the hardware's: x86 raises a processor exception
+/// for a zero divisor and for `MIN / -1`, and a processor exception is not a trap with a
+/// message and exit 101. Testing first is what turns them into the behaviour
+/// spec/04-expressions.md requires.
+fn division(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    let k = v.a;
+    if !bytecode::kind_is_integer(k) {
+        emitter::fail(e, "this is a compiler bug: op \(v.op) reached the backend with no integer kind");
+        return;
+    }
+    let mut msg = "divide by zero";
+    if v.op == ir::OP_REM { msg = "remainder by zero"; }
+
+    load(e, fs, regalloc::SCRATCH_B, v.args.at(1)); // the divisor
+    a.test_rr(regalloc::SCRATCH_B, regalloc::SCRATCH_B);
+    trap_if(e, x86::EQUAL, msg, v);
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+
+    if !bytecode::kind_is_signed(k) {
+        // Unsigned division cannot overflow, and `div` is the instruction for it: `idiv` on a
+        // `u64` above i64::MAX would read both operands as negative.
+        a.mov_rr(x86::RAX, regalloc::SCRATCH_A);
+        a.xor_rr(x86::RDX, x86::RDX);
+        a.div_r(regalloc::SCRATCH_B);
+        if v.op == ir::OP_REM { def(e, fs, v, x86::RDX); return; }
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+
+    // The one overflowing division: the type's most negative value divided by -1 has no
+    // representation in it.
+    let not_min = a.new_label("div_not_min");
+    a.cmp_ri(regalloc::SCRATCH_B, 0 - 1);
+    a.jcc(x86::NOT_EQUAL, not_min);
+    a.mov_ri(x86::RAX, arith::min_of(k));
+    a.cmp_rr(regalloc::SCRATCH_A, x86::RAX);
+    trap_if(e, x86::EQUAL, "arithmetic overflow", v);
+    a.bind(not_min);
+
+    a.mov_rr(x86::RAX, regalloc::SCRATCH_A);
+    a.cqo();
+    a.idiv_r(regalloc::SCRATCH_B);
+    if v.op == ir::OP_REM { def(e, fs, v, x86::RDX); return; }
+    def(e, fs, v, x86::RAX);
+}
+
+fn bitwise(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    load(e, fs, regalloc::SCRATCH_B, v.args.at(1));
+    if v.op == ir::OP_AND { a.and_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B); }
+    if v.op == ir::OP_OR { a.or_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B); }
+    if v.op == ir::OP_XOR { a.xor_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B); }
+    def(e, fs, v, regalloc::SCRATCH_A);
+}
+
+/// Lowers `<<` and `>>`, which trap when the amount is not less than the width
+/// (spec/04-expressions.md). x86 would silently mask the count to six bits instead, which is a
+/// different program.
+fn shift(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    let k = v.a;
+    if !bytecode::kind_is_integer(k) {
+        emitter::fail(e, "this is a compiler bug: op \(v.op) reached the backend with no integer kind");
+        return;
+    }
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    load(e, fs, regalloc::SCRATCH_B, v.args.at(1));
+
+    // The amount is compared against the *operand's* width, not the register's: `1u8 << 8` is
+    // out of range even though the register has plenty of room.
+    a.cmp_ri(regalloc::SCRATCH_B, bytecode::kind_bits(k));
+    trap_if(e, x86::ABOVE_EQUAL, "shift amount out of range", v);
+
+    // The count has to be in cl, and cl may be holding something the allocator put there, so
+    // it is saved around the shift.
+    a.push(x86::RCX);
+    a.mov_rr(x86::RCX, regalloc::SCRATCH_B);
+    if v.op == ir::OP_SHL {
+        a.shl_cl(regalloc::SCRATCH_A);
+    } else if bytecode::kind_is_signed(k) {
+        a.sar_cl(regalloc::SCRATCH_A); // arithmetic: the sign comes back
+    } else {
+        a.shr_cl(regalloc::SCRATCH_A); // logical: it does not
+    }
+    a.pop(x86::RCX);
+    if v.op == ir::OP_SHL {
+        // A left shift overflows when the bits it pushed out mattered, which at any width is
+        // "the result does not fit".
+        trap_unless_fits64(e, fs, k, regalloc::SCRATCH_A, regalloc::SCRATCH_B, v);
+    }
+    def(e, fs, v, regalloc::SCRATCH_A);
+}
+
+/// `trap_unless_fits` for a left shift, which at full width has no spare bits to check
+/// against: there, shifting the result back must recover the operand, and the amount is still
+/// in `amount` for that.
+fn trap_unless_fits64(e: emitter::Emitter, fs: stackmap::FnState, k: i64, reg: i64,
+                      amount: i64, v: ir::Value) {
+    let a = e.a;
+    if bytecode::kind_bits(k) < 64 { trap_unless_fits(e, fs, k, reg, v); return; }
+    a.mov_rr(x86::RAX, reg);
+    a.push(x86::RCX);
+    a.mov_rr(x86::RCX, amount);
+    if bytecode::kind_is_signed(k) { a.sar_cl(x86::RAX); } else { a.shr_cl(x86::RAX); }
+    a.pop(x86::RCX);
+    load(e, fs, regalloc::SCRATCH_B, v.args.at(0));
+    a.cmp_rr(x86::RAX, regalloc::SCRATCH_B);
+    trap_if(e, x86::NOT_EQUAL, "arithmetic overflow", v);
+}
+
+/// Lowers `==`, `!=`, `<`, `<=`, `>` and `>=`.
+///
+/// Which machine comparison to use depends on the operand's static type, which the IR carries
+/// because the bytecode was widened to carry it: a register holds sixty-four bits and nothing
+/// in it says whether they are a signed integer, an unsigned one, or a pointer to a String.
+fn compare(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let kind = v.a;
+    if bytecode::kind_is_integer(kind) {
+        // A narrow integer is stored in range and extended to sixty-four bits, so the width
+        // does not enter into the comparison -- only the signedness does.
+        if bytecode::kind_is_signed(kind) {
+            finish_compare(e, fs, v, signed_cond(v.op));
+        } else {
+            finish_compare(e, fs, v, unsigned_cond(v.op));
+        }
+        return;
+    }
+    if kind == bytecode::KIND_CHAR || kind == bytecode::KIND_BOOL || kind == bytecode::KIND_UNIT {
+        finish_compare(e, fs, v, signed_cond(v.op));
+        return;
+    }
+    if kind == bytecode::KIND_FLOAT { float_compare(e, fs, v); return; }
+    if kind == bytecode::KIND_REF {
+        if v.op == ir::OP_EQ || v.op == ir::OP_NE { structural_compare(e, fs, v); return; }
+        // `<` and friends are built in only for integers, floats, char and String
+        // (spec/04-expressions.md); a struct, tuple or enum reaching here is a checker bug,
+        // not a missing lowering.
+        emitter::fail(e, "this is a compiler bug: ordering a reference value in native code");
+        return;
+    }
+    if kind == bytecode::KIND_STRING {
+        if v.op == ir::OP_EQ || v.op == ir::OP_NE { structural_compare(e, fs, v); return; }
+        string_order(e, fs, v);
+        return;
+    }
+    if kind == bytecode::KIND_UNKNOWN {
+        emitter::fail(e, "this is a compiler bug: a comparison reached the backend with no operand kind");
+        return;
+    }
+    emitter::fail(e, "unimplemented: comparing kind \(kind) values in native code");
+}
+
+/// Emits the comparison itself, once the condition code is decided.
+fn finish_compare(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value, cond: i64) {
+    let a = e.a;
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    load(e, fs, regalloc::SCRATCH_B, v.args.at(1));
+    a.cmp_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B);
+    a.setcc(cond, x86::RAX);
+    a.movzx8(x86::RAX, x86::RAX);
+    def(e, fs, v, x86::RAX);
+}
+
+/// Lowers `==` and `!=` on an aggregate or a String by calling the runtime's recursive
+/// structural equality. Both operands are pushed before the call, matching `call` and
+/// `construct`: the call clobbers the caller-saved registers, so nothing here may assume an
+/// operand's allocated location survives it.
+fn structural_compare(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    a.push(regalloc::SCRATCH_A);
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(1));
+    a.push(regalloc::SCRATCH_A);
+    a.pop(x86::RSI);
+    a.pop(x86::RDI);
+    a.call(e.rt.equal_objects);
+    stackmap::record_call(e, fs, v);
+    if v.op == ir::OP_NE { a.xor_ri(x86::RAX, 1); }
+    def(e, fs, v, x86::RAX);
+}
+
+/// Lowers `<`, `<=`, `>` and `>=` on String by calling the runtime's lexicographic byte
+/// comparison, reused rather than duplicated: it already returns the three-way sign `cmp`'s
+/// ordering needs, and a sign compared against zero with the ordinary signed condition is
+/// exactly the bool an operator needs.
+fn string_order(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    a.push(regalloc::SCRATCH_A);
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(1));
+    a.push(regalloc::SCRATCH_A);
+    a.pop(x86::RSI);
+    a.pop(x86::RDI);
+    a.call(e.rt.compare_bytes);
+    stackmap::record_call(e, fs, v);
+    a.cmp_ri(x86::RAX, 0);
+    a.setcc(signed_cond(v.op), x86::RAX);
+    a.movzx8(x86::RAX, x86::RAX);
+    def(e, fs, v, x86::RAX);
+}
+
+fn signed_cond(op: i64) -> i64 {
+    if op == ir::OP_EQ { return x86::EQUAL; }
+    if op == ir::OP_NE { return x86::NOT_EQUAL; }
+    if op == ir::OP_LT { return x86::LESS; }
+    if op == ir::OP_LE { return x86::LESS_EQUAL; }
+    if op == ir::OP_GT { return x86::GREATER; }
+    x86::GREATER_EQUAL
+}
+
+fn unsigned_cond(op: i64) -> i64 {
+    if op == ir::OP_EQ { return x86::EQUAL; }
+    if op == ir::OP_NE { return x86::NOT_EQUAL; }
+    if op == ir::OP_LT { return x86::BELOW; }
+    if op == ir::OP_LE { return x86::BELOW_EQUAL; }
+    if op == ir::OP_GT { return x86::ABOVE; }
+    x86::ABOVE_EQUAL
+}
+
+/// Traps when a condition holds, and falls through when it does not.
+///
+/// The stub is emitted inline, jumped over, because a trap ends the program: the cost of the
+/// extra jump is paid once per trapping operation on the path that does not trap, and there is
+/// no need for an out-of-line section.
+fn trap_if(e: emitter::Emitter, cond: i64, msg: String, v: ir::Value) {
+    let past = e.a.new_label("no_trap");
+    e.a.jcc(x86::invert(cond), past);
+    runtime_trap(e, emitter::trap_message(e, msg, emitter::span_text(e, v.file, v.span)));
+    e.a.bind(past);
+}
+
+/// Lowers a direct call. Argument 0 is the callee; the rest are the arguments.
+///
+/// The callee is always a bare function value here: `closures.origin` repoints any call whose
+/// callee is not one at a closure call before this ever runs, so a callee that fails this
+/// check is this routine's own caller's bug, not a program this backend cannot yet handle.
+fn call(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    let regs = arg_regs();
+    let callee = v.args.at(0);
+    if callee.op != ir::OP_FUNC {
+        emitter::fail(e, "this is a compiler bug: a direct call's callee is not a bare function value");
+        return;
+    }
+    let n = v.args.len() - 1;
+    if n > regs.len() {
+        emitter::fail(e, "unimplemented: passing \(n) arguments, past the \(regs.len()) the registers carry");
+        return;
+    }
+    // An argument may currently live in the register a *later* argument has to go into, so the
+    // values are pushed in order and popped into place. The pushes are balanced before the
+    // call, which is what keeps rsp 16-byte aligned there.
+    let mut i = 0;
+    while i < n {
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(i + 1));
+        a.push(regalloc::SCRATCH_A);
+        i = i + 1;
+    }
+    let mut j = n - 1;
+    while j >= 0 {
+        a.pop(regs.at(j));
+        j = j - 1;
+    }
+    a.call(e.fn_labels.at(callee.a));
+    stackmap::record_call(e, fs, v);
+    def(e, fs, v, x86::RAX);
+}
+
+/// Lowers a closure creation: allocate a closure object and fill it. Field 0 is always the
+/// underlying function's entry address -- computed the same way a bare function reference's
+/// own lowering computes it, not read from the arguments, since the bytecode never pushes it
+/// -- and fields 1.. are the captures, in argument order. The captures are read after the
+/// allocator call for the same reason `construct`'s fields are: the call can collect, and a
+/// capture parked on the raw stack across it is not in the collector's root set.
+fn closure(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    if v.a < 0 || v.a >= e.prog.closures.len() {
+        emitter::fail(e, "this is a compiler bug: closure index \(v.a) is out of range");
+        return;
+    }
+    let ci = e.prog.closures.at(v.a);
+    let desc = e.prog.types.get(ci.ty);
+    a.mov_ri(x86::RDI, desc.words as u64);
+    a.mov_ri(x86::RSI, ci.ty as u64);
+    a.call(e.rt.alloc);
+    stackmap::record_call(e, fs, v);
+    a.mov_rr(regalloc::SCRATCH_B, x86::RAX); // the new object, held while the fields land
+    let mut i = 0;
+    while i < v.args.len() {
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(i));
+        a.mov_mr(x86::at(regalloc::SCRATCH_B, field_offset(i + 1)), regalloc::SCRATCH_A);
+        i = i + 1;
+    }
+    a.lea_label(regalloc::SCRATCH_A, e.fn_labels.at(ci.fn_index));
+    a.mov_mr(x86::at(regalloc::SCRATCH_B, field_offset(0)), regalloc::SCRATCH_A);
+    def(e, fs, v, regalloc::SCRATCH_B);
+}
+
+/// Lowers a capture read. The closure reference itself comes from the frame slot the register
+/// allocator reserved for it and the prologue filled from `[rbp+16]`, never from `[rbp+16]`
+/// again: a collection during the body moves the object, and only the slot -- inside the
+/// reference area the stack map describes -- is updated to say where it went. Field 0 is the
+/// function's own entry address, so a capture at index i sits at field i+1.
+fn capture(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    if fs.regs.closure_slot == 0 {
+        emitter::fail(e, "this is a compiler bug: a capture is read in a function declaring none");
+        return;
+    }
+    a.mov_rm(regalloc::SCRATCH_A, mem(fs, regalloc::in_slot(fs.regs.closure_slot)));
+    a.mov_rm(regalloc::SCRATCH_B, x86::at(regalloc::SCRATCH_A, field_offset(v.b + 1)));
+    def(e, fs, v, regalloc::SCRATCH_B);
+}
+
+/// Lowers an indirect call: argument 0 is a closure-object reference -- never a bare code
+/// pointer, `closures.origin` established that as an invariant before this ever runs -- and the
+/// rest are the real arguments, passed exactly the way `call` passes them.
+///
+/// The callee's code address comes from the object's field 0. The object reference itself also
+/// has to reach the callee, since its own body may read captures from it, but not through an
+/// argument register: every one may already be carrying a real parameter (a function is capped
+/// at 6, docs/spec/11-codegen.md, exactly how many there are), and shifting them over would
+/// give a direct call and an indirect one to the same function two different parameter
+/// conventions. It goes on the stack instead, in the fixed spot a call always leaves just above
+/// the return address -- `[rbp+16]` in the callee's own frame, which is exactly where `capture`
+/// reads it back. An ordinary function reached this way (boxed rather than a real closure
+/// literal) never reads that spot at all, so leaving it there costs it nothing: one calling
+/// convention serves both, and the call site never has to know which of the two it has.
+fn call_closure(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    let regs = arg_regs();
+    let n = v.args.len() - 1;
+    if n > regs.len() {
+        emitter::fail(e, "unimplemented: calling a closure with \(n) arguments, past the \(regs.len()) the registers carry");
+        return;
+    }
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    a.mov_rm(regalloc::SCRATCH_B, x86::at(regalloc::SCRATCH_A, field_offset(0)));
+    a.push(regalloc::SCRATCH_B); // the code address, saved across the argument pushes below
+    a.push(regalloc::SCRATCH_A); // the closure reference, saved the same way
+    let mut i = 0;
+    while i < n {
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(i + 1));
+        a.push(regalloc::SCRATCH_A);
+        i = i + 1;
+    }
+    let mut j = n - 1;
+    while j >= 0 {
+        a.pop(regs.at(j));
+        j = j - 1;
+    }
+    a.pop(regalloc::SCRATCH_A); // the closure reference
+    a.pop(regalloc::SCRATCH_B); // the code address
+    // rsp must be 16-byte aligned at `call`, and the closure reference is one word -- eight
+    // bytes short on its own -- so it goes on the stack twice. Which of the two the callee
+    // reads at `[rbp+16]` does not matter: they are the same value, and the second exists only
+    // to pay for the first.
+    a.push(regalloc::SCRATCH_A);
+    a.push(regalloc::SCRATCH_A);
+    a.call_reg(regalloc::SCRATCH_B);
+    stackmap::record_call(e, fs, v);
+    a.add_ri(x86::RSP, 16);
+    def(e, fs, v, x86::RAX);
+}
+
+/// Lowers a struct, tuple or variant construction: allocate an object of the given exact
+/// layout (ADR-0019) and fill its fields from the operands, in order.
+///
+/// Every field value is read from its own home *after* the allocator call, never parked on the
+/// stack across it. The allocator can collect (ADR-0022), and a collection moves objects: the
+/// collector's root set is this frame's tracked registers and its reference-kind spill slots
+/// (ADR-0021's stack map), and a reference pushed to the raw stack is in neither, so it would
+/// come back pointing into the space just vacated. Reading afterwards is also what makes the
+/// clobbering harmless: an operand of a call-clobbering operation is live across that call by
+/// construction, so the register allocator already gave it a callee-saved register or a spill
+/// slot, both of which the collector updates in place.
+fn construct(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value, t: i64) {
+    let a = e.a;
+    let desc = e.prog.types.get(t);
+    let mut c = 0;
+    while c < v.args.len() {
+        if desc.kinds.at(c) == layout::WORD_REF && v.args.at(c).op == ir::OP_FUNC {
+            // A bare top-level function reference is an index, not a heap object, and writing
+            // one into a reference-shaped field needs the same boxing into a captureless
+            // closure the virtual machine does (ADR-0019). Reaching this branch means
+            // `closures.origin` failed to box it first -- every use of a function value that is
+            // not being a call's own immediate callee is supposed to be boxed before
+            // construction ever sees it.
+            emitter::fail(e, "this is a compiler bug: an unboxed function value reached a reference-shaped field");
+            return;
+        }
+        c = c + 1;
+    }
+    a.mov_ri(x86::RDI, desc.words as u64);
+    a.mov_ri(x86::RSI, t as u64);
+    a.call(e.rt.alloc);
+    stackmap::record_call(e, fs, v);
+    a.mov_rr(regalloc::SCRATCH_B, x86::RAX); // the new object, held while the fields land
+    let mut i = 0;
+    while i < v.args.len() {
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(i));
+        a.mov_mr(x86::at(regalloc::SCRATCH_B, field_offset(i)), regalloc::SCRATCH_A);
+        i = i + 1;
+    }
+    def(e, fs, v, regalloc::SCRATCH_B);
+}
+
+/// Traps when a runtime routine reported the one error it can have, and falls through when it
+/// did not. The message names the user's own line, which the span walk finds when the call
+/// being lowered is one the prelude makes.
+fn refused_status(e: emitter::Emitter, v: ir::Value, refused: String) {
+    let a = e.a;
+    let ok = a.new_label("refused_status_ok");
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, ok);
+    spans::trap_at_user_span(e, v, refused);
+    a.bind(ok);
+}
+
+/// Turns a string routine's status into one of the two traps spec/14-strings.md distinguishes,
+/// and falls through when the index was legal.
+///
+/// Two messages rather than one, because a string index fails in two ways that mean different
+/// things: an index outside the string is arithmetic the caller got wrong, and one inside it
+/// that splits a character is a byte index used where a character index was meant.
+fn str_status(e: emitter::Emitter, v: ir::Value) {
+    let a = e.a;
+    let ok = a.new_label("str_status_ok");
+    let not_boundary = a.new_label("str_status_not_boundary");
+
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, ok);
+    a.cmp_ri(x86::RAX, strings::STR_NOT_BOUNDARY);
+    a.jcc(x86::EQUAL, not_boundary);
+    spans::trap_at_user_span(e, v, "index out of range");
+    a.bind(not_boundary);
+    spans::trap_at_user_span(e, v, "string index is not a character boundary");
+    a.bind(ok);
+}
+
+/// Turns a blocking runtime routine's status into a trap, and falls through when the operation
+/// succeeded.
+///
+/// The runtime returns a status rather than trapping itself because a trap's text names a
+/// source location and a runtime routine has none of its own -- the line §12's messages want is
+/// the programmer's, which the span walk resolves when the call being lowered is one the
+/// prelude makes.
+fn sched_status(e: emitter::Emitter, v: ir::Value, refused: String) {
+    let a = e.a;
+    let ok = a.new_label("sched_status_ok");
+    let not_refused = a.new_label("sched_status_not_refused");
+
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, ok);
+    a.cmp_ri(x86::RAX, sched::REFUSED);
+    a.jcc(x86::NOT_EQUAL, not_refused);
+    spans::trap_at_user_span(e, v, refused);
+    a.bind(not_refused);
+    spans::trap_at_user_span(e, v, "all threads are blocked");
+    a.bind(ok);
+}
+
+/// Lowers a call to one of the compiler-provided functions.
+fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    let idx = v.a;
+    let n = v.args.len();
+
+    if idx == compile::BUILTIN_SPAWN {
+        // `rt_spawn(closure, result_is_ref) -> handle`. The handle is an integer as far as the
+        // rest of the program is concerned; the bytecode compiler wraps it in the
+        // `JoinHandle[T]` the checker gave the call (spec/12-concurrency.md). The second
+        // argument is a constant the compiler supplies, because a thread's result lives in a
+        // control block that no stack map covers and only the compiler knows its T.
+        if !arity(e, n, 2, "spawn") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        load(e, fs, x86::RSI, v.args.at(1));
+        a.call(e.rt.thread_spawn);
+        stackmap::record_call(e, fs, v);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if idx == compile::BUILTIN_JOIN {
+        if !arity(e, n, 1, "join") { return; }
+        // The argument is the `JoinHandle[T]` object, not the handle: the prelude's own method
+        // passes `self`. The control block's address is its first field.
+        load(e, fs, x86::RDI, v.args.at(0));
+        a.mov_rm(x86::RDI, x86::at(x86::RDI, emitter::OBJ_HEADER_SIZE));
+        a.call(e.rt.thread_join);
+        stackmap::record_call(e, fs, v);
+        sched_status(e, v, "handle already joined");
+        def(e, fs, v, x86::RDX);
+        return;
+    }
+    if idx == compile::BUILTIN_CHANNEL {
+        // `rt_chan_new(capacity, elem_is_ref) -> handle`, with the second argument the one the
+        // bytecode compiler adds: a queued value may be a reference, and a channel is raw
+        // memory the collector reads from the outside.
+        if !arity(e, n, 2, "channel") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        load(e, fs, x86::RSI, v.args.at(1));
+        a.call(e.rt.chan_new);
+        stackmap::record_call(e, fs, v);
+        sched_status(e, v, "channel capacity is negative");
+        def(e, fs, v, x86::RDX);
+        return;
+    }
+    if idx == compile::BUILTIN_SEND {
+        // The argument is the `Sender[T]` object; the channel is its first field, exactly as
+        // `join`'s handle is.
+        if !arity(e, n, 2, "send") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        a.mov_rm(x86::RDI, x86::at(x86::RDI, emitter::OBJ_HEADER_SIZE));
+        load(e, fs, x86::RSI, v.args.at(1));
+        a.call(e.rt.chan_send);
+        stackmap::record_call(e, fs, v);
+        sched_status(e, v, "send on a closed channel");
+        a.xor_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if idx == compile::BUILTIN_AWAIT {
+        if !arity(e, n, 1, "await") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        a.mov_rm(x86::RDI, x86::at(x86::RDI, emitter::OBJ_HEADER_SIZE));
+        a.call(e.rt.chan_recv);
+        stackmap::record_call(e, fs, v);
+        sched_status(e, v, "receive on a channel that does not exist");
+        def(e, fs, v, x86::RDX);
+        return;
+    }
+    if idx == compile::BUILTIN_TAKEN {
+        // The value the receive above took, held on this thread until now so that asking "is
+        // there one?" and taking it are one step (the prelude's own `recv`).
+        if !arity(e, n, 1, "taken") { return; }
+        a.call(e.rt.chan_taken);
+        stackmap::record_call(e, fs, v);
+        sched_status(e, v, "no value was taken from this channel");
+        def(e, fs, v, x86::RDX);
+        return;
+    }
+    if idx == compile::BUILTIN_CLOSE_CHAN {
+        if !arity(e, n, 1, "close") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        a.mov_rm(x86::RDI, x86::at(x86::RDI, emitter::OBJ_HEADER_SIZE));
+        a.call(e.rt.chan_close);
+        stackmap::record_call(e, fs, v);
+        sched_status(e, v, "channel already closed");
+        a.xor_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if idx == compile::BUILTIN_MUTEX {
+        if !arity(e, n, 2, "mutex") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        load(e, fs, x86::RSI, v.args.at(1));
+        a.call(e.rt.mutex_new);
+        stackmap::record_call(e, fs, v);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if idx == compile::BUILTIN_WITH_LOCK {
+        if !arity(e, n, 2, "with_lock") { return; }
+        with_lock(e, fs, v);
+        return;
+    }
+    if idx == compile::BUILTIN_HASH {
+        // The specified hash (spec/13-collections.md): the same number on all three engines,
+        // which is why the algorithm and the encoding are in the specification rather than in
+        // whichever runtime got there first.
+        if !arity(e, n, 1, "hash::of") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        a.mov_ri(x86::RSI, hash::hash_kind_of(v.args.at(0).kind) as u64);
+        a.call(e.rt.hash_word);
+        stackmap::record_call(e, fs, v);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if idx == compile::BUILTIN_STR_LEN {
+        if !arity(e, n, 1, "str::len") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        a.call(e.rt.str_len);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if idx == compile::BUILTIN_STR_BYTE_AT || idx == compile::BUILTIN_STR_CHAR_AT
+        || idx == compile::BUILTIN_STR_CHAR_WIDTH {
+        if !arity(e, n, 2, "a string index") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        load(e, fs, x86::RSI, v.args.at(1));
+        if idx == compile::BUILTIN_STR_BYTE_AT {
+            a.call(e.rt.str_byte_at);
+        } else if idx == compile::BUILTIN_STR_CHAR_AT {
+            a.call(e.rt.str_char_at);
+        } else {
+            a.call(e.rt.str_char_width);
+        }
+        str_status(e, v);
+        def(e, fs, v, x86::RDX);
+        return;
+    }
+    if idx == compile::BUILTIN_STR_SLICE {
+        if !arity(e, n, 3, "str::slice") { return; }
+        str_slice(e, fs, v);
+        return;
+    }
+    if idx == compile::BUILTIN_STR_CONCAT {
+        if !arity(e, n, 2, "str::concat") { return; }
+        str_concat(e, fs, v);
+        return;
+    }
+    if idx == compile::BUILTIN_ARG_COUNT {
+        if !arity(e, n, 0, "env::arg_count") { return; }
+        // The first word of the argument vector is the count the kernel wrote there
+        // (spec/17-process.md); no routine is needed to read one word.
+        a.mov_rm(regalloc::SCRATCH_A, x86::at(x86::R15, emitter::RT_ARGV_OFF));
+        a.mov_rm(regalloc::SCRATCH_A, x86::at(regalloc::SCRATCH_A, 0));
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if idx == compile::BUILTIN_ARG_AT {
+        if !arity(e, n, 1, "env::arg_at") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        a.call(e.rt.arg_at);
+        stackmap::record_call(e, fs, v);
+        refused_status(e, v, "index out of range");
+        def(e, fs, v, x86::RDX);
+        return;
+    }
+    if idx == compile::BUILTIN_EXIT {
+        if !arity(e, n, 1, "process::exit") { return; }
+        // It ends the process rather than the thread, so there is nothing to unwind and no
+        // scheduler to tell: the syscall is the whole of it (spec/17-process.md).
+        load(e, fs, x86::RDI, v.args.at(0));
+        a.and_ri(x86::RDI, 255);
+        a.mov_ri(x86::RAX, e.target.sys_exit as u64);
+        a.syscall();
+        a.ud2();
+        a.xor_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if idx == compile::BUILTIN_CHAR_VALID {
+        if !arity(e, n, 1, "char::from_u32") { return; }
+        // `n <= 0x10FFFF && (n < 0xD800 || n > 0xDFFF)`, as two compares and a mask: the
+        // surrogate range is exactly the values whose top eleven bits are 0b1101_1011_0, so
+        // `(n & ~0x7FF) == 0xD800` tests it in one instruction.
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        a.mov_ri(x86::RAX, 0u64);
+        a.cmp_ri(regalloc::SCRATCH_A, 1114111);
+        let too_big = a.new_label("char_from_u32_out");
+        a.jcc(x86::ABOVE, too_big);
+        a.mov_rr(regalloc::SCRATCH_B, regalloc::SCRATCH_A);
+        a.and_ri(regalloc::SCRATCH_B, 0 - 2048); // ^0x7FF, sign-extended
+        a.cmp_ri(regalloc::SCRATCH_B, 55296);
+        a.jcc(x86::EQUAL, too_big);
+        a.mov_ri(x86::RAX, 1u64);
+        a.bind(too_big);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if idx == compile::BUILTIN_FLOAT_BITS || idx == compile::BUILTIN_FLOAT_FROM_BITS {
+        if !arity(e, n, 1, "a float reinterpretation") { return; }
+        // Nothing to emit but the move. A float lives in a general-purpose register as its own
+        // bits and is moved into an XMM only to be computed on, so `float::bits` and
+        // `float::from_bits` are the same sixty-four bits under a different static type
+        // (spec/16-floats.md).
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if idx == compile::BUILTIN_READ_FILE || idx == compile::BUILTIN_FILE_EXISTS {
+        if !arity(e, n, 1, "a path operation") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        if idx == compile::BUILTIN_READ_FILE {
+            a.call(e.rt.fs_read);
+            // It allocates the String it reads into, so the call site is a safepoint like any
+            // other allocation in user code (ADR-0021).
+            stackmap::record_call(e, fs, v);
+        } else {
+            a.call(e.rt.fs_exists);
+        }
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if idx == compile::BUILTIN_WRITE_FILE {
+        if !arity(e, n, 2, "fs::write_file") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        load(e, fs, x86::RSI, v.args.at(1));
+        a.call(e.rt.fs_write);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if idx == compile::BUILTIN_TAKEN_TEXT {
+        if !arity(e, n, 0, "fs::taken_text") { return; }
+        a.call(e.rt.fs_taken);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if idx == compile::BUILTIN_NEW_ARRAY {
+        // `rt_array_new(capacity, typeid)`: the second argument is the layout the bytecode
+        // compiler chose for this instantiation, which is what tells the collector whether the
+        // elements are references (ADR-0028).
+        if !arity(e, n, 2, "array::new") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        load(e, fs, x86::RSI, v.args.at(1));
+        a.call(e.rt.array_new);
+        stackmap::record_call(e, fs, v);
+        refused_status(e, v, "array capacity is negative");
+        def(e, fs, v, x86::RDX);
+        return;
+    }
+    if idx == compile::BUILTIN_ARRAY_LEN || idx == compile::BUILTIN_ARRAY_CAP {
+        if !arity(e, n, 1, "an array length") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        if idx == compile::BUILTIN_ARRAY_LEN { a.call(e.rt.array_len); } else { a.call(e.rt.array_cap); }
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if idx == compile::BUILTIN_ARRAY_AT {
+        if !arity(e, n, 2, "array::at") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        load(e, fs, x86::RSI, v.args.at(1));
+        a.call(e.rt.array_at);
+        refused_status(e, v, "index out of range");
+        def(e, fs, v, x86::RDX);
+        return;
+    }
+    if idx == compile::BUILTIN_ARRAY_SET {
+        if !arity(e, n, 3, "array::set") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        load(e, fs, x86::RSI, v.args.at(1));
+        load(e, fs, x86::RDX, v.args.at(2));
+        a.call(e.rt.array_set);
+        refused_status(e, v, "index out of range");
+        a.xor_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if idx == compile::BUILTIN_ARRAY_PUSH {
+        if !arity(e, n, 2, "array::push") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        load(e, fs, x86::RSI, v.args.at(1));
+        a.call(e.rt.array_push);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if idx == compile::BUILTIN_ARRAY_TRUNCATE {
+        if !arity(e, n, 2, "array::truncate") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        load(e, fs, x86::RSI, v.args.at(1));
+        a.call(e.rt.array_truncate);
+        a.xor_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if idx == compile::BUILTIN_PRINT || idx == compile::BUILTIN_PRINTLN {
+        if !arity(e, n, 1, "print") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        if idx == compile::BUILTIN_PRINTLN { a.call(e.rt.println); } else { a.call(e.rt.print); }
+        stackmap::record_call(e, fs, v);
+        a.xor_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if idx == compile::BUILTIN_PANIC {
+        // `panic` traps with a message the program computed, so unlike every other trap the
+        // text is not known while compiling and the runtime writes the String.
+        if !arity(e, n, 1, "panic") { return; }
+        load(e, fs, x86::RDI, v.args.at(0));
+        if emitter::is_prelude_span(v.file) {
+            // A `panic` written in the prelude -- `Option::expect` is the one that matters --
+            // has a span naming a file the programmer never opened. The line comes from the
+            // same run-time walk every other prelude trap uses, so that the three engines say
+            // the same thing.
+            a.call(e.rt.panic_span);
+            a.ud2();
+            return;
+        }
+        let suffix = emitter::raw_string(e, " at \(emitter::span_text(e, v.file, v.span))\n");
+        a.mov_ri(x86::RSI, suffix.addr as u64);
+        a.mov_ri(x86::RDX, suffix.length as u64);
+        a.call(e.rt.panic);
+        a.ud2();
+        return;
+    }
+    if idx == compile::BUILTIN_REF_EQ {
+        // Identity, not equality: two references compare equal exactly when they name the same
+        // object, which for a reference is bit-for-bit register equality -- no runtime call,
+        // unlike the aggregate builtins.
+        if !arity(e, n, 2, "ref_eq") { return; }
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        load(e, fs, regalloc::SCRATCH_B, v.args.at(1));
+        a.cmp_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B);
+        a.setcc(x86::EQUAL, x86::RAX);
+        a.movzx8(x86::RAX, x86::RAX);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if idx == compile::BUILTIN_CMP_INT || idx == compile::BUILTIN_CMP_UINT
+        || idx == compile::BUILTIN_CMP_FLOAT || idx == compile::BUILTIN_CMP_STRING {
+        if !arity(e, n, 2, "cmp") { return; }
+        build_ordering(e, fs, v);
+        return;
+    }
+    if idx == compile::BUILTIN_FITS_ADD || idx == compile::BUILTIN_FITS_SUB
+        || idx == compile::BUILTIN_FITS_MUL {
+        if !arity(e, n, 2, "a fits-check") { return; }
+        fits_check(e, fs, v);
+        return;
+    }
+    if idx == compile::BUILTIN_SATURATING_ADD || idx == compile::BUILTIN_SATURATING_SUB
+        || idx == compile::BUILTIN_SATURATING_MUL {
+        if !arity(e, n, 2, "a saturating operation") { return; }
+        saturating_arith(e, fs, v);
+        return;
+    }
+    emitter::fail(e, "unimplemented: builtin \(idx) in native code");
+}
+
+/// Checks a builtin's argument count, recording the compiler bug and answering false when it
+/// is wrong. A builtin arrives from the bytecode compiler, which decided the count; a
+/// mismatch is that compiler's bug, not a program the language rejects.
+fn arity(e: emitter::Emitter, got: i64, want: i64, what: String) -> bool {
+    if got == want { return true; }
+    emitter::fail(e, "this is a compiler bug: \(what) takes \(want) arguments, got \(got)");
+    false
+}
+
+/// Lowers `Mutex::with`: take the lock, call the body with the guarded value, release the
+/// lock, and yield what the body returned.
+///
+/// All three land at this one call site rather than in a runtime routine, because the middle
+/// one is a call into Origin code -- with its own frame, its own stack map and its own closure
+/// convention -- and because there is then no path out of the body that skips the release. A
+/// panic inside it ends the process (ADR-0026), which is the only other exit and needs no lock
+/// dropped.
+///
+/// The body's call gets its own safepoint entry. It is a call in the middle of an operation
+/// the register allocator sees as one instruction, so the live references at it are exactly the
+/// ones it recorded for that instruction -- but the collector still has to find an entry for
+/// its return address, or a collection inside the body walks this frame as though it were a
+/// runtime routine's, with no roots of its own.
+fn with_lock(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+
+    load(e, fs, x86::RDI, v.args.at(0));
+    a.mov_rm(x86::RDI, x86::at(x86::RDI, emitter::OBJ_HEADER_SIZE)); // the mutex, out of Mutex[T]
+    a.call(e.rt.mutex_lock);
+    stackmap::record_call(e, fs, v);
+    sched_status(e, v, "mutex re-entered by the same thread");
+
+    // The guarded value came back in rdx and is the body's only argument. The closure goes on
+    // the stack where a closure's own body reads it, twice for the alignment a call wants.
+    a.mov_rr(x86::RDI, x86::RDX);
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(1));
+    a.mov_rm(regalloc::SCRATCH_B, x86::at(regalloc::SCRATCH_A, field_offset(0)));
+    a.push(regalloc::SCRATCH_A);
+    a.push(regalloc::SCRATCH_A);
+    a.call_reg(regalloc::SCRATCH_B);
+    stackmap::record_call(e, fs, v);
+    a.add_ri(x86::RSP, 16);
+
+    // The result rides the stack across the release, which is sound only because
+    // `rt_mutex_unlock` cannot allocate: it drops the owner and wakes the waiters. A reference
+    // parked on the raw stack across anything that *can* collect is exactly the bug `construct`
+    // was fixed for.
+    a.push(x86::RAX);
+    a.push(x86::RAX);
+    load(e, fs, x86::RDI, v.args.at(0));
+    a.mov_rm(x86::RDI, x86::at(x86::RDI, emitter::OBJ_HEADER_SIZE));
+    a.call(e.rt.mutex_unlock);
+    a.pop(x86::RAX);
+    a.pop(x86::RAX);
+    def(e, fs, v, x86::RAX);
+}
+
+/// The two string operations that allocate.
+///
+/// The allocation is emitted *here*, in user code, rather than inside a runtime routine --
+/// which is the whole reason the runtime side of each is split into a check and a leaf copy
+/// (`strings.origin`'s slice check explains). A routine of its own would have to hold the source
+/// string across its own allocation, and the collector's root walk substitutes a
+/// no-roots-of-its-own entry for a frame with no stack map, so nothing would update it when a
+/// collection moved the object. At a call site in user code, `record_call` writes a real entry
+/// and the register allocator has already given the operands homes the collector walks -- the
+/// same thing `construct` relies on for a struct's fields, and the reason both read their
+/// operands again *after* the allocation rather than before.
+fn str_slice(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    load(e, fs, x86::RDI, v.args.at(0));
+    load(e, fs, x86::RSI, v.args.at(1));
+    load(e, fs, x86::RDX, v.args.at(2));
+    a.call(e.rt.str_slice_check);
+    str_status(e, v);
+
+    a.mov_rr(x86::RDI, x86::RDX); // the result's length in bytes
+    a.call(e.rt.str_alloc);
+    stackmap::record_call(e, fs, v);
+
+    a.mov_rr(regalloc::SCRATCH_A, x86::RAX); // the new String, held while its bytes land
+    load(e, fs, x86::RSI, v.args.at(0));     // wherever the source is *now*
+    load(e, fs, x86::RDX, v.args.at(1));
+    a.mov_rr(x86::RDI, regalloc::SCRATCH_A);
+    a.call(e.rt.str_slice_into);
+    def(e, fs, v, regalloc::SCRATCH_A);
+}
+
+fn str_concat(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    a.mov_rm(x86::RDI, x86::at(regalloc::SCRATCH_A, strings::STR_LEN_OFF));
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(1));
+    a.mov_rm(regalloc::SCRATCH_B, x86::at(regalloc::SCRATCH_A, strings::STR_LEN_OFF));
+    a.add_rr(x86::RDI, regalloc::SCRATCH_B);
+    a.call(e.rt.str_alloc);
+    stackmap::record_call(e, fs, v);
+
+    a.mov_rr(regalloc::SCRATCH_A, x86::RAX);
+    load(e, fs, x86::RSI, v.args.at(0));
+    load(e, fs, x86::RDX, v.args.at(1));
+    a.mov_rr(x86::RDI, regalloc::SCRATCH_A);
+    a.call(e.rt.str_concat_into);
+    def(e, fs, v, regalloc::SCRATCH_A);
+}
+
+/// Lowers a `cmp` builtin: decide Less, Equal or Greater by the operand kind the bytecode
+/// compiler already baked into which of the four builtins this is, then allocate the
+/// corresponding zero-payload `Ordering` variant -- the same zero-argument allocation the
+/// virtual machine's own ordering does, just chosen by three jumps here instead of a switch
+/// there.
+fn build_ordering(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    a.push(regalloc::SCRATCH_A);
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(1));
+    a.push(regalloc::SCRATCH_A);
+    a.pop(regalloc::SCRATCH_B); // b
+    a.pop(regalloc::SCRATCH_A); // a
+
+    let less = a.new_label("cmp_less");
+    let greater = a.new_label("cmp_greater");
+    let equal = a.new_label("cmp_equal");
+    let done = a.new_label("cmp_done");
+
+    if v.a == compile::BUILTIN_CMP_INT {
+        a.cmp_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B);
+        a.jcc(x86::LESS, less);
+        a.jcc(x86::GREATER, greater);
+        a.jmp(equal);
+    } else if v.a == compile::BUILTIN_CMP_UINT {
+        a.cmp_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_B);
+        a.jcc(x86::BELOW, less);
+        a.jcc(x86::ABOVE, greater);
+        a.jmp(equal);
+    } else if v.a == compile::BUILTIN_CMP_FLOAT {
+        a.movq_xr(x86::XMM0, regalloc::SCRATCH_A);
+        a.movq_xr(x86::XMM1, regalloc::SCRATCH_B);
+        a.ucomisd_xx(x86::XMM0, x86::XMM1);
+        // Unordered (either operand NaN): the virtual machine's own ordering finds both `<`
+        // and `>` false and falls through to Equal, so this does too, rather than inventing a
+        // fourth outcome the VM does not have.
+        a.jcc(x86::PARITY, equal);
+        a.jcc(x86::BELOW, less);
+        a.jcc(x86::ABOVE, greater);
+        a.jmp(equal);
+    } else if v.a == compile::BUILTIN_CMP_STRING {
+        a.mov_rr(x86::RDI, regalloc::SCRATCH_A);
+        a.mov_rr(x86::RSI, regalloc::SCRATCH_B);
+        a.call(e.rt.compare_bytes);
+        stackmap::record_call(e, fs, v);
+        a.cmp_ri(x86::RAX, 0);
+        a.jcc(x86::LESS, less);
+        a.jcc(x86::GREATER, greater);
+        a.jmp(equal);
+    } else {
+        emitter::fail(e, "this is a compiler bug: builtin \(v.a) is not a `cmp`");
+        return;
+    }
+
+    a.bind(less);
+    alloc_ordering(e, fs, v, e.prog.prelude.less);
+    a.jmp(done);
+    a.bind(greater);
+    alloc_ordering(e, fs, v, e.prog.prelude.greater);
+    a.jmp(done);
+    a.bind(equal);
+    alloc_ordering(e, fs, v, e.prog.prelude.equal);
+
+    a.bind(done);
+    def(e, fs, v, x86::RAX);
+}
+
+/// Allocates one of the three `Ordering` variants, by the index the compiler recorded.
+///
+/// The word count is zero rather than the descriptor's, because these three carry no payload
+/// -- and asking the registry would be both slower and, at seven bytes a site, larger.
+fn alloc_ordering(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value, idx: i64) {
+    e.a.xor_rr(x86::RDI, x86::RDI);
+    e.a.mov_ri(x86::RSI, e.prog.variants.at(idx).ty as u64);
+    e.a.call(e.rt.alloc);
+    stackmap::record_call(e, fs, v);
+}
+
+/// Lowers the predicate behind `checked_add` and its siblings: does `a op b` fit in the
+/// operand type? It answers a bool and builds nothing.
+///
+/// The `Option` is the bytecode compiler's to build, because it is the call's own
+/// instantiation: `Option[u8]` and `Option[i64]` are different types with different layouts
+/// (ADR-0019), and a runtime has one recorded variant index rather than one per instantiation.
+fn fits_check(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    let k = checked_kind(v);
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    load(e, fs, regalloc::SCRATCH_B, v.args.at(1));
+
+    let no = a.new_label("fits_no");
+    let done = a.new_label("fits_done");
+    arith_into(e, k, checked_op_of(v.a), no);
+    a.mov_ri(x86::RAX, 1u64);
+    a.jmp(done);
+    a.bind(no);
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.bind(done);
+    def(e, fs, v, x86::RAX);
+}
+
+/// Lowers `saturating_add`, `saturating_sub` and `saturating_mul`: the same instruction again,
+/// with overflow clamped to the end of the range it ran off.
+///
+/// Which end that is follows from the sign of the *true* result, and the wrapped answer is
+/// exactly the thing that does not say. The operands do:
+///
+///   - `a + b` overflows only when the operands share a sign, and the true sum has it.
+///   - `a - b` overflows only when they differ, and the true difference has `a`'s.
+///   - `a * b` is negative exactly when the operands' signs differ, which is the sign of their
+///     xor -- and that stays true when the product wraps.
+///
+/// So the deciding value is computed *before* the operation, from operands the operation is
+/// about to consume, and read after the flag it must not disturb.
+fn saturating_arith(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    let k = checked_kind(v);
+    let op = checked_op_of(v.a);
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    load(e, fs, regalloc::SCRATCH_B, v.args.at(1));
+
+    // Which end an overflow ran off follows from the *operands*, which is exactly what the
+    // wrapped answer cannot say -- so it is computed before the operation consumes them. r9
+    // rather than rcx: rcx is in the allocator's pool and would need saving, and nothing here
+    // calls anything, so a caller-saved scratch is enough.
+    //
+    // For an unsigned type there is only one end to run off downwards, and only `-` can.
+    let end = x86::R9;
+    if bytecode::kind_is_signed(k) {
+        a.mov_rr(end, regalloc::SCRATCH_A);
+        // A product is negative when the signs differ.
+        if op == AR_MUL { a.xor_rr(end, regalloc::SCRATCH_B); }
+    } else if op == AR_SUB {
+        // Any negative value: an unsigned subtraction clamps to 0.
+        a.mov_ri(end, runtime::U64_ALL_ONES);
+    } else {
+        a.xor_rr(end, end);
+    }
+
+    let over = a.new_label("saturating_over");
+    let done = a.new_label("saturating_done");
+    arith_into(e, k, op, over);
+    a.jmp(done);
+
+    a.bind(over);
+    a.mov_ri(regalloc::SCRATCH_A, arith::max_of(k));
+    a.mov_ri(regalloc::SCRATCH_B, arith::min_of(k));
+    a.cmp_ri(end, 0);
+    a.cmov(x86::LESS, regalloc::SCRATCH_A, regalloc::SCRATCH_B);
+    a.bind(done);
+    def(e, fs, v, regalloc::SCRATCH_A);
+}
+
+/// The width a checked or saturating operation answers at, which the bytecode compiler put on
+/// the instruction from the receiver's own type.
+fn checked_kind(v: ir::Value) -> i64 {
+    if bytecode::kind_is_integer(v.operand_kind) { return v.operand_kind; }
+    bytecode::KIND_I64
+}
+
+/// Names which operation a checked or saturating builtin index performs.
+fn checked_op_of(idx: i64) -> i64 {
+    if idx == compile::BUILTIN_FITS_ADD || idx == compile::BUILTIN_SATURATING_ADD { return AR_ADD; }
+    if idx == compile::BUILTIN_FITS_SUB || idx == compile::BUILTIN_SATURATING_SUB { return AR_SUB; }
+    AR_MUL
+}
+
+/// Renders a value as a String.
+fn to_str(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    let kind = v.a;
+    if bytecode::kind_is_integer(kind) {
+        load(e, fs, x86::RDI, v.args.at(0));
+        // The routine cannot ask the register whether its bits are signed, so the static type
+        // tells it.
+        if bytecode::kind_is_signed(kind) {
+            a.mov_ri(x86::RSI, 1u64);
+        } else {
+            a.xor_rr(x86::RSI, x86::RSI);
+        }
+        a.call(e.rt.int_to_str);
+        stackmap::record_call(e, fs, v);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if kind == bytecode::KIND_STRING {
+        // A String renders as itself.
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if kind == bytecode::KIND_BOOL {
+        // Both results are String objects already in read-only data, so rendering a bool is a
+        // conditional move between two pointers and allocates nothing.
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        a.mov_ri(x86::RAX, emitter::string_literal(e, "true").addr as u64);
+        a.mov_ri(regalloc::SCRATCH_B, emitter::string_literal(e, "false").addr as u64);
+        a.test_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
+        a.cmov(x86::EQUAL, x86::RAX, regalloc::SCRATCH_B);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if kind == bytecode::KIND_CHAR {
+        // A char renders as its UTF-8 encoding: one to four bytes in a fresh String
+        // (spec/14-strings.md's table, read the other way round).
+        load(e, fs, x86::RDI, v.args.at(0));
+        a.call(e.rt.char_to_str);
+        stackmap::record_call(e, fs, v);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if kind == bytecode::KIND_UNKNOWN {
+        emitter::fail(e, "this is a compiler bug: `to_str` reached the backend with no operand kind");
+        return;
+    }
+    emitter::fail(e, "unimplemented: `to_str` on kind \(kind) in native code");
+}
+
+/// Lowers `+`, `-`, `*` and `/` on floats, which never trap (spec/04-expressions.md): overflow
+/// is an infinity and 0.0/0.0 is a NaN.
+///
+/// Floats live in general-purpose registers like everything else and move to SSE only for the
+/// arithmetic itself. That costs two moves per operation and buys one register class in the
+/// allocator instead of two -- a trade worth revisiting once anything float-heavy exists to
+/// measure.
+fn float_arith(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    load(e, fs, regalloc::SCRATCH_B, v.args.at(1));
+    a.movq_xr(x86::XMM0, regalloc::SCRATCH_A);
+    a.movq_xr(x86::XMM1, regalloc::SCRATCH_B);
+    if v.op == ir::OP_ADDF { a.addsd_xx(x86::XMM0, x86::XMM1); }
+    if v.op == ir::OP_SUBF { a.subsd_xx(x86::XMM0, x86::XMM1); }
+    if v.op == ir::OP_MULF { a.mulsd_xx(x86::XMM0, x86::XMM1); }
+    if v.op == ir::OP_DIVF { a.divsd_xx(x86::XMM0, x86::XMM1); }
+    a.movq_rx(x86::RAX, x86::XMM0);
+    def(e, fs, v, x86::RAX);
+}
+
+/// Lowers a comparison on floats.
+///
+/// IEEE comparison is not the integer one with different registers. `ucomisd` sets the parity
+/// flag when either operand is NaN, and every ordered comparison must be false then --
+/// including `==`, which is why `NaN == NaN` is false, and `!=`, which must be *true* for a
+/// NaN. Getting this wrong is the classic float bug, and spec/04-expressions.md pins the
+/// behaviour that the three engines have to agree on.
+fn float_compare(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+    load(e, fs, regalloc::SCRATCH_B, v.args.at(1));
+    a.movq_xr(x86::XMM0, regalloc::SCRATCH_A);
+    a.movq_xr(x86::XMM1, regalloc::SCRATCH_B);
+
+    // The comparison is arranged so that the unsigned conditions read correctly: `ucomisd`
+    // sets the carry and zero flags as an unsigned compare would, with parity for unordered.
+    if v.op == ir::OP_GT || v.op == ir::OP_GE {
+        // `a > b` is `b < a` with the operands exchanged, which keeps every case on the
+        // below/below-equal side where NaN clears the flags rather than setting them.
+        a.ucomisd_xx(x86::XMM1, x86::XMM0);
+    } else {
+        a.ucomisd_xx(x86::XMM0, x86::XMM1);
+    }
+
+    let mut cond = x86::BELOW_EQUAL;
+    if v.op == ir::OP_EQ { cond = x86::EQUAL; }
+    if v.op == ir::OP_NE { cond = x86::NOT_EQUAL; }
+    if v.op == ir::OP_LT || v.op == ir::OP_GT { cond = x86::BELOW; }
+
+    a.setcc(cond, x86::RAX);
+    a.movzx8(x86::RAX, x86::RAX);
+
+    // NaN makes `ucomisd` set the zero, parity and carry flags together, so `setbe` and `sete`
+    // would report true for an unordered pair. Every comparison but `!=` must be false there,
+    // and `!=` must be true, so the parity flag is folded in explicitly.
+    if v.op == ir::OP_NE {
+        a.setcc(x86::PARITY, regalloc::SCRATCH_A);
+        a.movzx8(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
+        a.or_rr(x86::RAX, regalloc::SCRATCH_A);
+    } else {
+        a.setcc(x86::NO_PARITY, regalloc::SCRATCH_A);
+        a.movzx8(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
+        a.and_rr(x86::RAX, regalloc::SCRATCH_A);
+    }
+    def(e, fs, v, x86::RAX);
+}
+
+/// Lowers a conversion between primitive types.
+fn cast(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
+    let a = e.a;
+    let kind = v.a;
+    let bits = v.b & 255;
+    let signed = (v.b & 256) != 0;
+
+    if kind == bytecode::CAST_INT_TRUNC || kind == bytecode::CAST_CHAR_TO_INT {
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        truncate(e, regalloc::SCRATCH_A, bits, signed);
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if kind == bytecode::CAST_BOOL_TO_INT {
+        // A bool is already 0 or 1.
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    if kind == bytecode::CAST_INT_TO_FLOAT {
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        a.cvtsi2sd(x86::XMM0, regalloc::SCRATCH_A);
+        a.movq_rx(x86::RAX, x86::XMM0);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if kind == bytecode::CAST_FLOAT_WIDEN {
+        // f32 is carried as an f64 already, so widening is the identity.
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        def(e, fs, v, regalloc::SCRATCH_A);
+        return;
+    }
+    emitter::fail(e, "unimplemented: cast \(kind) in native code");
+}
+
+/// Narrows an integer to a width, sign-extending or zero-extending to fill the register, which
+/// is what keeps the one-word value model consistent.
+fn truncate(e: emitter::Emitter, r: i64, bits: i64, signed: bool) {
+    if bits >= 64 || bits == 0 { return; }
+    let shift = 64 - bits;
+    e.a.shl_i(r, shift);
+    if signed { e.a.sar_i(r, shift); return; }
+    e.a.shr_i(r, shift);
+}
+
+/// Lowers a block's exit, after emitting the copies its successors' phis need.
+pub fn terminator(e: emitter::Emitter, fs: stackmap::FnState, b: ir::Block) {
+    let a = e.a;
+    match b.term {
+        Option::None => { emitter::fail(e, "this is a compiler bug: a block with no terminator"); },
+        Option::Some(t) => {
+            if t.op == ir::OP_RETURN {
+                if t.args.len() > 0 { load(e, fs, x86::RAX, t.args.at(0)); }
+                a.jmp(fs.epilogue);
+                return;
+            }
+            if t.op == ir::OP_JUMP {
+                preempt_check(e, fs, b, t);
+                phi_copies(e, fs, b, b.succs.at(0));
+                a.jmp(block_label(e, fs, b.succs.at(0)));
+                return;
+            }
+            if t.op == ir::OP_BRANCH {
+                preempt_check(e, fs, b, t);
+                // The phi copies differ per edge, so each edge gets its own landing pad when it
+                // has any: jumping straight to a shared successor would run the wrong copies.
+                load(e, fs, regalloc::SCRATCH_A, t.args.at(0));
+                a.test_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
+
+                let taken = edge_target(e, fs, b, b.succs.at(0));
+                let not_taken = edge_target(e, fs, b, b.succs.at(1));
+                a.jcc(x86::NOT_EQUAL, taken);
+                a.jmp(not_taken);
+                return;
+            }
+            emitter::fail(e, "unimplemented: terminator \(t.op) in native code");
+        },
+    }
+}
+
+/// One block's label, which `function` bound before lowering any of them.
+fn block_label(e: emitter::Emitter, fs: stackmap::FnState, b: ir::Block) -> x86::Label {
+    fs.block_lbl.get(b.id).expect("this is a compiler bug: a block was lowered with no label")
+}
+
+/// Emits the back edge's own safepoint: count down, and when the budget runs out let another
+/// thread run.
+///
+/// Nothing at all for a program that never spawns, and two instructions plus an untaken branch
+/// for one that does. It goes before the phi copies deliberately: the copies write into the
+/// loop's own carried values, and the call must not land between writing one and reading
+/// another.
+fn preempt_check(e: emitter::Emitter, fs: stackmap::FnState, b: ir::Block, t: ir::Value) {
+    if !e.preempts { return; }
+    match fs.regs.back_edges.get(b.id) {
+        Option::None => { return; },
+        Option::Some(is_back) => { if !is_back { return; } },
+    }
+    let a = e.a;
+    let skip = a.new_label("preempt_skip");
+    a.mov_rm(x86::RAX, x86::at(x86::R15, emitter::RT_BUDGET_OFF));
+    a.sub_ri(x86::RAX, 1);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_BUDGET_OFF), x86::RAX);
+    a.jcc(x86::NOT_EQUAL, skip);
+    a.call(e.rt.preempt);
+    stackmap::record_call(e, fs, t);
+    a.bind(skip);
+}
+
+/// A label to jump to for one edge: the successor itself when the edge carries no phi copies,
+/// or a small pad that performs them and then jumps.
+fn edge_target(e: emitter::Emitter, fs: stackmap::FnState, from: ir::Block, to: ir::Block) -> x86::Label {
+    if to.phis.is_empty() { return block_label(e, fs, to); }
+    let pad = e.a.new_label("edge \(from.id)->\(to.id)");
+    fs.pending.push(stackmap::Edge { label: pad, from: from, to: to });
+    pad
+}
+
+/// Moves each phi's incoming value into the phi's own location.
+///
+/// The copies happen simultaneously in SSA, so they cannot be emitted as a sequence of moves: a
+/// phi whose source is another phi of the same block would read a value that has already been
+/// overwritten. Pushing every source and popping into every destination in reverse performs an
+/// arbitrary permutation correctly, at the cost of some stack traffic, and is what the bytecode
+/// emitter already does for the same reason.
+pub fn phi_copies(e: emitter::Emitter, fs: stackmap::FnState, from: ir::Block, to: ir::Block) {
+    let a = e.a;
+    let idx = pred_index(to, from);
+    if idx < 0 || to.phis.is_empty() { return; }
+    let live = list::new[ir::Value]();
+    let mut i = 0;
+    while i < to.phis.len() {
+        let p = to.phis.at(i);
+        i = i + 1;
+        // A dead phi needs nothing kept.
+        match fs.regs.where_of.get(p.id) {
+            Option::None => { continue; },
+            Option::Some(l) => {},
+        }
+        live.push(p);
+    }
+    let mut j = 0;
+    while j < live.len() {
+        load(e, fs, regalloc::SCRATCH_A, live.at(j).args.at(idx));
+        a.push(regalloc::SCRATCH_A);
+        j = j + 1;
+    }
+    let mut k = live.len() - 1;
+    while k >= 0 {
+        a.pop(regalloc::SCRATCH_A);
+        def(e, fs, live.at(k), regalloc::SCRATCH_A);
+        k = k - 1;
+    }
+}
+
+/// Which of `to`'s predecessors `from` is, which is the index a phi's arguments are parallel
+/// to.
+fn pred_index(to: ir::Block, from: ir::Block) -> i64 {
+    let mut i = 0;
+    while i < to.preds.len() {
+        if to.preds.at(i).id == from.id { return i; }
+        i = i + 1;
+    }
+    0 - 1
+}

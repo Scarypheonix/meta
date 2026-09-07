@@ -1575,6 +1575,7 @@ fn contains_string(l: List[String], s: String) -> bool {
 
 fn no_fn_decl() -> ast::FnDecl {
     ast::FnDecl {
+        span: ast::Span { start: 0, end: 0 },
         file: "", info: ast::UNRESOLVED, public: false,
         name: ast::Ident { name: "", start: 0, end: 0, res: ast::UNRESOLVED },
         generics: list::new[ast::GenericParam](),
@@ -2471,7 +2472,7 @@ impl Checker {
 
     fn check_stmt(self, s: ast::Stmt) {
         match s {
-            ast::Stmt::Let(mutable, pat, ty, value) => self.check_let(mutable, pat, ty, value),
+            ast::Stmt::Let(_, mutable, pat, ty, value) => self.check_let(mutable, pat, ty, value),
             ast::Stmt::ExprStmt(e, semi) => {
                 let t = self.infer(e);
                 if semi {

@@ -1,0 +1,412 @@
+// The minimal DWARF4 debug information a native Origin binary carries (ADR-0023): a
+// line-number program mapping machine-code addresses to source positions, and the one
+// compile-unit DIE that anchors it.
+//
+// A translation of `internal/dwarf`.
+//
+// Full DWARF type and variable information is out of scope -- the spec's own acceptance
+// criterion is a working `breakpoint set --file f --line N`, and a function's *name* for `bt`
+// comes from a plain symbol table (`Func` here, encoded by `obj.origin` into whichever
+// container format's own symbol table), never from a DWARF subprogram DIE.
+//
+// This module only produces bytes; `obj.origin` decides where they sit in a file and how ELF's
+// section headers or Mach-O's `__DWARF` segment describe them (process rule 5: the encoding is
+// the one place both agree, neither derives it independently).
+
+use std::list;
+use std::map;
+
+/// One source-position row: the machine-code address where a source line begins. Origin has no
+/// macro or inlining expansion, so "where a line begins" is unambiguous -- unlike a compiler
+/// that must also record which line a row's code was *inlined from*.
+pub struct Line {
+    /// A virtual address inside `.text`.
+    pub address: i64,
+    /// The source file's own recorded name, used verbatim: spec/11-codegen.md's determinism
+    /// clause forbids resolving it to an absolute path, which would vary across checkouts and
+    /// machines.
+    pub file: String,
+    /// 1-based, matching the position mapper and DWARF's own convention.
+    pub line: i64,
+    /// 1-based; 0 means "column not tracked for this row".
+    pub col: i64,
+}
+
+/// One function's address range, for the symbol table `bt` reads a frame's name from.
+pub struct Func {
+    pub name: String,
+    pub address: i64,
+    pub size: i64,
+}
+
+/// The three sections, as byte lists.
+pub struct Sections {
+    pub abbrev: List[i64],
+    pub info: List[i64],
+    pub line: List[i64],
+}
+
+const VERSION4: i64 = 4;
+
+// Tags (§7.5.3). Only one DIE kind exists in this phase's scope (ADR-0023).
+const DW_TAG_COMPILE_UNIT: i64 = 0x11;
+/// The compile-unit DIE has no children -- no subprogram DIEs yet.
+const DW_CHILDREN_NO: i64 = 0x00;
+
+// Attributes (§7.5.4).
+const DW_AT_NAME: i64 = 0x03;
+const DW_AT_LOW_PC: i64 = 0x11;
+const DW_AT_HIGH_PC: i64 = 0x12;
+const DW_AT_STMT_LIST: i64 = 0x10;
+const DW_AT_PRODUCER: i64 = 0x25;
+
+// Forms (§7.5.6).
+const DW_FORM_ADDR: i64 = 0x01;   // an address, target-pointer-sized (8 bytes here)
+const DW_FORM_DATA8: i64 = 0x07;  // a fixed 8-byte constant
+const DW_FORM_STRING: i64 = 0x08; // an inline null-terminated string
+const DW_FORM_SEC_OFF: i64 = 0x17; // an offset into another debug section (4 bytes)
+
+/// The line-program header's own tuning parameters for *special* opcodes (§6.2.5.1), which
+/// this module never emits. Their values are only required to be present and valid, never
+/// actually consulted.
+const LINE_BASE: i64 = 0xFB; // -5 as a byte: line_base is nominally signed
+const LINE_RANGE: i64 = 14;
+
+// Standard line-number opcodes (§6.2.5.2). `OPCODE_BASE` names the first free opcode number
+// for (unused, here) vendor extensions, and is also the length of the standard opcode-lengths
+// table the line-program header carries.
+const DW_LNS_COPY: i64 = 0x01;
+const DW_LNS_ADVANCE_LINE: i64 = 0x03;
+const DW_LNS_SET_FILE: i64 = 0x04;
+const DW_LNS_SET_COLUMN: i64 = 0x05;
+const OPCODE_BASE: i64 = 13;
+
+// Extended line-number opcodes (§6.2.5.3): a zero opcode byte, a ULEB128 length, then the real
+// opcode byte and its own operand.
+const DW_LNE_END_SEQUENCE: i64 = 0x01;
+const DW_LNE_SET_ADDRESS: i64 = 0x02;
+
+/// How many ULEB128 operands each standard opcode 1..OPCODE_BASE-1 takes, in order -- required
+/// by the line-program header regardless of which opcodes this module actually emits, so a
+/// reader can skip an opcode it does not recognize.
+fn standard_opcode_lengths() -> List[i64] {
+    let l = list::new[i64]();
+    let counts = list::new[i64]();
+    counts.push(0); // copy
+    counts.push(1); // advance_pc
+    counts.push(1); // advance_line
+    counts.push(1); // set_file
+    counts.push(1); // set_column
+    counts.push(0); // negate_stmt
+    counts.push(0); // set_basic_block
+    counts.push(0); // const_add_pc
+    counts.push(1); // fixed_advance_pc
+    counts.push(0); // set_prologue_end
+    counts.push(0); // set_epilogue_begin
+    counts.push(1); // set_isa
+    let mut i = 0;
+    while i < counts.len() { l.push(counts.at(i)); i = i + 1; }
+    l
+}
+
+/// Encodes `.debug_abbrev`, `.debug_info` and `.debug_line` for one compiled program.
+///
+/// `low_pc` and `high_pc` bound the whole program's own `.text`: the compile-unit DIE's address
+/// range, and where the line-number program's own end-of-sequence closes the final row. Both
+/// are addresses the caller already has, so this module never needs to know anything about
+/// segments or files beyond the names in each row.
+pub fn build(main: String, lines: List[Line], low_pc: i64, high_pc: i64) -> Sections {
+    let files = file_table(lines);
+    Sections {
+        abbrev: build_abbrev(),
+        info: build_info(primary(main, files), low_pc, high_pc),
+        line: build_line_program(lines, files, high_pc),
+    }
+}
+
+/// What the compile unit is named after: the file `main` is written in.
+///
+/// It is passed in rather than taken from the line table, because the line table is in address
+/// order and the lowest address is whichever function the code generator emitted first -- which
+/// is a prelude one as soon as the prelude contributes any non-generic function at all, and
+/// would name every Origin program `<prelude>`. An empty name, or one that contributed no line
+/// at all, falls back to the first file.
+fn primary(main: String, files: List[String]) -> String {
+    let mut i = 0;
+    while i < files.len() {
+        if files.at(i) == main { return files.at(i); }
+        i = i + 1;
+    }
+    if !files.is_empty() { return files.at(0); }
+    "<unknown>"
+}
+
+/// Every distinct file name in `lines`, in order of first appearance -- deterministic because
+/// the rows themselves are produced in a deterministic (address) order.
+fn file_table(lines: List[Line]) -> List[String] {
+    let seen = map::new[String, bool]();
+    let files = list::new[String]();
+    let mut i = 0;
+    while i < lines.len() {
+        let name = lines.at(i).file;
+        i = i + 1;
+        if name.is_empty() { continue; }
+        match seen.get(name) {
+            Option::Some(x) => { continue; },
+            Option::None => {},
+        }
+        seen.insert(name, true);
+        files.push(name);
+    }
+    if files.is_empty() { files.push("<unknown>"); }
+    files
+}
+
+/// A row's file name as a 1-based position in `files`, DWARF's own file-table convention
+/// (index 0 is reserved).
+fn file_index(files: List[String], name: String) -> i64 {
+    let mut i = 0;
+    while i < files.len() {
+        if files.at(i) == name { return i + 1; }
+        i = i + 1;
+    }
+    1
+}
+
+/// Encodes `.debug_abbrev`: one abbreviation declaration, for the single compile-unit DIE
+/// `.debug_info` ever contains (ADR-0023 -- no subprogram, variable or type DIEs yet).
+///
+/// An abbreviation table entry is: a ULEB128 code (how `.debug_info`'s own DIE refers back to
+/// this declaration), the tag, the children flag, then (attribute, form) ULEB128 pairs
+/// terminated by (0, 0); the whole table is terminated by a single zero byte where the next
+/// entry's code would be.
+fn build_abbrev() -> List[i64] {
+    let b = list::new[i64]();
+    uleb128(b, 1); // abbreviation code 1 -- the only one `.debug_info`'s DIE ever names
+    uleb128(b, DW_TAG_COMPILE_UNIT);
+    b.push(DW_CHILDREN_NO);
+
+    attr(b, DW_AT_NAME, DW_FORM_STRING);
+    attr(b, DW_AT_LOW_PC, DW_FORM_ADDR);
+    attr(b, DW_AT_HIGH_PC, DW_FORM_DATA8); // an 8-byte length, added to low_pc (§2.17.2)
+    attr(b, DW_AT_STMT_LIST, DW_FORM_SEC_OFF);
+    attr(b, DW_AT_PRODUCER, DW_FORM_STRING);
+    uleb128(b, 0); // (attribute, form) terminator
+    uleb128(b, 0);
+
+    uleb128(b, 0); // table terminator: the next abbreviation code, if any, is 0
+    b
+}
+
+fn attr(b: List[i64], at: i64, form: i64) {
+    uleb128(b, at);
+    uleb128(b, form);
+}
+
+/// Encodes `.debug_info`: a compilation-unit header followed by the single compile-unit DIE
+/// that names the program's own address range and points at `.debug_line` -- the one fact
+/// `lldb` needs to find the right line program for a `--file` breakpoint at all.
+///
+/// 32-bit DWARF (a 4-byte unit length): the whole program is nowhere near 4 GiB of debug info,
+/// so the 64-bit escape buys nothing.
+fn build_info(primary_file: String, low_pc: i64, high_pc: i64) -> List[i64] {
+    let body = list::new[i64]();
+    put_u16(body, VERSION4);
+    put_u32(body, 0); // the abbrev-section offset: the only table
+    body.push(8);     // address size: 8 bytes (x86-64)
+
+    // The DIE itself: abbreviation code 1, then its attributes in the exact order the
+    // abbreviation declared them.
+    uleb128(body, 1);
+    c_string(body, primary_file); // the name: the file `main` is written in
+    put_u64(body, low_pc);
+    put_u64(body, high_pc - low_pc); // the high pc as an offset (§2.17.2)
+    put_u32(body, 0);                // the statement list: offset 0 into `.debug_line`
+    c_string(body, "origin");        // the producer
+
+    let out = list::new[i64]();
+    put_u32(out, body.len());
+    append(out, body);
+    out
+}
+
+/// Encodes `.debug_line`: one line-number program, covering the whole program's own `.text`
+/// (there is exactly one compile unit, ADR-0023). Only the standard and extended opcodes are
+/// used, never a *special* opcode (DWARF's single-byte combined address-and-line-advance form)
+/// -- a real compactness optimization the spec allows skipping, so the line base and range are
+/// present only because the header format requires some value.
+fn build_line_program(lines: List[Line], files: List[String], end_addr: i64) -> List[i64] {
+    let sorted = sort_lines(lines);
+    let header = line_program_header(files);
+    let program = line_program_body(sorted, files, end_addr);
+
+    let body = list::new[i64]();
+    put_u16(body, VERSION4);
+    put_u32(body, header.len());
+    append(body, header);
+    append(body, program);
+
+    let out = list::new[i64]();
+    put_u32(out, body.len());
+    append(out, body);
+    out
+}
+
+/// Everything from the minimum instruction length through the file table's own terminator --
+/// exactly the span the header length itself measures.
+fn line_program_header(files: List[String]) -> List[i64] {
+    let h = list::new[i64]();
+    h.push(1);          // minimum_instruction_length
+    h.push(1);          // maximum_operations_per_instruction (DWARF4)
+    h.push(1);          // default_is_stmt
+    h.push(LINE_BASE);  // unused: no special opcodes
+    h.push(LINE_RANGE); // unused: no special opcodes
+    h.push(OPCODE_BASE);
+    append(h, standard_opcode_lengths());
+    h.push(0); // include_directories: none, just the terminator
+
+    let mut i = 0;
+    while i < files.len() {
+        c_string(h, files.at(i));
+        uleb128(h, 0); // directory index: 0, no directory table
+        uleb128(h, 0); // mtime: not tracked
+        uleb128(h, 0); // file length: not tracked
+        i = i + 1;
+    }
+    h.push(0); // the file-table terminator: an entry with an empty name
+    h
+}
+
+/// The actual opcode stream: for every row, an absolute address (so each row is independent --
+/// no reliance on the address-advance opcode's own instruction-length scaling, which this
+/// module does not use), the file and line if either changed, the column, and a copy to commit
+/// the row. The end-of-sequence closes the program at `end_addr`, marking everything from the
+/// last row's address up to there as still part of the program (required: a sequence must end
+/// with this, one past the last valid byte).
+fn line_program_body(lines: List[Line], files: List[String], end_addr: i64) -> List[i64] {
+    let p = list::new[i64]();
+    let mut cur_file = 1;
+    let mut cur_line = 1;
+    let mut i = 0;
+    while i < lines.len() {
+        let ln = lines.at(i);
+        i = i + 1;
+        set_address(p, ln.address);
+
+        let fi = file_index(files, ln.file);
+        if fi != cur_file {
+            p.push(DW_LNS_SET_FILE);
+            uleb128(p, fi);
+            cur_file = fi;
+        }
+        if ln.line != cur_line {
+            p.push(DW_LNS_ADVANCE_LINE);
+            sleb128(p, ln.line - cur_line);
+            cur_line = ln.line;
+        }
+        p.push(DW_LNS_SET_COLUMN);
+        uleb128(p, ln.col);
+        p.push(DW_LNS_COPY);
+    }
+
+    set_address(p, end_addr);
+    p.push(0); // the extended-opcode marker
+    uleb128(p, 1);
+    p.push(DW_LNE_END_SEQUENCE);
+    p
+}
+
+/// Emits a set-address: an extended opcode with a fixed 8-byte operand, never a ULEB128 -- the
+/// reason a line table built from nothing but `.text` addresses is byte-identical on both of
+/// the build's two passes with no separate length check needed (ADR-0023): the operand's
+/// *encoded width* can never vary with its value.
+fn set_address(p: List[i64], addr: i64) {
+    p.push(0); // the extended-opcode marker
+    uleb128(p, 1 + 8);
+    p.push(DW_LNE_SET_ADDRESS);
+    put_u64(p, addr);
+}
+
+/// Sorts rows by address, defensively: the encoders above assume ascending order (a
+/// line-number program is a sequence of forward-only address advances) and produce nonsense
+/// silently rather than an error if that is violated, so this is the one place that invariant
+/// is enforced regardless of what the caller does.
+///
+/// An insertion sort: the caller already produces the rows in address order, so this is linear
+/// on the input it actually gets.
+fn sort_lines(lines: List[Line]) -> List[Line] {
+    let out = list::new[Line]();
+    let mut c = 0;
+    while c < lines.len() { out.push(lines.at(c)); c = c + 1; }
+    let mut i = 1;
+    while i < out.len() {
+        let x = out.at(i);
+        let mut j = i - 1;
+        while j >= 0 && out.at(j).address > x.address {
+            out.set(j + 1, out.at(j));
+            j = j - 1;
+        }
+        out.set(j + 1, x);
+        i = i + 1;
+    }
+    out
+}
+
+// --- Encoding primitives ---------------------------------------------------------------
+//
+// LEB128 (Little Endian Base 128) is how DWARF encodes every variable-width integer: counts,
+// offsets, signed line deltas. Both forms are self-terminating (the high bit of each byte says
+// whether another follows), which is what lets a consumer walk a stream of them with no
+// separate length field.
+
+/// Appends `v` as an unsigned LEB128.
+fn uleb128(b: List[i64], v: i64) {
+    let mut x = v;
+    loop {
+        let mut c = x & 0x7F;
+        x = x >> 7;
+        if x != 0 { c = c | 0x80; }
+        b.push(c);
+        if x == 0 { return; }
+    }
+}
+
+/// Appends `v` as a signed LEB128 -- DWARF's own line-advance deltas need this, since a line
+/// number can move backward (a loop body textually below its own header).
+fn sleb128(b: List[i64], v: i64) {
+    let mut x = v;
+    loop {
+        let mut c = x & 0x7F;
+        // An arithmetic shift: it sign-extends, which is exactly what this needs.
+        x = x >> 7;
+        let sign_bit_set = (c & 0x40) != 0;
+        let done = (x == 0 && !sign_bit_set) || (x == 0 - 1 && sign_bit_set);
+        if !done { c = c | 0x80; }
+        b.push(c);
+        if done { return; }
+    }
+}
+
+/// Appends `s` followed by a terminating zero byte, the inline-string form's own encoding.
+fn c_string(b: List[i64], s: String) {
+    let mut i = 0;
+    while i < s.len() { b.push(s.byte_at(i)); i = i + 1; }
+    b.push(0);
+}
+
+fn put_u16(b: List[i64], v: i64) { put_le(b, v, 2); }
+fn put_u32(b: List[i64], v: i64) { put_le(b, v, 4); }
+fn put_u64(b: List[i64], v: i64) { put_le(b, v, 8); }
+
+fn put_le(b: List[i64], v: i64, n: i64) {
+    let mut i = 0;
+    while i < n {
+        b.push((v >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+fn append(dst: List[i64], src: List[i64]) {
+    let mut i = 0;
+    while i < src.len() { dst.push(src.at(i)); i = i + 1; }
+}

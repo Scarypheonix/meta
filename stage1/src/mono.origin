@@ -382,7 +382,7 @@ impl Walker {
 
     fn walk_stmt(self, at: i64, s: ast::Stmt) {
         match s {
-            ast::Stmt::Let(mutable, p, ty, value) => {
+            ast::Stmt::Let(_, mutable, p, ty, value) => {
                 self.walk_pat(at, p);
                 self.walk_expr(at, value);
             }
