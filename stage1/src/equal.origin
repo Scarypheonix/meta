@@ -1,0 +1,429 @@
+// Structural `==` on an aggregate or a String, and the per-type table it reads.
+//
+// A translation of `internal/backend/equal.go`. ADR-0019's exact layouts made this
+// possible: every object's shape is now a small, uniform per-word kind array, whether the
+// comparison is emitted here or read by the virtual machine.
+//
+// The static kind widens equality enough to say "this is a reference" but not which
+// concrete type -- unlike string conversion and the ordering operators, it carries no
+// further identity. Rather than thread a type id through the IR, structural equality
+// resolves the concrete shape at run time, from the operands' own header, against a table
+// this module emits once per program: one shared recursive routine instead of one generated
+// comparison per type, and the "which type" question answered exactly where the collector's
+// own scanning already answers it -- the object's header.
+
+use std::list;
+
+use emitter;
+use layout;
+use runtime;
+use x86;
+
+/// The table's per-type record size, in words: shape, object kind, kinds address, element
+/// kind. A power-of-two size keeps the row address a shift rather than a multiply. The
+/// fourth word is an array's single element kind (ADR-0028), which is what a run of elements
+/// has instead of one kind per word; it is zero for every other shape.
+pub const TYPE_TABLE_ENTRY_WORDS: i64 = 4;
+/// log2 of the row size in bytes: a row is 32 bytes, so a type id's row address is the table
+/// base plus the id shifted left by 5.
+pub const TYPE_TABLE_ROW_SHIFT: i64 = 5;
+
+/// Lays out a per-type row: the object's shape and object kind (from the static descriptor,
+/// constant for a given type id), and the address of its kinds byte array for a fixed shape.
+/// A fixed object's actual field count and a byte array's actual length both live in the
+/// object's own header, not this table, since only the header varies per instance.
+pub fn emit_type_table(e: emitter::Emitter) {
+    let n = e.prog.types.len();
+    let kinds_addr = list::new[i64]();
+    let mut id = 0;
+    while id < n {
+        kinds_addr.push(0);
+        id = id + 1;
+    }
+    let mut i = 1;
+    while i < n {
+        let d = e.prog.types.get(i);
+        let at = i;
+        i = i + 1;
+        if d.shape != layout::FIXED || d.kinds.is_empty() { continue; }
+        let addr = e.ro_data_addr + e.ro_data.len();
+        let mut k = 0;
+        while k < d.kinds.len() {
+            e.ro_data.push(d.kinds.at(k) & 255);
+            k = k + 1;
+        }
+        kinds_addr.set(at, addr);
+    }
+    while e.ro_data.len() % emitter::WORD_SIZE != 0 { e.ro_data.push(0); }
+    e.type_table_addr = e.ro_data_addr + e.ro_data.len();
+
+    // Type id 0 is reserved and never looked up, but the table is indexed by id times the
+    // entry size from one shared base, so id 0 still needs a placeholder row to keep every
+    // real id's offset correct.
+    let mut z = 0;
+    while z < TYPE_TABLE_ENTRY_WORDS {
+        emitter::put_u64(e.ro_data, 0);
+        z = z + 1;
+    }
+    let mut j = 1;
+    while j < n {
+        let d = e.prog.types.get(j);
+        emitter::put_u64(e.ro_data, d.shape);
+        emitter::put_u64(e.ro_data, d.kind);
+        emitter::put_u64(e.ro_data, kinds_addr.at(j));
+        emitter::put_u64(e.ro_data, d.elem);
+        j = j + 1;
+    }
+}
+
+/// Clears the high 32 bits of `r` in place. An AND with a 32-bit immediate sign-extends over
+/// a 64-bit operand, which can express "clear the low bits" but not "clear the high half,
+/// keep the low one" -- exactly what reading a header's low-32-bit type id out of a 64-bit
+/// word needs -- so the mask is built in a register instead.
+pub fn mask_low32(e: emitter::Emitter, r: i64, scratch: i64) {
+    e.a.mov_ri(scratch, 4294967295u64);
+    e.a.and_rr(r, scratch);
+}
+
+/// The structural-equality runtime routine: rdi = a, rsi = b, result in rax (0 or 1). It
+/// recurses on a reference field, the same way the virtual machine does, and traps on
+/// comparing two closures.
+///
+/// Registers: rbx = a, r13 = b, r12 = the loop index, kept across the recursive call (they
+/// are callee-saved, so the call's own prologue and epilogue preserve them for free).
+/// [rbp-40] and [rbp-48] hold the current type's kinds address and word count -- read once
+/// per call, not per iteration, and cheap to keep on the stack rather than spend a fourth
+/// callee-saved register on.
+pub fn emit_equal_objects(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.equal_objects);
+
+    a.push(x86::RBP);
+    a.mov_rr(x86::RBP, x86::RSP);
+    a.push(x86::RBX);
+    a.push(x86::R12);
+    a.push(x86::R13);
+    a.push(x86::R14);
+    a.sub_ri(x86::RSP, 32);
+
+    let kinds_slot = x86::at(x86::RBP, 0 - 40);
+    let words_slot = x86::at(x86::RBP, 0 - 48);
+
+    let epilogue = a.new_label("eq_epilogue");
+    let is_true = a.new_label("eq_true");
+    let is_false = a.new_label("eq_false");
+
+    a.mov_rr(x86::RBX, x86::RDI);
+    a.mov_rr(x86::R13, x86::RSI);
+
+    a.cmp_rr(x86::RBX, x86::R13);
+    a.jcc(x86::EQUAL, is_true);
+
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, 0)); // header a
+    a.mov_rm(x86::RCX, x86::at(x86::R13, 0)); // header b
+    mask_low32(e, x86::RAX, x86::R8);
+    mask_low32(e, x86::RCX, x86::R8);
+    a.cmp_rr(x86::RAX, x86::RCX);
+    a.jcc(x86::NOT_EQUAL, is_false);
+    // rax = the shared type id.
+
+    a.mov_rr(x86::RCX, x86::RAX);
+    a.shl_i(x86::RCX, TYPE_TABLE_ROW_SHIFT);
+    a.mov_ri(x86::R9, e.type_table_addr as u64);
+    a.add_rr(x86::RCX, x86::R9); // rcx = this type id's table row
+
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, 0)); // shape
+    let bytes_case = a.new_label("eq_bytes");
+    let array_case = a.new_label("eq_array");
+    a.cmp_ri(x86::RAX, layout::BYTE_ARRAY);
+    a.jcc(x86::EQUAL, bytes_case);
+    a.cmp_ri(x86::RAX, layout::REF_ARRAY);
+    a.jcc(x86::EQUAL, array_case);
+    a.cmp_ri(x86::RAX, layout::RAW_ARRAY);
+    a.jcc(x86::EQUAL, array_case);
+
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, 8)); // object kind
+    let trap_fn = a.new_label("eq_trap_fn");
+    a.cmp_ri(x86::RAX, layout::OBJ_CLOSURE);
+    a.jcc(x86::EQUAL, trap_fn);
+
+    // Fixed shape: recurse over each word by its static kind.
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, 0)); // header a again (rax was clobbered)
+    a.shr_i(x86::RAX, 32);                    // words: the header's forward bit and unused
+    a.mov_mr(words_slot, x86::RAX);           // bits above it are 0 for any live object.
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, 16));
+    a.mov_mr(kinds_slot, x86::RAX); // the kinds address
+
+    a.xor_rr(x86::R12, x86::R12); // i = 0
+    let fixed_loop = a.new_label("eq_fixed_loop");
+    a.bind(fixed_loop);
+    a.mov_rm(x86::RAX, words_slot);
+    a.cmp_rr(x86::R12, x86::RAX);
+    a.jcc(x86::GREATER_EQUAL, is_true);
+
+    a.mov_rm(x86::RAX, kinds_slot);
+    a.add_rr(x86::RAX, x86::R12);
+    a.xor_rr(x86::R14, x86::R14);
+    a.mov_rm8(x86::R14, x86::at(x86::RAX, 0)); // this word's kind
+
+    a.mov_rr(x86::RAX, x86::R12);
+    a.shl_i(x86::RAX, 3);
+    a.add_ri(x86::RAX, emitter::OBJ_HEADER_SIZE);
+    a.mov_rr(x86::RCX, x86::RAX); // the field's byte offset, kept for both operands
+    a.add_rr(x86::RAX, x86::RBX);
+    a.mov_rm(x86::R8, x86::at(x86::RAX, 0)); // field word from a
+    a.mov_rr(x86::RAX, x86::RCX);
+    a.add_rr(x86::RAX, x86::R13);
+    a.mov_rm(x86::R9, x86::at(x86::RAX, 0)); // field word from b
+
+    eq_word_pair(e, is_false);
+    a.add_ri(x86::R12, 1);
+    a.jmp(fixed_loop);
+
+    // A byte array: a String. Its length is payload word 0; equal length and equal bytes is
+    // equal content.
+    //
+    // The whole words are compared a word at a time and the trailing bytes one at a time,
+    // which is not an optimization but the only correct reading. The bytes above a partial
+    // final word's last meaningful one are NOT part of the value and are NOT zero: the
+    // string allocator writes only the bytes it was given, and after the first collection
+    // the space it bump-allocates from is a semispace that has been used before, so those
+    // bytes hold whatever the previous cycle left there. Comparing them made two strings of
+    // the same text unequal -- but only in native code, only after a collection, and only
+    // for a length that is not a multiple of eight.
+    a.bind(bytes_case);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, emitter::OBJ_HEADER_SIZE)); // len a
+    a.mov_rm(x86::RCX, x86::at(x86::R13, emitter::OBJ_HEADER_SIZE)); // len b
+    a.cmp_rr(x86::RAX, x86::RCX);
+    a.jcc(x86::NOT_EQUAL, is_false);
+    a.mov_mr(words_slot, x86::RAX); // the length in bytes, for the tail
+    a.shr_i(x86::RAX, 3);           // whole words = len / 8
+    a.mov_mr(kinds_slot, x86::RAX); // reused here as the whole-word count
+
+    a.xor_rr(x86::R12, x86::R12);
+    let bytes_loop = a.new_label("eq_bytes_loop");
+    let bytes_tail = a.new_label("eq_bytes_tail");
+    a.bind(bytes_loop);
+    a.mov_rm(x86::RAX, kinds_slot);
+    a.cmp_rr(x86::R12, x86::RAX);
+    a.jcc(x86::GREATER_EQUAL, bytes_tail);
+
+    a.mov_rr(x86::RCX, x86::R12);
+    a.shl_i(x86::RCX, 3);
+    a.add_ri(x86::RCX, emitter::STR_BYTES_OFF);
+    a.mov_rr(x86::RAX, x86::RCX);
+    a.add_rr(x86::RAX, x86::RBX);
+    a.mov_rm(x86::R8, x86::at(x86::RAX, 0));
+    a.mov_rr(x86::RAX, x86::RCX);
+    a.add_rr(x86::RAX, x86::R13);
+    a.mov_rm(x86::R9, x86::at(x86::RAX, 0));
+    a.cmp_rr(x86::R8, x86::R9);
+    a.jcc(x86::NOT_EQUAL, is_false);
+    a.add_ri(x86::R12, 1);
+    a.jmp(bytes_loop);
+
+    // The bytes past the last whole word: at most seven, one at a time.
+    a.bind(bytes_tail);
+    a.mov_rr(x86::R12, x86::RAX);
+    a.shl_i(x86::R12, 3); // i = whole words * 8, the first byte of the tail
+    let tail_loop = a.new_label("eq_bytes_tail_loop");
+    a.bind(tail_loop);
+    a.mov_rm(x86::RAX, words_slot);
+    a.cmp_rr(x86::R12, x86::RAX);
+    a.jcc(x86::GREATER_EQUAL, is_true);
+
+    a.mov_rr(x86::RCX, x86::R12);
+    a.add_ri(x86::RCX, emitter::STR_BYTES_OFF);
+    a.mov_rr(x86::RAX, x86::RCX);
+    a.add_rr(x86::RAX, x86::RBX);
+    a.xor_rr(x86::R8, x86::R8);
+    a.mov_rm8(x86::R8, x86::at(x86::RAX, 0));
+    a.mov_rr(x86::RAX, x86::RCX);
+    a.add_rr(x86::RAX, x86::R13);
+    a.xor_rr(x86::R9, x86::R9);
+    a.mov_rm8(x86::R9, x86::at(x86::RAX, 0));
+    a.cmp_rr(x86::R8, x86::R9);
+    a.jcc(x86::NOT_EQUAL, is_false);
+    a.add_ri(x86::R12, 1);
+    a.jmp(tail_loop);
+
+    // An array (ADR-0028): equal lengths and pairwise-equal elements, with the room above
+    // the length no part of the value. One kind for the whole run, from the table's fourth
+    // word, rather than one per word.
+    a.bind(array_case);
+    a.mov_rm(x86::RAX, x86::at(x86::RCX, 24));
+    a.mov_mr(kinds_slot, x86::RAX); // the element kind, for every element
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, emitter::OBJ_HEADER_SIZE));
+    a.mov_rm(x86::RDX, x86::at(x86::R13, emitter::OBJ_HEADER_SIZE));
+    a.cmp_rr(x86::RAX, x86::RDX);
+    a.jcc(x86::NOT_EQUAL, is_false);
+    a.mov_mr(words_slot, x86::RAX);
+
+    a.xor_rr(x86::R12, x86::R12);
+    let array_loop = a.new_label("eq_array_loop");
+    a.bind(array_loop);
+    a.mov_rm(x86::RAX, words_slot);
+    a.cmp_rr(x86::R12, x86::RAX);
+    a.jcc(x86::GREATER_EQUAL, is_true);
+
+    a.mov_rr(x86::RCX, x86::R12);
+    a.shl_i(x86::RCX, 3);
+    a.add_ri(x86::RCX, emitter::OBJ_HEADER_SIZE + emitter::WORD_SIZE);
+    a.mov_rr(x86::RAX, x86::RCX);
+    a.add_rr(x86::RAX, x86::RBX);
+    a.mov_rm(x86::R8, x86::at(x86::RAX, 0));
+    a.mov_rr(x86::RAX, x86::RCX);
+    a.add_rr(x86::RAX, x86::R13);
+    a.mov_rm(x86::R9, x86::at(x86::RAX, 0));
+    a.mov_rm(x86::R14, kinds_slot);
+
+    eq_word_pair(e, is_false);
+    a.add_ri(x86::R12, 1);
+    a.jmp(array_loop);
+
+    a.bind(trap_fn);
+    // No native closure-object comparison can reach here; the message still matches the
+    // other two engines' exactly, for the day one can.
+    runtime::trap_with(e,
+        emitter::raw_string(e, "origin: function values cannot be compared with `==` at <runtime>\n"));
+
+    a.bind(is_true);
+    a.mov_ri(x86::RAX, 1u64);
+    a.jmp(epilogue);
+    a.bind(is_false);
+    a.xor_rr(x86::RAX, x86::RAX);
+
+    a.bind(epilogue);
+    a.add_ri(x86::RSP, 32);
+    a.pop(x86::R14);
+    a.pop(x86::R13);
+    a.pop(x86::R12);
+    a.pop(x86::RBX);
+    a.pop(x86::RBP);
+    a.ret();
+}
+
+/// Compares one pair of words -- a's in r8, b's in r9 -- by the kind in r14, jumping to
+/// `is_false` when they differ and falling through when they do not.
+///
+/// Both loops above need exactly this, over a struct's per-word kinds and over an array's
+/// single element kind, and the three cases have to stay identical to the virtual machine's
+/// own equality for the differential to hold. So it is written once and emitted at both
+/// sites rather than being two pieces that must be kept in step.
+fn eq_word_pair(e: emitter::Emitter, is_false: x86::Label) {
+    let a = e.a;
+    let word_ref = a.new_label("eq_word_ref");
+    let word_float = a.new_label("eq_word_float");
+    let done = a.new_label("eq_word_done");
+
+    a.cmp_ri(x86::R14, layout::WORD_REF);
+    a.jcc(x86::EQUAL, word_ref);
+    a.cmp_ri(x86::R14, layout::WORD_FLOAT);
+    a.jcc(x86::EQUAL, word_float);
+
+    // Every other kind (int, bool, char, unit, or a test's bare "raw") compares as raw bits,
+    // exactly as the virtual machine treats them.
+    a.cmp_rr(x86::R8, x86::R9);
+    a.jcc(x86::NOT_EQUAL, is_false);
+    a.jmp(done);
+
+    a.bind(word_ref);
+    a.mov_rr(x86::RDI, x86::R8);
+    a.mov_rr(x86::RSI, x86::R9);
+    a.call(e.rt.equal_objects);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, is_false);
+    a.jmp(done);
+
+    a.bind(word_float);
+    // IEEE equality: unordered (either operand NaN) is never equal, which the spec pins for
+    // a float at top level and inside an aggregate alike.
+    a.movq_xr(x86::XMM0, x86::R8);
+    a.movq_xr(x86::XMM1, x86::R9);
+    a.ucomisd_xx(x86::XMM0, x86::XMM1);
+    a.jcc(x86::PARITY, is_false);
+    a.jcc(x86::NOT_EQUAL, is_false);
+
+    a.bind(done);
+}
+
+const U64_ALL_ONES: u64 = 18446744073709551615u64;
+
+/// The lexicographic byte comparison a `String`'s ordering needs: rdi = a, rsi = b, result
+/// in rax as a three-way sign. A sign is exactly as informative as two bool comparisons and
+/// cheaper to turn into one of Less/Equal/Greater at the call site.
+///
+/// A leaf routine: it calls nothing, so unlike structural equality it needs no
+/// 16-byte-aligned sub-frame, just the four callee-saved registers it uses.
+pub fn emit_compare_bytes(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.compare_bytes);
+
+    a.push(x86::RBX);
+    a.push(x86::R12);
+    a.push(x86::R13);
+    a.push(x86::R14);
+
+    a.mov_rr(x86::RBX, x86::RDI); // a
+    a.mov_rr(x86::R13, x86::RSI); // b
+
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, emitter::OBJ_HEADER_SIZE)); // len a
+    a.mov_rm(x86::RCX, x86::at(x86::R13, emitter::OBJ_HEADER_SIZE)); // len b
+    a.mov_rr(x86::R14, x86::RAX);
+    a.cmp_rr(x86::RCX, x86::R14);
+    a.cmov(x86::LESS, x86::R14, x86::RCX); // r14 = min(len a, len b)
+
+    let neg1 = a.new_label("cb_neg1");
+    let pos1 = a.new_label("cb_pos1");
+    let done = a.new_label("cb_done");
+
+    a.xor_rr(x86::R12, x86::R12); // i = 0
+    let loop_top = a.new_label("cb_loop");
+    a.bind(loop_top);
+    a.cmp_rr(x86::R12, x86::R14);
+    let after_common = a.new_label("cb_after_common");
+    a.jcc(x86::GREATER_EQUAL, after_common);
+
+    a.mov_rr(x86::R8, x86::R12);
+    a.add_ri(x86::R8, emitter::STR_BYTES_OFF);
+    a.mov_rr(x86::R9, x86::R8);
+    a.add_rr(x86::R9, x86::RBX);
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.mov_rm8(x86::RAX, x86::at(x86::R9, 0)); // byte a
+    a.mov_rr(x86::R9, x86::R8);
+    a.add_rr(x86::R9, x86::R13);
+    a.xor_rr(x86::RCX, x86::RCX);
+    a.mov_rm8(x86::RCX, x86::at(x86::R9, 0)); // byte b
+
+    a.cmp_rr(x86::RAX, x86::RCX);
+    a.jcc(x86::LESS, neg1);
+    a.jcc(x86::GREATER, pos1);
+    a.add_ri(x86::R12, 1);
+    a.jmp(loop_top);
+
+    // Every byte of the shorter's length matched: the shorter string sorts first, unless they
+    // are the same length, in which case they are equal.
+    a.bind(after_common);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, emitter::OBJ_HEADER_SIZE)); // len a again
+    a.mov_rm(x86::RCX, x86::at(x86::R13, emitter::OBJ_HEADER_SIZE)); // len b
+    a.cmp_rr(x86::RAX, x86::RCX);
+    a.jcc(x86::LESS, neg1);
+    a.jcc(x86::GREATER, pos1);
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.jmp(done);
+
+    a.bind(neg1);
+    a.mov_ri(x86::RAX, U64_ALL_ONES); // -1
+    a.jmp(done);
+    a.bind(pos1);
+    a.mov_ri(x86::RAX, 1u64);
+
+    a.bind(done);
+    a.pop(x86::R14);
+    a.pop(x86::R13);
+    a.pop(x86::R12);
+    a.pop(x86::RBX);
+    a.ret();
+}

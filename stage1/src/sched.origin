@@ -1,0 +1,292 @@
+// The run queue: what a thread parked on a channel hands the processor to, and what runs
+// the threads `main` never joined before the process exits.
+//
+// A translation of `internal/backend/sched.go` (spec/12-concurrency.md).
+
+use emitter;
+use runtime;
+use thread;
+use x86;
+
+/// Statuses the blocking runtime routines return in rax. The caller -- the lowering of the
+/// builtin -- turns a non-zero one into a trap with its own span, rather than the runtime
+/// trapping with a span it does not have.
+pub const OK: i64 = 0;
+pub const DEADLOCK: i64 = 1;
+/// The operation's own error: sending on a closed channel, closing a closed channel,
+/// joining a joined handle, re-entering a held mutex. Which one it means is decided by which
+/// routine returned it, so one status serves them all.
+pub const REFUSED: i64 = 2;
+
+/// How many back edges a thread may cross before it must offer the processor to somebody
+/// else.
+///
+/// A count rather than a clock, because a timer means a signal handler and a signal handler
+/// means a great deal of runtime this phase does not otherwise need. What the spec asks for
+/// is that a compute loop cannot starve a ready thread, and a deterministic count delivers
+/// that -- with the side benefit that two runs of the same program schedule identically,
+/// which a timer would not give.
+pub const PREEMPT_BUDGET: i64 = 1024;
+
+/// The frame shape the collector's synthetic stack-map entry describes: a frame pointer,
+/// then all four callee-saved registers in the order the walk names them, at [rbp-8] through
+/// [rbp-32]. Every runtime routine that can be on the stack while a collection walks it must
+/// have exactly this shape, whether or not it needs the registers, because the walk recovers
+/// the *caller's* register values from these slots.
+pub fn runtime_prologue(e: emitter::Emitter) {
+    let a = e.a;
+    a.push(x86::RBP);
+    a.mov_rr(x86::RBP, x86::RSP);
+    a.push(x86::RBX);
+    a.push(x86::R12);
+    a.push(x86::R13);
+    a.push(x86::R14);
+}
+
+pub fn runtime_epilogue(e: emitter::Emitter) {
+    let a = e.a;
+    a.pop(x86::R14);
+    a.pop(x86::R13);
+    a.pop(x86::R12);
+    a.pop(x86::RBX);
+    a.pop(x86::RBP);
+}
+
+/// `rt_sched_next() -> rax`: the next runnable thread after the current one in list order,
+/// or 0 when there is none.
+///
+/// Round-robin over the one list every thread is already on -- the same list the collector
+/// walks -- rather than a queue of its own: with a handful of green threads a scan is
+/// shorter than the code to keep a queue correct, and the list is the only structure that is
+/// guaranteed to hold every thread whatever state it is in.
+///
+/// A leaf. It calls nothing and cannot allocate, so it needs no frame for the collector to
+/// find, and it uses only rax/rcx/rdx/r8, which the private runtime convention leaves free.
+pub fn emit_sched_next(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.sched_next);
+
+    let found = a.new_label("sched_found");
+    let none = a.new_label("sched_none");
+    let after_loop = a.new_label("sched_after_loop");
+    let from_head = a.new_label("sched_from_head");
+    let head_loop = a.new_label("sched_head_loop");
+
+    // Pass one: the first runnable thread strictly after the current one, so that a thread
+    // yielding repeatedly does not always hand back to the same neighbour.
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_CURRENT_OFF));
+    a.mov_rm(x86::RDX, x86::at(x86::RCX, thread::TCB_NEXT_OFF));
+    a.bind(after_loop);
+    a.test_rr(x86::RDX, x86::RDX);
+    a.jcc(x86::EQUAL, from_head);
+    runnable(e, x86::RDX, found);
+    a.mov_rm(x86::RDX, x86::at(x86::RDX, thread::TCB_NEXT_OFF));
+    a.jmp(after_loop);
+
+    // Pass two: from the head, which may reach the current thread itself -- correct for a
+    // yield (nothing else wants the processor) and unreachable for a park (the parking
+    // thread has already marked itself blocked).
+    a.bind(from_head);
+    a.mov_rm(x86::RDX, x86::at(x86::R15, emitter::RT_THREADS_OFF));
+    a.bind(head_loop);
+    a.test_rr(x86::RDX, x86::RDX);
+    a.jcc(x86::EQUAL, none);
+    runnable(e, x86::RDX, found);
+    a.mov_rm(x86::RDX, x86::at(x86::RDX, thread::TCB_NEXT_OFF));
+    a.jmp(head_loop);
+
+    a.bind(found);
+    a.mov_rr(x86::RAX, x86::RDX);
+    a.ret();
+
+    a.bind(none);
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.ret();
+}
+
+/// Jumps to `yes` when the thread in `reg` can run: it has not finished and is not blocked
+/// on a condition. Clobbers rax and r8.
+fn runnable(e: emitter::Emitter, reg: i64, yes: x86::Label) {
+    let a = e.a;
+    let no = a.new_label("sched_not_runnable");
+    a.mov_rm(x86::RAX, x86::at(reg, thread::TCB_STATE_OFF));
+    a.cmp_ri(x86::RAX, thread::THREAD_DONE);
+    a.jcc(x86::EQUAL, no);
+    a.mov_rm(x86::R8, x86::at(reg, thread::TCB_BLOCKED_OFF));
+    a.test_rr(x86::R8, x86::R8);
+    a.jcc(x86::EQUAL, yes);
+    a.bind(no);
+}
+
+/// `rt_wake_all()`: clear every thread's blocked flag.
+///
+/// A leaf, and deliberately unconditional -- it does not skip the running thread, whose flag
+/// is zero anyway, and it does not skip finished threads, whose flag nothing reads.
+pub fn emit_sched_wake_all(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.sched_wake_all);
+
+    let loop_top = a.new_label("wake_loop");
+    let done = a.new_label("wake_done");
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_THREADS_OFF));
+    a.bind(loop_top);
+    a.test_rr(x86::RCX, x86::RCX);
+    a.jcc(x86::EQUAL, done);
+    a.mov_mi(x86::at(x86::RCX, thread::TCB_BLOCKED_OFF), 0);
+    a.mov_rm(x86::RCX, x86::at(x86::RCX, thread::TCB_NEXT_OFF));
+    a.jmp(loop_top);
+    a.bind(done);
+    a.ret();
+}
+
+/// `rt_park() -> rax`: give up the processor, and come back when something has woken this
+/// thread.
+///
+/// The caller sets its own blocked flag first and re-checks its own condition after, because
+/// the condition lives in the caller's code and nothing here can evaluate it. So this
+/// returns for two reasons that look the same from the outside -- a real wake, and a
+/// broadcast that did not help -- and the caller's loop tells them apart.
+///
+/// `DEADLOCK` means no other thread can run: every one of them has finished or is blocked,
+/// and no code that could clear a blocked flag will ever execute. That is total deadlock
+/// exactly, detected rather than hung on. The blocked flag is cleared on the way out so that
+/// the thread about to trap is not itself counted as stuck by anything that looks afterwards.
+pub fn emit_sched_park(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.sched_park);
+
+    runtime_prologue(e);
+
+    let stuck = a.new_label("park_stuck");
+
+    a.mov_rm(x86::RBX, x86::at(x86::R15, emitter::RT_CURRENT_OFF));
+    a.call(e.rt.sched_next);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, stuck);
+
+    // Park this one and adopt the other. The state is what the collector reads to decide
+    // that this stack has a real frame chain to walk, so it is set before the switch and
+    // restored after it, not around the wake.
+    a.mov_mi(x86::at(x86::RBX, thread::TCB_STATE_OFF), thread::THREAD_PARKED);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_CURRENT_OFF), x86::RAX);
+    a.mov_rr(x86::RSI, x86::RAX);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.call(e.rt.thread_switch);
+
+    // Resumed: this thread is the current one again, whoever switched back into it.
+    a.mov_mr(x86::at(x86::R15, emitter::RT_CURRENT_OFF), x86::RBX);
+    a.mov_mi(x86::at(x86::RBX, thread::TCB_STATE_OFF), thread::THREAD_RUNNING);
+    a.mov_mi(x86::at(x86::RBX, thread::TCB_BLOCKED_OFF), 0);
+    a.xor_rr(x86::RAX, x86::RAX);
+    runtime_epilogue(e);
+    a.ret();
+
+    a.bind(stuck);
+    a.mov_mi(x86::at(x86::RBX, thread::TCB_BLOCKED_OFF), 0);
+    a.mov_ri(x86::RAX, DEADLOCK as u64);
+    runtime_epilogue(e);
+    a.ret();
+}
+
+/// `rt_preempt()`: the budget ran out, so let another thread run.
+///
+/// This is a yield, not a park. The thread stays runnable, so the scheduler may well hand
+/// the processor straight back -- which is what happens when nothing else can use it, and
+/// costs a scan of the thread list.
+///
+/// It saves nothing the caller might be holding, and does not have to: a back edge is a call
+/// site for the register allocator when a program is preemptible, so anything live across one
+/// is already in a callee-saved register or a frame slot, and the collector has a stack map
+/// for the return address.
+pub fn emit_preempt(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.preempt);
+
+    runtime_prologue(e);
+    let done = a.new_label("preempt_done");
+
+    a.mov_ri(x86::RAX, PREEMPT_BUDGET as u64);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_BUDGET_OFF), x86::RAX);
+
+    a.mov_rm(x86::RBX, x86::at(x86::R15, emitter::RT_CURRENT_OFF));
+    a.call(e.rt.sched_next);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, done);
+    a.cmp_rr(x86::RAX, x86::RBX);
+    a.jcc(x86::EQUAL, done);
+
+    a.mov_mi(x86::at(x86::RBX, thread::TCB_STATE_OFF), thread::THREAD_PARKED);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_CURRENT_OFF), x86::RAX);
+    a.mov_rr(x86::RSI, x86::RAX);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.call(e.rt.thread_switch);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_CURRENT_OFF), x86::RBX);
+    a.mov_mi(x86::at(x86::RBX, thread::TCB_STATE_OFF), thread::THREAD_RUNNING);
+
+    a.bind(done);
+    runtime_epilogue(e);
+    a.ret();
+}
+
+/// `rt_drain()`: run every spawned thread that has not finished, and return once they all
+/// have.
+///
+/// Spec section 12 says the process does not exit while a green thread is still runnable --
+/// `main` returning ends the program only after every spawned thread is done, deliberately
+/// unlike Go, where the race between exit and a goroutine is a familiar bug. So the entry
+/// point calls this between `main` and `exit`.
+///
+/// `main` is never marked done: it is the thread every finished thread's wake brings back,
+/// and marking it done would leave a program whose threads all finish with nobody to switch
+/// to. The loop below is what ends instead.
+pub fn emit_sched_drain(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.sched_drain);
+
+    runtime_prologue(e);
+
+    let loop_top = a.new_label("drain_loop");
+    let scan = a.new_label("drain_scan");
+    let scan_next = a.new_label("drain_scan_next");
+    let wait_one = a.new_label("drain_wait");
+    let done = a.new_label("drain_done");
+
+    a.mov_rm(x86::RBX, x86::at(x86::R15, emitter::RT_CURRENT_OFF)); // main
+
+    a.bind(loop_top);
+    // Anything left that is not this thread and not finished?
+    a.mov_rm(x86::R12, x86::at(x86::R15, emitter::RT_THREADS_OFF));
+    a.bind(scan);
+    a.test_rr(x86::R12, x86::R12);
+    a.jcc(x86::EQUAL, done);
+    a.cmp_rr(x86::R12, x86::RBX);
+    a.jcc(x86::EQUAL, scan_next);
+    a.mov_rm(x86::RAX, x86::at(x86::R12, thread::TCB_STATE_OFF));
+    a.cmp_ri(x86::RAX, thread::THREAD_DONE);
+    a.jcc(x86::NOT_EQUAL, wait_one);
+    a.bind(scan_next);
+    a.mov_rm(x86::R12, x86::at(x86::R12, thread::TCB_NEXT_OFF));
+    a.jmp(scan);
+
+    a.bind(wait_one);
+    // Wait for it, exactly the way `join` waits: block, and let the scheduler run whoever
+    // can. A finishing thread wakes everybody, which is what brings this loop back.
+    a.mov_mi(x86::at(x86::RBX, thread::TCB_BLOCKED_OFF), 1);
+    a.call(e.rt.sched_park);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, loop_top);
+
+    // Nothing runnable and something unfinished: every remaining thread is blocked on a
+    // condition no thread will ever satisfy. `main` has left its own code, so there is no
+    // user span to name -- unlike a deadlock a thread's own `recv` detects.
+    runtime::trap_with(e, e.deadlock_msg);
+
+    a.bind(done);
+    runtime_epilogue(e);
+    a.ret();
+}

@@ -1,0 +1,290 @@
+// The emitter: the state one code-generation pass carries, and the pieces every routine
+// that emits into it shares.
+//
+// A translation of the parts of `internal/backend/backend.go` and `runtime.go` that the
+// runtime routines and the lowering both read. It is a module of its own because Origin's
+// coherence rules keep an inherent `impl` with the type it belongs to, and the emitting
+// code is far too large for one file: the routines take the emitter as an argument instead,
+// which is the same relationship the Go methods have to their receiver.
+
+use std::list;
+use std::map;
+use std::str;
+
+use bytecode;
+use layout;
+use obj;
+use x86;
+
+/// The size of each of the two semispaces the runtime asks mmap for at start-up
+/// (ADR-0022): one is "current" and the other is where the next collection copies live
+/// objects into. Total mapped memory is therefore twice this, trivial against the 8 GiB
+/// target machine.
+///
+/// 128 MiB rather than the 64 it was through Phase 8, because the largest Origin program in
+/// existence outgrew it: stage1 running its own optimizer over its own source holds every
+/// function's SSA at once -- which is not a leak but what inlining needs, since it reads a
+/// callee's IR while rewriting the caller -- and that is a live set a 64 MiB semispace
+/// cannot hold. The collector is single-space and non-generational, so the live set has to
+/// fit in one semispace with room to allocate.
+pub const HEAP_SIZE: i64 = 134217728;
+
+// The runtime block's fields, addressed through r15.
+pub const RT_BUMP_OFF: i64 = 0;
+pub const RT_END_OFF: i64 = 8;
+/// The stack-map table (ADR-0021): its address in read-only data, and how many entries it
+/// holds. Both are compile-time constants, so they are written directly into the initial
+/// data segment rather than by any instruction -- unlike the bump pointer and the heap
+/// limit, which only mmap's own return value can supply.
+pub const RT_STACK_MAP_OFF: i64 = 16;
+pub const RT_STACK_MAP_COUNT_OFF: i64 = 24;
+/// The address of the semispace collection is not currently allocating out of: the
+/// collector's destination, and the space the bump pointer and limit describe after a
+/// collection flips them. Its end is always this plus `HEAP_SIZE`.
+pub const RT_OTHER_START_OFF: i64 = 32;
+/// The destination semispace's bump pointer while a collection is in progress. Meaningless
+/// outside an active collection, unlike every other runtime-block field.
+pub const RT_GC_NEXT_OFF: i64 = 40;
+/// The thread control block of the thread now running, and the head of the list of every
+/// thread the program has created.
+pub const RT_CURRENT_OFF: i64 = 48;
+pub const RT_THREADS_OFF: i64 = 56;
+/// The span table a trap consults to name the user's line, and its length.
+pub const RT_SPAN_TABLE_OFF: i64 = 64;
+pub const RT_SPAN_COUNT_OFF: i64 = 72;
+/// The channel and mutex lists.
+pub const RT_CHANNELS_OFF: i64 = 80;
+pub const RT_MUTEXES_OFF: i64 = 88;
+/// How many back edges the running thread may still cross before it must yield.
+pub const RT_BUDGET_OFF: i64 = 96;
+/// The address the kernel left the argument vector at.
+pub const RT_ARGV_OFF: i64 = 104;
+/// How many more allocations may succeed before a forced collection.
+pub const RT_GC_COUNTDOWN_OFF: i64 = 112;
+/// The block's size in bytes; it lives in the writable segment.
+pub const RT_BLOCK_SIZE: i64 = 120;
+
+/// The size of everything the machine holds in a register.
+pub const WORD_SIZE: i64 = 8;
+/// The object header that precedes every payload.
+pub const OBJ_HEADER_SIZE: i64 = 8;
+/// Where a String's bytes begin, past the header and the length word.
+pub const STR_BYTES_OFF: i64 = 16;
+
+/// A constant already sitting in read-only data: its address and its length.
+pub struct StaticStr {
+    pub addr: i64,
+    pub length: i64,
+}
+
+pub fn no_static_str() -> StaticStr { StaticStr { addr: 0, length: 0 } }
+
+/// Names the emitted runtime routines so lowering can call them.
+pub struct RuntimeLabels {
+    pub mut start: x86::Label,
+    pub mut alloc: x86::Label,
+    pub mut write: x86::Label,
+    pub mut trap: x86::Label,
+    pub mut int_to_str: x86::Label,
+    pub mut print: x86::Label,
+    pub mut println: x86::Label,
+    pub mut panic: x86::Label,
+    pub mut equal_objects: x86::Label,
+    pub mut compare_bytes: x86::Label,
+    pub mut collect: x86::Label,
+    pub mut lookup_stack_map: x86::Label,
+    pub mut evacuate: x86::Label,
+    pub mut scan_object: x86::Label,
+    pub mut thread_switch: x86::Label,
+    pub mut thread_new: x86::Label,
+    pub mut thread_entry: x86::Label,
+    pub mut thread_spawn: x86::Label,
+    pub mut thread_join: x86::Label,
+    pub mut thread_main: x86::Label,
+    pub mut sched_next: x86::Label,
+    pub mut sched_wake_all: x86::Label,
+    pub mut sched_park: x86::Label,
+    pub mut sched_drain: x86::Label,
+    pub mut trap_span: x86::Label,
+    pub mut span_here: x86::Label,
+    pub mut arg_at: x86::Label,
+    pub mut panic_span: x86::Label,
+    pub mut span_lookup: x86::Label,
+    pub mut chan_new: x86::Label,
+    pub mut chan_send: x86::Label,
+    pub mut chan_recv: x86::Label,
+    pub mut chan_taken: x86::Label,
+    pub mut chan_close: x86::Label,
+    pub mut mutex_new: x86::Label,
+    pub mut mutex_lock: x86::Label,
+    pub mut mutex_unlock: x86::Label,
+    pub mut preempt: x86::Label,
+    pub mut array_new: x86::Label,
+    pub mut array_len: x86::Label,
+    pub mut array_cap: x86::Label,
+    pub mut array_at: x86::Label,
+    pub mut array_set: x86::Label,
+    pub mut array_push: x86::Label,
+    pub mut array_truncate: x86::Label,
+    pub mut hash_mix: x86::Label,
+    pub mut hash_word: x86::Label,
+    pub mut hash_object: x86::Label,
+    pub mut str_len: x86::Label,
+    pub mut str_byte_at: x86::Label,
+    pub mut str_slice_check: x86::Label,
+    pub mut str_slice_into: x86::Label,
+    pub mut str_concat_into: x86::Label,
+    pub mut str_char_at: x86::Label,
+    pub mut str_char_width: x86::Label,
+    pub mut str_alloc: x86::Label,
+    pub mut char_to_str: x86::Label,
+    pub mut fs_copy_path: x86::Label,
+    pub mut fs_read: x86::Label,
+    pub mut fs_write: x86::Label,
+    pub mut fs_exists: x86::Label,
+    pub mut fs_taken: x86::Label,
+}
+
+
+/// The emitter's state for one pass over the whole program.
+pub struct Emitter {
+    pub prog: bytecode::Program,
+    pub target: obj::Target,
+    pub a: x86::Asm,
+    pub mut rt: RuntimeLabels,
+
+    pub mut ro_data_addr: i64,
+    pub mut data_addr: i64,
+    pub ro_data: List[i64],
+
+    pub mut string_type: i64,
+    pub mut newline_addr: i64,
+    pub mut out_of_memory_msg: StaticStr,
+    /// Spec section 12's `all threads are blocked`, for the one place that detects it with
+    /// no user code left on the stack to name: the drain loop `_start` runs after `main` has
+    /// returned.
+    pub mut deadlock_msg: StaticStr,
+    /// The location a trap names when the stack walk finds no user call site to blame.
+    pub mut runtime_loc_msg: StaticStr,
+    /// The `origin: ` a panic's message is wrapped in, so that the three engines print the
+    /// same line.
+    pub mut panic_prefix: StaticStr,
+    /// The ` at ` between a panic's message and the location the stack walk found, when the
+    /// panic itself was written in the prelude.
+    pub mut at_msg: StaticStr,
+    /// A constant-pool index to the String object built for it, so a literal costs no
+    /// allocation at run time.
+    pub const_str: Map[i64, StaticStr],
+    /// The fully formatted trap messages, deduplicated.
+    pub trap_msg: Map[String, StaticStr],
+
+    /// The base of the per-type layout table structural equality reads.
+    pub mut type_table_addr: i64,
+    /// The synthetic stack-map entry the collector's root walk substitutes when it reaches a
+    /// frame with no real entry -- one of the runtime's own routines, which allocates
+    /// internally but, like every runtime routine, was deliberately never given a call-site
+    /// entry (ADR-0021's own documented scope).
+    pub mut gc_runtime_entry_addr: i64,
+
+    pub mut fn_labels: List[x86::Label],
+    /// This program can have more than one thread, so its loops carry a preemption check.
+    /// It is a whole-program property because a program that never spawns has nothing to be
+    /// preempted for, and the check is not free: it makes every back edge a call site.
+    pub mut preempts: bool,
+    /// The first thing that went wrong, or `""`.
+    pub mut error: String,
+}
+
+/// Puts a bare run of bytes in read-only data: a trap message, which the runtime writes with
+/// `write` and never treats as an Origin value.
+pub fn raw_string(e: Emitter, s: String) -> StaticStr {
+    let out = StaticStr { addr: e.ro_data_addr + e.ro_data.len(), length: s.len() };
+    let mut i = 0;
+    while i < s.len() {
+        e.ro_data.push(s.byte_at(i));
+        i = i + 1;
+    }
+    out
+}
+
+/// Puts a constant-pool string in read-only data as a complete String object, header and
+/// all, so that a literal is a pointer rather than an allocation.
+pub fn string_const(e: Emitter, idx: i64) -> StaticStr {
+    match e.const_str.get(idx) {
+        Option::Some(s) => { return s; },
+        Option::None => {},
+    }
+    // Objects are word-aligned, because the header packs a size into bits 32..55 and the
+    // collector walks by words.
+    while e.ro_data.len() % WORD_SIZE != 0 { e.ro_data.push(0); }
+    let text = e.prog.consts.at(idx).text;
+    let out = StaticStr { addr: e.ro_data_addr + e.ro_data.len(), length: text.len() };
+    put_string_object(e.ro_data, text, e.string_type);
+    e.const_str.insert(idx, out);
+    out
+}
+
+/// The bytes of a String as it exists on the heap, for a literal that can live in read-only
+/// data instead of being allocated at run time.
+pub fn put_string_object(out: List[i64], s: String, type_id: i64) {
+    let byte_words = (s.len() + WORD_SIZE - 1) / WORD_SIZE;
+    let words = 1 + byte_words;
+    // The header: the type id in the low 32 bits and the payload size in words at bit 32,
+    // exactly as the layout module packs it for the collector.
+    put_u64(out, header_word(type_id, words));
+    put_u64(out, s.len());
+    let mut i = 0;
+    while i < s.len() {
+        out.push(s.byte_at(i));
+        i = i + 1;
+    }
+    let mut pad = byte_words * WORD_SIZE - s.len();
+    while pad > 0 {
+        out.push(0);
+        pad = pad - 1;
+    }
+}
+
+/// An object header: the type id in the low 32 bits, the payload size in words at bit 32.
+pub fn header_word(type_id: i64, words: i64) -> i64 {
+    (words << 32) | (type_id & 4294967295)
+}
+
+pub fn put_u64(out: List[i64], v: i64) {
+    let mut i = 0;
+    while i < 8 {
+        out.push((v >> (8 * i)) & 255);
+        i = i + 1;
+    }
+}
+
+pub fn put_u32(out: List[i64], v: i64) {
+    let mut i = 0;
+    while i < 4 {
+        out.push((v >> (8 * i)) & 255);
+        i = i + 1;
+    }
+}
+
+/// Formats a trap exactly as the interpreter and the virtual machine print it, and puts it
+/// in read-only data.
+///
+/// Every span is known while compiling, so the whole line is a constant and the runtime does
+/// no formatting at all. It has to match the other two engines character for character: the
+/// end-to-end suite compares their stderr byte for byte.
+pub fn trap_message(e: Emitter, msg: String, at: String) -> StaticStr {
+    let text = "origin: \(msg) at \(at)\n";
+    match e.trap_msg.get(text) {
+        Option::Some(s) => s,
+        Option::None => {
+            let s = raw_string(e, text);
+            e.trap_msg.insert(text, s);
+            s
+        },
+    }
+}
+
+/// Records the first thing that went wrong. A later one is not more informative.
+pub fn fail(e: Emitter, msg: String) {
+    if e.error == "" { e.error = msg; }
+}

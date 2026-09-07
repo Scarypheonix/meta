@@ -1,0 +1,402 @@
+// Green threads: the control block, the context switch, and the trampoline a new thread
+// starts in (spec/12-concurrency.md).
+//
+// A translation of `internal/backend/thread.go`.
+
+use emitter;
+use runtime;
+use sched;
+use x86;
+
+// A thread control block, kept in raw mmap'd memory rather than the collected heap: the
+// collector moves objects, and a structure the scheduler holds a raw pointer to across a
+// switch cannot move underneath it. The block sits at the base of the thread's own mapping,
+// below its stack, so one mmap gives both and freeing is one munmap.
+
+pub const TCB_STATE_OFF: i64 = 0;
+/// The parked thread's stack pointer -- everything else it saved is on that stack, which is
+/// what makes a switch a handful of pushes.
+pub const TCB_RSP_OFF: i64 = 8;
+/// Its frame pointer at the moment it parked, which is where the collector starts walking
+/// this thread's chain (ADR-0022's own walk, per thread).
+pub const TCB_RBP_OFF: i64 = 16;
+/// What the thread's closure returned, read by `join`.
+pub const TCB_RESULT_OFF: i64 = 24;
+/// The closure the thread runs. It is a reference into the collected heap, so it is a root
+/// the collector must visit and rewrite: the thread has not called it yet, and nothing else
+/// refers to it.
+pub const TCB_CLOSURE_OFF: i64 = 32;
+/// Chains every thread the program has created, so the collector can find all of their
+/// stacks and the scheduler can find the next runnable one.
+pub const TCB_NEXT_OFF: i64 = 40;
+/// Records that a handle has been joined, so joining twice traps rather than blocking
+/// forever on a thread that already finished.
+pub const TCB_JOINED_OFF: i64 = 48;
+/// The mapping's own address, for munmap when the thread is done.
+pub const TCB_STACK_BASE_OFF: i64 = 56;
+/// 1 while this thread is waiting for a condition it cannot check for itself -- a value on
+/// a channel, room in one, a thread to finish, a lock to be dropped. The scheduler will not
+/// run a blocked thread, so "no thread is runnable" is exactly total deadlock.
+///
+/// It is deliberately separate from the state, which the collector reads for a different
+/// question: whether this thread has a stack worth walking. A thread parked on a channel and
+/// a thread that merely yielded have the same state and different blockedness.
+pub const TCB_BLOCKED_OFF: i64 = 64;
+/// Whether the result this thread will leave behind is a reference the collector must
+/// evacuate, or a raw value it must not touch. The runtime cannot tell them apart -- that is
+/// what the stack map exists for elsewhere -- so the compiler, which knows `spawn`'s own T,
+/// writes the answer here.
+pub const TCB_RESULT_IS_REF_OFF: i64 = 72;
+/// The value a receive took off a channel, between the two halves of the prelude's own
+/// `recv`. It is a root the collector must visit when the channel's element type is a
+/// reference, for the same reason the result is: raw memory, no stack map over it.
+pub const TCB_TAKEN_OFF: i64 = 80;
+pub const TCB_TAKEN_IS_REF_OFF: i64 = 88;
+/// A multiple of 16, so a stack primed above it stays aligned.
+pub const TCB_SIZE: i64 = 96;
+
+// Thread states.
+//
+// The collector reads these: a `ready` thread has never run, so its primed stack is not a
+// frame chain and walking it would misread the six zeroed slots as frames -- only its
+// closure is a root. A `parked` one stopped inside the switch, so its chain is real and
+// starts at the rbp that switch saved. A `done` one has no stack worth walking; only the
+// result it left behind is a root.
+pub const THREAD_READY: i64 = 0;
+pub const THREAD_RUNNING: i64 = 1;
+pub const THREAD_PARKED: i64 = 2;
+pub const THREAD_DONE: i64 = 3;
+
+// What the switch pushes before it swaps stacks: six registers, then the caller's own
+// return address above them. A parked thread's tracked registers are therefore at known
+// offsets from its saved rsp, which is what lets the collector recover them without the
+// thread running.
+pub const SWITCH_R15_OFF: i64 = 0;
+pub const SWITCH_R14_OFF: i64 = 8;
+pub const SWITCH_R13_OFF: i64 = 16;
+pub const SWITCH_R12_OFF: i64 = 24;
+pub const SWITCH_RBP_OFF: i64 = 32;
+pub const SWITCH_RBX_OFF: i64 = 40;
+pub const SWITCH_RET_OFF: i64 = 48;
+
+/// The reservation for one green thread, mapped anonymously and therefore committed by the
+/// kernel only as pages are touched. The spec specifies a stack that starts small and grows
+/// on demand to 8 MiB; reserving 8 MiB of address space and letting demand paging supply the
+/// pages achieves the same observable behaviour -- an untouched page costs nothing -- without
+/// a growth check on every function entry.
+pub const THREAD_STACK_SIZE: i64 = 8388608;
+
+const U64_ALL_ONES: u64 = 18446744073709551615u64;
+
+/// `rt_switch(from_tcb rdi, to_tcb rsi)`.
+///
+/// A context switch is only as big as the calling convention says it must be. The System V
+/// ABI makes rbx, rbp and r12..r15 callee-saved, so a routine that pushes them, swaps stacks,
+/// and pops them has preserved everything the *caller* was entitled to keep; the caller-saved
+/// registers were already the caller's problem at any call, and a switch is a call.
+///
+/// r15 is deliberately saved and restored with the rest even though every thread shares one
+/// runtime block: ADR-0018 reserves it, and a switch that assumed its value would be a rule
+/// the next reader has to know rather than one the code states.
+pub fn emit_thread_switch(e: emitter::Emitter) {
+    let a = e.a;
+    a.bind(e.rt.thread_switch);
+
+    a.push(x86::RBX);
+    a.push(x86::RBP);
+    a.push(x86::R12);
+    a.push(x86::R13);
+    a.push(x86::R14);
+    a.push(x86::R15);
+
+    // Park the outgoing thread: its stack pointer is all the collector and the scheduler
+    // need, since the saved registers are now on that stack and rbp is among them.
+    a.mov_mr(x86::at(x86::RDI, TCB_RSP_OFF), x86::RSP);
+    a.mov_mr(x86::at(x86::RDI, TCB_RBP_OFF), x86::RBP);
+
+    // Adopt the incoming one.
+    a.mov_rm(x86::RSP, x86::at(x86::RSI, TCB_RSP_OFF));
+
+    a.pop(x86::R15);
+    a.pop(x86::R14);
+    a.pop(x86::R13);
+    a.pop(x86::R12);
+    a.pop(x86::RBP);
+    a.pop(x86::RBX);
+    // Returns onto the incoming thread's own stack, into whatever it was doing when it
+    // parked -- or, for a thread that has never run, into the trampoline its stack was
+    // primed with.
+    a.ret();
+}
+
+/// `rt_thread_new(closure rdi) -> tcb rax`.
+///
+/// It maps one region for the control block and the stack together, primes the stack so that
+/// the first switch into this thread lands in the trampoline, and links it into the list
+/// every thread is on.
+pub fn emit_thread_new(e: emitter::Emitter) {
+    let a = e.a;
+    a.bind(e.rt.thread_new);
+
+    a.push(x86::RBX);
+    a.mov_rr(x86::RBX, x86::RDI); // the closure, across the mmap call
+
+    a.mov_ri(x86::RAX, e.target.sys_mmap as u64);
+    a.xor_rr(x86::RDI, x86::RDI);
+    a.mov_ri(x86::RSI, (TCB_SIZE + THREAD_STACK_SIZE) as u64);
+    a.mov_ri(x86::RDX, 3u64);
+    a.mov_ri(x86::R10, e.target.map_anon_private as u64);
+    a.mov_ri(x86::R8, U64_ALL_ONES);
+    a.xor_rr(x86::R9, x86::R9);
+    a.syscall();
+
+    let ok = a.new_label("thread_stack_ok");
+    a.cmp_ri(x86::RAX, 4096);
+    a.jcc(x86::ABOVE_EQUAL, ok);
+    runtime::trap_with(e, e.out_of_memory_msg);
+    a.bind(ok);
+
+    // rax is the mapping: the control block first, the stack above it growing down from the
+    // far end.
+    a.mov_mi(x86::at(x86::RAX, TCB_STATE_OFF), THREAD_READY);
+    a.mov_mi(x86::at(x86::RAX, TCB_JOINED_OFF), 0);
+    a.mov_mr(x86::at(x86::RAX, TCB_CLOSURE_OFF), x86::RBX);
+    a.mov_mr(x86::at(x86::RAX, TCB_STACK_BASE_OFF), x86::RAX);
+    a.mov_mi(x86::at(x86::RAX, TCB_RESULT_OFF), 0);
+    a.mov_mi(x86::at(x86::RAX, TCB_TAKEN_OFF), 0);
+    a.mov_mi(x86::at(x86::RAX, TCB_TAKEN_IS_REF_OFF), 0);
+    a.mov_mi(x86::at(x86::RAX, TCB_BLOCKED_OFF), 0);
+
+    // The stack pointer starts at the top of the mapping, 16-byte aligned, and is then primed
+    // with what the switch's tail expects to find: six saved registers and a return address
+    // it will `ret` into.
+    a.mov_rr(x86::RCX, x86::RAX);
+    a.add_ri(x86::RCX, TCB_SIZE + THREAD_STACK_SIZE);
+    a.and_ri(x86::RCX, 0 - 16);
+
+    // The trampoline's address, as the address `ret` will jump to.
+    a.lea_label(x86::RDX, e.rt.thread_entry);
+    a.sub_ri(x86::RCX, emitter::WORD_SIZE);
+    a.mov_mr(x86::at(x86::RCX, 0), x86::RDX);
+
+    // Six callee-saved slots beneath it, in the order the switch pops them: rbx, rbp, r12,
+    // r13, r14 and finally r15, which is popped first and therefore sits lowest.
+    //
+    // Five of them may hold anything -- the trampoline reads its thread from the runtime
+    // block, not from a register -- but the *slots* must exist, because the switch pops six
+    // words before it returns. r15 is the exception and must be primed with the runtime block
+    // itself (ADR-0018 reserves it): a new thread whose r15 popped as zero would dereference
+    // null in the trampoline's first instruction.
+    let mut i = 0;
+    while i < 6 {
+        a.sub_ri(x86::RCX, emitter::WORD_SIZE);
+        a.mov_mi(x86::at(x86::RCX, 0), 0);
+        i = i + 1;
+    }
+    a.mov_mr(x86::at(x86::RCX, 0), x86::R15);
+    a.mov_mr(x86::at(x86::RAX, TCB_RSP_OFF), x86::RCX);
+    a.mov_mr(x86::at(x86::RAX, TCB_RBP_OFF), x86::RCX);
+
+    // Link it onto the list of every thread, which the collector walks for roots.
+    a.mov_rm(x86::RDX, x86::at(x86::R15, emitter::RT_THREADS_OFF));
+    a.mov_mr(x86::at(x86::RAX, TCB_NEXT_OFF), x86::RDX);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_THREADS_OFF), x86::RAX);
+
+    a.pop(x86::RBX);
+    a.ret();
+}
+
+/// The trampoline a new thread's primed stack returns into.
+///
+/// It is never called: the switch pops six saved registers and executes `ret`, and the
+/// address this label names is what was placed where that `ret` looks. So it begins with no
+/// arguments, no return address of its own, and a stack that is otherwise empty --
+/// everything it needs comes from the runtime block.
+pub fn emit_thread_entry(e: emitter::Emitter) {
+    let a = e.a;
+    a.bind(e.rt.thread_entry);
+
+    // The thread that was switched into is the current one, by definition of the switch.
+    a.mov_rm(x86::RBX, x86::at(x86::R15, emitter::RT_CURRENT_OFF));
+    a.mov_mi(x86::at(x86::RBX, TCB_STATE_OFF), THREAD_RUNNING);
+
+    // Call the closure exactly as the closure-call lowering does, because the body was
+    // compiled expecting that and nothing else: the code address comes out of the object's
+    // first field, and the object itself goes on the stack just above the return address,
+    // where a capture read reads it. Twice, for the alignment a call wants.
+    //
+    // Passing it in rdi instead -- which this did, on the strength of a stale reading of
+    // ADR-0020 -- works for exactly as long as the spawned closure captures nothing. The
+    // first one that captured a value read its capture from whatever the stack happened to
+    // hold, which was zero.
+    a.mov_rm(x86::RDI, x86::at(x86::RBX, TCB_CLOSURE_OFF));
+    a.mov_rm(x86::RAX, x86::at(x86::RDI, emitter::OBJ_HEADER_SIZE));
+    a.push(x86::RDI);
+    a.push(x86::RDI);
+    a.call_reg(x86::RAX);
+    a.add_ri(x86::RSP, 16);
+
+    // Publish the result before the state, so that a thread observing `done` never reads a
+    // result that has not been written. Only one thread runs at a time here, so this is
+    // ordering for the reader's sake rather than against a race.
+    a.mov_rm(x86::RBX, x86::at(x86::R15, emitter::RT_CURRENT_OFF));
+    a.mov_mr(x86::at(x86::RBX, TCB_RESULT_OFF), x86::RAX);
+    a.mov_mi(x86::at(x86::RBX, TCB_STATE_OFF), THREAD_DONE);
+
+    // Finishing is a state change like any other, so everyone waiting gets to re-check:
+    // whoever joined this thread, and `main`'s own drain loop, which is waiting for exactly
+    // this.
+    a.call(e.rt.sched_wake_all);
+
+    // Hand the processor to whoever can use it. A finished thread never runs again, so this
+    // switch does not return and the outgoing save is only bookkeeping.
+    let stuck = a.new_label("entry_stuck");
+    a.call(e.rt.sched_next);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, stuck);
+    a.mov_rr(x86::RSI, x86::RAX);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_CURRENT_OFF), x86::RSI);
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.call(e.rt.thread_switch);
+
+    // Unreachable: nothing ever switches back into a finished thread. If the scheduler ever
+    // did, stopping is better than running off the end of the trampoline into whatever
+    // follows it (process rule 8).
+    a.ud2();
+
+    // The wake above makes `main` runnable whatever it was waiting for, and `main` is never
+    // marked done, so a finished thread always has somewhere to go. Reaching this would mean
+    // the thread list itself is wrong rather than that the program deadlocked.
+    a.bind(stuck);
+    runtime::trap_with(e, e.deadlock_msg);
+}
+
+/// `rt_spawn(closure rdi, result_is_ref rsi) -> tcb rax`.
+///
+/// Creating a thread does not start it. Spec section 12 says `spawn` returns immediately and
+/// the handle is the only way to observe the result, so the new thread sits `ready` until
+/// something switches into it.
+pub fn emit_thread_spawn(e: emitter::Emitter) {
+    let a = e.a;
+    a.bind(e.rt.thread_spawn);
+
+    a.push(x86::RBX);
+    a.mov_rr(x86::RBX, x86::RSI); // result_is_ref, across the call
+    a.call(e.rt.thread_new);
+    a.mov_mr(x86::at(x86::RAX, TCB_RESULT_IS_REF_OFF), x86::RBX);
+    a.pop(x86::RBX);
+    a.ret();
+}
+
+/// `rt_join(tcb rdi) -> status rax, result rdx`.
+///
+/// Waiting for a thread is the same shape as waiting for anything else: block, hand the
+/// processor to the scheduler, and re-check on the way back. It does not run the thread it is
+/// waiting for -- a joined thread may itself park on a channel, and then the joiner running
+/// it would be waiting for a thread that is waiting for a third.
+///
+/// The status says what the caller must trap on, rather than trapping here: a runtime routine
+/// has no span, and the spec's messages name the user's own line.
+///
+/// The full prologue is load-bearing, not habit. This frame is what a parked joining thread's
+/// stack chain starts at, and the collector reads a frame it finds no stack-map entry for as
+/// the synthetic runtime entry: no roots of its own, all four callee-saved registers pushed.
+/// Without the `push rbp` this frame would not exist in the chain at all, the saved rbp would
+/// be the *caller's*, and that caller -- ordinary Origin code, holding its own live
+/// references -- would be described by the synthetic entry instead of by its own. Its roots
+/// would then never be evacuated, silently, exactly while another thread is allocating hard
+/// enough to move them.
+pub fn emit_thread_join(e: emitter::Emitter) {
+    let a = e.a;
+    a.bind(e.rt.thread_join);
+
+    sched::runtime_prologue(e);
+    a.mov_rr(x86::RBX, x86::RDI); // the thread being joined
+    a.mov_rm(x86::R12, x86::at(x86::R15, emitter::RT_CURRENT_OFF)); // this one
+
+    // Joining twice is a programming error, like sending on a closed channel: the second call
+    // would otherwise block forever on a thread that already finished.
+    let refused = a.new_label("join_refused");
+    let stuck = a.new_label("join_stuck");
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, TCB_JOINED_OFF));
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, refused);
+    a.mov_mi(x86::at(x86::RBX, TCB_JOINED_OFF), 1);
+
+    let loop_top = a.new_label("join_loop");
+    let done = a.new_label("join_done");
+    a.bind(loop_top);
+    a.mov_rm(x86::RAX, x86::at(x86::RBX, TCB_STATE_OFF));
+    a.cmp_ri(x86::RAX, THREAD_DONE);
+    a.jcc(x86::EQUAL, done);
+
+    a.mov_mi(x86::at(x86::R12, TCB_BLOCKED_OFF), 1);
+    a.call(e.rt.sched_park);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, stuck);
+    a.jmp(loop_top);
+
+    a.bind(done);
+    a.mov_rm(x86::RDX, x86::at(x86::RBX, TCB_RESULT_OFF));
+    a.xor_rr(x86::RAX, x86::RAX);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(refused);
+    a.mov_ri(x86::RAX, sched::REFUSED as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    sched::runtime_epilogue(e);
+    a.ret();
+
+    a.bind(stuck);
+    a.mov_ri(x86::RAX, sched::DEADLOCK as u64);
+    a.xor_rr(x86::RDX, x86::RDX);
+    sched::runtime_epilogue(e);
+    a.ret();
+}
+
+/// Gives the program's first thread a control block of its own.
+///
+/// It has no stack to map -- the kernel gave it one -- but it needs the block, because every
+/// switch names two threads and the collector needs somewhere to record where this one parked
+/// while another runs. Called from the entry point before `main`.
+pub fn emit_main_thread(e: emitter::Emitter) {
+    let a = e.a;
+    a.bind(e.rt.thread_main);
+
+    // mmap one page: a control block, no stack.
+    a.mov_ri(x86::RAX, e.target.sys_mmap as u64);
+    a.xor_rr(x86::RDI, x86::RDI);
+    a.mov_ri(x86::RSI, 4096u64);
+    a.mov_ri(x86::RDX, 3u64);
+    a.mov_ri(x86::R10, e.target.map_anon_private as u64);
+    a.mov_ri(x86::R8, U64_ALL_ONES);
+    a.xor_rr(x86::R9, x86::R9);
+    a.syscall();
+
+    let ok = a.new_label("main_tcb_ok");
+    a.cmp_ri(x86::RAX, 4096);
+    a.jcc(x86::ABOVE_EQUAL, ok);
+    runtime::trap_with(e, e.out_of_memory_msg);
+    a.bind(ok);
+
+    a.mov_mi(x86::at(x86::RAX, TCB_STATE_OFF), THREAD_RUNNING);
+    a.mov_mi(x86::at(x86::RAX, TCB_JOINED_OFF), 1); // nothing joins main
+    a.mov_mi(x86::at(x86::RAX, TCB_CLOSURE_OFF), 0);
+    a.mov_mi(x86::at(x86::RAX, TCB_RESULT_OFF), 0);
+    a.mov_mi(x86::at(x86::RAX, TCB_RESULT_IS_REF_OFF), 0);
+    a.mov_mi(x86::at(x86::RAX, TCB_TAKEN_OFF), 0);
+    a.mov_mi(x86::at(x86::RAX, TCB_TAKEN_IS_REF_OFF), 0);
+    a.mov_mi(x86::at(x86::RAX, TCB_BLOCKED_OFF), 0);
+    // Main goes on the thread list like every other thread. The walk skips whichever thread
+    // is running, so listing main costs nothing while main is the thread that allocated --
+    // and while main is parked inside `join`, that list is the collector's only way to reach
+    // its stack at all. Leaving it off meant a spawned thread's collection never walked
+    // main's frames, so a list main held across the join was not evacuated and came back
+    // corrupt.
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_THREADS_OFF));
+    a.mov_mr(x86::at(x86::RAX, TCB_NEXT_OFF), x86::RCX);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_THREADS_OFF), x86::RAX);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_CURRENT_OFF), x86::RAX);
+    a.ret();
+}

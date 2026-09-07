@@ -1,0 +1,444 @@
+// The runtime's core routines, in hand-emitted machine code.
+//
+// A translation of `internal/backend/runtime.go`: the entry point, the bump allocator, the
+// `write` loop every output path goes through, the trap that ends a program, and the
+// decimal rendering of an integer. There is no libc (ADR-0017), so `syscall` is the only
+// way any of this reaches the operating system.
+
+use std::list;
+
+use emitter;
+use x86;
+
+/// When positive, forces a collection every that many successful allocations, on top of the
+/// ones running out of space causes. It is a debugging knob and zero in a shipped compiler:
+/// it makes a program allocate into a fresh semispace constantly, which is exactly what a
+/// lost root needs in order to be caught near where it was lost rather than thousands of
+/// allocations later.
+pub const DEBUG_COLLECT_EVERY: i64 = 0;
+
+/// Maps one semispace-sized anonymous, read-write, private region and leaves its address in
+/// rax, trapping with `out of memory` on failure. It is inlined at both of the entry
+/// point's two call sites (ADR-0022's two semispaces) rather than a callable routine, since
+/// the entry point runs before r15's own runtime block is fully written and this needs no
+/// calling convention beyond "leave the result in rax".
+fn mmap_heap(e: emitter::Emitter) {
+    let a = e.a;
+    // mmap(NULL, HEAP_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    a.mov_ri(x86::RAX, e.target.sys_mmap as u64);
+    a.xor_rr(x86::RDI, x86::RDI);
+    a.mov_ri(x86::RSI, emitter::HEAP_SIZE as u64);
+    a.mov_ri(x86::RDX, 3u64);
+    a.mov_ri(x86::R10, e.target.map_anon_private as u64);
+    a.mov_ri(x86::R8, U64_ALL_ONES);
+    a.xor_rr(x86::R9, x86::R9);
+    a.syscall();
+
+    // A failed mmap returns a small negative value rather than a pointer. Treating that as a
+    // heap would corrupt the first page of memory silently, so it traps.
+    let ok = a.new_label("heap_ok");
+    a.cmp_ri(x86::RAX, 4096);
+    a.jcc(x86::ABOVE_EQUAL, ok);
+    trap_with(e, e.out_of_memory_msg);
+    a.bind(ok);
+}
+
+/// The all-ones word, which `0u64 - 1u64` cannot produce because it traps.
+const U64_ALL_ONES: u64 = 18446744073709551615u64;
+
+/// The program's entry point: claim a heap, call `main`, exit cleanly.
+pub fn emit_start(e: emitter::Emitter, main_label: x86::Label) {
+    let a = e.a;
+    a.bind(e.rt.start);
+
+    // r15 holds the runtime block for the rest of the program's life (ADR-0018 reserves
+    // it). The address is an immediate: the data segment's address was decided before a byte
+    // of code was emitted, so there is nothing to relocate.
+    a.mov_ri(x86::R15, e.data_addr as u64);
+
+    // Two semispaces (ADR-0022): the first becomes the current space, the second is the
+    // collector's destination on the first collection. `syscall` clobbers only rcx and r11,
+    // never rbx, so the first mmap's result survives in rbx across the second call.
+    mmap_heap(e);
+    a.mov_rr(x86::RBX, x86::RAX);
+    mmap_heap(e);
+
+    a.mov_mr(x86::at(x86::R15, emitter::RT_BUMP_OFF), x86::RBX);
+    a.mov_rr(x86::RCX, x86::RBX);
+    a.add_ri(x86::RCX, emitter::HEAP_SIZE);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_END_OFF), x86::RCX);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_OTHER_START_OFF), x86::RAX);
+    if DEBUG_COLLECT_EVERY > 0 {
+        a.mov_mi(x86::at(x86::R15, emitter::RT_GC_COUNTDOWN_OFF), DEBUG_COLLECT_EVERY);
+    }
+
+    // The kernel hands over a 16-byte aligned stack with argc on top. That address is the
+    // argument vector and this is the only moment it is known, so it is saved before the
+    // alignment below moves rsp away from it (spec/17-process.md).
+    a.mov_mr(x86::at(x86::R15, emitter::RT_ARGV_OFF), x86::RSP);
+
+    // Origin's `main` takes no arguments, and every call site keeps the alignment the ABI
+    // requires, so aligning once here is enough.
+    a.and_ri(x86::RSP, 0 - 16);
+
+    // Main needs a control block of its own before any thread can switch away from it: every
+    // switch names two threads, and the collector needs somewhere to record where this one
+    // parked while another runs.
+    a.call(e.rt.thread_main);
+
+    // The collector's rbp-chain walk (ADR-0022) stops when a frame's saved caller-rbp is
+    // zero. `main`'s own prologue pushes whatever is in rbp right now as that first saved
+    // value, so clearing it here is what gives the walk a well-defined end after main's own
+    // frame, rather than however this routine's own rbp happens to be left.
+    a.xor_rr(x86::RBP, x86::RBP);
+
+    a.call(main_label);
+
+    // Spec section 12: `main` returning ends the program only once every spawned thread has
+    // finished. A thread nobody joined has had no reason to run before now, and one that
+    // parked on a channel is still waiting to be woken; the drain loop runs both to
+    // completion.
+    a.call(e.rt.sched_drain);
+
+    a.mov_ri(x86::RAX, e.target.sys_exit as u64);
+    a.xor_rr(x86::RDI, x86::RDI);
+    a.syscall();
+    a.ud2();
+}
+
+/// The bump allocator: rdi = payload words, rsi = type id, result in rax.
+///
+/// When the bump pointer would exceed the current semispace, it collects once (ADR-0022) and
+/// retries the very same allocation; only a request that still does not fit after a real
+/// collection traps with `out of memory`.
+pub fn emit_alloc(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.alloc);
+
+    // total = header + words*8
+    a.mov_rr(x86::RCX, x86::RDI);
+    a.shl_i(x86::RCX, 3);
+    a.add_ri(x86::RCX, emitter::OBJ_HEADER_SIZE);
+
+    a.mov_rm(x86::RAX, x86::at(x86::R15, emitter::RT_BUMP_OFF)); // the object's address
+    a.mov_rr(x86::RDX, x86::RAX);
+    a.add_rr(x86::RDX, x86::RCX); // rdx = the new bump pointer
+
+    let fits = a.new_label("alloc_fits");
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_END_OFF));
+    a.cmp_rr(x86::RDX, x86::RCX);
+    if DEBUG_COLLECT_EVERY > 0 {
+        // The debugging knob: it fits, but count the allocation down and collect anyway when
+        // the count runs out. A lost root is a rare coincidence of one collection landing at
+        // one moment; forcing them every few allocations turns the whole class into
+        // something a small program reproduces.
+        let countdown = a.new_label("alloc_countdown");
+        a.jcc(x86::ABOVE, countdown); // does not fit: collect, as always
+        a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_GC_COUNTDOWN_OFF));
+        a.sub_ri(x86::RCX, 1);
+        a.mov_mr(x86::at(x86::R15, emitter::RT_GC_COUNTDOWN_OFF), x86::RCX);
+        a.test_rr(x86::RCX, x86::RCX);
+        a.jcc(x86::NOT_EQUAL, fits);
+        a.mov_mi(x86::at(x86::R15, emitter::RT_GC_COUNTDOWN_OFF), DEBUG_COLLECT_EVERY);
+        a.bind(countdown);
+    } else {
+        a.jcc(x86::BELOW_EQUAL, fits);
+    }
+
+    // Doesn't fit: collect once and retry. The collector's own calling convention (ADR-0022)
+    // takes the caller of `alloc` as its first frame to walk: r9 names its return address,
+    // and rbp is already exactly its rbp, since nothing above this point has touched either.
+    // rdi/rsi (words/typeid) do not survive a call on their own -- collect clobbers every
+    // caller-saved register reaching into everything it calls -- so they are pushed across it
+    // and popped back before the retry.
+    a.mov_rm(x86::R9, x86::at(x86::RSP, 0));
+    a.push(x86::RDI);
+    a.push(x86::RSI);
+    a.call(e.rt.collect);
+    a.pop(x86::RSI);
+    a.pop(x86::RDI);
+
+    a.mov_rr(x86::RCX, x86::RDI);
+    a.shl_i(x86::RCX, 3);
+    a.add_ri(x86::RCX, emitter::OBJ_HEADER_SIZE);
+    a.mov_rm(x86::RAX, x86::at(x86::R15, emitter::RT_BUMP_OFF));
+    a.mov_rr(x86::RDX, x86::RAX);
+    a.add_rr(x86::RDX, x86::RCX);
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_END_OFF));
+    a.cmp_rr(x86::RDX, x86::RCX);
+    a.jcc(x86::BELOW_EQUAL, fits);
+    trap_with(e, e.out_of_memory_msg);
+
+    a.bind(fits);
+    a.mov_mr(x86::at(x86::R15, emitter::RT_BUMP_OFF), x86::RDX);
+
+    // The header is the type id in the low 32 bits and the payload size in words at bit 32,
+    // exactly as the layout module packs it for the collector.
+    a.mov_rr(x86::RCX, x86::RDI);
+    a.shl_i(x86::RCX, 32);
+    a.or_rr(x86::RCX, x86::RSI);
+    a.mov_mr(x86::at(x86::RAX, 0), x86::RCX);
+    a.ret();
+}
+
+/// `write(fd = rdi, buf = rsi, len = rdx)`, looping until the whole buffer is gone.
+///
+/// The loop is the point. A single `write` may transfer less than it was given -- a large
+/// program's output down a pipe does exactly that -- and a runtime that ignores the return
+/// value truncates output that the interpreter would have printed in full. The end-to-end
+/// differential compares the three engines byte for byte, so a short write is a
+/// miscompilation like any other.
+pub fn emit_write(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.write);
+
+    let loop_top = a.new_label("write_loop");
+    let done = a.new_label("write_done");
+
+    a.bind(loop_top);
+    a.test_rr(x86::RDX, x86::RDX);
+    a.jcc(x86::EQUAL, done);
+
+    // The syscall clobbers rcx and r11, so fd is kept in r8 across it.
+    a.mov_rr(x86::R8, x86::RDI);
+    a.mov_ri(x86::RAX, e.target.sys_write as u64);
+    a.syscall();
+
+    // A negative result is an error. There is nowhere useful to report it -- stderr may be
+    // what just failed -- so the program exits non-zero rather than looping forever.
+    let failed = a.new_label("write_failed");
+    a.cmp_ri(x86::RAX, 0);
+    a.jcc(x86::LESS_EQUAL, failed);
+
+    a.add_rr(x86::RSI, x86::RAX);
+    a.sub_rr(x86::RDX, x86::RAX);
+    a.mov_rr(x86::RDI, x86::R8);
+    a.jmp(loop_top);
+
+    a.bind(failed);
+    a.mov_ri(x86::RAX, e.target.sys_exit as u64);
+    a.mov_ri(x86::RDI, 1u64);
+    a.syscall();
+    a.ud2();
+
+    a.bind(done);
+    a.ret();
+}
+
+/// Writes a message to stderr and exits 101: rdi = message, rsi = length.
+///
+/// The message is already complete in read-only data -- `origin: divide by zero at
+/// file.origin:6:13` -- because every trap site's span is known while compiling. The runtime
+/// does no formatting, and the text matches what the interpreter and the virtual machine
+/// print, which is what lets the end-to-end suite compare all three.
+pub fn emit_trap(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.trap);
+
+    a.mov_rr(x86::RDX, x86::RSI);
+    a.mov_rr(x86::RSI, x86::RDI);
+    a.mov_ri(x86::RDI, 2u64);
+    a.call(e.rt.write);
+
+    a.mov_ri(x86::RAX, e.target.sys_exit as u64);
+    a.mov_ri(x86::RDI, 101u64);
+    a.syscall();
+    a.ud2();
+}
+
+/// Renders a 64-bit integer as decimal into a fresh String: rdi = the integer, rsi =
+/// non-zero when those bits are to be read as signed, result in rax.
+///
+/// The signedness is an argument rather than two routines because only the sign test
+/// differs: `u64::MAX` and `-1i64` are the same sixty-four bits and the caller's static type
+/// is the only thing that says which number they are.
+pub fn emit_int_to_str(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.int_to_str);
+
+    a.push(x86::RBP);
+    a.mov_rr(x86::RBP, x86::RSP);
+    a.push(x86::RBX);
+    a.push(x86::R12);
+    a.push(x86::R13);
+    a.push(x86::R14);
+    a.sub_ri(x86::RSP, 32); // the digit buffer: 20 digits and a sign fit in 21 bytes
+
+    // r12 walks backwards from the end of the buffer; r13 remembers the end.
+    a.mov_rr(x86::R12, x86::RSP);
+    a.add_ri(x86::R12, 32);
+    a.mov_rr(x86::R13, x86::R12);
+
+    // r14 records whether a minus sign is owed. The magnitude is produced by negating into
+    // *unsigned* bits: negating the most negative integer leaves its own bit pattern, which
+    // read as unsigned is exactly its magnitude, so the digits come out right with no special
+    // case.
+    a.xor_rr(x86::R14, x86::R14);
+    a.mov_rr(x86::RAX, x86::RDI);
+    let not_neg = a.new_label("not_negative");
+    a.test_rr(x86::RSI, x86::RSI);
+    a.jcc(x86::EQUAL, not_neg); // unsigned: never a sign, and the digits are already right
+    a.cmp_ri(x86::RAX, 0);
+    a.jcc(x86::GREATER_EQUAL, not_neg);
+    a.neg_r(x86::RAX);
+    a.mov_ri(x86::R14, 1u64);
+    a.bind(not_neg);
+
+    let digits = a.new_label("digit_loop");
+    a.mov_ri(x86::RBX, 10u64);
+    a.bind(digits);
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.div_r(x86::RBX); // unsigned: rax = quotient, rdx = remainder
+    a.add_ri(x86::RDX, 48); // '0'
+    a.sub_ri(x86::R12, 1);
+    a.mov_mr8(x86::at(x86::R12, 0), x86::RDX);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::NOT_EQUAL, digits);
+
+    let no_sign = a.new_label("no_sign");
+    a.test_rr(x86::R14, x86::R14);
+    a.jcc(x86::EQUAL, no_sign);
+    a.sub_ri(x86::R12, 1);
+    a.mov_ri(x86::RDX, 45u64); // '-'
+    a.mov_mr8(x86::at(x86::R12, 0), x86::RDX);
+    a.bind(no_sign);
+
+    // rbx = length in bytes.
+    a.mov_rr(x86::RBX, x86::R13);
+    a.sub_rr(x86::RBX, x86::R12);
+
+    // words = 1 length word + ceil(len/8) byte words.
+    a.mov_rr(x86::RDI, x86::RBX);
+    a.add_ri(x86::RDI, 7);
+    a.shr_i(x86::RDI, 3);
+    a.add_ri(x86::RDI, 1);
+    a.mov_ri(x86::RSI, e.string_type as u64);
+    a.call(e.rt.alloc);
+
+    a.mov_mr(x86::at(x86::RAX, emitter::OBJ_HEADER_SIZE), x86::RBX); // the length word
+
+    // Copy the digits into place, one byte at a time: the source is somewhere in the middle
+    // of a stack buffer, so there is no alignment to exploit.
+    a.mov_rr(x86::RCX, x86::RAX);
+    a.add_ri(x86::RCX, emitter::STR_BYTES_OFF);
+    let copy_loop = a.new_label("copy_loop");
+    let copy_done = a.new_label("copy_done");
+    a.bind(copy_loop);
+    a.cmp_rr(x86::R12, x86::R13);
+    a.jcc(x86::ABOVE_EQUAL, copy_done);
+    a.mov_rm8(x86::RDX, x86::at(x86::R12, 0));
+    a.mov_mr8(x86::at(x86::RCX, 0), x86::RDX);
+    a.add_ri(x86::R12, 1);
+    a.add_ri(x86::RCX, 1);
+    a.jmp(copy_loop);
+    a.bind(copy_done);
+
+    a.add_ri(x86::RSP, 32);
+    a.pop(x86::R14);
+    a.pop(x86::R13);
+    a.pop(x86::R12);
+    a.pop(x86::RBX);
+    a.pop(x86::RBP);
+    a.ret();
+}
+
+/// Writes a String to stdout, with and without a trailing newline. The two entry points
+/// share a body: `println` sets a flag and falls into `print`.
+pub fn emit_print(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+
+    a.bind(e.rt.println);
+    a.mov_ri(x86::RCX, 1u64);
+    let body = a.new_label("print_body");
+    a.jmp(body);
+
+    a.bind(e.rt.print);
+    a.xor_rr(x86::RCX, x86::RCX);
+
+    a.bind(body);
+    a.push(x86::RBP);
+    a.mov_rr(x86::RBP, x86::RSP);
+    a.push(x86::RBX);
+    a.push(x86::R12);
+    a.sub_ri(x86::RSP, 8); // keep rsp 16-byte aligned across the calls below
+
+    a.mov_rr(x86::R12, x86::RCX); // the newline flag, saved across the write
+
+    a.mov_rm(x86::RDX, x86::at(x86::RDI, emitter::OBJ_HEADER_SIZE)); // length
+    a.mov_rr(x86::RSI, x86::RDI);
+    a.add_ri(x86::RSI, emitter::STR_BYTES_OFF);
+    a.mov_ri(x86::RDI, 1u64);
+    a.call(e.rt.write);
+
+    let done = a.new_label("print_done");
+    a.test_rr(x86::R12, x86::R12);
+    a.jcc(x86::EQUAL, done);
+    a.mov_ri(x86::RDI, 1u64);
+    a.mov_ri(x86::RSI, e.newline_addr as u64);
+    a.mov_ri(x86::RDX, 1u64);
+    a.call(e.rt.write);
+
+    a.bind(done);
+    a.add_ri(x86::RSP, 8);
+    a.pop(x86::R12);
+    a.pop(x86::RBX);
+    a.pop(x86::RBP);
+    a.ret();
+}
+
+/// Reports a `panic` and exits 101: rdi = the message String, rsi = the address of the
+/// site's ` at file:line:col` suffix, rdx = its length.
+///
+/// Unlike every other trap, a panic's text is not a constant: the message is a String the
+/// program computed. Only the two ends are known while compiling, so the runtime writes three
+/// pieces and the result reads exactly as the interpreter's does.
+pub fn emit_panic(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.panic);
+
+    a.push(x86::RBP);
+    a.mov_rr(x86::RBP, x86::RSP);
+    a.push(x86::RBX);
+    a.push(x86::R12);
+    a.push(x86::R13);
+    a.push(x86::R14);
+
+    a.mov_rr(x86::RBX, x86::RDI); // the message
+    a.mov_rr(x86::R12, x86::RSI); // the suffix
+    a.mov_rr(x86::R13, x86::RDX);
+
+    a.mov_ri(x86::RDI, 2u64);
+    a.mov_ri(x86::RSI, e.panic_prefix.addr as u64);
+    a.mov_ri(x86::RDX, e.panic_prefix.length as u64);
+    a.call(e.rt.write);
+
+    a.mov_ri(x86::RDI, 2u64);
+    a.mov_rr(x86::RSI, x86::RBX);
+    a.add_ri(x86::RSI, emitter::STR_BYTES_OFF);
+    a.mov_rm(x86::RDX, x86::at(x86::RBX, emitter::OBJ_HEADER_SIZE));
+    a.call(e.rt.write);
+
+    a.mov_ri(x86::RDI, 2u64);
+    a.mov_rr(x86::RSI, x86::R12);
+    a.mov_rr(x86::RDX, x86::R13);
+    a.call(e.rt.write);
+
+    a.mov_ri(x86::RAX, e.target.sys_exit as u64);
+    a.mov_ri(x86::RDI, 101u64);
+    a.syscall();
+    a.ud2();
+}
+
+/// An unconditional trap with a message already in read-only data.
+pub fn trap_with(e: emitter::Emitter, msg: emitter::StaticStr) {
+    e.a.mov_ri(x86::RDI, msg.addr as u64);
+    e.a.mov_ri(x86::RSI, msg.length as u64);
+    e.a.call(e.rt.trap);
+    e.a.ud2();
+}
