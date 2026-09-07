@@ -27,6 +27,16 @@ pub struct File {
     starts: List[i64],
 }
 
+/// The name the prelude is known by, whatever path it was read from.
+///
+/// It is load-bearing rather than cosmetic, which is why it is a constant and not the file's
+/// own path: the Go compiler decides "was this declared in the prelude?" by comparing this
+/// exact name, and so must anything that means to be the same compiler. It lives here, with
+/// file identity, because three readers now need it -- the driver that loads the prelude, the
+/// checker that asks whether a declaration came from it, and the backend, which re-reports a
+/// trap at the innermost frame whose call site was *not* written in it.
+pub const PRELUDE_NAME: String = "<prelude>";
+
 /// Indexes `src` for position lookup. `name` appears verbatim in diagnostics.
 pub fn file(name: String, src: String) -> File {
     let starts = list::new[i64]();

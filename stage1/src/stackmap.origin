@@ -1,0 +1,159 @@
+// The stack map: which frame slots and which registers hold a live reference at each call
+// site.
+//
+// A translation of `internal/backend/stackmap.go`. The entry's own shape is `layout.origin`'s
+// (process rule 5): this module records the entries and writes the table, and
+// `rt_lookup_stack_map` reads it back.
+
+use std::list;
+use std::map;
+
+use emitter;
+use ir;
+use layout;
+use regalloc;
+use spans;
+use x86;
+
+/// Marks the address immediately after a call instruction as a safepoint, naming which
+/// callee-saved registers hold a live reference at that exact point (ADR-0021) and where the
+/// current function's own reference-kind spill slots are.
+///
+/// `v` is the IR value whose lowering just emitted the call; every call site in the lowering
+/// has one in scope already.
+///
+/// The runtime routines' own internal calls -- write, trap, panic, and everything inside the
+/// runtime itself -- are deliberately not covered here. None of them ever holds an
+/// Origin-level reference of its own to report, and trap and panic never return to Origin
+/// code at all, so a collection can never resume at their return address. Reaching one of
+/// those frames while walking the call stack is the collector's own problem to solve (skip it
+/// structurally via its saved rbp), not a gap in this table.
+pub fn record_call(e: emitter::Emitter, fs: FnState, v: ir::Value) {
+    let label = e.a.new_label("safepoint");
+    e.a.bind(label);
+    spans::record_user_span(e, v, label);
+
+    let mut mask = 0;
+    match fs.regs.call_site_regs.get(v.id) {
+        Option::Some(regs) => {
+            let mut i = 0;
+            while i < regs.len() {
+                mask = mask | (1 << callee_saved_bit(regs.at(i)));
+                i = i + 1;
+            }
+        },
+        Option::None => {},
+    }
+    e.safepoints.push(emitter::PendingSafepoint {
+        label: label,
+        entry: layout::StackMapEntry {
+            return_addr: 0,
+            ref_offset: fs.slot_base + emitter::WORD_SIZE,
+            ref_count: fs.regs.ref_slots,
+            reg_mask: mask,
+            saved_mask: saved_mask(fs),
+        },
+    })
+}
+
+/// The bit one callee-saved register occupies in a mask: rbx 0, r12 1, r13 2, r14 3 -- the
+/// fixed order the register allocator's own list never varies, and the order the prologue
+/// pushes them in, which is what makes a set bit's rank among the bits below it its push
+/// position.
+fn callee_saved_bit(r: i64) -> i64 {
+    if !regalloc::is_callee_saved(r) {
+        panic("a caller-saved register cannot hold a live reference at a call site");
+    }
+    if r == x86::RBX { return 0; }
+    if r == x86::R12 { return 1; }
+    if r == x86::R13 { return 2; }
+    3
+}
+
+/// Which callee-saved registers the current function's own prologue pushed -- a per-function
+/// fact recorded on every one of that function's call sites, since the stack map has no other
+/// place to name "the current function" from. The collector walking the rbp chain (ADR-0022)
+/// uses it to tell a live-but-untouched register (still the physical register, unchanged
+/// since the call) from one this function itself spilled to a fixed rbp-relative slot in its
+/// own prologue (the caller's original value, recovered from there instead).
+fn saved_mask(fs: FnState) -> i64 {
+    let mut mask = 0;
+    let mut i = 0;
+    while i < fs.regs.used.len() {
+        mask = mask | (1 << callee_saved_bit(fs.regs.used.at(i)));
+        i = i + 1;
+    }
+    mask
+}
+
+/// The per-function part of the lowering's state: what a call site needs to describe its own
+/// frame.
+///
+/// It is a struct of its own rather than more fields on the emitter because the emitter is
+/// whole-program state and this is not -- and because `record_call` is reached from the
+/// lowering of every instruction that calls anything, which is most of them.
+pub struct FnState {
+    pub mut func: ir::Func,
+    pub mut regs: regalloc::Alloc,
+    /// Where the spill slots begin: below the saved callee-saved registers.
+    pub mut slot_base: i64,
+    /// The frame's own size, after alignment.
+    pub mut frame: i64,
+    pub mut block_lbl: Map[i64, x86::Label],
+    pub mut epilogue: x86::Label,
+    /// The phi landing pads a conditional branch created, emitted after the blocks so that
+    /// no block falls through into one.
+    pub mut pending: List[Edge],
+    /// `record_line`'s dedupe state: a value's span produces a new row only when it names a
+    /// different line than the previous instruction's did.
+    pub mut last_debug_file: String,
+    pub mut last_debug_line: i64,
+}
+
+/// One control-flow edge that needs phi copies on it, and the pad they were put in.
+pub struct Edge {
+    pub label: x86::Label,
+    pub from: ir::Block,
+    pub to: ir::Block,
+}
+
+/// Resolves every recorded safepoint's return address (every label now bound, since every
+/// function's code has been emitted), sorts the table the way spec/11-codegen.md requires for
+/// a binary search, and appends it to read-only data.
+pub fn build_stack_map(e: emitter::Emitter) -> spans::Table {
+    let entries = list::new[layout::StackMapEntry]();
+    let mut i = 0;
+    while i < e.safepoints.len() {
+        let sp = e.safepoints.at(i);
+        let en = sp.entry;
+        en.return_addr = e.a.addr(sp.label);
+        entries.push(en);
+        i = i + 1;
+    }
+    sort_entries(entries);
+
+    let table = layout::encode_stack_map(entries);
+    let addr = e.ro_data_addr + e.ro_data.len();
+    let mut j = 0;
+    while j < table.len() {
+        e.ro_data.push(table.at(j));
+        j = j + 1;
+    }
+    spans::Table { addr: addr, count: entries.len() }
+}
+
+/// Sorts the entries by return address. An insertion sort, for the reason the span table's
+/// own gives: lowering walks the program forward, so the input is already nearly ordered.
+fn sort_entries(entries: List[layout::StackMapEntry]) {
+    let mut i = 1;
+    while i < entries.len() {
+        let x = entries.at(i);
+        let mut j = i - 1;
+        while j >= 0 && entries.at(j).return_addr > x.return_addr {
+            entries.set(j + 1, entries.at(j));
+            j = j - 1;
+        }
+        entries.set(j + 1, x);
+        i = i + 1;
+    }
+}

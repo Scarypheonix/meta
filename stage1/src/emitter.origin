@@ -11,9 +11,11 @@ use std::list;
 use std::map;
 use std::str;
 
+use ast;
 use bytecode;
 use layout;
 use obj;
+use source;
 use x86;
 
 /// The size of each of the two semispaces the runtime asks mmap for at start-up
@@ -181,6 +183,16 @@ pub struct Emitter {
     /// its constant-pool index, keyed by that text so one run of bytes is written once.
     pub literals: Map[String, StaticStr],
 
+    /// Every source file the program was built from, by the name an IR value's `file` gives.
+    /// It is what turns a span back into `file:line:col` -- the Go side reaches a
+    /// `source.File` through the span itself, and stage1's span is two integers.
+    pub files: Map[String, source::File],
+    /// Each call site whose safepoint the stack map will describe, awaiting the return
+    /// address only a bound label can give.
+    pub safepoints: List[PendingSafepoint],
+    /// Each call site a trap may be re-reported at: those written outside the prelude.
+    pub user_spans: List[PendingUserSpan],
+
     /// The base of the per-type layout table structural equality reads.
     pub mut type_table_addr: i64,
     /// The synthetic stack-map entry the collector's root walk substitutes when it reaches a
@@ -197,6 +209,37 @@ pub struct Emitter {
     /// The first thing that went wrong, or `""`.
     pub mut error: String,
 }
+
+/// One call site recorded during instruction lowering. Its return address is not known yet
+/// -- a label only resolves once every instruction that could come after it has been emitted
+/// -- so the label travels until the whole program's code exists and every one of them is
+/// resolved at once.
+pub struct PendingSafepoint {
+    pub label: x86::Label,
+    pub entry: layout::StackMapEntry,
+}
+
+/// One call site a trap may be re-reported at. Like a safepoint, its return address is a
+/// label that resolves only once every instruction after it exists.
+pub struct PendingUserSpan {
+    pub label: x86::Label,
+    pub text: StaticStr,
+}
+
+/// `file:line:col` for one IR value's span, or `<no span>`.
+///
+/// A span in stage1 is two byte offsets and the file's name; only the file itself can turn
+/// an offset into a line and a column, which is why the emitter carries them.
+pub fn span_text(e: Emitter, file: String, at: ast::Span) -> String {
+    match e.files.get(file) {
+        Option::Some(f) => f.locate(at.start),
+        Option::None => "<no span>",
+    }
+}
+
+/// Whether a span names the prelude rather than a file the programmer wrote, which is the
+/// same test the interpreter and the virtual machine make.
+pub fn is_prelude_span(file: String) -> bool { file == source::PRELUDE_NAME }
 
 /// Puts a bare run of bytes in read-only data: a trap message, which the runtime writes with
 /// `write` and never treats as an Origin value.

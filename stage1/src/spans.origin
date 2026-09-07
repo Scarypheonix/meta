@@ -1,0 +1,335 @@
+// Which line a runtime-raised trap names.
+//
+// A translation of `internal/backend/spans.go`.
+//
+// Most traps know their line while compiling: `divide by zero` is emitted at the division,
+// and `lower.origin` bakes the whole message, span and all, into read-only data. The
+// concurrency traps do not. `send on a closed channel` is discovered inside a runtime
+// routine, and the call that reached it was written in the *prelude* -- `Sender::send`
+// calling `chan::send_value` -- so the span the backend has at that point names a file the
+// programmer never opened.
+//
+// The other two engines answer this at run time: a trap whose span is in the prelude is
+// re-reported at the innermost frame whose call site is not. §12's worked examples are
+// written that way, so the three engines only agree if native code does the same thing. It
+// has the machinery already -- the collector walks the rbp chain and binary-searches a table
+// keyed by return address -- so this is that walk against a second table: one entry per call
+// site in user code, holding the text of its own span.
+//
+// `-O1` and above mostly settle this before the backend sees it: inlining a prelude method
+// rewrites its spans to the call site, which turns the trap back into one with a known line.
+// `-O0` inlines nothing, and the suite runs all three levels.
+
+use std::list;
+
+use emitter;
+use ir;
+use runtime;
+use sched;
+use x86;
+
+/// One row: the return address, and the address and length of the span's own text
+/// (`file.origin:12:5`, no message and no newline around it).
+pub const SPAN_ENTRY_WORDS: i64 = 3;
+
+/// Notes the call being lowered as one a trap may be re-reported at, unless it was written
+/// in the prelude -- the whole point of the walk is to skip those.
+///
+/// The label must be bound by the caller (`record_call` already binds one at the same address
+/// for the stack map, and both tables are keyed by exactly that address).
+pub fn record_user_span(e: emitter::Emitter, v: ir::Value, label: x86::Label) {
+    if emitter::is_prelude_span(v.file) { return; }
+    let text = emitter::raw_string(e, emitter::span_text(e, v.file, v.span));
+    e.user_spans.push(emitter::PendingUserSpan { label: label, text: text });
+}
+
+/// Resolves every recorded call site's return address and appends the sorted table to
+/// read-only data, exactly as the stack map's own builder does for safepoints.
+pub fn build_span_table(e: emitter::Emitter) -> Table {
+    let rows = list::new[Row]();
+    let mut i = 0;
+    while i < e.user_spans.len() {
+        let s = e.user_spans.at(i);
+        rows.push(Row { ret: e.a.addr(s.label), text: s.text.addr, length: s.text.length });
+        i = i + 1;
+    }
+    sort_rows(rows);
+
+    let addr = e.ro_data_addr + e.ro_data.len();
+    let mut j = 0;
+    while j < rows.len() {
+        let r = rows.at(j);
+        emitter::put_u64(e.ro_data, r.ret);
+        emitter::put_u64(e.ro_data, r.text);
+        emitter::put_u64(e.ro_data, r.length);
+        j = j + 1;
+    }
+    Table { addr: addr, count: rows.len() }
+}
+
+/// One resolved row, before it is written out.
+struct Row {
+    pub ret: i64,
+    pub text: i64,
+    pub length: i64,
+}
+
+/// Where a table landed and how many rows it has, for the runtime block's own two fields.
+pub struct Table {
+    pub addr: i64,
+    pub count: i64,
+}
+
+/// Sorts the rows by return address, which is what makes the binary search legal.
+///
+/// An insertion sort: the rows arrive nearly in address order already, since lowering walks
+/// the program forward, so this is close to linear on the input it actually gets.
+fn sort_rows(rows: List[Row]) {
+    let mut i = 1;
+    while i < rows.len() {
+        let x = rows.at(i);
+        let mut j = i - 1;
+        while j >= 0 && rows.at(j).ret > x.ret {
+            rows.set(j + 1, rows.at(j));
+            j = j - 1;
+        }
+        rows.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+/// Writes `rt_trap_span(prefix rdi, prefix_len rsi)`: report a trap whose message is known
+/// but whose line is not, and exit 101.
+///
+/// The prefix is the whole message up to and including " at ", so this appends a location and
+/// a newline and the result reads exactly as a compile-time trap message does.
+pub fn emit_trap_span(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.trap_span);
+
+    sched::runtime_prologue(e);
+    a.mov_rr(x86::R12, x86::RDI); // the prefix, across every call below
+    a.mov_rr(x86::R13, x86::RSI);
+
+    // r14 and rbx end up holding the location's text.
+    a.mov_rr(x86::RDI, x86::RBP);
+    a.call(e.rt.span_here);
+    a.mov_rr(x86::R14, x86::RAX);
+    a.mov_rr(x86::RBX, x86::RDX);
+
+    a.mov_ri(x86::RDI, 2u64);
+    a.mov_rr(x86::RSI, x86::R12);
+    a.mov_rr(x86::RDX, x86::R13);
+    a.call(e.rt.write);
+
+    a.mov_ri(x86::RDI, 2u64);
+    a.mov_rr(x86::RSI, x86::R14);
+    a.mov_rr(x86::RDX, x86::RBX);
+    a.call(e.rt.write);
+
+    a.mov_ri(x86::RDI, 2u64);
+    a.mov_ri(x86::RSI, e.newline_addr as u64);
+    a.mov_ri(x86::RDX, 1u64);
+    a.call(e.rt.write);
+
+    a.mov_ri(x86::RAX, e.target.sys_exit as u64);
+    a.mov_ri(x86::RDI, 101u64);
+    a.syscall();
+    a.ud2();
+}
+
+/// Writes `rt_span_here(rbp rdi) -> rax, rdx`: the text of the innermost user-code call site
+/// at or below the frame it is given, and its length.
+///
+/// It walks out from that frame until a return address turns up in the span table, which
+/// holds user-code call sites only -- so the first hit is the innermost frame the programmer
+/// wrote. A frame with no entry is skipped rather than stopping the walk: the routines
+/// between here and user code are the prelude's and the runtime's own. When nothing matches,
+/// the answer is `<runtime>`, which is honest.
+///
+/// It is a routine of its own because two callers need the same walk: a trap whose message is
+/// a compile-time constant (`rt_trap_span`) and `panic`, whose message is a String the program
+/// computed (`rt_panic_span`). One walk, one place to be wrong about frame layout.
+pub fn emit_span_here(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.span_here);
+
+    a.push(x86::RBP);
+    a.mov_rr(x86::RBP, x86::RSP);
+    a.push(x86::RBX);
+    a.push(x86::R12);
+
+    a.mov_rr(x86::RBX, x86::RDI); // the frame to start from
+
+    // The fallback, if no frame on the way out was written in user code.
+    a.mov_ri(x86::R12, e.runtime_loc_msg.addr as u64);
+    a.mov_ri(x86::RAX, e.runtime_loc_msg.addr as u64);
+    a.mov_ri(x86::RDX, e.runtime_loc_msg.length as u64);
+
+    let walk = a.new_label("span_here_walk");
+    let next = a.new_label("span_here_next");
+    let done = a.new_label("span_here_done");
+
+    a.bind(walk);
+    a.test_rr(x86::RBX, x86::RBX);
+    a.jcc(x86::EQUAL, done);
+    a.mov_rm(x86::RDI, x86::at(x86::RBX, 8)); // the call that reached this frame
+    a.call(e.rt.span_lookup);
+    a.test_rr(x86::RAX, x86::RAX);
+    a.jcc(x86::EQUAL, next);
+    a.mov_rm(x86::RDX, x86::at(x86::RAX, 16));
+    a.mov_rm(x86::RAX, x86::at(x86::RAX, 8));
+    a.jmp(done);
+
+    a.bind(next);
+    a.mov_rm(x86::RBX, x86::at(x86::RBX, 0));
+    a.mov_ri(x86::RAX, e.runtime_loc_msg.addr as u64);
+    a.mov_ri(x86::RDX, e.runtime_loc_msg.length as u64);
+    a.jmp(walk);
+
+    a.bind(done);
+    a.pop(x86::R12);
+    a.pop(x86::RBX);
+    a.pop(x86::RBP);
+    a.ret();
+}
+
+/// Writes `rt_panic_span(msg String rdi)`: `panic` from inside the prelude.
+///
+/// `panic`'s message is a String the program computed, so unlike every other trap its text is
+/// not known while compiling; and when the `panic` itself was written in the prelude --
+/// `Option::expect` is the one that matters -- its span names a file the programmer never
+/// opened. This is the two answers together: the runtime writes the message, and the line
+/// comes from the same walk `rt_trap_span` uses.
+pub fn emit_panic_span(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.panic_span);
+
+    sched::runtime_prologue(e);
+    a.mov_rr(x86::RBX, x86::RDI); // the message
+
+    a.mov_rr(x86::RDI, x86::RBP);
+    a.call(e.rt.span_here);
+    a.mov_rr(x86::R12, x86::RAX);
+    a.mov_rr(x86::R13, x86::RDX);
+
+    a.mov_ri(x86::RDI, 2u64);
+    a.mov_ri(x86::RSI, e.panic_prefix.addr as u64);
+    a.mov_ri(x86::RDX, e.panic_prefix.length as u64);
+    a.call(e.rt.write);
+
+    a.mov_ri(x86::RDI, 2u64);
+    a.mov_rr(x86::RSI, x86::RBX);
+    a.add_ri(x86::RSI, emitter::STR_BYTES_OFF);
+    a.mov_rm(x86::RDX, x86::at(x86::RBX, emitter::OBJ_HEADER_SIZE));
+    a.call(e.rt.write);
+
+    a.mov_ri(x86::RDI, 2u64);
+    a.mov_ri(x86::RSI, e.at_msg.addr as u64);
+    a.mov_ri(x86::RDX, e.at_msg.length as u64);
+    a.call(e.rt.write);
+
+    a.mov_ri(x86::RDI, 2u64);
+    a.mov_rr(x86::RSI, x86::R12);
+    a.mov_rr(x86::RDX, x86::R13);
+    a.call(e.rt.write);
+
+    a.mov_ri(x86::RDI, 2u64);
+    a.mov_ri(x86::RSI, e.newline_addr as u64);
+    a.mov_ri(x86::RDX, 1u64);
+    a.call(e.rt.write);
+
+    a.mov_ri(x86::RAX, e.target.sys_exit as u64);
+    a.mov_ri(x86::RDI, 101u64);
+    a.syscall();
+    a.ud2();
+}
+
+/// Writes `rt_span_lookup(ret_addr rdi) -> rax`: the row for that return address, or 0.
+///
+/// Binary search over a table sorted by address, the same shape and the same reason as
+/// `rt_lookup_stack_map`: one row per user-code call site is a lot of rows, and a trap is
+/// allowed to be slow but a linear scan of every call site in the program is silly when the
+/// table is already sorted.
+///
+/// A leaf: it calls nothing and uses only the scratch registers.
+pub fn emit_span_lookup(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.span_lookup);
+
+    let loop_head = a.new_label("span_loop");
+    let found = a.new_label("span_found");
+    let not_found = a.new_label("span_not_found");
+    let go_right = a.new_label("span_go_right");
+
+    a.mov_rm(x86::R8, x86::at(x86::R15, emitter::RT_SPAN_TABLE_OFF));
+    a.mov_rm(x86::R9, x86::at(x86::R15, emitter::RT_SPAN_COUNT_OFF));
+    a.xor_rr(x86::RCX, x86::RCX); // lo = 0
+    a.mov_rr(x86::RDX, x86::R9);  // hi = count
+
+    a.bind(loop_head);
+    a.cmp_rr(x86::RCX, x86::RDX);
+    a.jcc(x86::ABOVE_EQUAL, not_found);
+
+    a.mov_rr(x86::RAX, x86::RDX);
+    a.add_rr(x86::RAX, x86::RCX);
+    a.shr_i(x86::RAX, 1); // mid
+
+    a.mov_rr(x86::R10, x86::RAX);
+    a.mov_ri(x86::R11, (SPAN_ENTRY_WORDS * emitter::WORD_SIZE) as u64);
+    a.imul_rr(x86::R10, x86::R11);
+    a.add_rr(x86::R10, x86::R8); // &table[mid]
+
+    a.mov_rm(x86::R11, x86::at(x86::R10, 0));
+    a.cmp_rr(x86::R11, x86::RDI);
+    a.jcc(x86::EQUAL, found);
+    a.jcc(x86::BELOW, go_right);
+    a.mov_rr(x86::RDX, x86::RAX); // hi = mid
+    a.jmp(loop_head);
+    a.bind(go_right);
+    a.mov_rr(x86::RCX, x86::RAX);
+    a.add_ri(x86::RCX, 1); // lo = mid+1
+    a.jmp(loop_head);
+
+    a.bind(found);
+    a.mov_rr(x86::RAX, x86::R10);
+    a.ret();
+
+    a.bind(not_found);
+    a.xor_rr(x86::RAX, x86::RAX);
+    a.ret();
+}
+
+/// Emits a trap whose message is known and whose line is decided at run time.
+///
+/// When the call being lowered was written outside the prelude, the line is known right here
+/// and the message is a constant like every other trap's. It is only inside the prelude that
+/// the walk is needed at all.
+pub fn trap_at_user_span(e: emitter::Emitter, v: ir::Value, msg: String) {
+    if !emitter::is_prelude_span(v.file) {
+        runtime::trap_with(e, emitter::trap_message(e, msg, emitter::span_text(e, v.file, v.span)));
+        return;
+    }
+    let prefix = trap_prefix(e, msg);
+    e.a.mov_ri(x86::RDI, prefix.addr as u64);
+    e.a.mov_ri(x86::RSI, prefix.length as u64);
+    e.a.call(e.rt.trap_span);
+    e.a.ud2();
+}
+
+/// A trap message up to the location it will name: `origin: <msg> at `.
+fn trap_prefix(e: emitter::Emitter, msg: String) -> emitter::StaticStr {
+    let text = "origin: \(msg) at ";
+    match e.trap_msg.get(text) {
+        Option::Some(s) => s,
+        Option::None => {
+            let s = emitter::raw_string(e, text);
+            e.trap_msg.insert(text, s);
+            s
+        },
+    }
+}

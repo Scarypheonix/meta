@@ -117,14 +117,6 @@ fn main() {
     }
 }
 
-/// The name the prelude is known by, whatever path it was read from.
-///
-/// It is load-bearing rather than cosmetic, which is why it is a constant here and not
-/// the file's own path: the Go compiler decides "was this declared in the prelude?" by
-/// comparing this exact name (its `DeclaredInPrelude`), and so must anything that means
-/// to be the same compiler.
-const PRELUDE_NAME: String = "<prelude>";
-
 /// Resolves each file named after the first as its own package, with the first as the
 /// prelude, and prints the resolution trace of each under a `== path` header.
 ///
@@ -185,7 +177,7 @@ fn run_package(argv: List[String], command: String, level: i64) -> bool {
                 }
                 let inputs = list::new[resolve::Input]();
                 inputs.push(resolve::Input {
-                    file: PRELUDE_NAME, module: "", tree: prelude_tree, prelude: true,
+                    file: source::PRELUDE_NAME, module: "", tree: prelude_tree, prelude: true,
                 });
                 inputs.push(resolve::Input {
                     file: path, module: "", tree: tree, prelude: false,
@@ -198,7 +190,7 @@ fn run_package(argv: List[String], command: String, level: i64) -> bool {
                 } else {
                     if typed {
                         let units = list::new[check::Unit]();
-                        units.push(check::Unit { file: PRELUDE_NAME, tree: prelude_tree });
+                        units.push(check::Unit { file: source::PRELUDE_NAME, tree: prelude_tree });
                         units.push(check::Unit { file: path, tree: tree });
                         let checked = check::program(resolved, units);
                         if !report_check(checked, command) {
@@ -211,7 +203,7 @@ fn run_package(argv: List[String], command: String, level: i64) -> bool {
                                 // verdict as `run`.
                                 let munits = list::new[mono::Unit]();
                                 munits.push(mono::Unit {
-                                    file: PRELUDE_NAME, tree: prelude_tree,
+                                    file: source::PRELUDE_NAME, tree: prelude_tree,
                                 });
                                 munits.push(mono::Unit { file: path, tree: tree });
                                 let mo = mono::program(checked, munits);
@@ -221,7 +213,7 @@ fn run_package(argv: List[String], command: String, level: i64) -> bool {
                                     if lowered_command(command) {
                                         let cunits = list::new[compile::Unit]();
                                         cunits.push(compile::Unit {
-                                            file: PRELUDE_NAME, tree: prelude_tree,
+                                            file: source::PRELUDE_NAME, tree: prelude_tree,
                                         });
                                         cunits.push(compile::Unit { file: path, tree: tree });
                                         if !report_lowered(
@@ -279,7 +271,7 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String, le
     let trees = list::new[ast::File]();
     let inputs = list::new[resolve::Input]();
     inputs.push(resolve::Input {
-        file: PRELUDE_NAME, module: "", tree: prelude_tree, prelude: true,
+        file: source::PRELUDE_NAME, module: "", tree: prelude_tree, prelude: true,
     });
     let mut u = 0;
     while u < paths.len() {
@@ -314,7 +306,7 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String, le
         return true;
     }
     let units = list::new[check::Unit]();
-    units.push(check::Unit { file: PRELUDE_NAME, tree: prelude_tree });
+    units.push(check::Unit { file: source::PRELUDE_NAME, tree: prelude_tree });
     let mut k = 0;
     while k < trees.len() {
         units.push(check::Unit { file: paths.at(k), tree: trees.at(k) });
@@ -328,7 +320,7 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String, le
         return true;
     }
     let munits = list::new[mono::Unit]();
-    munits.push(mono::Unit { file: PRELUDE_NAME, tree: prelude_tree });
+    munits.push(mono::Unit { file: source::PRELUDE_NAME, tree: prelude_tree });
     let mut m = 0;
     while m < trees.len() {
         munits.push(mono::Unit { file: paths.at(m), tree: trees.at(m) });
@@ -342,7 +334,7 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String, le
         return true;
     }
     let cunits = list::new[compile::Unit]();
-    cunits.push(compile::Unit { file: PRELUDE_NAME, tree: prelude_tree });
+    cunits.push(compile::Unit { file: source::PRELUDE_NAME, tree: prelude_tree });
     let mut b = 0;
     while b < trees.len() {
         cunits.push(compile::Unit { file: paths.at(b), tree: trees.at(b) });
