@@ -110,9 +110,21 @@ func (e *emitter) instr(v *ir.Value) error {
 		return e.floatArith(v)
 
 	case ir.OpRemF:
-		// Float remainder is not an SSE instruction; x87's `fprem` is the only hardware
-		// form and pulling in the x87 stack for one operation is not worth it.
-		return fmt.Errorf("unimplemented: float remainder in native code")
+		// SSE has no remainder instruction, so this is the one arithmetic operator that
+		// costs a call (float.go explains what the routine does and why it agrees with
+		// the other two engines bit for bit).
+		// Pushed and popped rather than loaded straight into the argument registers: the
+		// allocator may have put the *second* operand in rdi, and loading the first there
+		// would destroy it before it is read. structuralCompare has the same shape for the
+		// same reason.
+		e.load(scratchA, v.Args[0])
+		e.a.Push(scratchA)
+		e.load(scratchA, v.Args[1])
+		e.a.Push(scratchA)
+		e.a.Pop(x86.RSI)
+		e.a.Pop(x86.RDI)
+		e.a.Call(e.rt.floatMod)
+		e.def(v, x86.RAX)
 
 	case ir.OpNegF:
 		// Negating a float flips its sign bit, which is a raw-word operation: -0.0 and
@@ -676,6 +688,30 @@ func (e *emitter) call(v *ir.Value) error {
 	return nil
 }
 
+// loadArgsInto brings a call's operands into the argument registers, whatever the allocator
+// did with them.
+//
+// It cannot load each one into its own register in turn: the allocator is free to have put a
+// *later* operand in an *earlier* one's register, and the first load would then destroy a value
+// not yet read. `7.5 % 2.0` is what found it -- both operands are ordinary local values there,
+// where every other two-operand runtime call arrives through a prelude method whose parameters
+// the prologue has already put in argument order, so nothing else had the shape. One inlining
+// decision away, they all do.
+//
+// Pushing every operand and popping in reverse performs the whole permutation without needing
+// to know which moves conflict, which is what `call` does with a user function's arguments for
+// exactly the same reason. The pushes are balanced before the call, so rsp keeps the alignment
+// a call wants.
+func (e *emitter) loadArgsInto(args []*ir.Value) {
+	for _, a := range args {
+		e.load(scratchA, a)
+		e.a.Push(scratchA)
+	}
+	for i := len(args) - 1; i >= 0; i-- {
+		e.a.Pop(argRegs[i])
+	}
+}
+
 // closure lowers OpClosure: allocate a closure object and fill it. Field 0 is always
 // the underlying function's entry address -- computed the same way OpFunc's own
 // lowering computes it, not read from Args, since bytecode.OpClosure never pushes it --
@@ -784,8 +820,7 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 2 {
 			return fmt.Errorf("this is a compiler bug: spawn takes two arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
-		e.load(x86.RSI, v.Args[1])
+		e.loadArgsInto(v.Args)
 		e.a.Call(e.rt.threadSpawn)
 		e.recordCall(v)
 		e.def(v, x86.RAX)
@@ -812,8 +847,7 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 2 {
 			return fmt.Errorf("this is a compiler bug: channel takes two arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
-		e.load(x86.RSI, v.Args[1])
+		e.loadArgsInto(v.Args)
 		e.a.Call(e.rt.chanNew)
 		e.recordCall(v)
 		e.schedStatus(v, "channel capacity is negative")
@@ -826,9 +860,8 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 2 {
 			return fmt.Errorf("this is a compiler bug: send takes two arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
+		e.loadArgsInto(v.Args)
 		e.a.MovRM(x86.RDI, x86.At(x86.RDI, objHeaderSize))
-		e.load(x86.RSI, v.Args[1])
 		e.a.Call(e.rt.chanSend)
 		e.recordCall(v)
 		e.schedStatus(v, "send on a closed channel")
@@ -877,8 +910,7 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 2 {
 			return fmt.Errorf("this is a compiler bug: mutex takes two arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
-		e.load(x86.RSI, v.Args[1])
+		e.loadArgsInto(v.Args)
 		e.a.Call(e.rt.mutexNew)
 		e.recordCall(v)
 		e.def(v, x86.RAX)
@@ -917,8 +949,7 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 2 {
 			return fmt.Errorf("this is a compiler bug: a string index takes two arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
-		e.load(x86.RSI, v.Args[1])
+		e.loadArgsInto(v.Args)
 		switch v.Const {
 		case compile.BuiltinStrByteAt:
 			e.a.Call(e.rt.strByteAt)
@@ -1033,8 +1064,7 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 2 {
 			return fmt.Errorf("this is a compiler bug: fs::write_file takes two arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
-		e.load(x86.RSI, v.Args[1])
+		e.loadArgsInto(v.Args)
 		e.a.Call(e.rt.fsWrite)
 		e.def(v, x86.RAX)
 		return nil
@@ -1054,8 +1084,7 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 2 {
 			return fmt.Errorf("this is a compiler bug: array::new takes two arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
-		e.load(x86.RSI, v.Args[1])
+		e.loadArgsInto(v.Args)
 		e.a.Call(e.rt.arrayNew)
 		e.recordCall(v)
 		e.refusedStatus(v, "array capacity is negative")
@@ -1079,8 +1108,7 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 2 {
 			return fmt.Errorf("this is a compiler bug: array::at takes two arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
-		e.load(x86.RSI, v.Args[1])
+		e.loadArgsInto(v.Args)
 		e.a.Call(e.rt.arrayAt)
 		e.refusedStatus(v, "index out of range")
 		e.def(v, x86.RDX)
@@ -1090,9 +1118,7 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 3 {
 			return fmt.Errorf("this is a compiler bug: array::set takes three arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
-		e.load(x86.RSI, v.Args[1])
-		e.load(x86.RDX, v.Args[2])
+		e.loadArgsInto(v.Args)
 		e.a.Call(e.rt.arraySet)
 		e.refusedStatus(v, "index out of range")
 		e.a.XorRR(scratchA, scratchA)
@@ -1103,8 +1129,7 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 2 {
 			return fmt.Errorf("this is a compiler bug: array::push takes two arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
-		e.load(x86.RSI, v.Args[1])
+		e.loadArgsInto(v.Args)
 		e.a.Call(e.rt.arrayPush)
 		e.def(v, x86.RAX)
 		return nil
@@ -1113,8 +1138,7 @@ func (e *emitter) builtin(v *ir.Value) error {
 		if len(v.Args) != 2 {
 			return fmt.Errorf("this is a compiler bug: array::truncate takes two arguments, got %d", len(v.Args))
 		}
-		e.load(x86.RDI, v.Args[0])
-		e.load(x86.RSI, v.Args[1])
+		e.loadArgsInto(v.Args)
 		e.a.Call(e.rt.arrayTruncate)
 		e.a.XorRR(scratchA, scratchA)
 		e.def(v, scratchA)
@@ -1269,9 +1293,7 @@ func (e *emitter) refusedStatus(v *ir.Value, refused string) {
 // read their operands again *after* the allocation rather than before.
 func (e *emitter) strSlice(v *ir.Value) error {
 	a := e.a
-	e.load(x86.RDI, v.Args[0])
-	e.load(x86.RSI, v.Args[1])
-	e.load(x86.RDX, v.Args[2])
+	e.loadArgsInto(v.Args)
 	a.Call(e.rt.strSliceCheck)
 	e.strStatus(v)
 

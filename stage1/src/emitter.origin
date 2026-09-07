@@ -151,6 +151,8 @@ pub struct RuntimeLabels {
     pub mut fs_write: x86::Label,
     pub mut fs_exists: x86::Label,
     pub mut fs_taken: x86::Label,
+    /// `%` on floats, which SSE has no instruction for (`float.origin`).
+    pub mut float_mod: x86::Label,
 }
 
 /// A `RuntimeLabels` with every field the same placeholder, for an emitter that has not named
@@ -224,6 +226,7 @@ pub fn no_labels() -> RuntimeLabels {
         fs_write: none,
         fs_exists: none,
         fs_taken: none,
+        float_mod: none,
     }
 }
 

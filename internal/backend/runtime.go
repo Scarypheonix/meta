@@ -181,6 +181,8 @@ type runtimeLabels struct {
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
+	// floatMod is `%` on floats, which SSE has no instruction for (float.go).
+	floatMod x86.Label
 }
 
 // emitRuntime writes every runtime routine and returns their labels. `_start` is emitted
@@ -249,6 +251,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.fsWrite = e.a.NewLabel("rt_fs_write")
 	e.rt.fsExists = e.a.NewLabel("rt_fs_exists")
 	e.rt.fsTaken = e.a.NewLabel("rt_fs_taken")
+	e.rt.floatMod = e.a.NewLabel("rt_float_mod")
 
 	e.emitStart(mainLabel)
 	e.emitAlloc()
@@ -310,6 +313,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitFsWrite()
 	e.emitFsExists()
 	e.emitFsTaken()
+	e.emitFloatMod()
 	e.emitCollect()
 }
 

@@ -25,6 +25,7 @@ use dwarf;
 use emitter;
 use equal;
 use files;
+use float;
 use hash;
 use ir;
 use irbuild;
@@ -412,6 +413,7 @@ fn emit_runtime(e: emitter::Emitter, main_label: x86::Label) {
     e.rt.fs_write = a.new_label("rt_fs_write");
     e.rt.fs_exists = a.new_label("rt_fs_exists");
     e.rt.fs_taken = a.new_label("rt_fs_taken");
+    e.rt.float_mod = a.new_label("rt_float_mod");
 
     runtime::emit_start(e, main_label);
     runtime::emit_alloc(e);
@@ -473,6 +475,7 @@ fn emit_runtime(e: emitter::Emitter, main_label: x86::Label) {
     files::emit_fs_write(e);
     files::emit_fs_exists(e);
     files::emit_fs_taken(e);
+    float::emit_float_mod(e);
     collect::emit_collect(e);
 }
 

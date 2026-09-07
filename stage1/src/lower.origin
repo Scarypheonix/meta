@@ -143,9 +143,21 @@ pub fn instr(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
         return;
     }
     if op == ir::OP_REMF {
-        // Float remainder is not an SSE instruction; x87's `fprem` is the only hardware form
-        // and pulling in the x87 stack for one operation is not worth it.
-        emitter::fail(e, "unimplemented: float remainder in native code");
+        // SSE has no remainder instruction, so this is the one arithmetic operator that costs a
+        // call (`float.origin` explains what the routine does and why it agrees with the other
+        // two engines bit for bit).
+        // Pushed and popped rather than loaded straight into the argument registers: the
+        // allocator may have put the *second* operand in rdi, and loading the first there would
+        // destroy it before it is read. `structural_compare` has the same shape for the same
+        // reason.
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(0));
+        a.push(regalloc::SCRATCH_A);
+        load(e, fs, regalloc::SCRATCH_A, v.args.at(1));
+        a.push(regalloc::SCRATCH_A);
+        a.pop(x86::RSI);
+        a.pop(x86::RDI);
+        a.call(e.rt.float_mod);
+        def(e, fs, v, x86::RAX);
         return;
     }
     if op == ir::OP_NEGF {
@@ -680,6 +692,35 @@ fn call(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
     def(e, fs, v, x86::RAX);
 }
 
+/// Brings a call's operands into the argument registers, whatever the allocator did with them.
+///
+/// It cannot load each one into its own register in turn: the allocator is free to have put a
+/// *later* operand in an *earlier* one's register, and the first load would then destroy a value
+/// not yet read. `7.5 % 2.0` is what found it -- both operands are ordinary local values there,
+/// where every other two-operand runtime call arrives through a prelude method whose parameters
+/// the prologue has already put in argument order, so nothing else had the shape. One inlining
+/// decision away, they all do.
+///
+/// Pushing every operand and popping in reverse performs the whole permutation without needing
+/// to know which moves conflict, which is what `call` does with a user function's arguments for
+/// exactly the same reason. The pushes are balanced before the call, so rsp keeps the alignment
+/// a call wants.
+fn load_args_into(e: emitter::Emitter, fs: stackmap::FnState, args: List[ir::Value]) {
+    let a = e.a;
+    let regs = arg_regs();
+    let mut i = 0;
+    while i < args.len() {
+        load(e, fs, regalloc::SCRATCH_A, args.at(i));
+        a.push(regalloc::SCRATCH_A);
+        i = i + 1;
+    }
+    let mut j = args.len() - 1;
+    while j >= 0 {
+        a.pop(regs.at(j));
+        j = j - 1;
+    }
+}
+
 /// Lowers a closure creation: allocate a closure object and fill it. Field 0 is always the
 /// underlying function's entry address -- computed the same way a bare function reference's
 /// own lowering computes it, not read from the arguments, since the bytecode never pushes it
@@ -887,8 +928,7 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
         // argument is a constant the compiler supplies, because a thread's result lives in a
         // control block that no stack map covers and only the compiler knows its T.
         if !arity(e, n, 2, "spawn") { return; }
-        load(e, fs, x86::RDI, v.args.at(0));
-        load(e, fs, x86::RSI, v.args.at(1));
+        load_args_into(e, fs, v.args);
         a.call(e.rt.thread_spawn);
         stackmap::record_call(e, fs, v);
         def(e, fs, v, x86::RAX);
@@ -911,8 +951,7 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
         // bytecode compiler adds: a queued value may be a reference, and a channel is raw
         // memory the collector reads from the outside.
         if !arity(e, n, 2, "channel") { return; }
-        load(e, fs, x86::RDI, v.args.at(0));
-        load(e, fs, x86::RSI, v.args.at(1));
+        load_args_into(e, fs, v.args);
         a.call(e.rt.chan_new);
         stackmap::record_call(e, fs, v);
         sched_status(e, v, "channel capacity is negative");
@@ -923,9 +962,8 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
         // The argument is the `Sender[T]` object; the channel is its first field, exactly as
         // `join`'s handle is.
         if !arity(e, n, 2, "send") { return; }
-        load(e, fs, x86::RDI, v.args.at(0));
+        load_args_into(e, fs, v.args);
         a.mov_rm(x86::RDI, x86::at(x86::RDI, emitter::OBJ_HEADER_SIZE));
-        load(e, fs, x86::RSI, v.args.at(1));
         a.call(e.rt.chan_send);
         stackmap::record_call(e, fs, v);
         sched_status(e, v, "send on a closed channel");
@@ -966,8 +1004,7 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
     }
     if idx == compile::BUILTIN_MUTEX {
         if !arity(e, n, 2, "mutex") { return; }
-        load(e, fs, x86::RDI, v.args.at(0));
-        load(e, fs, x86::RSI, v.args.at(1));
+        load_args_into(e, fs, v.args);
         a.call(e.rt.mutex_new);
         stackmap::record_call(e, fs, v);
         def(e, fs, v, x86::RAX);
@@ -1000,8 +1037,7 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
     if idx == compile::BUILTIN_STR_BYTE_AT || idx == compile::BUILTIN_STR_CHAR_AT
         || idx == compile::BUILTIN_STR_CHAR_WIDTH {
         if !arity(e, n, 2, "a string index") { return; }
-        load(e, fs, x86::RDI, v.args.at(0));
-        load(e, fs, x86::RSI, v.args.at(1));
+        load_args_into(e, fs, v.args);
         if idx == compile::BUILTIN_STR_BYTE_AT {
             a.call(e.rt.str_byte_at);
         } else if idx == compile::BUILTIN_STR_CHAR_AT {
@@ -1099,8 +1135,7 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
     }
     if idx == compile::BUILTIN_WRITE_FILE {
         if !arity(e, n, 2, "fs::write_file") { return; }
-        load(e, fs, x86::RDI, v.args.at(0));
-        load(e, fs, x86::RSI, v.args.at(1));
+        load_args_into(e, fs, v.args);
         a.call(e.rt.fs_write);
         def(e, fs, v, x86::RAX);
         return;
@@ -1116,8 +1151,7 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
         // compiler chose for this instantiation, which is what tells the collector whether the
         // elements are references (ADR-0028).
         if !arity(e, n, 2, "array::new") { return; }
-        load(e, fs, x86::RDI, v.args.at(0));
-        load(e, fs, x86::RSI, v.args.at(1));
+        load_args_into(e, fs, v.args);
         a.call(e.rt.array_new);
         stackmap::record_call(e, fs, v);
         refused_status(e, v, "array capacity is negative");
@@ -1133,8 +1167,7 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
     }
     if idx == compile::BUILTIN_ARRAY_AT {
         if !arity(e, n, 2, "array::at") { return; }
-        load(e, fs, x86::RDI, v.args.at(0));
-        load(e, fs, x86::RSI, v.args.at(1));
+        load_args_into(e, fs, v.args);
         a.call(e.rt.array_at);
         refused_status(e, v, "index out of range");
         def(e, fs, v, x86::RDX);
@@ -1142,9 +1175,7 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
     }
     if idx == compile::BUILTIN_ARRAY_SET {
         if !arity(e, n, 3, "array::set") { return; }
-        load(e, fs, x86::RDI, v.args.at(0));
-        load(e, fs, x86::RSI, v.args.at(1));
-        load(e, fs, x86::RDX, v.args.at(2));
+        load_args_into(e, fs, v.args);
         a.call(e.rt.array_set);
         refused_status(e, v, "index out of range");
         a.xor_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
@@ -1153,16 +1184,14 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
     }
     if idx == compile::BUILTIN_ARRAY_PUSH {
         if !arity(e, n, 2, "array::push") { return; }
-        load(e, fs, x86::RDI, v.args.at(0));
-        load(e, fs, x86::RSI, v.args.at(1));
+        load_args_into(e, fs, v.args);
         a.call(e.rt.array_push);
         def(e, fs, v, x86::RAX);
         return;
     }
     if idx == compile::BUILTIN_ARRAY_TRUNCATE {
         if !arity(e, n, 2, "array::truncate") { return; }
-        load(e, fs, x86::RDI, v.args.at(0));
-        load(e, fs, x86::RSI, v.args.at(1));
+        load_args_into(e, fs, v.args);
         a.call(e.rt.array_truncate);
         a.xor_rr(regalloc::SCRATCH_A, regalloc::SCRATCH_A);
         def(e, fs, v, regalloc::SCRATCH_A);
@@ -1302,9 +1331,7 @@ fn with_lock(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
 /// operands again *after* the allocation rather than before.
 fn str_slice(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
     let a = e.a;
-    load(e, fs, x86::RDI, v.args.at(0));
-    load(e, fs, x86::RSI, v.args.at(1));
-    load(e, fs, x86::RDX, v.args.at(2));
+    load_args_into(e, fs, v.args);
     a.call(e.rt.str_slice_check);
     str_status(e, v);
 

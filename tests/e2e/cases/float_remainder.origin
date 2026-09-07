@@ -1,0 +1,58 @@
+// `%` on floats, which for four phases worked on two engines and refused to build on the third.
+//
+// SSE has no remainder instruction and x87's `fprem` was not worth pulling the x87 stack in
+// for, so `internal/backend` failed loudly at compile time rather than computing something
+// wrong (process rule 8) -- which is why nothing here could be written until now.
+//
+// The remainder is *unique*: for finite x and non-zero y there is exactly one r with |r| < |y|,
+// sign(r) = sign(x), and x - r a multiple of y. So any exact algorithm agrees with any other,
+// and the three engines agree by construction rather than by having copied each other.
+//
+// The values are the ones an inexact implementation gets wrong: subnormals at both ends, the
+// largest finite double, a ratio far too large to reach by repeated subtraction, and both
+// zeros, whose sign the result has to carry.
+use std::float;
+use std::io;
+use std::list;
+
+fn main() {
+    let xs = values();
+    let mut i = 0;
+    while i < xs.len() {
+        let mut j = 0;
+        while j < xs.len() {
+            // The bits rather than the rendering: two different NaNs print the same, and which
+            // one an undefined remainder answers is something `float::bits` can see.
+            io::println("\(float::bits(xs.at(i) % xs.at(j)))");
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    // The identity §04 states, where neither side traps.
+    io::println("\(7.5 % 2.0)");
+    io::println("\(0.0 - 7.5 % 2.0)");
+    io::println("\((0.0 - 7.5) % 2.0)");
+    io::println("\(1e300 % 3.0)");
+}
+
+fn values() -> List[f64] {
+    let l = list::new[f64]();
+    l.push(0.0);
+    l.push(0.0 - 0.0);
+    l.push(1.0);
+    l.push(0.0 - 1.0);
+    l.push(2.5);
+    l.push(7.0);
+    l.push(1e300);
+    l.push(1e-300);
+    // The smallest subnormal, and one just above it.
+    l.push(5e-324);
+    l.push(1e-320);
+    l.push(1.7976931348623157e308);
+    // The smallest normal.
+    l.push(2.2250738585072014e-308);
+    l.push(0.1);
+    l.push(123456789.987654321);
+    l
+}
