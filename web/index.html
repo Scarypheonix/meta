@@ -4,119 +4,81 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Origin playground</title>
-<style>
-  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 1.5rem; }
-  h1 { font-size: 1rem; font-weight: 600; margin: 0 0 .25rem; }
-  p.note { margin: 0 0 1rem; color: #555; font-family: system-ui, sans-serif; }
-  textarea { width: 100%; height: 16rem; font: inherit; padding: .5rem; box-sizing: border-box; }
-  .controls { margin: .75rem 0; display: flex; gap: .5rem; align-items: center; }
-  button { font: inherit; padding: .35rem .9rem; }
-  pre { background: #f4f4f4; padding: .75rem; white-space: pre-wrap; word-break: break-word; min-height: 3rem; }
-  pre.err { background: #fdf0f0; }
-  .host { color: #666; font-style: italic; font-family: system-ui, sans-serif; }
-  label { font-family: system-ui, sans-serif; }
-</style>
+<link rel="stylesheet" href="style.css" />
 </head>
 <body>
 
-<h1>Origin playground</h1>
-<p class="note">
-  Everything below runs in this tab. Your code is never uploaded, and nothing about this run
-  reaches a server. This page is the Phase&nbsp;10 proof harness — a plain textarea, no editor.
-</p>
+<header class="bar">
+  <div class="brand">
+    <strong>Origin</strong>
+    <span class="sub">playground</span>
+  </div>
+  <div class="controls">
+    <button id="run" class="primary" disabled>Run</button>
+    <button id="stop" disabled>Stop</button>
+    <label>Example
+      <select id="example"><option value="">—</option></select>
+    </label>
+    <label>Engine
+      <select id="engine">
+        <option value="vm">bytecode VM</option>
+        <option value="interp">interpreter</option>
+      </select>
+    </label>
+    <label>Opt
+      <select id="opt"><option>0</option><option selected>1</option><option>2</option></select>
+    </label>
+    <button id="share">Copy link</button>
+  </div>
+</header>
 
-<textarea id="src" spellcheck="false">use std::io;
+<main>
+  <section class="pane editor-pane">
+    <div class="pane-head"><span>program</span><span id="editor-kind" class="muted"></span></div>
+    <!-- The textarea is the page, not a placeholder: app.js upgrades it to CodeMirror when
+         the bundle is available and leaves it alone when it is not. ADR-0034 requires the
+         editor to stay off the critical path to running a program. -->
+    <textarea id="src" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+  </section>
 
-fn fib(n: i64) -> i64 {
-    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
-}
+  <section class="pane output-pane">
+    <div class="pane-head">
+      <span>output</span>
+      <span id="status" class="muted"></span>
+    </div>
+    <div class="streams">
+      <pre id="stdout" aria-label="standard output"></pre>
+      <pre id="stderr" aria-label="standard error"></pre>
+    </div>
+    <div id="host" class="host"></div>
+  </section>
+</main>
 
-fn main() {
-    let mut i = 0;
-    while i &lt;= 10 {
-        io::println(fib(i).to_str());
-        i = i + 1;
-    }
-}
-</textarea>
+<footer>
+  <p>
+    <strong>Everything here runs in this tab.</strong> Your program is compiled and executed
+    by a WebAssembly build of the Origin compiler inside your own browser. It is never
+    uploaded, and no server &mdash; including the one that served this page &mdash; ever sees
+    it or runs it.
+  </p>
+  <p id="storage-note">
+    Your program is kept in this browser&rsquo;s local storage so it is still here when you
+    come back. It stays on this device, is not synced anywhere, is not visible to whoever
+    runs this site, and <strong>is lost if you clear site data</strong>.
+    <button id="forget" class="link">Forget my program</button>
+  </p>
+  <p class="muted">
+    <strong>Copy link</strong> puts the whole program in the link itself, after the
+    <code>#</code>, which browsers never send to a server. Nothing is stored, so a link
+    cannot expire or be taken back &mdash; whoever has it has a copy of the program.
+  </p>
+</footer>
 
-<div class="controls">
-  <button id="run">Run</button>
-  <button id="stop" disabled>Stop</button>
-  <label>engine
-    <select id="engine"><option value="vm">vm</option><option value="interp">interp</option></select>
-  </label>
-  <label>opt
-    <select id="opt"><option>0</option><option selected>1</option><option>2</option></select>
-  </label>
-  <span id="status" class="host"></span>
-</div>
-
-<strong>stdout</strong>
-<pre id="stdout"></pre>
-<strong>stderr</strong>
-<pre id="stderr" class="err"></pre>
-<div id="host" class="host"></div>
-
-<script>
-const $ = (id) => document.getElementById(id);
-let worker = null;
-
-function setRunning(running) {
-  $("run").disabled = running;
-  $("stop").disabled = !running;
-  $("status").textContent = running ? "running…" : "";
-}
-
-// A terminated worker is a discarded module (ADR-0036): the next run starts a fresh one
-// rather than inheriting whatever state a killed program was in.
-function stop(reason) {
-  if (!worker) return;
-  worker.terminate();
-  worker = null;
-  setRunning(false);
-  if (reason) $("host").textContent = reason;
-}
-
-$("run").onclick = () => {
-  stop(null);
-  $("stdout").textContent = "";
-  $("stderr").textContent = "";
-  $("host").textContent = "";
-  setRunning(true);
-
-  worker = new Worker("worker.js");
-  worker.onmessage = (e) => {
-    const m = e.data;
-    if (m.kind === "output") {
-      $(m.stream).textContent += m.text;
-      return;
-    }
-    if (m.kind === "failed") {
-      // The host speaking about the run, never the program's own output (spec §7).
-      $("host").textContent = "the playground could not run this: " + m.message;
-      stop(null);
-      return;
-    }
-    // `done` carries the full captured streams; the chunks above were the same bytes
-    // delivered early, so assigning here is idempotent rather than additive.
-    $("stdout").textContent = m.stdout;
-    $("stderr").textContent = m.stderr;
-    let host = "exit status " + m.exit;
-    if (m.truncated) host += " · output truncated at the 4 MiB ceiling";
-    if (m.internalError) host += " · " + m.internalError;
-    $("host").textContent = host;
-    stop(null);
-  };
-  worker.postMessage({
-    source: $("src").value,
-    engine: $("engine").value,
-    opt: Number($("opt").value),
-  });
-};
-
-$("stop").onclick = () => stop("stopped by you — the program did not finish");
-</script>
+<script src="codemirror.js"></script>
+<script src="origin-mode.js"></script>
+<script src="share.js"></script>
+<script src="examples.js"></script>
+<script src="app.js"></script>
 
 </body>
 </html>
