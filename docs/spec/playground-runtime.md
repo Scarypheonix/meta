@@ -69,7 +69,7 @@ Linux and macOS, a system call underneath it, and each says what the browser doe
 | `std::fs` (§15) | `openat`, `read`, `write` | every operation fails; see §3 | **yes, and it is the only one** |
 | `process::exit` (§17) | `exit_group` | unwinds to the entry point, which reports the status | none observable |
 | `args()` (§17) | the kernel's argument vector | supplied by the caller across the boundary | none observable |
-| Green threads, channels, `Mutex` (§12) | goroutines on one OS thread | goroutines on one OS thread | none; see §5 |
+| Green threads, channels, `Mutex` (§12) | goroutines, preempted by the host | goroutines, yielding explicitly at a back edge | **§08's preemption had to be asked for**; see §5 |
 | Traps and panics (§08, ADR-0005, ADR-0026) | a message on stderr, exit 101 | the same message on captured stderr, exit 101 | none |
 | Allocation and collection (§08) | Go's heap (interpreter), `internal/gc` (VM) | identical — both are Go | none |
 | Integer overflow (ADR-0005) | traps | traps | none |
@@ -88,7 +88,10 @@ exist in Origin**:
   *"Origin has no I/O to be asynchronous about — `io::println` is the entire surface."* It
   was never built. `docs/deferred.md` still carries it. There is no event loop to port.
 
-The single genuine gap is the filesystem, and §3 is the whole of it.
+The filesystem is the only gap in what a program can *observe*, and §3 is the whole of it.
+One thing in the table cost implementation work to keep in the "none" column rather than
+being free: §08's back-edge preemption, which this host does not provide and had to be
+asked for. §5 records what that was and how the corpus found it.
 
 ## 3. `std::fs` in the browser
 
@@ -108,7 +111,7 @@ Through the prelude, a program observes:
 ```origin
 match read_to_string("anything") {
     Result::Ok(text) => io::println(text),        // never taken in the browser
-    Result::Err(e)   => io::println(e.to_str()),  // always taken; prints "other"
+    Result::Err(e)   => io::println(e.to_str()),  // always taken; prints "I/O error"
 }
 ```
 
@@ -168,15 +171,42 @@ scope here.
 
 This matters because it changes what has to be argued. The question is not whether a
 user-space scheduler survives having no OS threads; it is whether **Go's** scheduler works
-under `GOOS=js`. It does: the js/wasm port runs goroutines, channels, `select` and the race
-of a program's exit against its threads on a single thread, cooperatively scheduled, and
+under `GOOS=js`. Mostly it does: the js/wasm port runs goroutines, channels, `select` and
+the race of a program's exit against its threads on a single thread, and
 `internal/vm/concurrent.go`'s collector registration is unaffected because it is ordinary Go
 synchronization.
 
-The observable consequence is **none**, because the property the browser lacks — real
-parallelism — is one no engine had. `CLAUDE.md` records it under known-deferred: *"no engine
-runs threads in parallel."* A program that depends on two Origin threads running at the same
-instant was already unsupported on Linux and macOS.
+**One part of it does not, and it had to be fixed rather than documented.** §08 says
+scheduling is *"preemptive at safepoints: a green thread that runs a loop containing a
+back-edge can always be descheduled, so a compute loop cannot starve the scheduler."* Both
+engines got that from the host and neither survived losing it:
+
+- The **virtual machine** has an explicit safepoint on every backward jump, and its body is
+  to release the world lock and re-take it. On a host with real threads that is enough — a
+  thread blocked on the lock is running on another processor and takes it the instant it is
+  free. Under `GOOS=js` there is one thread and no asynchronous preemption, so `Unlock`
+  followed immediately by `Lock` re-acquires the lock every time and the waiting thread
+  never runs.
+- The **interpreter** had no safepoint at all. Its own comment recorded why it did not need
+  one: *"Green threads are goroutines. That is not a shortcut around §08's M:N scheduler —
+  Go's own scheduler is M:N, and it preempts, which is what §08 asks for."* That reasoning
+  is correct on every host that preempts and false on the one that does not.
+
+Preemption in Go's runtime is delivered by signals, and a browser has none. So both engines
+now yield explicitly at a back edge — `runtime.Gosched`, in a `js`-tagged file, a no-op
+everywhere else so that no other host pays for it. The guarantee §08 states is therefore
+kept on this host too, by asking for it rather than by inheriting it.
+
+This was found by running the corpus, not by reading the code: without it,
+`tests/e2e/cases/preemption_at_a_back_edge.origin` — a spin loop that ends only when
+another thread sets its flag — **hangs forever** on both engines. Every other engine runs it.
+A program that hangs is the worst available way to differ, because nothing reports it, and
+it is the reason §6's differential covers the whole corpus rather than a sample.
+
+What genuinely *is* absent, and is not a divergence, is real parallelism: no engine ever had
+it. `CLAUDE.md` records it under known-deferred — *"no engine runs threads in parallel."* A
+program that depends on two Origin threads running at the same instant was already
+unsupported on Linux and macOS.
 
 What *is* new is that a program which never yields never returns, and in a browser that
 freezes the tab it runs in. The runtime answers this by construction rather than by

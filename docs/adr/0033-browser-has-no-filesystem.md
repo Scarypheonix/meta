@@ -21,8 +21,12 @@ worth recording because it is most of this ADR's context:
   be asynchronous about"* — with the item still sitting in `docs/deferred.md`. Nothing to
   port.
 - **Green threads are goroutines** in both engines, not the native runtime's M:N scheduler,
-  and Go's js/wasm port runs goroutines. Nothing to replace. (ADR-0036 covers the real
-  browser-specific consequence, which is about the event loop and not about scheduling.)
+  and Go's js/wasm port runs goroutines — so the threading model itself needs no port. It
+  did need one repair, which reading alone would not have found and which is not this ADR's
+  subject: js/wasm has no asynchronous preemption, so §08's back-edge safepoint had to be
+  made an explicit `runtime.Gosched` in both engines. `docs/spec/playground-runtime.md` §5
+  records it, and the corpus is what found it. (ADR-0036 covers the other browser-specific
+  scheduling consequence, which is about the event loop.)
 - **Panics, traps, `process::exit` and allocation** touch no system call on these two
   engines. `process::exit` is a Go panic carrying a status, recovered in `Run()`; the
   VM's collector is `internal/gc`, which contains no `os` or `syscall` reference.

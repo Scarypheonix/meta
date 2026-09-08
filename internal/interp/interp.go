@@ -435,6 +435,7 @@ func (in *Interp) evalExpr(e ast.Expr) (Value, ctrl) {
 
 	case *ast.While:
 		for {
+			in.backEdge()
 			cond, c := in.evalExpr(v.Cond)
 			if c.stops() {
 				return Unit{}, c
@@ -457,6 +458,7 @@ func (in *Interp) evalExpr(e ast.Expr) (Value, ctrl) {
 
 	case *ast.Loop:
 		for {
+			in.backEdge()
 			_, c := in.evalBlock(v.Body)
 			switch c.kind {
 			case ctrlBreak:
@@ -751,6 +753,7 @@ func (in *Interp) evalFor(fo *ast.For) (Value, ctrl) {
 	it := in.callResolved(intoIter, iterable, "into_iter", bytecode.KindUnknown, nil, fo.Iter.Span())
 	f := in.frame()
 	for {
+		in.backEdge()
 		next := in.callResolved(nextFn, it, "next", bytecode.KindUnknown, nil, fo.Span())
 		e, ok := next.(*Enum)
 		if !ok || e.Def.Name.Name != "Option" {

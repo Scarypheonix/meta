@@ -2,6 +2,7 @@ package interp
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/scarypheonix/meta/internal/diag"
 )
@@ -27,6 +28,13 @@ type runtime struct {
 	// parked in wait. When they are equal, nothing can ever make progress again.
 	live    int
 	blocked int
+
+	// spawned records that the program has started a thread at some point. It is read
+	// without the lock, at every loop back edge, by the browser build's yield
+	// (yield_js.go) -- a program that never spawned has nothing to yield to and must not
+	// pay more than a load to establish that. It is never cleared: a thread that has
+	// finished still means this program is one that uses threads.
+	spawned atomic.Bool
 
 	// trap is the first trap raised by any thread. Once set the process is ending, so
 	// every parked thread is woken to unwind (ADR-0026).
@@ -193,6 +201,7 @@ func (in *Interp) spawn(body *Closure, span diag.Span) int64 {
 	r.nextTid++
 	r.threads[h] = &threadState{}
 	r.live++
+	r.spawned.Store(true)
 	r.mu.Unlock()
 
 	// A thread gets its own frames and its own depth -- the call stack is the one piece

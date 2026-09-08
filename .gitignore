@@ -11,3 +11,7 @@
 .DS_Store
 *.swp
 tests/e2e/scratch/
+
+# The browser host's compiled module. Reproducible from source in one command
+# (web/README.md); six megabytes of binary per rebuild does not belong in history.
+/web/origin.wasm

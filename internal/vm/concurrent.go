@@ -189,6 +189,7 @@ func (v *VM) safepoint() {
 		return
 	}
 	v.w.exec.Unlock()
+	schedulerYield()
 	v.w.exec.Lock()
 	v.w.mu.Lock()
 	fatal := v.w.ending()
