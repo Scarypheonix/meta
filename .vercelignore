@@ -3,25 +3,31 @@
 # The build (`./build-web`) compiles `cmd/originwasm` for js/wasm, so it needs `go.mod`,
 # `cmd/`, `internal/` and `web/` -- and nothing else in this repository. Everything below is
 # either a different project, a test corpus, or a committed binary, and leaving it out keeps
-# roughly thirteen megabytes of it off every deployment.
+# roughly fifteen megabytes of it off every deployment.
+#
+# EVERY PATTERN IS ANCHORED WITH A LEADING SLASH, and that is not decoration. This file uses
+# .gitignore syntax, where a pattern with no slash in it matches a path *component* at any
+# depth -- so an unanchored `check` removes `internal/check` along with the `./check` script,
+# and the deploy then fails with "no required module provides package .../internal/check".
+# It did. Anchoring says "this one, at the root, and nothing else".
 #
 # This file is about upload weight only. It cannot affect what is served: that is
 # `outputDirectory` in vercel.json, which is `web/`.
 
 # A different, unrelated static site that happens to share this repository (ADR-0002). It
 # must not be deployed here, and the output directory already ensures it is not.
-site/
+/site/
 
-# The test corpus and the suite. Nothing the module needs to build.
-tests/
-check
+# The test corpus and the suite gate. Nothing the module needs to build.
+/tests/
+/check
 
 # The self-hosted compiler's Origin source (34,000 lines) and the committed stage1 binary.
 # `cmd/originwasm` builds from the Go tree, not from these.
-stage1/
-bootstrap/
-selfhost.test
+/stage1/
+/bootstrap/
+/selfhost.test
 
 # Documentation.
-docs/
-CLAUDE.md
+/docs/
+/CLAUDE.md
