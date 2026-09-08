@@ -54,7 +54,21 @@ if [ ! -f "$shim" ]; then
   echo "error: ${WANT_GO} has no lib/wasm/wasm_exec.js at ${shim}" >&2
   exit 1
 fi
-if ! cmp -s "$shim" web/wasm_exec.js; then
+if [ ! -r web/wasm_exec.js ]; then
+  echo "error: web/wasm_exec.js is missing or unreadable" >&2
+  exit 1
+fi
+
+# Compared with the shell itself rather than with `cmp`, which is diffutils and is not on
+# every build image -- Vercel's is not. `cmp -s` then exits 127, `if ! cmp -s` reads that as
+# "the files differ", and the build fails claiming a mismatch that is not there. A check that
+# cannot tell "different" from "I could not look" is worse than no check, because it fails
+# where it should pass and sends whoever reads it after the wrong thing.
+#
+# The size comparison is here because `$(cat ...)` drops trailing newlines from both sides,
+# so content alone would call two files equal that differ only in how they end.
+if [ "$(cat "$shim")" != "$(cat web/wasm_exec.js)" ] ||
+   [ "$(wc -c < "$shim")" != "$(wc -c < web/wasm_exec.js)" ]; then
   cat >&2 <<EOF
 error: web/wasm_exec.js is not the one ${WANT_GO} ships.
 
