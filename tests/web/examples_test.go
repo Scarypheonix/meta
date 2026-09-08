@@ -162,3 +162,38 @@ func jsString(s string) string {
 	b.WriteByte('"')
 	return b.String()
 }
+
+// TestEveryExampleIsCoveredByTheWasmDifferential is what lets the browser test run three
+// programs instead of twenty-six.
+//
+// The argument for that cut is that tests/wasm already runs every example through this exact
+// module on both engines, against these same golden files. That argument holds only while
+// every example is a program tests/wasm actually runs, and the one class it excludes is the
+// programs that use std::fs (ADR-0033: on a host with no filesystem their output is expected
+// to differ, so they are named exclusions there).
+//
+// So this checks the condition directly, on the source. Add an example that reads or writes a
+// file and this fails, which is the moment to decide whether the browser test should cover it
+// rather than the moment to discover the coverage was assumed.
+func TestEveryExampleIsCoveredByTheWasmDifferential(t *testing.T) {
+	root := testutil.RepoRoot(t)
+	// The prelude's file interface (spec/15-files.md) and the four operations under it.
+	fsUses := []string{"fs::", "read_to_string", "write_string", "file_exists"}
+
+	for _, e := range examples {
+		src := readCase(t, root, e.name, ".origin")
+		for _, use := range fsUses {
+			if strings.Contains(src, use) {
+				t.Errorf("example %q uses %s, so tests/wasm excludes it and does not check its "+
+					"output on either engine. The browser test runs only three programs on the "+
+					"strength of that coverage; either drop this example or widen browserRuns.",
+					e.name, use)
+			}
+		}
+		// A generated example that is not a corpus case has no golden files, so nothing
+		// anywhere would notice it breaking.
+		if _, err := os.Stat(filepath.Join(root, "tests", "e2e", "cases", e.name+".out")); err != nil {
+			t.Errorf("example %q has no tests/e2e golden output: %v", e.name, err)
+		}
+	}
+}

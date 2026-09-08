@@ -140,6 +140,27 @@ type browserResult struct {
 	} `json:"fallback"`
 }
 
+// browserRuns is what the page is driven over, and it is deliberately not the whole example
+// list.
+//
+// Every example is a tests/e2e case, and TestEveryExampleIsCoveredByTheWasmDifferential holds
+// them to the one condition under which tests/wasm runs them -- so all thirteen already go
+// through this exact module, on both engines, compared against these same golden files. Doing
+// it again here asks a question that is already answered, which is what CLAUDE.md's budget
+// rule says to look for when the suite gets long. It cost about fourteen seconds of a
+// five-minute ceiling.
+//
+// What a browser answers and Node cannot is whether the *page* is wired: that a program
+// reaches the module from the editor, that both streams reach the DOM, that a non-zero exit
+// is reported, and that the engine control selects an engine rather than being decorative.
+// Three runs establish that. The rest of this test -- the editor, the menu, sharing, the
+// fallback -- is the part Node could never have covered, and none of it was cut.
+var browserRuns = []struct{ name, engine string }{
+	{"hello", "vm"},              // stdout reaches the page at all
+	{"overflow_traps", "vm"},     // so do stderr and a non-zero exit status
+	{"overflow_traps", "interp"}, // and the engine control reaches a second engine
+}
+
 func TestThePlaygroundRunsItsExamplesInABrowser(t *testing.T) {
 	root := testutil.RepoRoot(t)
 	node, nodePath := requireBrowser(t)
@@ -148,17 +169,13 @@ func TestThePlaygroundRunsItsExamplesInABrowser(t *testing.T) {
 	srv := httptest.NewServer(http.FileServer(http.Dir(dir)))
 	defer srv.Close()
 
-	// Every example on both engines: the page's engine control is a claim about what runs,
-	// and a claim nothing checks is one that quietly stops being true.
 	type planCase struct {
 		Name   string `json:"name"`
 		Engine string `json:"engine"`
 	}
 	var cases []planCase
-	for _, e := range examples {
-		for _, engine := range []string{"vm", "interp"} {
-			cases = append(cases, planCase{e.name, engine})
-		}
+	for _, r := range browserRuns {
+		cases = append(cases, planCase{r.name, r.engine})
 	}
 	shareSource := readCase(t, root, "closure_counter", ".origin")
 	plan, err := json.Marshal(map[string]any{"cases": cases, "share": shareSource})

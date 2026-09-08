@@ -4,8 +4,9 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Phases 0 through 9 are complete** (see `docs/phases/`). **The compiler compiles itself.**
-See Status, at the bottom of this file, for what exists and what is next.
+**Phases 0 through 10 are complete** (see `docs/phases/`). **The compiler compiles itself**,
+and it runs in a browser. See Status, at the bottom of this file, for what exists and what is
+next.
 
 ---
 
@@ -24,6 +25,8 @@ go test -run xxx -fuzz FuzzParse ./tests/fuzz/   # fuzz the parser
 gofmt -w cmd internal tests
 UPDATE_GOLDEN=1 go test ./...   # rewrite golden files (never hand-edit one)
 go run ./cmd/originc version
+GOOS=js GOARCH=wasm go build -o web/origin.wasm ./cmd/originwasm   # the browser host
+UPDATE_GOLDEN=1 go test ./tests/web/    # regenerate the playground's example list
 ```
 
 `./check` must exit 0 before any commit, and before any phase is declared complete. It
@@ -34,6 +37,8 @@ either is breached.
 
 ```
 cmd/originc/          stage0 compiler driver (Go)
+cmd/originwasm/       the browser host: the pipeline and both engines, GOOS=js GOARCH=wasm,
+                      exporting one function (docs/spec/playground-runtime.md)
 internal/source/      file identity, byte offset -> line/column (one implementation)
 internal/diag/        spans, codes, diagnostic rendering
 internal/lex/         tokens
@@ -70,6 +75,9 @@ tests/selfhost/       stage1 against the Go compiler it replaces, over this repo
 tests/floats/         the float rendering against Go's strconv, over 14,000 bit patterns
 tests/debuginfo/      lldb/llvm-dwarfdump on both formats; skips if they are absent
 tests/fuzz/           fuzz targets for the lexer and parser
+tests/wasm/           the browser build against the end-to-end corpus, under Node: 98 cases
+                      on both engines, byte for byte against the same golden files
+tests/web/            the playground page, driven in Chromium; skips without playwright
 docs/spec/            THE language specification — normative; §13 collections, §14
                       strings, §15 files were added in Phase 7, §16 floats in Phase 8
 docs/adr/             architecture decision records — every irreversible choice
@@ -81,6 +89,8 @@ stage1/src/           the compiler for Origin, written in Origin: thirty-six mod
                       there is
 bootstrap/            the last known-good stage1 binary, and what it builds from
                       stage1/src -- the same bytes (process rule 9)
+web/                  the Origin playground: a static page that compiles and runs Origin in
+                      the visitor's browser, with no backend of any kind
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```
 
@@ -184,6 +194,31 @@ This project outlasts any single context window.
   lives in one place with one test suite guarding it.
 
 ## Status
+
+**Phase 10 is complete** (`docs/phases/10-complete.md`). **Origin runs in a browser**, entirely
+client-side, with no server executing user code and no backend at all:
+
+```
+98 of the 102 end-to-end cases, on both engines, through the WebAssembly module
+   -> byte-identical stdout, stderr and exit status to the native run
+```
+
+`cmd/originwasm` is the whole pipeline as a `GOOS=js GOARCH=wasm` module exporting one
+function; `web/` is the page around it. 1.5 MB gzipped, of which the CodeMirror editor is
+94 KB. Five ADRs: **0032** (both engines, the VM by default), **0033** (a host with no
+filesystem: every file operation fails as `Err(IoError::Other)`, and the `os` calls are behind
+a build tag so the module cannot reach one), **0034** (CodeMirror, vendored), **0035** (a
+shared program travels in the URL fragment, which browsers never transmit) and **0036** (a Web
+Worker, so a non-terminating program does not freeze the tab and `terminate()` is a real stop
+button).
+
+Two things to carry forward. **Running the corpus is what found everything**: §08's back-edge
+preemption does not survive a host with no signals, and `preemption_at_a_back_edge` hung
+forever on both engines until they were made to yield explicitly. And **two defects older than
+the phase** — a stale reference in the VM's `spawn` (a moving collector rewrites its roots, and
+a Go local captured by a goroutine is not one) and a data race in `types.Prune` (path
+compression made a write out of a read; `-race` reported 18, and reports 0 now). Both have
+regression tests that fail on the code they replace.
 
 **Phase 9 is complete** (`docs/phases/9-complete.md`). **The compiler compiles itself**, and the
 result is a fixed point:
