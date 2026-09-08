@@ -6,7 +6,7 @@
 # editor bundle, the generated example list) is in git already, so the build's whole job is
 # the module.
 #
-# It is deliberately not `go build` on its own, for two reasons that are the same reason.
+# It is deliberately not `go build` on its own, for three reasons.
 #
 #   1. The module's ABI and `web/wasm_exec.js` change together. `wasm_exec.js` is Go's own
 #      JavaScript shim, copied verbatim, and it is committed -- so a module built by a
@@ -15,9 +15,14 @@
 #      a deploy host, so this checks it here too, and refuses rather than shipping the
 #      mismatch.
 #
-#   2. A build host's Go version is not ours to choose. GOTOOLCHAIN pins the exact toolchain
-#      and Go fetches it if it is not already there, so the module is built by go1.24.7
-#      whatever the host happens to ship.
+#   2. A build host's Go version is not ours to choose, and some hosts have no Go at all
+#      (Vercel's build image does not). GOTOOLCHAIN pins the exact toolchain and Go fetches
+#      it on demand; if there is no Go to do the fetching, this fetches one first.
+#
+#   3. Everything the build writes goes inside the workspace rather than /tmp. An extracted
+#      Go toolchain is ~287 MB and Go's own build temporaries go to $TMPDIR by default, so a
+#      host whose /tmp is a small tmpfs gets a build killed part-way through with nothing
+#      useful on stderr. The workspace is the disk the host actually gave us.
 #
 # Usage: ./build-web    (from anywhere; it finds the repository root itself)
 
@@ -28,24 +33,41 @@ set -euo pipefail
 readonly WANT_GO=go1.24.7
 
 cd "$(dirname "$0")"
+readonly ROOT="$PWD"
 
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
+
+# --- where the build is allowed to write --------------------------------------------------
+#
+# All inside the workspace. `outputDirectory` is `web/`, so none of this is served, and
+# .gitignore keeps a local run from dirtying the tree.
+
+export GOCACHE="$ROOT/.build/gocache"
+export GOMODCACHE="$ROOT/.build/gomodcache"
+export GOTMPDIR="$ROOT/.build/gotmp"
+mkdir -p "$GOCACHE" "$GOMODCACHE" "$GOTMPDIR"
 
 # --- the toolchain -----------------------------------------------------------------------
 
 if ! command -v go >/dev/null 2>&1; then
   # Most hosts ship a Go; this is for the ones that do not. Any Go recent enough to
-  # understand GOTOOLCHAIN (1.21+) is enough, because the line below re-pins it anyway.
-  say "no go on PATH; fetching ${WANT_GO} to bootstrap"
-  bootstrap="$(mktemp -d)"
+  # understand GOTOOLCHAIN (1.21+) would do, because the line below re-pins it anyway --
+  # fetching the wanted one directly just saves a second download.
+  say "no go on PATH; fetching ${WANT_GO}"
+  bootstrap="$ROOT/.build/toolchain"
+  mkdir -p "$bootstrap"
   curl -fsSL "https://go.dev/dl/${WANT_GO}.linux-amd64.tar.gz" | tar -xz -C "$bootstrap"
   export PATH="$bootstrap/go/bin:$PATH"
 fi
 
 # Pin the exact toolchain. Go downloads it on demand and caches it, so this is a no-op on a
-# host that already has it and a one-time fetch on a host that does not.
+# host that already has the right one.
 export GOTOOLCHAIN="$WANT_GO"
 say "building with $(go version)"
+
+# What the host actually gave us, printed before the work rather than guessed at after a
+# failure. A build killed for want of disk says nothing on its way out.
+say "workspace: $(df -Pk "$ROOT" 2>/dev/null | awk 'NR==2{printf "%.1f GiB free", $4/1048576}' || echo 'unknown')"
 
 # --- the shim and the module must come from the same Go ------------------------------------
 
@@ -88,10 +110,25 @@ fi
 
 # --- the module ----------------------------------------------------------------------------
 
-say "compiling cmd/originwasm to WebAssembly"
-GOOS=js GOARCH=wasm go build -o web/origin.wasm ./cmd/originwasm
+say "compiling cmd/originwasm to WebAssembly (about 10s on two cores)"
 
-# A zero-length or missing artefact would otherwise be found by the visitor rather than here.
+# The exit status is reported rather than left to `set -e`, because the failure this most
+# needs to be legible about -- a host killing the compiler for want of memory or disk -- does
+# not come with a message of its own.
+set +e
+GOOS=js GOARCH=wasm go build -o web/origin.wasm ./cmd/originwasm
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  echo "error: the compiler exited with status ${rc}" >&2
+  if [ "$rc" -ge 128 ]; then
+    echo "  (a status of 128 or more means it was killed by a signal $((rc - 128)) rather" >&2
+    echo "   than failing on its own; on a build host that is usually memory or disk)" >&2
+  fi
+  df -Pk "$ROOT" >&2 2>/dev/null || true
+  exit "$rc"
+fi
+
 if [ ! -s web/origin.wasm ]; then
   echo "error: web/origin.wasm was not produced" >&2
   exit 1

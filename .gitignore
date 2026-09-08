@@ -15,3 +15,7 @@ tests/e2e/scratch/
 # The browser host's compiled module. Reproducible from source in one command
 # (web/README.md); six megabytes of binary per rebuild does not belong in history.
 /web/origin.wasm
+
+# Where ./build-web keeps the Go toolchain, caches and temporaries it needs at deploy time.
+# Inside the workspace rather than /tmp, because a build host's /tmp may be a small tmpfs.
+/.build/
