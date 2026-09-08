@@ -25,7 +25,7 @@ go test -run xxx -fuzz FuzzParse ./tests/fuzz/   # fuzz the parser
 gofmt -w cmd internal tests
 UPDATE_GOLDEN=1 go test ./...   # rewrite golden files (never hand-edit one)
 go run ./cmd/originc version
-GOOS=js GOARCH=wasm go build -o web/origin.wasm ./cmd/originwasm   # the browser host
+./build-web          # the playground's build output: pins the toolchain, builds the module
 UPDATE_GOLDEN=1 go test ./tests/web/    # regenerate the playground's example list
 ```
 
@@ -90,7 +90,8 @@ stage1/src/           the compiler for Origin, written in Origin: thirty-six mod
 bootstrap/            the last known-good stage1 binary, and what it builds from
                       stage1/src -- the same bytes (process rule 9)
 web/                  the Origin playground: a static page that compiles and runs Origin in
-                      the visitor's browser, with no backend of any kind
+                      the visitor's browser, with no backend of any kind. `./build-web`
+                      produces its one uncommitted artefact; `vercel.json` deploys it
 site/                 pre-existing static website; unrelated to Origin (ADR-0002)
 ```
 

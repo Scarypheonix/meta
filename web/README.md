@@ -27,11 +27,23 @@ bounded output) are the decisions behind the rest.
 ## Building
 
 ```
+./build-web
+```
+
+That is the repository-root script a deploy host runs, and it is the one command this
+directory needs. It does three things: pins the Go toolchain to the version below with
+`GOTOOLCHAIN`, so the module is built by go1.24.7 whatever the host happens to ship; checks
+that `web/wasm_exec.js` is the one that toolchain ships, and refuses to build if it is not;
+then compiles the module.
+
+The build itself is a single `go build`, and running it by hand is fine:
+
+```
 GOOS=js GOARCH=wasm go build -o web/origin.wasm ./cmd/originwasm
 ```
 
-`origin.wasm` is not committed: it is ~6 MB, it is reproducible from source in that one
-command, and a copy per rebuild would be history nobody can read.
+`origin.wasm` is not committed: it is ~6 MB, it is reproducible from source in one command,
+and a copy per rebuild would be history nobody can read.
 
 `wasm_exec.js` **is** committed, and it is Go's, copied verbatim from
 `$(go env GOROOT)/lib/wasm/wasm_exec.js`. It is version-locked to the toolchain that builds
@@ -83,10 +95,30 @@ it is a mystery.
 
 ## Deploying
 
-Copy this directory to any static host after building the module. There is nothing else —
-no runtime, no database, no configuration. Note that `site/` (ADR-0002) is a different,
-unrelated static site in this repository, so a host serving one of them needs its source
-directory pointed at the right one.
+Copy this directory to any static host after running `./build-web`. There is nothing else —
+no runtime, no database, no secrets, and nothing server-side. `site/` (ADR-0002) is a
+different, unrelated static site in this repository, so a host must be pointed at the right
+one; `vercel.json` is what does that here.
+
+`vercel.json` at the repository root configures it for Vercel:
+
+| Setting | Value | Why |
+|---|---|---|
+| `framework` | `null` | there is no framework to detect; the preset would guess wrong |
+| `buildCommand` | `./build-web` | the module is not committed, so it is built at deploy time |
+| `outputDirectory` | `web` | this directory, and not `site/` |
+| `installCommand` | an echo | there is nothing to install: the editor is vendored (ADR-0034) |
+| `headers` | `application/wasm` on `/(.*)\\.wasm` | some browsers refuse a module served as anything else |
+
+There are **no serverless functions and no API routes**. Vercel creates functions from an
+`api/` directory, and this repository has none — the Go tree under `cmd/` and `internal/` is
+the compiler, built *by* the build command into a WebAssembly module, never deployed as
+server-side code. Nothing here needs an environment variable or a secret.
+
+`.vercelignore` keeps the parts of the repository the build does not read — the test corpus,
+the documentation, `stage1/`, the committed `bootstrap/` binary and the other site — out of
+the upload, which takes it from about 16.8 MB to 1.9 MB. It cannot affect what is served:
+`outputDirectory` decides that.
 
 ## Tests
 

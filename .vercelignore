@@ -1,0 +1,27 @@
+# What the playground's deploy does not need uploaded.
+#
+# The build (`./build-web`) compiles `cmd/originwasm` for js/wasm, so it needs `go.mod`,
+# `cmd/`, `internal/` and `web/` -- and nothing else in this repository. Everything below is
+# either a different project, a test corpus, or a committed binary, and leaving it out keeps
+# roughly thirteen megabytes of it off every deployment.
+#
+# This file is about upload weight only. It cannot affect what is served: that is
+# `outputDirectory` in vercel.json, which is `web/`.
+
+# A different, unrelated static site that happens to share this repository (ADR-0002). It
+# must not be deployed here, and the output directory already ensures it is not.
+site/
+
+# The test corpus and the suite. Nothing the module needs to build.
+tests/
+check
+
+# The self-hosted compiler's Origin source (34,000 lines) and the committed stage1 binary.
+# `cmd/originwasm` builds from the Go tree, not from these.
+stage1/
+bootstrap/
+selfhost.test
+
+# Documentation.
+docs/
+CLAUDE.md

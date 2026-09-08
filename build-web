@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# build-web — produce the playground's build output.
+#
+# This is what a static host runs at deploy time. It builds one artefact, `web/origin.wasm`,
+# which is the only thing in `web/` that is not committed: everything else (the page, the
+# editor bundle, the generated example list) is in git already, so the build's whole job is
+# the module.
+#
+# It is deliberately not `go build` on its own, for two reasons that are the same reason.
+#
+#   1. The module's ABI and `web/wasm_exec.js` change together. `wasm_exec.js` is Go's own
+#      JavaScript shim, copied verbatim, and it is committed -- so a module built by a
+#      *different* Go than the one that shim came from can load and then misbehave in ways
+#      that are hard to read. `tests/web` checks that pairing locally. Nothing runs tests on
+#      a deploy host, so this checks it here too, and refuses rather than shipping the
+#      mismatch.
+#
+#   2. A build host's Go version is not ours to choose. GOTOOLCHAIN pins the exact toolchain
+#      and Go fetches it if it is not already there, so the module is built by go1.24.7
+#      whatever the host happens to ship.
+#
+# Usage: ./build-web    (from anywhere; it finds the repository root itself)
+
+set -euo pipefail
+
+# The toolchain this page's committed wasm_exec.js came from. Changing it means copying that
+# file again from the same toolchain -- the check below is what stops the two from drifting.
+readonly WANT_GO=go1.24.7
+
+cd "$(dirname "$0")"
+
+say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
+
+# --- the toolchain -----------------------------------------------------------------------
+
+if ! command -v go >/dev/null 2>&1; then
+  # Most hosts ship a Go; this is for the ones that do not. Any Go recent enough to
+  # understand GOTOOLCHAIN (1.21+) is enough, because the line below re-pins it anyway.
+  say "no go on PATH; fetching ${WANT_GO} to bootstrap"
+  bootstrap="$(mktemp -d)"
+  curl -fsSL "https://go.dev/dl/${WANT_GO}.linux-amd64.tar.gz" | tar -xz -C "$bootstrap"
+  export PATH="$bootstrap/go/bin:$PATH"
+fi
+
+# Pin the exact toolchain. Go downloads it on demand and caches it, so this is a no-op on a
+# host that already has it and a one-time fetch on a host that does not.
+export GOTOOLCHAIN="$WANT_GO"
+say "building with $(go version)"
+
+# --- the shim and the module must come from the same Go ------------------------------------
+
+shim="$(go env GOROOT)/lib/wasm/wasm_exec.js"
+if [ ! -f "$shim" ]; then
+  echo "error: ${WANT_GO} has no lib/wasm/wasm_exec.js at ${shim}" >&2
+  exit 1
+fi
+if ! cmp -s "$shim" web/wasm_exec.js; then
+  cat >&2 <<EOF
+error: web/wasm_exec.js is not the one ${WANT_GO} ships.
+
+  committed: web/wasm_exec.js
+  toolchain: ${shim}
+
+They are two halves of one interface and are version-locked (web/README.md). Refusing to
+build a module the committed shim may not load correctly. To take the toolchain's version
+deliberately:
+
+  cp ${shim} web/wasm_exec.js
+
+and update WANT_GO in this script and the version named in web/README.md to match.
+EOF
+  exit 1
+fi
+
+# --- the module ----------------------------------------------------------------------------
+
+say "compiling cmd/originwasm to WebAssembly"
+GOOS=js GOARCH=wasm go build -o web/origin.wasm ./cmd/originwasm
+
+# A zero-length or missing artefact would otherwise be found by the visitor rather than here.
+if [ ! -s web/origin.wasm ]; then
+  echo "error: web/origin.wasm was not produced" >&2
+  exit 1
+fi
+
+say "web/origin.wasm is $(wc -c < web/origin.wasm) bytes"
+say "build output is web/"
