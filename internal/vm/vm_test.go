@@ -354,3 +354,55 @@ fn main() {
 			large, small, float64(large)/float64(small))
 	}
 }
+
+// TestASpawnedThreadsClosureSurvivesACollectionBeforeItRuns is the regression test for a
+// stale reference in `spawn`.
+//
+// The closure handed to a new thread is registered as a root before the goroutine starts,
+// so a collection cannot free it. That is only half of what a *moving* collector requires:
+// when the object moves, the collector rewrites the roots it was handed, and a Go local
+// captured by the goroutine's own closure is not one of them. `spawn` used to call the
+// captured local, so a collection landing between the registration and the thread's first
+// instruction left it calling the address the closure used to be at.
+//
+// The window is a few instructions wide, which is why the corpus hit it about once in three
+// full runs and why a small nursery finds it immediately: this program allocates hard in the
+// parent right after each spawn, so a collection lands inside the window nearly every time.
+// Before the fix it fails in well under a second, as `vm: called an object that is not a
+// closure` or `vm: field read on a value that is not an object` -- both being what reading a
+// moved object's old address looks like one level apart.
+func TestASpawnedThreadsClosureSurvivesACollectionBeforeItRuns(t *testing.T) {
+	src := `use std::io;
+use std::thread;
+
+struct Box { value: i64 }
+
+fn main() {
+    let mut i = 0;
+    let mut total = 0;
+    while i < 40 {
+        let carried = Box { value: i };
+        let h = thread::spawn(|| -> i64 { carried.value });
+        // Allocate hard in the parent, so a collection lands while the child is between
+        // being registered as a root and running its first instruction.
+        let mut j = 0;
+        while j < 200 {
+            let junk = Box { value: j };
+            j = j + 1;
+        }
+        total = total + h.join();
+        i = i + 1;
+    }
+    io::println(total.to_str());
+}
+`
+	stdout, stderr, code := runWith(t, src, gc.Config{NurseryWords: 512, OldWords: 1 << 12, CardWords: 16})
+	if code != 0 {
+		t.Fatalf("exit %d\nstderr:\n%s", code, stderr)
+	}
+	// 0 + 1 + ... + 39. Each thread reads the field of the object its closure captured, so a
+	// wrong answer means one of them read an object that had moved out from under it.
+	if stdout != "780\n" {
+		t.Errorf("stdout = %q, want %q", stdout, "780\n")
+	}
+}

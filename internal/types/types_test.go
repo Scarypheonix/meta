@@ -253,3 +253,33 @@ func TestFreeVars(t *testing.T) {
 		t.Errorf("after binding one variable FreeVars found %d, want 1", n)
 	}
 }
+
+// TestPruneDoesNotMutate is the regression test for a data race.
+//
+// Prune used to compress the path it walked -- `v.Ref = Prune(v.Ref)` -- which made a
+// *write* to shared state out of what every one of its callers performs as a read. That is
+// harmless while only the checker runs, because the checker is single-threaded and is
+// mutating the graph anyway. It stops being harmless the moment a solved graph is read
+// concurrently, which is exactly what the interpreter does: `kindOfType` prunes on the
+// arithmetic path, green threads are goroutines, and several of them inspect the same types
+// at once. `go test -race ./tests/e2e` reported nineteen races on the threaded programs,
+// every one of them here.
+//
+// This asserts the invariant directly rather than by running threads, so it is deterministic
+// and needs no -race: the chain must be walked, and must be left exactly as it was found.
+func TestPruneDoesNotMutate(t *testing.T) {
+	end := P(I64)
+	mid := &Var{ID: 2, Ref: end}
+	head := &Var{ID: 1, Ref: mid}
+
+	if got := Prune(head); got != Type(end) {
+		t.Fatalf("Prune followed the chain to %v, want %v", got, end)
+	}
+	if head.Ref != Type(mid) {
+		t.Errorf("Prune rewrote head.Ref to %v; it must leave the chain alone, because "+
+			"callers read concurrently and a read that writes is a data race", head.Ref)
+	}
+	if mid.Ref != Type(end) {
+		t.Errorf("Prune rewrote mid.Ref to %v; it must leave the chain alone", mid.Ref)
+	}
+}

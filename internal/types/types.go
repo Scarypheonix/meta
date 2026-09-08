@@ -229,8 +229,10 @@ const (
 	FloatDefault
 )
 
-// Var is an inference variable. Binding is by mutation with path compression, which is
-// why every read goes through Prune.
+// Var is an inference variable. Binding is by mutation -- unify.go's bind and the two
+// defaulting cases write Ref, and nothing else does -- which is why every read goes through
+// Prune. Prune itself does not write; see the note there for why that matters once a solved
+// graph is read from several threads.
 //
 // Level implements Rémy's ranked generalization: a variable created inside a `let`
 // right-hand side has a higher level than the binding around it, and only variables
@@ -265,15 +267,34 @@ func (*ErrorT) String() string { return "{unknown}" }
 // Error is the shared error type instance.
 var Error = &ErrorT{}
 
-// Prune follows bound inference variables to the type they stand for, compressing the
-// path as it goes. Every function that inspects a type must call it first.
+// Prune follows bound inference variables to the type they stand for. Every function that
+// inspects a type must call it first.
+//
+// It does not compress the path, and that is deliberate. Compression made this a *write* to
+// shared state on what every caller treats as a read, which is fine while only the checker
+// runs and it is single-threaded -- and is a data race the moment a solved type graph is
+// read concurrently. The interpreter does exactly that: `kindOfType` prunes on the
+// arithmetic path, and green threads are goroutines, so several of them inspect the same
+// types at once. `go test -race ./tests/e2e` reported it on every threaded program.
+//
+// Losing compression costs nothing that was being paid for. The three sites that bind a
+// variable (unify.go's bind and the two defaulting cases) all run during checking, so by the
+// time the graph is read concurrently it is solved and immutable, and the chains that
+// compression would have shortened are already as short as inference left them. Measured on
+// the heaviest checking workload the project has -- `originc check stage1/src`, 34,000 lines
+// of Origin -- the two versions are 360/408/375 ms against 346/397/378 ms: the difference is
+// smaller than the variance between runs of either.
+//
+// The loop replaces the recursion for the same reason it is cheap to do so: the chain is
+// walked either way, and an iterative walk cannot deepen the Go stack on a pathological one.
 func Prune(t Type) Type {
-	v, ok := t.(*Var)
-	if !ok || v.Ref == nil {
-		return t
+	for {
+		v, ok := t.(*Var)
+		if !ok || v.Ref == nil {
+			return t
+		}
+		t = v.Ref
 	}
-	v.Ref = Prune(v.Ref)
-	return v.Ref
 }
 
 // IsError reports whether t is the error type, after pruning.

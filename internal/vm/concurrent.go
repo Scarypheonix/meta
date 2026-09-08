@@ -308,7 +308,23 @@ func (v *VM) spawn(body Value, span diag.Span) int64 {
 			w.exec.Unlock()
 		}()
 
-		result := child.callValue(body, span)
+		// Read the closure back out of the root rather than using the captured `body`.
+		//
+		// Registering it in temps keeps it *reachable*, which is what the comment above the
+		// registration says and all it says. It does not keep `body` correct: the collector
+		// moves objects, and when it does it rewrites the roots it was handed --
+		// `child.temps[0]` among them -- while a Go local captured by this closure is not a
+		// root and cannot be rewritten. A collection between the registration above and this
+		// line therefore leaves `body` holding the address the closure used to be at.
+		//
+		// The window is small and the consequence is not: the thread calls a stale reference
+		// and reads whatever now lives there, which surfaces as `called an object that is not
+		// a closure` or, one level in, `field read on a value that is not an object`.
+		//
+		// temps is a base/restore stack (values.go's callBuiltin appends above its own base
+		// and truncates back to it), so index 0 stays this closure for the thread's life. The
+		// read is under `w.exec`, so no collection can be in flight while it happens.
+		result := child.callValue(child.temps[0], span)
 
 		w.mu.Lock()
 		st := w.threads[h]
