@@ -1,0 +1,21 @@
+// EXPECT: accept
+// spec: 13-collections.md — `[a, b, c]` builds a List.
+
+// ADR-0039. The literal is a spelling of `list::new` plus pushes, so it needs no
+// `use std::list;` and collections stay a library. `[` in prefix position was unreachable
+// in the grammar, so this costs ADR-0013's rule nothing.
+use std::io;
+
+fn main() {
+    let xs = [1, 2, 3];
+    io::println("\(xs.len())");
+
+    let empty: List[i64] = [];
+    io::println("\(empty.len())");
+
+    let nested = [[1, 2], [3]];
+    io::println("\(nested.at(0).len())");
+
+    let trailing = [1, 2,];
+    io::println("\(trailing.len())");
+}

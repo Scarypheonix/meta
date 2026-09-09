@@ -1,0 +1,16 @@
+// EXPECT: accept
+// spec: 02-grammar.md — `[` after an expression is type application, as ADR-0013 says.
+
+// The list literal does not weaken ADR-0013: `[` begins a literal only where an expression
+// may start. Here it follows one, so it is an instantiation.
+use std::io;
+use std::list;
+
+fn id[T](x: T) -> T { x }
+
+fn main() {
+    io::println("\(id[i64](7))");
+    let xs = list::new[i64]();
+    xs.push(1);
+    io::println("\(xs.len())");
+}

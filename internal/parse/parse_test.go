@@ -412,3 +412,107 @@ func TestNodeIDsAreUniqueAndNonZero(t *testing.T) {
 		t.Errorf("walked only %d nodes; the test is not exercising much", len(seen))
 	}
 }
+
+func TestIfLetDesugarsToATwoArmMatch(t *testing.T) {
+	// ADR-0038. Nothing downstream learns a new form, so what the parser must produce is a
+	// `Match` -- with the LetForm the usefulness check reads to report E0008 rather than
+	// E0006 against an arm the programmer never wrote.
+	f, bag := parseSrc(t, "fn f() { if let Some(n) = o { n } else { 0 } }")
+	if bag.HasErrors() {
+		t.Fatalf("unexpected errors:\n%s", bag)
+	}
+	m, ok := f.Items[0].(*ast.FnDecl).Body.Tail.(*ast.Match)
+	if !ok {
+		t.Fatalf("`if let` must parse to a Match, got %T", f.Items[0].(*ast.FnDecl).Body.Tail)
+	}
+	if m.LetForm != ast.LetFormIf {
+		t.Errorf("LetForm = %v, want LetFormIf", m.LetForm)
+	}
+	if len(m.Arms) != 2 {
+		t.Fatalf("want two arms, got %d", len(m.Arms))
+	}
+	if _, ok := m.Arms[1].Pat.(*ast.WildcardPat); !ok {
+		t.Errorf("the second arm must be `_`, got %T", m.Arms[1].Pat)
+	}
+}
+
+func TestIfLetWithoutAnElseYieldsUnit(t *testing.T) {
+	f, bag := parseSrc(t, "fn f() { if let Some(n) = o { n } }")
+	if bag.HasErrors() {
+		t.Fatalf("unexpected errors:\n%s", bag)
+	}
+	m := f.Items[0].(*ast.FnDecl).Body.Tail.(*ast.Match)
+	tup, ok := m.Arms[1].Body.(*ast.TupleExpr)
+	if !ok || len(tup.Elems) != 0 {
+		t.Errorf("the missing else must become `()`, got %T", m.Arms[1].Body)
+	}
+}
+
+func TestWhileLetDesugarsToALoopAroundAMatch(t *testing.T) {
+	// The `loop` is what makes `break` and `continue` in the body bind correctly, since
+	// loop depth counts `while`/`for`/`loop` and not `match`.
+	f, bag := parseSrc(t, "fn f() { while let Some(n) = it.next() { g(n); } }")
+	if bag.HasErrors() {
+		t.Fatalf("unexpected errors:\n%s", bag)
+	}
+	loop, ok := f.Items[0].(*ast.FnDecl).Body.Tail.(*ast.Loop)
+	if !ok {
+		t.Fatalf("`while let` must parse to a Loop, got %T", f.Items[0].(*ast.FnDecl).Body.Tail)
+	}
+	m, ok := loop.Body.Tail.(*ast.Match)
+	if !ok {
+		t.Fatalf("the loop body must be a Match, got %T", loop.Body.Tail)
+	}
+	if m.LetForm != ast.LetFormWhile {
+		t.Errorf("LetForm = %v, want LetFormWhile", m.LetForm)
+	}
+	if _, ok := m.Arms[1].Body.(*ast.Break); !ok {
+		t.Errorf("the miss arm must be `break`, got %T", m.Arms[1].Body)
+	}
+}
+
+func TestListLiteralDesugarsToPushes(t *testing.T) {
+	// ADR-0039. The literal is a spelling of `list::new` plus one push per element, in
+	// source order -- which is what makes §04's left-to-right evaluation fall out.
+	f, bag := parseSrc(t, "fn f() { [a, b, c] }")
+	if bag.HasErrors() {
+		t.Fatalf("unexpected errors:\n%s", bag)
+	}
+	block, ok := f.Items[0].(*ast.FnDecl).Body.Tail.(*ast.Block)
+	if !ok {
+		t.Fatalf("a list literal must parse to a Block, got %T", f.Items[0].(*ast.FnDecl).Body.Tail)
+	}
+	if len(block.Stmts) != 4 {
+		t.Fatalf("want a let plus three pushes, got %d statements", len(block.Stmts))
+	}
+	let, ok := block.Stmts[0].(*ast.LetStmt)
+	if !ok {
+		t.Fatalf("the first statement must be the binding, got %T", block.Stmts[0])
+	}
+	if name := let.Pat.(*ast.BindPat).Name.Name; name != listBinding {
+		t.Errorf("the binding is %q, want %q -- it must not be nameable by a program", name, listBinding)
+	}
+	for i := 1; i < 4; i++ {
+		call, ok := block.Stmts[i].(*ast.ExprStmt).X.(*ast.MethodCall)
+		if !ok || call.Name.Name != "push" {
+			t.Fatalf("statement %d must be a push, got %T", i, block.Stmts[i].(*ast.ExprStmt).X)
+		}
+	}
+}
+
+func TestBracketAfterAnExpressionIsStillTypeApplication(t *testing.T) {
+	// The boundary ADR-0013 draws, which the list literal must not move: `[` begins a
+	// literal only where an expression may start.
+	f, bag := parseSrc(t, "fn f() { g[i64](1) }")
+	if bag.HasErrors() {
+		t.Fatalf("unexpected errors:\n%s", bag)
+	}
+	call, ok := f.Items[0].(*ast.FnDecl).Body.Tail.(*ast.Call)
+	if !ok {
+		t.Fatalf("want a Call, got %T", f.Items[0].(*ast.FnDecl).Body.Tail)
+	}
+	path, ok := call.Fn.(*ast.PathExpr)
+	if !ok || len(path.Args) != 1 {
+		t.Errorf("`g[i64]` must be an instantiation with one type argument, got %T", call.Fn)
+	}
+}

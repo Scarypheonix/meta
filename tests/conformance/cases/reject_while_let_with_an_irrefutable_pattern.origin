@@ -1,0 +1,6 @@
+// EXPECT: reject E0008
+// spec: 05-patterns.md — `while let` requires a refutable pattern.
+fn main() {
+    let mut n = 0;
+    while let x = n { n = n + 1; if n > 2 { break; } }
+}

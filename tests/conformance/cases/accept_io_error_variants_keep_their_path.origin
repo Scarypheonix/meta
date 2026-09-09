@@ -1,0 +1,19 @@
+// EXPECT: accept
+// spec: 07-modules.md — only Option, Result and Ordering are unqualified.
+
+// IoError is a prelude enum whose variants are NOT in scope, so `other` is free to be an
+// ordinary catch-all binding. Taking every prelude enum instead made W0003 fire on exactly
+// this shape, which is what corrected ADR-0037.
+use std::io;
+
+fn describe(e: IoError) -> String {
+    match e {
+        IoError::NotFound => "missing",
+        other => "other",
+    }
+}
+
+fn main() {
+    io::println(describe(IoError::NotFound));
+    io::println(describe(IoError::Other));
+}

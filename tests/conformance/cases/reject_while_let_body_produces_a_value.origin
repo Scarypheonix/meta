@@ -1,0 +1,9 @@
+// EXPECT: reject E0308
+// spec: 02-grammar.md — a `while let` body produces no value, as a `while` body does.
+
+// The desugaring must not make the two loops differ: a body whose value was silently
+// discarded would be an inconsistency a reader has no way to predict (ADR-0038).
+fn main() {
+    let o = Some(1);
+    while let Some(x) = o { x }
+}

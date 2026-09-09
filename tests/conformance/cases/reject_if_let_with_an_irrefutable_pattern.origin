@@ -1,0 +1,10 @@
+// EXPECT: reject E0008
+// spec: 05-patterns.md — `if let` requires a refutable pattern.
+
+// The mirror of E0005. The desugaring's `_` arm would be unreachable, and reporting E0006
+// against an arm the programmer never wrote would name syntax that is not in the source
+// (ADR-0038).
+fn main() {
+    let pair = (1, 2);
+    if let (a, b) = pair { }
+}

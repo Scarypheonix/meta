@@ -1,0 +1,13 @@
+// EXPECT: accept
+// spec: 07-modules.md — the prelude is step 4, so every earlier step shadows it.
+
+// A module's own declaration wins over a prelude variant of the same name, which is what
+// keeps a program that already had one meaning what it meant (ADR-0037).
+use std::io;
+
+struct Ok { n: i64 }
+
+fn main() {
+    let v = Ok { n: 7 };
+    io::println("\(v.n)");
+}

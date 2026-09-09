@@ -1,0 +1,22 @@
+// EXPECT: accept
+// spec: 02-grammar.md — `if let` and `while let` desugar to a match and a loop.
+
+// ADR-0038. `break` and `continue` in a `while let` body bind to the loop the desugaring
+// introduces, because `match` is not a loop; `continue` therefore re-evaluates the
+// scrutinee.
+use std::io;
+
+fn main() {
+    let xs = [1, 2, 3, 4];
+    if let Some(v) = xs.get(0) { io::println("first \(v)"); } else { io::println("empty"); }
+    if let None = xs.get(99) { io::println("past the end"); }
+
+    let it = xs.into_iter();
+    let mut odd = 0;
+    while let Some(v) = it.next() {
+        if v % 2 == 0 { continue; }
+        if v > 3 { break; }
+        odd = odd + v;
+    }
+    io::println("odd \(odd)");
+}

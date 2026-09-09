@@ -1,0 +1,122 @@
+// The three Phase 11 shorthands, in one program that does something.
+//
+// Each of them is defined by rewriting into a form that already existed (ADR-0037, ADR-0038,
+// ADR-0039), so what this case is really asserting is that the rewriting is *unobservable*:
+// the same program written the long way produces the same bytes on all three engines at
+// every optimization level. `long_way` below is that program, and `main` prints both.
+//
+// The shapes worth having a case for, rather than the features in the abstract:
+//
+//   - a bare variant in expression and in pattern position, and the qualified form beside it
+//   - `if let` with and without an `else`, since the `else`-less form desugars to `()`
+//   - `continue` and `break` inside a `while let`, which bind to the loop the desugaring
+//     introduces rather than to anything the programmer can see
+//   - a list literal nested inside another, whose synthesized bindings must not collide
+//   - elements with a side effect, which pin the left-to-right order §04 requires
+use std::io;
+use std::list;
+
+struct Tally { mut evens: i64, mut odds: i64 }
+
+fn note(t: Tally, n: i64) {
+    if n % 2 == 0 { t.evens = t.evens + 1; } else { t.odds = t.odds + 1; }
+}
+
+/// Returns the first element strictly greater than `bound`, or `None`.
+fn first_above(xs: List[i64], bound: i64) -> Option[i64] {
+    let it = xs.into_iter();
+    while let Some(v) = it.next() {
+        if v <= bound { continue; }
+        return Some(v);
+    }
+    None
+}
+
+/// Splits on the first negative element: everything before it, and whether one was found.
+fn upto_negative(xs: List[i64]) -> Result[List[i64], String] {
+    let out = list::new[i64]();
+    let it = xs.into_iter();
+    while let Some(v) = it.next() {
+        if v < 0 { return Err("negative at index \(out.len())"); }
+        out.push(v);
+    }
+    Ok(out)
+}
+
+fn describe(o: Option[i64]) -> String {
+    if let Some(v) = o { "found \(v)" } else { "nothing" }
+}
+
+fn tick(t: Tally, n: i64) -> i64 { note(t, n); n }
+
+fn main() {
+    // A literal whose elements have a side effect: §04 fixes the order left to right, and
+    // the tally is what would change if a desugaring pushed them in any other.
+    let t = Tally { evens: 0, odds: 0 };
+    let xs = [tick(t, 3), tick(t, 8), tick(t, 5), tick(t, 12)];
+    io::println("evens \(t.evens) odds \(t.odds)");
+    io::println("len \(xs.len())");
+
+    io::println(describe(first_above(xs, 4)));
+    io::println(describe(first_above(xs, 99)));
+
+    // `if let` without an `else` is a statement whose value is `()`.
+    if let Some(v) = first_above(xs, 10) { io::println("big \(v)"); }
+    if let None = first_above(xs, 10) { io::println("unreachable"); }
+
+    match upto_negative(xs) {
+        Ok(kept) => io::println("kept \(kept.len())"),
+        Err(e) => io::println(e),
+    }
+    match upto_negative([1, 0 - 2, 3]) {
+        Ok(kept) => io::println("kept \(kept.len())"),
+        Err(e) => io::println(e),
+    }
+
+    // Nested literals: each is its own block, so the bindings they introduce cannot collide.
+    let grid = [[1, 2, 3], [4], []];
+    let mut total = 0;
+    for row in grid {
+        for v in row { total = total + v; }
+    }
+    io::println("grid \(total)");
+
+    // The qualified spelling denotes the same variant, and `Ordering` comes along too.
+    match Option::Some(2).unwrap_or(0).cmp(2) {
+        Less => io::println("<"),
+        Equal => io::println("="),
+        Greater => io::println(">"),
+    }
+
+    io::println(long_way());
+}
+
+/// The same answers, written the way Origin 0.1 required. Printing both is the point: if a
+/// desugaring were observable, these two lines would differ.
+fn long_way() -> String {
+    let ys = list::new[i64]();
+    ys.push(3);
+    ys.push(8);
+    ys.push(5);
+    ys.push(12);
+
+    let mut found = Option::None;
+    let it = ys.into_iter();
+    let mut going = true;
+    while going {
+        match it.next() {
+            Option::Some(v) => {
+                if v > 4 {
+                    found = Option::Some(v);
+                    going = false;
+                }
+            }
+            Option::None => { going = false; }
+        }
+    }
+    let shown = match found {
+        Option::Some(v) => "found \(v)",
+        Option::None => "nothing",
+    };
+    "long way: \(shown), len \(ys.len())"
+}

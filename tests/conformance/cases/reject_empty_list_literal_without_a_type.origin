@@ -1,0 +1,9 @@
+// EXPECT: reject E0309
+// spec: 13-collections.md — `[]` constrains nothing and needs an annotation.
+
+// No dedicated rule for the empty literal: each push constrains the element type, and with
+// no pushes there is nothing to constrain it, which is an ordinary inference failure
+// (ADR-0039).
+fn main() {
+    let xs = [];
+}

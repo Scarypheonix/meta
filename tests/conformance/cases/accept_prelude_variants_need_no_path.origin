@@ -1,0 +1,22 @@
+// EXPECT: accept
+// spec: 07-modules.md — Option, Result and Ordering put their variants in scope.
+
+// ADR-0037. The three enums the language's own constructs produce and consume put their
+// variants in the global scope, so `Some(x)` is `Option::Some(x)`. The qualified form still
+// means the same thing, which is what makes the change cost no existing program a rewrite.
+use std::io;
+
+fn half(n: i64) -> Option[i64] {
+    if n % 2 == 0 { Some(n / 2) } else { None }
+}
+
+fn positive(n: i64) -> Result[i64, String] {
+    if n > 0 { Ok(n) } else { Err("not positive") }
+}
+
+fn main() {
+    match half(10) { Some(v) => io::println("\(v)"), None => io::println("odd") }
+    match half(7) { Option::Some(v) => io::println("\(v)"), Option::None => io::println("odd") }
+    match positive(1) { Ok(v) => io::println("\(v)"), Err(e) => io::println(e) }
+    match 1.cmp(2) { Less => io::println("<"), Equal => io::println("="), Greater => io::println(">") }
+}

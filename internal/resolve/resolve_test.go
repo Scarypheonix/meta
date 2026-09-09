@@ -24,6 +24,12 @@ func resolveSrc(t *testing.T, src string) (*ast.File, *Result, *diag.Bag) {
 
 // resolveWithPrelude resolves a file together with the prelude, sharing one id
 // generator so that node ids stay unique across both.
+//
+// The prelude goes in as Prelude: true, the way `internal/driver` passes it. It used to go
+// in as an ordinary file, which put its items in the root module's scope instead of the
+// globals -- close enough to work for what the tests then asked, but not the arrangement
+// the compiler actually runs, and nothing that depends on the distinction would have been
+// testable.
 func resolveWithPrelude(t *testing.T, src string) (*ast.File, *Result, *diag.Bag) {
 	t.Helper()
 	ids := ast.NewIDGen()
@@ -33,7 +39,7 @@ func resolveWithPrelude(t *testing.T, src string) (*ast.File, *Result, *diag.Bag
 	if bag.HasErrors() {
 		t.Fatalf("the test source does not parse:\n%s", bag)
 	}
-	return f, Files(bag, pre, f), bag
+	return f, Program(bag, Input{File: pre, Prelude: true}, Input{File: f}), bag
 }
 
 func TestItemsAreVisibleBeforeTheyAreDeclared(t *testing.T) {
@@ -160,8 +166,8 @@ fn main() {
 
 func TestBareNameInPatternBindsUnlessItNamesAConstant(t *testing.T) {
 	// spec/02-grammar.md: a bare name in a pattern binds, unless it resolves to a unit
-	// variant or a constant. In 0.1 only the constant half is reachable, because a
-	// variant always needs a path.
+	// variant or a constant. Both halves are reachable since ADR-0037; this case covers
+	// the constant one, and the unit-variant one is below.
 	src := `
 const LIMIT: i64 = 10;
 fn main() {
@@ -184,6 +190,105 @@ fn main() {
 	second := m.Arms[1].Pat.(*ast.BindPat)
 	if ref := res.Refs[second.NodeID()]; ref.Kind != LocalVar {
 		t.Errorf("`other` names nothing, so the pattern must bind (got %v)", ref.Kind)
+	}
+}
+
+func TestPreludeVariantsResolveWithoutAPath(t *testing.T) {
+	// ADR-0037. `Option`, `Result` and `Ordering` put their variants in the global scope,
+	// so a bare `None` in a pattern matches the variant rather than binding -- which is the
+	// unit-variant half of spec/02-grammar.md's resolution rule, unreachable until now.
+	src := `
+fn main() {
+    match Some(1) {
+        Some(n) => { }
+        None => { }
+    }
+}
+`
+	f, res, bag := resolveWithPrelude(t, src)
+	if bag.HasErrors() {
+		t.Fatalf("unexpected errors:\n%s", bag)
+	}
+	m := f.Items[0].(*ast.FnDecl).Body.Tail.(*ast.Match)
+
+	// `Some(1)` in expression position.
+	call := m.Scrutinee.(*ast.Call)
+	if ref := res.Refs[call.Fn.(*ast.PathExpr).NodeID()]; ref.Kind != Variant {
+		t.Errorf("`Some` in an expression must name a variant (got %v)", ref.Kind)
+	} else if ref.Name != "Option::Some" {
+		// The qualified name is what makes the two spellings indistinguishable downstream.
+		t.Errorf("the Ref must carry the qualified name, got %q", ref.Name)
+	}
+
+	// `None` in pattern position is a bare name, so it goes through the binding rule.
+	none := m.Arms[1].Pat.(*ast.BindPat)
+	if ref := res.Refs[none.NodeID()]; ref.Kind != Variant {
+		t.Errorf("`None` in a pattern must match the variant, not bind (got %v)", ref.Kind)
+	}
+	if _, bound := res.Bindings[none.NodeID()]; bound {
+		t.Error("`None` must not introduce a binding")
+	}
+}
+
+func TestAUserDeclarationShadowsAPreludeVariant(t *testing.T) {
+	// The prelude is the last step of the resolution order (spec/07-modules.md), so a
+	// module's own declaration wins. This is what keeps a program that already had an `Ok`
+	// meaning what it meant.
+	src := `
+struct Ok { n: i64 }
+fn main() { let v = Ok { n: 1 }; }
+`
+	_, res, bag := resolveWithPrelude(t, src)
+	if bag.HasErrors() {
+		t.Fatalf("unexpected errors:\n%s", bag)
+	}
+	if res.Structs["Ok"] == nil {
+		t.Fatal("the user's `Ok` should have been declared")
+	}
+}
+
+func TestNearMissOnAUnitVariantWarns(t *testing.T) {
+	// W0003, registered since 0.1 and emitted for the first time by ADR-0037. Writing
+	// `none` where `None` was meant binds everything and matches nothing, and the resulting
+	// two-arm match looks right.
+	src := `
+fn main() {
+    match Some(1) {
+        Some(n) => { }
+        none => { }
+    }
+}
+`
+	_, _, bag := resolveWithPrelude(t, src)
+	if bag.HasErrors() {
+		t.Fatalf("a near miss is a warning, not an error:\n%s", bag)
+	}
+	if bag.WarningCount() != 1 {
+		t.Fatalf("want exactly one warning, got %d:\n%s", bag.WarningCount(), bag)
+	}
+	if out := bag.String(); !strings.Contains(out, "W0003") || !strings.Contains(out, "`None`") {
+		t.Errorf("the warning should name W0003 and the variant it means:\n%s", out)
+	}
+}
+
+func TestNoNearMissWarningInAnIrrefutablePosition(t *testing.T) {
+	// The warning is scoped to refutable positions, where a variant and a binding are both
+	// legal. `Ord::cmp(self, other: Self)` is the case that forced the scoping while
+	// `IoError::Other` was still in the global scope; the parameter must stay silent
+	// whatever else changes about which enums participate (ADR-0037).
+	src := `
+struct P { n: i64 }
+impl Ord for P {
+    fn cmp(self, other: Self) -> Ordering { self.n.cmp(other.n) }
+}
+fn main() { }
+`
+	_, _, bag := resolveWithPrelude(t, src)
+	if bag.HasErrors() {
+		t.Fatalf("unexpected errors:\n%s", bag)
+	}
+	if bag.WarningCount() != 0 {
+		t.Errorf("a parameter is irrefutable, so nothing should warn:\n%s", bag)
 	}
 }
 
