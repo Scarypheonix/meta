@@ -4,7 +4,7 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Phases 0 through 10 are complete** (see `docs/phases/`). **The compiler compiles itself**,
+**Phases 0 through 11 are complete** (see `docs/phases/`). **The compiler compiles itself**,
 and it runs in a browser. See Status, at the bottom of this file, for what exists and what is
 next.
 
@@ -195,6 +195,37 @@ This project outlasts any single context window.
   lives in one place with one test suite guarding it.
 
 ## Status
+
+**Phase 11 is complete** (`docs/phases/11-complete.md`). Three syntax simplifications, chosen
+from an audit of every candidate and ranked by cost, each of which leaves every existing program
+meaning exactly what it meant:
+
+```
+Option::Some(x)  ->  Some(x)              ADR-0037, the resolver and nothing else
+match o { Some(n) => a, None => {} }
+                 ->  if let Some(n) = o { a }    ADR-0038, a parser desugaring
+list::new(); push; push  ->  [a, b]       ADR-0039, a parser desugaring
+```
+
+**No golden file moved and no existing source was rewritten**, which is what made three features
+affordable at 208s of a 300s budget: both spellings of a variant resolve to the same `Ref`, and
+the two new forms were syntax errors before. `./check` runs in 176s at 1,929 MiB.
+
+Three things to carry forward. **The corpus corrected ADR-0037 within a minute of the first
+run**: the rule was "every enum the prelude declares", which put `IoError::Other` in the global
+scope, and `other` is the idiomatic name for a catch-all match arm — four sites here. The tell
+had already been misread, since W0003 had needed scoping away from `Ord::cmp(self, other: Self)`
+for the same collision. **A desugaring is invisible until a diagnostic points at it**: an
+irrefutable `if let` made the synthesized `_` arm unreachable and E0006 named syntax that is not
+in the source, so `ast.Match` carries the construct it came from and E0008 names the
+programmer's pattern instead. And **`resolveWithPrelude` had been passing the prelude as an
+ordinary file** rather than with `Prelude: true` for ten phases — the helper's mistake and every
+assertion's expectation were the same mistake, so no test could have caught it.
+
+**Next action: the user's to set** (rule 7). Held explicitly for a separate decision:
+**associated functions** (`List::new()`, 568 corpus sites, the only audited candidate that
+reaches the type checker) and **tuple element access** (`t.0`, whose `x.0.1` lexing is the one
+place any of this would reintroduce the context-sensitivity ADR-0013 removed).
 
 **Phase 10 is complete** (`docs/phases/10-complete.md`). **Origin runs in a browser**, entirely
 client-side, with no server executing user code and no backend at all:
