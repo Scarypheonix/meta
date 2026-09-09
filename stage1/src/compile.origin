@@ -1478,7 +1478,7 @@ impl Compiler {
             ast::ExprKind::Lambda(params, _, body) => self.lambda(e, params, body),
             ast::ExprKind::Block(b) => self.block_expr(e),
             ast::ExprKind::If(cond, then, els) => self.if_expr(e, cond, then, els),
-            ast::ExprKind::Match(scrut, arms) => self.match_expr(e, scrut, arms),
+            ast::ExprKind::Match(scrut, arms, _) => self.match_expr(e, scrut, arms),
             ast::ExprKind::While(cond, body) => self.while_expr(e, cond, body),
             ast::ExprKind::Loop(body) => self.loop_expr(e, body),
             ast::ExprKind::For(p, iter, body) => self.for_expr(e, p, iter, body),

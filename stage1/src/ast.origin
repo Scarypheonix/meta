@@ -185,6 +185,23 @@ pub struct BlockBody {
     pub tail: Option[Expr],
 }
 
+/// Which surface construct a `Match` was desugared from (ADR-0038). A `match` the
+/// programmer wrote is `LET_FORM_NONE`.
+///
+/// Its only reader is the usefulness check: an irrefutable pattern makes the `_` arm the
+/// desugaring adds unreachable, and reporting E0006 against an arm nobody wrote would be a
+/// diagnostic that lies about where the problem is. E0008 names the construct instead.
+pub const LET_FORM_NONE: i64 = 0;
+pub const LET_FORM_IF: i64 = 1;
+pub const LET_FORM_WHILE: i64 = 2;
+
+/// How a diagnostic spells the construct.
+pub fn let_form_name(f: i64) -> String {
+    if f == LET_FORM_IF { return "if let"; }
+    if f == LET_FORM_WHILE { return "while let"; }
+    "match"
+}
+
 pub struct Expr {
     pub span: Span,
     pub node: ExprKind,
@@ -226,7 +243,7 @@ pub enum ExprKind {
     Lambda(List[LambdaParam], Option[Type], Expr),
     Block(BlockBody),
     If(Expr, Expr, Option[Expr]),
-    Match(Expr, List[Arm]),
+    Match(Expr, List[Arm], i64),
     While(Expr, Expr),
     For(Pat, Expr, Expr),
     Loop(Expr),
@@ -934,7 +951,7 @@ fn dump_expr(out: List[String], e: Expr, depth: i64) {
                 Option::None => {}
             }
         }
-        ExprKind::Match(scrutinee, arms) => {
+        ExprKind::Match(scrutinee, arms, _) => {
             emit(out, depth, "match");
             dump_expr(out, scrutinee, depth + 1);
             let mut i = 0;

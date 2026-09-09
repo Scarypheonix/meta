@@ -701,7 +701,20 @@ fn report_resolution(out: resolve::Resolved, with_trace: bool) -> bool {
             t = t + 1;
         }
     }
-    out.errors.is_empty()
+    // A warning does not reject the program. W0003 is the resolver's first (ADR-0037), and
+    // counting it here would make `stage1 resolve` reject what `originc` accepts.
+    !any_resolve_error(errors)
+}
+
+fn any_resolve_error(errors: List[resolve::ResolveError]) -> bool {
+    let mut i = 0;
+    while i < errors.len() {
+        if !errors.at(i).warning {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
 }
 
 /// Runs one file, reporting whether it was accepted.

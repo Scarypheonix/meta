@@ -312,7 +312,7 @@ impl Walker {
                     Option::None => {}
                 }
             }
-            ast::ExprKind::Match(scrut, arms) => {
+            ast::ExprKind::Match(scrut, arms, _) => {
                 self.walk_expr(at, scrut);
                 let mut i = 0;
                 while i < arms.len() {

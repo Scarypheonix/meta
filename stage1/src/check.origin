@@ -2625,7 +2625,7 @@ impl Checker {
 
             ast::ExprKind::Block(_) => self.check_block_direct(e),
             ast::ExprKind::If(cond, then, els) => self.infer_if(cond, then, els),
-            ast::ExprKind::Match(scrutinee, arms) => self.infer_match(e, scrutinee, arms),
+            ast::ExprKind::Match(scrutinee, arms, form) => self.infer_match(e, scrutinee, arms, form),
 
             ast::ExprKind::While(cond, body) => {
                 self.expect_bool(cond, "a `while` condition");
@@ -3195,7 +3195,8 @@ impl Checker {
         }
     }
 
-    fn infer_match(self, e: ast::Expr, scrutinee: ast::Expr, arms: List[ast::Arm]) -> types::Type {
+    fn infer_match(self, e: ast::Expr, scrutinee: ast::Expr, arms: List[ast::Arm],
+                   form: i64) -> types::Type {
         let scrut = self.infer(scrutinee);
         if arms.is_empty() {
             self.error("E0004", e.span, "`match` with no arms");
@@ -3211,18 +3212,25 @@ impl Checker {
                 Option::Some(g) => self.expect_bool(g, "a match guard"),
                 Option::None => {}
             }
-            let got = self.infer(arm.body);
-            if !types::is_never(got) {
-                if have {
-                    self.unify_at(result, got, arm.body.span, "this arm");
-                } else {
-                    result = got;
-                    have = true;
+            // A `while let` body produces no value, exactly as a `while` body does: the two
+            // are the same loop and differing here would be an inconsistency a reader has no
+            // way to predict. Arm 0 is the body; arm 1 is the `break` the desugaring adds.
+            if form == ast::LET_FORM_WHILE && i == 0 {
+                self.expect_unit_block(arm.body, "a `while let` body");
+            } else {
+                let got = self.infer(arm.body);
+                if !types::is_never(got) {
+                    if have {
+                        self.unify_at(result, got, arm.body.span, "this arm");
+                    } else {
+                        result = got;
+                        have = true;
+                    }
                 }
             }
             i = i + 1;
         }
-        self.check_exhaustive(e, arms, scrut);
+        self.check_exhaustive(e, arms, scrut, form);
         if have { result } else { types::never() }
     }
 
@@ -4972,7 +4980,8 @@ fn not_useful() -> Witness { Witness { useful: false, cells: list::new[Pat2]() }
 fn useful_with(cells: List[Pat2]) -> Witness { Witness { useful: true, cells: cells } }
 
 impl Checker {
-    fn check_exhaustive(self, e: ast::Expr, arms: List[ast::Arm], scrut_in: types::Type) {
+    fn check_exhaustive(self, e: ast::Expr, arms: List[ast::Arm], scrut_in: types::Type,
+                        form: i64) {
         let scrut = self.normalize(scrut_in);
         if types::is_error(scrut) {
             return;
@@ -4999,7 +5008,15 @@ impl Checker {
                     a = a + 1;
                 }
                 if !reachable {
-                    self.error("E0006", arm.pat.span, "unreachable pattern");
+                    if form != ast::LET_FORM_NONE && i == 1 {
+                        // The unreachable arm is the `_` an `if let`/`while let` desugars
+                        // to (ADR-0038), which means the programmer's own pattern always
+                        // matches. E0006 here would underline syntax nobody wrote.
+                        self.error("E0008", arms.at(0).pat.span,
+                            "irrefutable pattern in `\(ast::let_form_name(form))`");
+                    } else {
+                        self.error("E0006", arm.pat.span, "unreachable pattern");
+                    }
                 }
             }
 

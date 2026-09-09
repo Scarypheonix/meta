@@ -875,7 +875,7 @@ fn is_block_expr(e: ast::Expr) -> bool {
     match e.node {
         ast::ExprKind::Block(_) => true,
         ast::ExprKind::If(_, _, _) => true,
-        ast::ExprKind::Match(_, _) => true,
+        ast::ExprKind::Match(_, _, _) => true,
         ast::ExprKind::While(_, _) => true,
         ast::ExprKind::For(_, _, _) => true,
         ast::ExprKind::Loop(_) => true,
@@ -1294,6 +1294,9 @@ impl Parser {
         if k == lex::K_LPAREN {
             return self.paren_or_tuple();
         }
+        if k == lex::K_LBRACKET {
+            return self.list_lit();
+        }
         if k == lex::K_LBRACE {
             return self.block();
         }
@@ -1305,6 +1308,9 @@ impl Parser {
         }
         if k == lex::K_WHILE {
             self.advance();
+            if self.at(lex::K_LET) {
+                return self.while_let(start);
+            }
             let cond = self.expr_no_struct();
             let body = self.block();
             return self.mk_expr(start, ast::ExprKind::While(cond, body));
@@ -1388,6 +1394,9 @@ impl Parser {
     fn if_expr(self) -> ast::Expr {
         let start = self.pos;
         self.advance();
+        if self.at(lex::K_LET) {
+            return self.if_let(start);
+        }
         let cond = self.expr_no_struct();
         let then = self.block();
         let mut els = Option::None;
@@ -1407,7 +1416,7 @@ impl Parser {
         let scrutinee = self.expr_no_struct();
         let arms = list::new[ast::Arm]();
         if !self.expect(lex::K_LBRACE) {
-            return self.mk_expr(start, ast::ExprKind::Match(scrutinee, arms));
+            return self.mk_expr(start, ast::ExprKind::Match(scrutinee, arms, ast::LET_FORM_NONE));
         }
         let saved = self.no_struct;
         self.no_struct = false;
@@ -1440,7 +1449,96 @@ impl Parser {
         }
         self.no_struct = saved;
         self.expect(lex::K_RBRACE);
-        self.mk_expr(start, ast::ExprKind::Match(scrutinee, arms))
+        self.mk_expr(start, ast::ExprKind::Match(scrutinee, arms, ast::LET_FORM_NONE))
+    }
+
+    /// `if let p = e { a } else { b }` -> `match e { p => a, _ => b }` (ADR-0038).
+    ///
+    /// Entered with `if` consumed and `let` current. The desugaring is `internal/parse`'s,
+    /// node for node, because the two compilers are compared on the tree they build.
+    fn if_let(self, start: i64) -> ast::Expr {
+        self.advance(); // let
+        let pat = self.pattern();
+        self.expect(lex::K_ASSIGN);
+        let scrut = self.expr_no_struct();
+        let then = self.block();
+
+        let mut els = self.mk_expr(start, ast::ExprKind::Tuple(list::new[ast::Expr]()));
+        if self.eat(lex::K_ELSE) {
+            if self.at(lex::K_IF) {
+                els = self.if_expr();
+            } else {
+                els = self.block();
+            }
+        }
+        let_match(self.span_from(start), ast::LET_FORM_IF, pat, scrut, then, els)
+    }
+
+    /// `while let p = e { body }` -> `loop { match e { p => body, _ => break } }`.
+    ///
+    /// `break` and `continue` in the body need nothing special: loop depth counts
+    /// `while`/`for`/`loop` and not `match`, so this `loop` is already the innermost one.
+    fn while_let(self, start: i64) -> ast::Expr {
+        self.advance(); // let
+        let pat = self.pattern();
+        self.expect(lex::K_ASSIGN);
+        let scrut = self.expr_no_struct();
+        let body = self.block();
+
+        let no_value: Option[ast::Expr] = Option::None;
+        let brk = self.mk_expr(start, ast::ExprKind::Break(no_value));
+        let m = let_match(self.span_from(start), ast::LET_FORM_WHILE, pat, scrut, body, brk);
+        let inner = self.mk_expr(start, ast::ExprKind::Block(ast::BlockBody {
+            stmts: list::new[ast::Stmt](), tail: Option::Some(m),
+        }));
+        self.mk_expr(start, ast::ExprKind::Loop(inner))
+    }
+
+    /// `[a, b, c]` -> `{ let xs = std::list::new(); xs.push(a); ..; xs }` (ADR-0039).
+    ///
+    /// The path is fully qualified because a literal is a form rather than a call to a name
+    /// the program must have imported, and the binding is spelled `[list]`, which no program
+    /// can name, so nested literals cannot collide.
+    fn list_lit(self) -> ast::Expr {
+        let start = self.pos;
+        let saved = self.no_struct;
+        self.no_struct = false;
+        self.advance(); // [
+        let elems = list::new[ast::Expr]();
+        let mut going = true;
+        while going && !self.at(lex::K_RBRACKET) && !self.at_eof() {
+            elems.push(self.expr());
+            if !self.eat(lex::K_COMMA) {
+                going = false;
+            }
+        }
+        self.no_struct = saved;
+        self.expect(lex::K_RBRACKET);
+
+        let at = self.span_from(start);
+        let name = ast::Ident {
+            name: LIST_BINDING, start: at.start, end: at.end, res: ast::UNRESOLVED,
+        };
+
+        let stmts = list::new[ast::Stmt]();
+        let no_type: Option[ast::Type] = Option::None;
+        stmts.push(ast::Stmt::Let(at, false,
+            ast::pat(at, ast::PatKind::Bind(false, name, no_pat())), no_type,
+            ast::expr(at, ast::ExprKind::Call(
+                path_expr(at, "std::list::new"), list::new[ast::Expr]()))));
+
+        let mut i = 0;
+        while i < elems.len() {
+            let args = list::new[ast::Expr]();
+            args.push(elems.at(i));
+            stmts.push(ast::Stmt::ExprStmt(
+                ast::expr(at, ast::ExprKind::Method("push", ident_expr(at, name), args)), true));
+            i = i + 1;
+        }
+
+        self.mk_expr(start, ast::ExprKind::Block(ast::BlockBody {
+            stmts: stmts, tail: Option::Some(ident_expr(at, name)),
+        }))
     }
 
     fn lambda(self) -> ast::Expr {
@@ -1541,6 +1639,56 @@ impl Parser {
 // `"total: \(n + 1)"` becomes `"total: ".concat((n + 1).to_str())`, here in the parser, so
 // nothing downstream learns a new form: the checker sees `concat` and `to_str` and applies
 // `Str` and `Show` to them like any other call.
+
+/// The name a list literal binds its new list to. Deliberately not a valid identifier, so
+/// no program can name it and no user binding can collide with one (ADR-0039).
+pub const LIST_BINDING: String = "[list]";
+
+fn no_pat() -> Option[ast::Pat] { Option::None }
+
+/// The two-arm `match` an `if let` or `while let` means. Every synthesized node carries the
+/// whole construct's span, so a diagnostic inside either arm underlines what the programmer
+/// wrote.
+///
+/// A free function taking the span rather than a method taking `self` and a token index,
+/// because the method form is seven arguments and the native backend passes six in
+/// registers (`docs/deferred.md`). `interpolated` is a free function for its own reasons and
+/// this one keeps it company.
+fn let_match(at: ast::Span, form: i64, pat: ast::Pat, scrut: ast::Expr,
+             then: ast::Expr, els: ast::Expr) -> ast::Expr {
+    let arms = list::new[ast::Arm]();
+    let no_guard: Option[ast::Expr] = Option::None;
+    arms.push(ast::Arm { span: at, pat: pat, guard: no_guard, body: then });
+    arms.push(ast::Arm {
+        span: at, pat: ast::pat(at, ast::PatKind::Wild), guard: no_guard, body: els,
+    });
+    ast::expr(at, ast::ExprKind::Match(scrut, arms, form))
+}
+
+/// A path expression from its `::`-separated text, for a desugaring that names something
+/// the programmer did not write.
+fn path_expr(at: ast::Span, text: String) -> ast::Expr {
+    let segs = list::new[ast::Ident]();
+    for seg in text.split("::") {
+        segs.push(ast::Ident { name: seg, start: at.start, end: at.end, res: ast::UNRESOLVED });
+    }
+    let types = list::new[ast::Type]();
+    ast::expr(at, ast::ExprKind::Path(ast::PathRef {
+        text: text, start: at.start, end: at.end, segs: segs, res: ast::UNRESOLVED,
+    }, types))
+}
+
+/// A one-segment path expression naming an existing binding.
+fn ident_expr(at: ast::Span, name: ast::Ident) -> ast::Expr {
+    let segs = list::new[ast::Ident]();
+    segs.push(ast::Ident {
+        name: name.name, start: name.start, end: name.end, res: ast::UNRESOLVED,
+    });
+    let types = list::new[ast::Type]();
+    ast::expr(at, ast::ExprKind::Path(ast::PathRef {
+        text: name.name, start: at.start, end: at.end, segs: segs, res: ast::UNRESOLVED,
+    }, types))
+}
 
 fn interpolated(t: lex::Token, errors: List[ParseError], at: ast::Span) -> ast::Expr {
     // Every node the desugaring builds carries the whole literal's span: none of these

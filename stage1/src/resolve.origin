@@ -265,6 +265,9 @@ pub struct ResolveError {
     pub file: String,
     pub start: i64,
     pub end: i64,
+    /// A warning does not reject the program. `check::CheckError` carries the same flag for
+    /// the same reason: the resolver gained one when W0003 started firing (ADR-0037).
+    pub warning: bool,
 }
 
 /// One file to resolve, with the module path it lives at and whether it is the prelude.
@@ -307,9 +310,53 @@ pub struct Resolver {
     mut scope: Scope,
     mut fn_depth: i64,
     mut loop_depth: i64,
+    /// True while a pattern in a refutable position -- a `match` arm, and so also an
+    /// `if let`/`while let` pattern, which desugar to one -- is being bound. It scopes
+    /// W0003 to the only place the confusion it warns about is possible (ADR-0037).
+    mut refutable: bool,
+    /// The prelude's unit variants, in declaration order, which is what W0003 compares a
+    /// binding's name against.
+    unit_variants: List[String],
     lambdas: List[LambdaCtx],
     /// The file whose body is being resolved, for spans in its diagnostics.
     mut file: String,
+}
+
+/// The enums whose variants are in scope under their own names, so that `Some(x)` means
+/// `Option::Some(x)` (ADR-0037, spec/07-modules.md).
+///
+/// These three and no others, because they are the ones the language's own constructs
+/// produce and consume: `?` unwraps an `Option` or a `Result`, `for` drives an
+/// `Iterator::next` returning an `Option`, and `Ord::cmp` returns an `Ordering`.
+///
+/// `IoError` is deliberately absent even though the prelude declares it too: `other` is the
+/// idiomatic name for a catch-all match arm, and `IoError::Other` collided with every one.
+fn unqualified_variant_enum(name: String) -> bool {
+    name == "Option" || name == "Result" || name == "Ordering"
+}
+
+/// Compares two names ignoring ASCII case, and only ASCII case.
+///
+/// The Go resolver folds exactly this much for the same reason (`equalFoldASCII`): full
+/// Unicode folding needs tables stage1 does not have, which is the gap its lexer already
+/// records for XID_Start, and folding only ASCII makes the two agree by construction rather
+/// than by the corpus happening to hold no non-ASCII identifier.
+fn eq_ignoring_case(a: String, b: String) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if lower_ascii(a.byte_at(i)) != lower_ascii(b.byte_at(i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn lower_ascii(c: i64) -> i64 {
+    if c >= 65 && c <= 90 { c + 32 } else { c }
 }
 
 /// The primitive type names, in scope everywhere. They are not declarations, so they
@@ -401,6 +448,8 @@ pub fn program(inputs: List[Input]) -> Resolved {
         scope: globals,
         fn_depth: 0,
         loop_depth: 0,
+        refutable: false,
+        unit_variants: list::new[String](),
         lambdas: list::new[LambdaCtx](),
         file: "",
     };
@@ -561,11 +610,46 @@ impl Resolver {
     fn error(self, code: String, at: ast::Span, message: String) {
         self.errors.push(ResolveError {
             code: code, message: message, file: self.file, start: at.start, end: at.end,
+            warning: false,
         });
     }
 
     fn error_at(self, code: String, id: ast::Ident, message: String) {
         self.error(code, ast::Span { start: id.start, end: id.end }, message);
+    }
+
+    fn warn_at(self, code: String, id: ast::Ident, message: String) {
+        self.errors.push(ResolveError {
+            code: code, message: message, file: self.file,
+            start: id.start, end: id.end, warning: true,
+        });
+    }
+
+    /// W0003: a binding whose name differs from an in-scope unit variant only by case
+    /// (spec/02-grammar.md). Writing `none` where `None` was meant binds everything and
+    /// matches nothing, and the resulting `match` looks right.
+    ///
+    /// Only in a refutable position, which is where a variant and a binding are both legal.
+    /// In a `let`, a parameter or a `for`, a name that resolved to a unit variant would make
+    /// the pattern refutable and E0005 already rejects it.
+    fn warn_near_variant(self, name: ast::Ident) {
+        if !self.refutable || name.name.is_empty() {
+            return;
+        }
+        match self.scope.lookup(name.name) {
+            Option::Some(r) => { if r.kind != K_LOCAL { return; } }
+            Option::None => {}
+        }
+        let mut i = 0;
+        while i < self.unit_variants.len() {
+            let cand = self.unit_variants.at(i);
+            if cand != name.name && eq_ignoring_case(cand, name.name) {
+                self.warn_at("W0003", name,
+                    "`\(name.name)` binds; it differs from the variant `\(cand)` only by case");
+                return;
+            }
+            i = i + 1;
+        }
     }
 }
 
@@ -639,7 +723,12 @@ impl Resolver {
         match item {
             ast::Item::Fn(d) => self.declare(d.name, ref_fn(d, self.file)),
             ast::Item::Struct(d) => self.declare(d.name, ref_struct(d, self.file)),
-            ast::Item::Enum(d) => self.declare(d.name, ref_enum(d, self.file)),
+            ast::Item::Enum(d) => {
+                self.declare(d.name, ref_enum(d, self.file));
+                if self.current.is_prelude && unqualified_variant_enum(d.name.name) {
+                    self.declare_prelude_variants(d);
+                }
+            }
             ast::Item::Const(d) => self.declare(d.name, ref_const(d, self.file)),
             ast::Item::Trait(d) => self.declare(d.name, ref_trait(d, self.file)),
             ast::Item::Alias(d) => self.declare(d.name, ref_alias(d, self.file)),
@@ -647,6 +736,43 @@ impl Resolver {
             // the receiver's type, which is the checker's question rather than this one's.
             ast::Item::Impl(_) => {}
             ast::Item::ErrorItem => {}
+        }
+    }
+
+    /// Puts one such enum's variants into the global scope, so that `Some(x)` means
+    /// `Option::Some(x)` (ADR-0037, spec/07-modules.md).
+    ///
+    /// The Ref is the one `variant_of` builds, qualified name included, so a variant
+    /// written either way is indistinguishable to every later pass.
+    ///
+    /// Variants are deliberately not registered as module items: a variant is reached
+    /// through its enum, and being scope-only is what makes shadowing work -- a user module
+    /// declares into its own scope, layered over the globals, so its `Some` wins.
+    fn declare_prelude_variants(self, d: ast::EnumDecl) {
+        let mut i = 0;
+        while i < d.variants.len() {
+            let v = d.variants.at(i);
+            if !v.name.name.is_empty() {
+                let mut dup = false;
+                match self.globals.names.get(v.name.name) {
+                    Option::Some(prev) => { if prev.kind != K_LOCAL { dup = true; } }
+                    Option::None => {}
+                }
+                if dup {
+                    self.error_at("E0433", v.name,
+                        "`\(v.name.name)` is declared more than once in this module");
+                } else {
+                    let vr = ref_decl(K_VARIANT, "\(d.name.name)::\(v.name.name)",
+                        self.file, v.name.start);
+                    vr.enum_decl = Option::Some(d);
+                    vr.variant = Option::Some(v);
+                    self.globals.names.insert(v.name.name, vr);
+                    if v.kind == ast::VARIANT_UNIT {
+                        self.unit_variants.push(v.name.name);
+                    }
+                }
+            }
+            i = i + 1;
         }
     }
 
@@ -1137,6 +1263,7 @@ impl Resolver {
                         Option::None => {}
                     }
                 }
+                self.warn_near_variant(name);
                 let l = Local {
                     name: name.name, mutable: pat_mut || mutable, file: self.file,
                     at: name.start, fn_depth: self.fn_depth,
@@ -1501,14 +1628,17 @@ impl Resolver {
                 }
             }
 
-            ast::ExprKind::Match(scrutinee, arms) => {
+            ast::ExprKind::Match(scrutinee, arms, _) => {
                 self.resolve_expr(scrutinee);
                 let mut i = 0;
                 while i < arms.len() {
                     let arm = arms.at(i);
                     let saved = self.scope;
                     self.scope = new_scope(Option::Some(saved));
+                    let saved_ref = self.refutable;
+                    self.refutable = true;
                     self.bind_pattern(arm.pat, false);
+                    self.refutable = saved_ref;
                     match arm.guard {
                         Option::Some(g) => self.resolve_expr(g),
                         Option::None => {}

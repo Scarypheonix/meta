@@ -10,8 +10,6 @@
 package resolve
 
 import (
-	"strings"
-
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/diag"
 )
@@ -947,7 +945,7 @@ func (r *resolver) warnNearVariant(name ast.Ident) {
 		return // it resolves to something in its own right; not a near miss
 	}
 	for _, cand := range r.unitVariants {
-		if cand == name.Name || !strings.EqualFold(cand, name.Name) {
+		if cand == name.Name || !equalFoldASCII(cand, name.Name) {
 			continue
 		}
 		r.bag.Warnf("W0003", name.Loc, "`%s` binds; it differs from the variant `%s` only by case", name.Name, cand).
@@ -955,6 +953,34 @@ func (r *resolver) warnNearVariant(name ast.Ident) {
 			Note("write `%s` to match that variant, or rename the binding", cand)
 		return
 	}
+}
+
+// equalFoldASCII compares two names ignoring ASCII case, and only ASCII case.
+//
+// Deliberately not strings.EqualFold. This rule has to hold identically in two
+// implementations of the same compiler -- `stage1/src/resolve.origin` is the other -- and
+// full Unicode case folding needs tables stage1 does not have, the same gap its lexer
+// records for XID_Start. Folding only ASCII makes the two agree by construction rather than
+// by the corpus happening to hold no non-ASCII identifier. The cost is a missed warning on
+// a name Origin permits and nothing here uses, and for a heuristic a missed warning is the
+// safe direction.
+func equalFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if lowerASCII(a[i]) != lowerASCII(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
 }
 
 // ---------------------------------------------------------------------------
