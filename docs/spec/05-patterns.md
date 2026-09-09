@@ -71,9 +71,15 @@ table with no default arm.
 | `String` | never exhaustive without `_` |
 
 `let p = e;` and `for p in e` require `p` to be **irrefutable** — exhaustive by itself
-for the scrutinee's type. `let Some(x) = opt;` is REJECTED with a note suggesting
-`match` or `if let`. (`if let` is DEFERRED, Phase 2 — it is sugar over a two-arm
-`match`.)
+for the scrutinee's type. `let Some(x) = opt;` is REJECTED as `E0005` with a note
+suggesting `match` or `if let`.
+
+`if let p = e` and `while let p = e` require the opposite: `p` MUST be **refutable**, or
+the test it performs has one answer. An irrefutable pattern there is REJECTED as `E0008`
+with a help naming `let`. Because both forms are defined by rewriting to a `match` whose
+second arm is `_` (§02), an irrefutable `p` would make that arm unreachable; `E0008` is
+reported in place of `E0006` so that the diagnostic names the construct the programmer
+wrote rather than an arm the rewriting introduced.
 
 ## Decision tree lowering
 
@@ -106,3 +112,8 @@ Snapshot tests in `tests/snapshot/match/` pin the generated tree for a fixed cor
 | `match e { A(x) \| B => 1 }` | REJECTED — `x` not bound in all alternatives |
 | `let (a, b) = pair;` | accepted — irrefutable |
 | `let Some(x) = opt;` | REJECTED — refutable pattern in `let` |
+| `if let Some(x) = opt { x } else { 0 }` | accepted — refutable |
+| `if let (a, b) = pair { .. }` | REJECTED — `E0008`, irrefutable; use `let` |
+| `while let Some(x) = it.next() { .. }` | accepted |
+| `match o { Some(x) => x, None => 0 }` | accepted — a prelude variant needs no path (§07) |
+| `match o { some => 0, .. }` | `W0003`: `some` binds, and differs from `Some` only by case |

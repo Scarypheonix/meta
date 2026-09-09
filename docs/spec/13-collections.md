@@ -80,6 +80,24 @@ fn (l: List[T]) set(i: i64, v: T) -> ()       // TRAPS `index out of range`
 fn (l: List[T]) clear() -> ()
 ```
 
+### The literal form
+
+`[e1, e2, e3]` builds a `List` (§02, ADR-0039). It means the constructor and the pushes,
+written out:
+
+```origin
+let xs = [1, 2, 3];
+// the same program as:
+let xs = list::new(); xs.push(1); xs.push(2); xs.push(3);
+```
+
+Elements are evaluated strictly left to right, like every other construct (§04). The
+element type is inferred from the elements, so `[1, 2, 3]` is a `List[i64]`; `[]` constrains
+nothing and needs an annotation (`let xs: List[i64] = [];`) or it is REJECTED as `E0309`.
+
+The literal needs no `use std::list;` — it is a form, not a call to a name the program has
+to have in scope. There is no literal for `Map`, whose constructor is `map::new`.
+
 `List[T]` implements `IntoIterator`, so `for x in xs` walks it in order, front to back. The
 iterator yields each element once and does not observe a `push` that happens during the walk.
 
@@ -202,6 +220,9 @@ out-of-range read to return whatever is next in memory.
 | Program | Output |
 |---|---|
 | `let xs = list::new[i64](); xs.push(1); xs.push(2); io::println(xs.len().to_str());` | `2` |
+| `let xs = [1, 2]; io::println(xs.len().to_str());` | `2` — the same program |
+| `let xs: List[i64] = []; io::println(xs.len().to_str());` | `0` |
+| `let xs = [];` | REJECTED — `E0309`, no element type |
 | push 0..99, then sum with `for` | `4950` |
 | `xs.get(7)` on a three-element list | `None` |
 | `array::at(a, 7)` on a three-element array | TRAPS `index out of range`, exit 101 |

@@ -167,6 +167,7 @@ Primary      = Literal
              | PathExpr
              | StructLit
              | TupleOrParen
+             | ListLit
              | Lambda
              | Block
              | IfExpr
@@ -187,19 +188,60 @@ FieldInit    = Ident ":" Expr | Ident ;
 TupleOrParen = "(" ")"
              | "(" Expr ")"
              | "(" Expr "," [ Expr { "," Expr } [ "," ] ] ")" ;
+ListLit      = "[" [ Expr { "," Expr } [ "," ] ] "]" ;
 Lambda       = "|" [ LambdaParams ] "|" ( Expr | "->" Type Block ) ;
 LambdaParams = LambdaParam { "," LambdaParam } [ "," ] ;
 LambdaParam  = Pattern [ ":" Type ] ;
 
-IfExpr       = "if" ExprNoStruct Block [ "else" ( IfExpr | Block ) ] ;
+IfExpr       = "if" ( LetCond | ExprNoStruct ) Block [ "else" ( IfExpr | Block ) ] ;
 MatchExpr    = "match" ExprNoStruct "{" { MatchArm } "}" ;
 MatchArm     = Pattern [ "if" Expr ] "=>" ( ExprWithBlock [ "," ] | Expr "," ) ;
-WhileExpr    = "while" ExprNoStruct Block ;
+WhileExpr    = "while" ( LetCond | ExprNoStruct ) Block ;
+LetCond      = "let" Pattern "=" ExprNoStruct ;
 ForExpr      = "for" Pattern "in" ExprNoStruct Block ;
 LoopExpr     = "loop" Block ;
 ```
 
+`ListLit` is the one place `[` begins an expression rather than type arguments, and the
+two never compete: `[` is a list literal only where an expression may *start*, and
+ADR-0013's rule — `[` after an expression is always type application — is unchanged. In
+`foo [1, 2]` the parser is still inside `foo`'s expression, so that is `foo` instantiated
+at two types; `ExprStmt` requires a `;` after a non-block expression, so writing the two as
+separate statements (`foo; [1, 2]`) is unambiguous.
+
 `FieldInit` written as a bare `Ident` is shorthand for `Ident: Ident`.
+
+## Desugarings
+
+Three surface forms are defined by rewriting, in the parser, into forms that already
+exist. This is normative: the rewritten program is what the rest of the specification
+applies to, so nothing downstream — name resolution, typing, exhaustiveness, evaluation
+order — needs a separate rule for any of them.
+
+| Source | Means |
+|---|---|
+| `if let p = e { a } else { b }` | `match e { p => a, _ => b }` |
+| `if let p = e { a }` | `match e { p => a, _ => () }` |
+| `while let p = e { body }` | `loop { match e { p => body, _ => break } }` |
+| `[e1, e2, e3]` | a block that builds a `List`, pushes `e1`, `e2`, `e3` in order, and evaluates to it |
+
+Consequences that follow from the rewriting rather than from a rule of their own:
+
+- `break` and `continue` inside a `while let` body bind to the `loop` the rewriting
+  introduces, because `match` is not a loop. `continue` therefore re-evaluates the
+  scrutinee, which is what `while let` means.
+- The `else` of an `if let` is reached when the pattern does not match, and an `if let`
+  without one has type `()`, exactly as an `if` without an `else` does (§04).
+- A list literal evaluates its elements strictly left to right (§04), because the pushes
+  are emitted in source order.
+- The element type of a list literal is inferred from its elements. `[]` constrains
+  nothing and is REJECTED as `E0309` unless context supplies the type, as in
+  `let xs: List[i64] = [];`.
+
+An `if let` or `while let` whose pattern is **irrefutable** is REJECTED as `E0008`, with a
+help naming `let`. This is the mirror of `E0005` — a refutable pattern in a `let` — and the
+two are errors for the same reason: a pattern in the wrong position is a mistake about
+what the code does, not a stylistic choice.
 
 ## Patterns
 
@@ -222,14 +264,21 @@ A bare `Ident` pattern is ambiguous between a fresh binding and a reference to a
 unit enum variant or a `const`. **Resolution rule:** if the identifier resolves in scope
 to a unit variant or a constant, the pattern matches that value; otherwise it introduces
 a binding. This is a name-resolution decision, not a parsing one. A pattern that shadows
-a unit variant unintentionally is a common bug, so the compiler MUST emit a warning when
-a binding pattern's name differs from an in-scope unit variant only by case.
+a unit variant unintentionally is a common bug, so the compiler MUST emit `W0003` when a
+binding pattern's name differs from an in-scope unit variant only by case, **in a
+refutable position** — a `match` arm or an `if let`/`while let` pattern.
 
-In Origin 0.1 this rule can only fire for a `const`: an enum variant is never in scope
-unqualified, because there are no glob imports (§07) and a variant is always written
-`Enum::Variant`. The unit-variant half of the rule becomes reachable when glob imports
-land (Phase 7), and is specified now so that adding them does not silently change the
-meaning of existing patterns.
+The warning is confined to refutable positions because that is where the confusion is
+possible. In a `let`, a parameter or a `for`, a name that resolved to a unit variant would
+make the pattern refutable and `E0005` already rejects it, so a binding there cannot
+silently have become a match. Warning about them as well would fire on
+`Ord::cmp(self, other: Self)` for every implementor, since `IoError::Other` is a unit
+variant in scope.
+
+Both halves of the rule are reachable. A `const` has always been; a unit variant became
+one when the prelude's enums put their variants in scope (§07, ADR-0037). A variant of a
+user enum is still written `Enum::Variant` and cannot fire the rule, because there are no
+glob imports (§07).
 
 ## Parser restrictions
 
@@ -282,3 +331,9 @@ criterion). The recovery strategy is normative:
 | `(1)` | the integer `1`, parenthesized |
 | `\|x\| x + 1` | lambda |
 | `match v { Some(n) if n > 0 => n, _ => 0 }` | guarded arm |
+| `[1, 2, 3]` | a `List[i64]` of three elements |
+| `[]` | REJECTED as `E0309` unless context gives the element type |
+| `f [i64]` | `f` instantiated at `i64`, not `f` then a list — `[` after an expression is type application |
+| `if let Some(n) = o { n } else { 0 }` | `match o { Some(n) => n, _ => 0 }` |
+| `while let Some(n) = it.next() { .. }` | `loop { match it.next() { Some(n) => .., _ => break } }` |
+| `if let x = e { .. }` | REJECTED as `E0008` — irrefutable pattern |

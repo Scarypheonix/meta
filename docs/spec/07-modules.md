@@ -51,6 +51,33 @@ A name that resolves at two different steps is not an error — the earlier step
 A name that resolves ambiguously *within* one step (two `use`s importing the same name)
 is REJECTED, naming both imports.
 
+### The prelude's variants
+
+Step 4 includes, besides the prelude's own items, **the variants of every enum the prelude
+declares**, under their own names (ADR-0037). `Some`, `None`, `Ok`, `Err`, `Less`, `Equal`,
+`Greater`, `NotFound`, `PermissionDenied` and `Other` therefore need no path, in an
+expression and in a pattern alike:
+
+```origin
+match parse(s) {
+    Ok(n)  => n,
+    Err(_) => 0,
+}
+```
+
+The qualified form remains legal and denotes the same variant, so `Option::Some(x)` and
+`Some(x)` are the same program.
+
+Because this is step 4, every earlier step shadows it: a local binding, an item declared in
+the current module, or an imported name called `Ok` wins, and a program that had one keeps
+its meaning. Two prelude enums MUST NOT declare the same variant name — the second is a
+duplicate declaration in the same scope and is REJECTED, since the alternative would make
+one of them unreachable silently.
+
+A **user** enum's variants are not in scope unqualified; `Enum::Variant` is how they are
+written, because there are no glob imports. If glob imports land, this rule becomes the
+ordinary consequence of the prelude being globbed rather than a rule of its own.
+
 ## `use`
 
 ```origin

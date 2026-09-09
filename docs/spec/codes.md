@@ -12,6 +12,7 @@ compiler appears here exactly once, and that no code appears twice.
 | E0005 | error | refutable pattern in `let` or `for` | 0.1 |
 | E0006 | error | unreachable pattern | 0.1 |
 | E0007 | error | binding not present in all or-pattern alternatives | 0.1 |
+| E0008 | error | irrefutable pattern in `if let` or `while let` | 0.1 |
 | E0308 | error | mismatched types | 0.1 |
 | E0309 | error | cannot infer type; annotation required | 0.1 |
 | E0310 | error | infinite type (occurs check) | 0.1 |
