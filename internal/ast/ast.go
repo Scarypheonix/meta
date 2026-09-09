@@ -524,11 +524,40 @@ type MatchArm struct {
 	Body  Expr
 }
 
+// LetForm names the surface construct a Match was desugared from.
+type LetForm int
+
+const (
+	// LetFormNone means the programmer wrote a `match`.
+	LetFormNone LetForm = iota
+	// LetFormIf means an `if let`.
+	LetFormIf
+	// LetFormWhile means a `while let`.
+	LetFormWhile
+)
+
+// Name is how a diagnostic spells the construct.
+func (f LetForm) Name() string {
+	switch f {
+	case LetFormIf:
+		return "if let"
+	case LetFormWhile:
+		return "while let"
+	}
+	return "match"
+}
+
 // Match is `match scrutinee { arms }`.
 type Match struct {
 	Base
 	Scrutinee Expr
 	Arms      []*MatchArm
+	// LetForm records that this Match is the desugaring of an `if let` or `while let`
+	// (ADR-0038, spec/02-grammar.md). Its only reader is the usefulness check: an
+	// irrefutable pattern makes the `_` arm the desugaring adds unreachable, and
+	// reporting E0006 against an arm the programmer never wrote would be a diagnostic
+	// that lies about where the problem is. It reports E0008 naming the construct instead.
+	LetForm LetForm
 }
 
 func (*Match) isExpr() {}

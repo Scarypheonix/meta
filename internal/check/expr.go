@@ -647,10 +647,20 @@ func (c *Checker) inferMatch(v *ast.Match) types.Type {
 	}
 
 	var result types.Type
-	for _, arm := range v.Arms {
+	for i, arm := range v.Arms {
 		c.bindPattern(arm.Pat, scrut, false)
 		if arm.Guard != nil {
 			c.expectBool(arm.Guard, "a match guard")
+		}
+		// A `while let` body produces no value, exactly as a `while` body does: the two
+		// are the same loop and differing here would be an inconsistency a reader has no
+		// way to predict. Arm 0 is the body; arm 1 is the `break` the desugaring adds
+		// (ADR-0038).
+		if v.LetForm == ast.LetFormWhile && i == 0 {
+			if body, ok := arm.Body.(*ast.Block); ok {
+				c.expectUnitBlock(body, "a `while let` body")
+				continue
+			}
 		}
 		got := c.infer(arm.Body)
 		switch {

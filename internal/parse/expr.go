@@ -405,6 +405,9 @@ func (p *Parser) parsePrimary() ast.Expr {
 		return p.parseMatch(start)
 	case lex.KwWhile:
 		p.advance()
+		if p.at(lex.KwLet) {
+			return p.parseWhileLet(start)
+		}
 		w := &ast.While{Cond: p.parseExprNoStruct(), Body: p.parseBlock()}
 		w.Base = p.base(start)
 		return w
@@ -496,6 +499,9 @@ func (p *Parser) parseParenOrTuple(start int) ast.Expr {
 
 func (p *Parser) parseIf(start int) ast.Expr {
 	p.advance() // if
+	if p.at(lex.KwLet) {
+		return p.parseIfLet(start)
+	}
 	e := &ast.If{Cond: p.parseExprNoStruct(), Then: p.parseBlock()}
 	if p.eat(lex.KwElse) {
 		if p.at(lex.KwIf) {

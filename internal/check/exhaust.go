@@ -68,7 +68,7 @@ func (c *Checker) checkExhaustive(m *ast.Match, scrut types.Type) {
 	var covered []row
 	truncated := false
 
-	for _, arm := range m.Arms {
+	for i, arm := range m.Arms {
 		alts := c.toPats(arm.Pat, scrut)
 
 		// Usefulness: an arm is unreachable when nothing it matches is left uncovered.
@@ -80,7 +80,18 @@ func (c *Checker) checkExhaustive(m *ast.Match, scrut types.Type) {
 					break
 				}
 			}
-			if !reachable {
+			switch {
+			case reachable:
+			case m.LetForm != ast.LetFormNone && i == 1:
+				// The unreachable arm is the `_` an `if let`/`while let` desugars to
+				// (ADR-0038), which means the programmer's own pattern always matches.
+				// Reporting E0006 here would underline syntax nobody wrote.
+				form := m.LetForm.Name()
+				c.bag.Errorf("E0008", m.Arms[0].Pat.Span(), "irrefutable pattern in `%s`", form).
+					Label("this pattern always matches").
+					Note("`%s` tests a pattern that can fail; this one cannot", form).
+					Help("use `let` for a pattern that always matches")
+			default:
 				c.bag.Errorf("E0006", arm.Pat.Span(), "unreachable pattern").
 					Label("this arm can never match").
 					Note("every value it would match is already handled above")
