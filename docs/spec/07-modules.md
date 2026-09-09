@@ -53,10 +53,9 @@ is REJECTED, naming both imports.
 
 ### The prelude's variants
 
-Step 4 includes, besides the prelude's own items, **the variants of every enum the prelude
-declares**, under their own names (ADR-0037). `Some`, `None`, `Ok`, `Err`, `Less`, `Equal`,
-`Greater`, `NotFound`, `PermissionDenied` and `Other` therefore need no path, in an
-expression and in a pattern alike:
+Step 4 includes, besides the prelude's own items, **the variants of `Option`, `Result` and
+`Ordering`** under their own names (ADR-0037). `Some`, `None`, `Ok`, `Err`, `Less`, `Equal`
+and `Greater` therefore need no path, in an expression and in a pattern alike:
 
 ```origin
 match parse(s) {
@@ -68,15 +67,23 @@ match parse(s) {
 The qualified form remains legal and denotes the same variant, so `Option::Some(x)` and
 `Some(x)` are the same program.
 
+These three and no others. They are the enums the language's own constructs produce and
+consume — `?` unwraps an `Option` or a `Result`, `for` drives an `Iterator::next` that
+returns an `Option`, `Ord::cmp` returns an `Ordering` — so a program cannot avoid writing
+their variants. Every other enum's variants, including those of the prelude's own
+`IoError`, are written `Enum::Variant`: `IoError::NotFound` says which domain the error
+came from, and a bare `Other` or `NotFound` in the global namespace would collide with
+ordinary binding names (`other` as a catch-all arm is idiomatic and appears throughout this
+repository).
+
 Because this is step 4, every earlier step shadows it: a local binding, an item declared in
 the current module, or an imported name called `Ok` wins, and a program that had one keeps
-its meaning. Two prelude enums MUST NOT declare the same variant name — the second is a
-duplicate declaration in the same scope and is REJECTED, since the alternative would make
+its meaning. The three MUST NOT declare the same variant name as each other — the second is
+a duplicate declaration in the same scope and is REJECTED, since the alternative would make
 one of them unreachable silently.
 
-A **user** enum's variants are not in scope unqualified; `Enum::Variant` is how they are
-written, because there are no glob imports. If glob imports land, this rule becomes the
-ordinary consequence of the prelude being globbed rather than a rule of its own.
+If glob imports land, this rule becomes the ordinary consequence of a module being globbed
+rather than a rule of its own.
 
 ## `use`
 

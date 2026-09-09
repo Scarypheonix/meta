@@ -47,23 +47,48 @@ reserved rule could be switched on.
   catch. Under this option the warning would be load-bearing; under the one chosen it is a
   backstop.
 
-- **A fixed list of three (`Option`, `Result`, `Ordering`).** Avoids putting `IoError`'s
-  generic-sounding `NotFound`, `PermissionDenied` and `Other` into the global namespace.
-  Rejected because the list is a second thing to maintain: adding a variant to a prelude
-  enum, or a fourth enum worth the treatment, would mean editing the compiler in two
-  languages, and "which enums are special" is precisely the kind of unwritten rule process
-  rule 6 exists to prevent. The namespace cost is real but is absorbed by shadowing
-  precedence, below.
+- **Every enum declared in the prelude.** Chosen first, and **wrong** — see the correction
+  below. The rule reads as a restatement of one that already holds (prelude items are in
+  scope everywhere), extended from the enum to the variants it declares, and it needs no
+  list in the compiler.
 
-- **Every enum declared in the prelude.** Chosen. The rule is a restatement of one that
-  already holds — prelude items are in scope everywhere — extended from the enum to the
-  variants it declares.
+- **The enums the language's own constructs produce and consume.** Chosen after the corpus
+  rejected the option above. `Option`, `Result` and `Ordering` are the three the compiler
+  itself names — `?` unwraps `Option` and `Result`, `for` drives `Iterator::next` which
+  returns an `Option`, `Ord::cmp` returns an `Ordering` — and `internal/check` and
+  `internal/compile` refer to them by name 8, 4 and 1 times respectively while never naming
+  `IoError`. A program cannot avoid writing these variants; it can easily avoid writing an
+  ordinary library enum's.
+
+## Correction, found by running the corpus
+
+The first decision here was "every enum declared in the prelude", on the argument that a
+list of special enums is a second thing to maintain. **`tests/e2e` rejected it**, and the
+failure is worth recording because nothing in the reasoning above predicted it:
+`expression_language.origin` writes
+
+```origin
+other => Result::Err(Fault::BadToken(other.to_str())),
+```
+
+`other` as the name of a catch-all binding is idiomatic in any language with pattern
+matching — it appears four times in this repository — and `IoError::Other` is a unit
+variant, so `W0003` fired on correct code. The same collision waits in `NotFound`.
+
+Scoping `W0003` to refutable positions had already been necessary to keep it off
+`Ord::cmp(self, other: Self)`. That should have been the tell: a name whose collision has
+to be worked around twice is not a name that belongs in the global scope. The rule is not
+"declared in the prelude" but "so ubiquitous that the qualifier is pure noise", and that is
+a judgment the language makes once — writing it down as a list *is* writing the judgment
+down, which is what process rule 6 asks for rather than what it warns against.
 
 ## Decision
 
-An enum declared in the prelude puts its variants into the global scope, under their own
-names, alongside the enum's name. The qualified form remains legal and denotes the same
-variant.
+`Option`, `Result` and `Ordering` — the three enums the language's own constructs produce
+and consume — put their variants into the global scope, under their own names, alongside
+the enum's name. The qualified form remains legal and denotes the same variant.
+
+Every other enum's variants, `IoError`'s included, are written `Enum::Variant`.
 
 `W0003` is emitted only for a binding pattern in a **refutable** position — a `match` arm
 or an `if let`/`while let` pattern — whose name differs from an in-scope unit variant only
@@ -88,17 +113,22 @@ by case.
   over the globals, so either shadows a prelude variant. A program that today declares
   `struct Other` or binds `let Ok = ...` continues to mean what it meant.
 
-- **`W0003`'s scoping is not a convenience.** `IoError::Other` is a unit variant and
-  `other` is the parameter name in `Ord::cmp(self, other: Self)` — used 12 times in the
-  prelude alone and in every user `impl Ord`. A warning that fired on irrefutable positions
-  would fire on all of them. It is also unnecessary there: in a `let`, a parameter or a
-  `for`, a name that resolved to a unit variant would make the pattern refutable and
-  `E0005` already rejects it, so the silent-capture confusion the warning guards cannot
-  arise. The warning belongs exactly where a variant and a binding are both legal.
+- **`W0003` stays scoped to refutable positions**, which is where a variant and a binding
+  are both legal. In a `let`, a parameter or a `for`, a name that resolved to a unit variant
+  would make the pattern refutable and `E0005` already rejects it, so the silent-capture
+  confusion the warning guards cannot arise there. With `IoError` out of the global scope
+  the pressure is off — `None`, `Less`, `Equal` and `Greater` are the only unit variants in
+  scope, and none is a plausible binding name — but the scoping is right on its own terms
+  and stays.
 
-- **Two prelude enums may not share a variant name.** The second declaration is a duplicate
-  in the global scope and is rejected as one. No two share a name today; the alternative —
-  last writer wins — would make one enum's variant unreachable with no diagnostic.
+- **The three enums may not share a variant name.** The second declaration is a duplicate
+  in the global scope and is rejected as one. No two share a name; the alternative — last
+  writer wins — would make one enum's variant unreachable with no diagnostic.
+
+- **The list is short because the criterion is narrow.** A fourth enum earns its place by
+  becoming something the language itself produces, not by being useful or by living in the
+  prelude. That is a higher bar than "someone would like the shorthand", and it is the bar
+  that keeps the global namespace from accumulating English words.
 
 - **A user enum's variants still need `Enum::Variant`.** This asymmetry is the price of not
   doing glob imports, and it is the reversal point: if glob imports land, the prelude

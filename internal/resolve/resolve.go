@@ -10,6 +10,8 @@
 package resolve
 
 import (
+	"strings"
+
 	"github.com/scarypheonix/meta/internal/ast"
 	"github.com/scarypheonix/meta/internal/diag"
 )
@@ -173,6 +175,15 @@ type resolver struct {
 	lambdas      []*lambdaCtx
 	// loopDepth guards `break` and `continue`.
 	loopDepth int
+	// refutable is true while a pattern in a refutable position -- a `match` arm, and so
+	// also an `if let`/`while let` pattern, which desugar to one -- is being bound. It
+	// scopes W0003 to the only place the confusion it warns about is possible
+	// (spec/02-grammar.md, ADR-0037).
+	refutable bool
+	// unitVariants are the prelude's unit variants, in declaration order, which is what
+	// W0003 compares a binding's name against. A slice rather than the globals map because
+	// a map's iteration order would make the diagnostic depend on the run.
+	unitVariants []string
 	// trace, when not nil, collects one line per resolution event, in the order they
 	// happen. It is the oracle stage1's own resolver is held to (tests/selfhost): the
 	// two walk the same tree in the same order, so a line's position in the trace is
@@ -440,6 +451,9 @@ func (r *resolver) declareItem(it ast.Item) {
 	case *ast.EnumDecl:
 		r.declare(v.Name, Ref{Kind: Enum, Enum: v, Name: v.Name.Name})
 		r.out.Enums[v.Name.Name] = v
+		if r.current != nil && r.current.Prelude && UnqualifiedVariantEnums[v.Name.Name] {
+			r.declarePreludeVariants(v)
+		}
 	case *ast.ConstDecl:
 		r.declare(v.Name, Ref{Kind: Const, Const: v, Name: v.Name.Name})
 	case *ast.TraitDecl:
@@ -451,6 +465,55 @@ func (r *resolver) declareItem(it ast.Item) {
 		// receiver's type, which is the checker's question rather than the resolver's,
 		// and the instance every call site reaches is monomorphization's (ADR-0010).
 	case *ast.ErrorItem:
+	}
+}
+
+// UnqualifiedVariantEnums are the enums whose variants are in scope under their own names,
+// so that `Some(x)` means `Option::Some(x)` (ADR-0037, spec/07-modules.md).
+//
+// These three and no others, because they are the ones the language's own constructs
+// produce and consume: `?` unwraps an `Option` or a `Result`, `for` drives an
+// `Iterator::next` returning an `Option`, and `Ord::cmp` returns an `Ordering`. A program
+// cannot avoid writing their variants.
+//
+// `IoError` is deliberately absent even though the prelude declares it too. The first
+// version of this rule took every prelude enum, and the corpus rejected it: `other` as the
+// name of a catch-all match arm is idiomatic and appears four times in this repository,
+// and `IoError::Other` collided with all of them.
+var UnqualifiedVariantEnums = map[string]bool{
+	"Option":   true,
+	"Result":   true,
+	"Ordering": true,
+}
+
+// declarePreludeVariants puts one such enum's variants into the global scope.
+//
+// The Ref is the one resolveVariant builds, qualified `Name` included, so a variant written
+// either way is indistinguishable to every later pass -- which is what makes the change
+// cost no golden file: existing source resolves to exactly the refs it did before.
+//
+// Variants are deliberately not registered as module items. A variant is reached through
+// its enum, and giving the root module a `Some` would invent a third spelling nothing asked
+// for. Being scope-only is also what makes shadowing work: a user module declares into its
+// own scope, layered over the globals, so its `Some` wins without a duplicate error.
+func (r *resolver) declarePreludeVariants(e *ast.EnumDecl) {
+	for _, va := range e.Variants {
+		if va.Name.Name == "" {
+			continue // the parser already reported a missing name
+		}
+		if prev, ok := r.globals.names[va.Name.Name]; ok && prev.Kind != LocalVar {
+			r.bag.Errorf("E0433", va.Name.Loc, "`%s` is declared more than once in this module", va.Name.Name).
+				Label("duplicate declaration").
+				Note("a prelude enum's variants share the global scope with the prelude's items")
+			continue
+		}
+		r.globals.names[va.Name.Name] = Ref{
+			Kind: Variant, Enum: e, Variant: va,
+			Name: e.Name.Name + "::" + va.Name.Name,
+		}
+		if va.Kind == ast.UnitVariant {
+			r.unitVariants = append(r.unitVariants, va.Name.Name)
+		}
 	}
 }
 
@@ -829,6 +892,7 @@ func (r *resolver) bindPattern(p ast.Pattern, mut bool) {
 				return
 			}
 		}
+		r.warnNearVariant(v.Name)
 		local := &Local{Name: v.Name.Name, Mut: v.Mut || mut, Decl: v.Name.Loc, fnDepth: r.fnDepth}
 		r.scope.names[v.Name.Name] = Ref{Kind: LocalVar, Local: local, Name: local.Name}
 		r.out.Bindings[v.NodeID()] = local
@@ -863,6 +927,34 @@ func (r *resolver) bindPattern(p ast.Pattern, mut bool) {
 
 func isConstructorLike(ref Ref) bool {
 	return ref.Kind == Variant || ref.Kind == Const
+}
+
+// warnNearVariant emits W0003 when a binding pattern's name differs from an in-scope unit
+// variant only by case (spec/02-grammar.md). Writing `some` where `Some` was meant binds
+// everything and matches nothing, and the two arms of such a `match` look right.
+//
+// Only in a refutable position, which is where a variant and a binding are both legal. In
+// a `let`, a parameter or a `for`, a name that resolved to a unit variant would make the
+// pattern refutable and E0005 already rejects it -- and warning there would fire on
+// `Ord::cmp(self, other: Self)` for every implementor, since `IoError::Other` is a unit
+// variant in scope (ADR-0037).
+func (r *resolver) warnNearVariant(name ast.Ident) {
+	if !r.refutable || name.Name == "" {
+		return
+	}
+	ref, ok := r.scope.lookup(name.Name)
+	if ok && ref.Kind != LocalVar {
+		return // it resolves to something in its own right; not a near miss
+	}
+	for _, cand := range r.unitVariants {
+		if cand == name.Name || !strings.EqualFold(cand, name.Name) {
+			continue
+		}
+		r.bag.Warnf("W0003", name.Loc, "`%s` binds; it differs from the variant `%s` only by case", name.Name, cand).
+			Label("this binds every value rather than matching one").
+			Note("write `%s` to match that variant, or rename the binding", cand)
+		return
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,7 +1261,10 @@ func (r *resolver) resolveExpr(e ast.Expr) {
 		for _, arm := range v.Arms {
 			saved := r.scope
 			r.scope = newScope(r.scope)
+			savedRef := r.refutable
+			r.refutable = true
 			r.bindPattern(arm.Pat, false)
+			r.refutable = savedRef
 			if arm.Guard != nil {
 				r.resolveExpr(arm.Guard)
 			}
