@@ -397,6 +397,8 @@ func (p *Parser) parsePrimary() ast.Expr {
 
 	case lex.LParen:
 		return p.parseParenOrTuple(start)
+	case lex.LBracket:
+		return p.parseListLit(start)
 	case lex.LBrace:
 		return p.parseBlock()
 	case lex.KwIf:
