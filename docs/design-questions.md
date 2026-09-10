@@ -92,3 +92,39 @@ and the failure model.
 
 The phase gates remain the user's: `docs/phases/6-complete.md` goes to them for review,
 as Phase 5's did.
+
+---
+
+## Phase 12 (surface syntax)
+
+Asked, across Phases 11 and 12: which of the available syntax simplifications to spend a
+phase on. The audit that preceded this (recorded in `docs/phases/11-complete.md` and
+extended in `12-complete.md`) put every candidate in front of the user with its measured
+cost, and named the two it recommended holding.
+
+The user answered:
+
+> "Just do whatever you want in order to simplify the syntax and grammar of Origin. But
+> dont push anything or make any change to the style of the website. The old website was
+> perfect."
+
+Delegated, on the Phase 0 pattern, with two constraints that are **not** delegated and are
+recorded here because they bound the phase rather than decorate it:
+
+1. **Nothing is pushed.** The work is committed locally and the remote is left where it
+   was. Lifting that is the user's, not something a green `./check` earns.
+2. **The website's style is not touched.** `web/` and `site/` keep the look they have.
+   A language change that alters what the playground *runs* is in scope; a change to how
+   the page *looks* is not.
+
+The answer taken under the delegation is **ADR-0040** (automatic semicolon insertion), and
+what it implies for the surface is `docs/spec/01-lexical.md` §"Statement terminators".
+
+Two things this delegation did *not* license, both left where the audit put them, because
+each is a decision rather than an implementation detail: **significant indentation**
+(a front-end redesign — §01, §02's recovery contract, both lexers, and every `.origin`
+file in the repository), and the two candidates the user held explicitly in Phase 11,
+**associated functions** and **tuple element access**. "Simplify the syntax" is not read
+as consent to any of those.
+
+The phase gate remains the user's: `docs/phases/12-complete.md` goes to them for review.

@@ -99,6 +99,13 @@ ItemStmt     = Item ;
 ExprStmt     = ExprWithBlock [ ";" ] | ExprWithoutBlock ";" ;
 ```
 
+Every `";"` in this grammar — in `UseDecl`, `LetStmt`, `ExprStmt`, `ConstDecl`,
+`TypeAliasDecl`, `AssocTypeDecl` and a bodiless `TraitFn` — may be **supplied by the lexer**
+at a line break rather than written (§01, ADR-0040). The parser cannot tell the two apart,
+so no production below changes. What §01 guarantees, and what the rest of this document
+relies on, is that a semicolon is never inserted before a `}`: a block's trailing expression
+keeps its meaning.
+
 A block's value is its trailing `Expr` if present, otherwise `()`. `ExprWithBlock` is
 any of `Block`, `IfExpr`, `MatchExpr`, `WhileExpr`, `ForExpr`, `LoopExpr`; used as a
 statement it needs no `;`, and it **ends there**: the parser does not carry on into a

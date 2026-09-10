@@ -24,9 +24,9 @@ implementation bug (§09).
 
 ## Whitespace and comments
 
-Whitespace is U+0009, U+000A, U+000B, U+000C, U+000D, U+0020. Origin is **not**
-newline-sensitive: there is no automatic semicolon insertion and newlines are
-indistinguishable from spaces to the parser.
+Whitespace is U+0009, U+000A, U+000B, U+000C, U+000D, U+0020. A newline is whitespace
+everywhere except for the one rule below: it may cause a semicolon to be inserted. Nothing
+else about the language depends on where a line ends, and indentation is never significant.
 
 ```
 LineComment  = "//" { any character except "\n" } ;
@@ -38,6 +38,79 @@ the opening `/*` of the outermost unterminated comment.
 
 Doc comments (`///` before an item) are lexed as ordinary line comments in 0.1 and
 attached to nothing. DEFERRED: doc comment capture (Phase 8, for the LSP hover).
+
+## Statement terminators
+
+A semicolon is **inserted** at a line break when all three of the following hold
+(ADR-0040). The token it inserts is an ordinary `;`: the grammar in §02 is unchanged, and
+the parser cannot tell an inserted semicolon from a written one.
+
+1. The last token of the line is one that can end a statement:
+
+   ```
+   Ident   IntLit   FloatLit   StringLit   CharLit
+   true    false    self       )           ]
+   break   continue return
+   ```
+
+   **`}` is deliberately not in this set** — see below.
+
+2. The lexer is not inside an unclosed `(` or `[`. A call, a type argument list or a list
+   literal may therefore be split across lines freely, with or without a trailing comma.
+
+3. The next token that is not whitespace or a comment is not `}`.
+
+Written semicolons remain legal wherever they are legal today; insertion only ever supplies
+one where the source could have written it.
+
+### Why `}` does not terminate a line
+
+Two constructs would break if it did, and both are consequences of Origin being
+expression-oriented rather than statement-oriented:
+
+- **A block's value is its trailing expression, written without a semicolon** (§02). Rule 3
+  is what protects it: in `fn f() -> u64 { 1u64 << w }` the line `1u64 << w` ends in a
+  trigger token, but the next token is `}`, so nothing is inserted and the expression stays
+  the block's value. Without rule 3 every value-returning function in the language would
+  quietly begin returning `()`.
+- **A brace-bodied `match` arm may omit its comma.** If `}` terminated a line, a semicolon
+  would land between two arms, where the grammar allows only a comma. The same exclusion is
+  what lets `}` and `else` sit on separate lines.
+
+The cost of the exclusion is that a statement ending in a brace needs its own semicolon when
+one is required: `let p = Point { x: 1 };` keeps it. A block *expression* used as a
+statement never needed one (§02's `ExprStmt`), so `if c { a }` on its own line is unaffected.
+
+### Continuing an expression across lines
+
+An expression that wraps must not leave a trigger token at the end of a line. Put the
+operator there instead:
+
+```origin
+let big = a_long_condition ||
+    another_condition;          // fine: the line ends in `||`
+
+let big = a_long_condition      // REJECTED: a semicolon is inserted here
+    || another_condition;
+```
+
+Inside `(` or `[` this does not apply, by rule 2. There is no line-continuation escape.
+
+### Worked examples
+
+| Source (two lines) | Inserted? | Why |
+|---|---|---|
+| `let x = 1` then `let y = 2` | yes | ends in a literal, next token is `let` |
+| `use std::io` then `fn main() {` | yes | ends in an identifier |
+| `1u64 << w` then `}` | **no** | rule 3: the block's value |
+| `Point { x: 1 }` then `let y = 2` | **no** | `}` is not a trigger |
+| `foo(a,` then `b)` | no | ends in `,`, and rule 2 applies |
+| `xs.get(0)` then `.unwrap_or(3)` | yes — REJECTED | move `.` to the previous line |
+| `x` then `+ y` | yes — REJECTED | move `+` to the previous line |
+| `f(x` then `+ y)` | no | rule 2: inside `(` |
+| `A => { g() }` then `B => 1,` | **no** | `}` is not a trigger; arms stay comma-separated |
+| `return` then `}` | no | rule 3 |
+| `break` then `let x = 1` | yes | `break` ends a statement |
 
 ## Keywords
 
