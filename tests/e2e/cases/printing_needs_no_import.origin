@@ -1,0 +1,13 @@
+// The smallest program Origin can express (ADR-0041).
+//
+// Four lines became three, and the one that went was the one carrying no information. The
+// case is here because the *absence* of an import is the feature: a regression would look
+// like a resolver error, not a wrong answer, and nothing else in the corpus would catch it
+// since every other case imports `std::io` anyway.
+fn main() {
+    println("hello, Origin.")
+    print("a")
+    print("b")
+    println("")
+    println("\(1 + 2) items")
+}

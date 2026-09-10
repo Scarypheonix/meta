@@ -254,8 +254,8 @@ func program(bag *diag.Bag, traced bool, inputs ...Input) (*Result, []string) {
 	for _, name := range PrimitiveNames {
 		r.globals.names[name] = Ref{Kind: Prim, Name: name}
 	}
-	for name := range globalBuiltins {
-		r.globals.names[name] = Ref{Kind: Builtin, Builtin: name, Name: name}
+	for name, builtin := range globalBuiltins {
+		r.globals.names[name] = Ref{Kind: Builtin, Builtin: builtin, Name: name}
 	}
 	r.registerStdModules()
 
@@ -315,10 +315,25 @@ func program(bag *diag.Bag, traced bool, inputs ...Input) (*Result, []string) {
 	return r.out, lines
 }
 
-// globalBuiltins are compiler-provided functions in scope everywhere, with no `use`.
-var globalBuiltins = map[string]bool{
-	"panic":  true,
-	"ref_eq": true,
+// globalBuiltins are compiler-provided functions in scope everywhere, with no `use`,
+// keyed by the name a program writes and valued by the builtin it names. The two coincide
+// for `panic` and `ref_eq`; they do not for printing.
+//
+// `print` and `println` are here rather than only in `std::io` because the language was
+// already inconsistent without them (ADR-0041): the prelude's `read_to_string`,
+// `write_string`, `file_exists` and `args` need no import, so reading a whole file off the
+// disk asked nothing of the programmer while printing a line asked for a `use`. `std::io`
+// remains and `io::println` still names the same operation.
+//
+// Two names, and the bar for a third is high: aimed at the person writing the program, and
+// universal enough that its absence is the surprising thing. Nothing else currently in
+// `std::` clears it -- most of that table is the plumbing the prelude is written in terms
+// of, with names (`new`, `len`, `at`, `of`, `bits`) far too ordinary to be global.
+var globalBuiltins = map[string]string{
+	"panic":   "panic",
+	"ref_eq":  "ref_eq",
+	"print":   "io::print",
+	"println": "io::println",
 }
 
 // stdModules are the compiler-provided modules of the standard library. They exist so

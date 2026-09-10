@@ -464,6 +464,11 @@ pub fn program(inputs: List[Input]) -> Resolved {
     // The two compiler-provided functions in scope everywhere, with no `use`.
     r.globals.names.insert("panic", ref_builtin("panic", "panic"));
     r.globals.names.insert("ref_eq", ref_builtin("ref_eq", "ref_eq"));
+    // Printing needs no `use` (ADR-0041). The name a program writes and the builtin it
+    // names differ here, which is what `ref_builtin`'s two arguments are for: `std::io`
+    // remains, and `io::println` still names the same operation.
+    r.globals.names.insert("print", ref_builtin("io::print", "print"));
+    r.globals.names.insert("println", ref_builtin("io::println", "println"));
     r.register_std();
 
     // Pass 1: place every file in the module tree.

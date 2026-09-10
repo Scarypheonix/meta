@@ -1,0 +1,15 @@
+// EXPECT: accept
+// spec: 07-modules.md — `print` and `println` resolve with no `use`.
+
+// ADR-0041. The language was already inconsistent: `read_to_string` and `args` come from
+// the prelude and need nothing, so reading a whole file off the disk asked less of the
+// programmer than printing a line did.
+use std::io
+
+fn main() {
+    println("bare")
+    print("no newline, ")
+    println("then one")
+    // `std::io` is untouched and names the same operation.
+    io::println("qualified")
+}

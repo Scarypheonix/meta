@@ -51,6 +51,26 @@ A name that resolves at two different steps is not an error — the earlier step
 A name that resolves ambiguously *within* one step (two `use`s importing the same name)
 is REJECTED, naming both imports.
 
+### Printing
+
+`print` and `println` resolve in every module with no `use` (ADR-0041), so the smallest
+program Origin can write is:
+
+```origin
+fn main() {
+    println("hi")
+}
+```
+
+`std::io` still exists and `io::println` still names the same operation; the bare name is an
+additional spelling, not a replacement. As with every global, a module's own declaration of
+the name shadows it.
+
+These two and no others from `std::`. The rest of that namespace — `std::array`, `std::str`,
+`std::hash`, `std::float`, `std::fs`, `std::chan`, `std::sync` — holds the operations the
+*prelude* is written in terms of rather than operations a program calls, and their names
+(`new`, `len`, `at`, `of`, `bits`) are far too ordinary to occupy the global scope.
+
 ### The prelude's variants
 
 Step 4 includes, besides the prelude's own items, **the variants of `Option`, `Result` and
