@@ -4,7 +4,7 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Phases 0 through 11 are complete** (see `docs/phases/`). **The compiler compiles itself**,
+**Phases 0 through 12 are complete** (see `docs/phases/`). **The compiler compiles itself**,
 and it runs in a browser. See Status, at the bottom of this file, for what exists and what is
 next.
 
@@ -195,6 +195,38 @@ This project outlasts any single context window.
   lives in one place with one test suite guarding it.
 
 ## Status
+
+**Phase 12 is complete** (`docs/phases/12-complete.md`). Semicolons are inserted at a line break
+(**ADR-0040**): 14,173 of the repository's 31,771 code lines end in one, and all of them are now
+optional. `./check` runs in 217s at 1,954 MiB.
+
+**Go's rule does not transfer, and that is the finding.** Origin is expression-oriented and Go is
+not, so two carve-outs are load-bearing rather than cosmetic: a block's value is its trailing
+expression written *without* a semicolon, so inserting one before `}` would have made **805
+value-returning functions quietly return `()`**; and `}` is not a trigger, because Origin's
+dominant `match` idiom is a brace-bodied arm with the comma omitted -- **442 sites** -- where a
+semicolon is not grammatical at all. With `}` in the trigger set: 6,149 insertions and 442 arms
+to rewrite. With it out: **129 insertions and 93 breaks.**
+
+**The migration wrote a bug and the corpus caught it.** The 93 wrapped expressions were migrated
+mechanically; where a line ended in a trailing `//` comment the operator was appended *inside* it
+and vanished, so `obj.origin`'s `header_size` and `sizeofcmds` silently lost terms and stage1's
+Mach-O writer could not pad its own header. It compiled and type-checked. What made it safe was
+asserting the invariant the migration claims -- *a pure operator move changes nothing but line
+breaks* -- by stripping comments and whitespace from both versions and comparing; only
+`lex.origin` diverges. **Write that check before running the tool, not after.**
+
+**This does not make Origin stop looking like C**, and was not meant to. The Phase 11 audit
+measured where that comes from: 18% of code lines are nothing but a closing brace. Semicolons are
+character texture; brace lines are whole lines.
+
+**Next action: the user's to set** (rule 7). Still held explicitly, and outside the Phase 12
+delegation: **associated functions** (`List::new()`, 568 sites) and **tuple element access**
+(`t.0`). Still open and not syntax questions at all: **`std::iter` is a normative §10 example that
+does not compile**, and the **formatter** is referenced twice in the spec but neither built nor
+scheduled -- the iterator gap is what the audit ranked first for changing how Origin looks, since
+852 `while` loops against 28 `for..in` and 731 manual increments each cost a nesting level and a
+closing brace.
 
 **Phase 11 is complete** (`docs/phases/11-complete.md`). Three syntax simplifications, chosen
 from an audit of every candidate and ranked by cost, each of which leaves every existing program
