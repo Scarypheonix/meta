@@ -201,8 +201,8 @@ fn replace_with_bool(v: ir::Value, val: bool) -> bool {
 }
 
 fn is_comparison(op: i64) -> bool {
-    op == ir::OP_EQ || op == ir::OP_NE || op == ir::OP_LT
-        || op == ir::OP_LE || op == ir::OP_GT || op == ir::OP_GE
+    op == ir::OP_EQ || op == ir::OP_NE || op == ir::OP_LT ||
+        op == ir::OP_LE || op == ir::OP_GT || op == ir::OP_GE
 }
 
 fn fold_binary(

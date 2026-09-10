@@ -278,12 +278,70 @@ func TestCharLiterals(t *testing.T) {
 }
 
 func TestComments(t *testing.T) {
+	// The semicolon after `a` is inserted (ADR-0040): a line comment is trivia, so it does
+	// not stop the line break that follows it from terminating the statement. The other
+	// three identifiers are on one line and take none.
 	toks, bag := lexAll(t, "a // line comment\nb /* block */ c /* /* nested */ */ d")
 	if bag.HasErrors() {
 		t.Fatalf("unexpected errors:\n%s", bag)
 	}
-	if got := kinds(toks); !eqKinds(got, []Kind{Ident, Ident, Ident, Ident}) {
-		t.Errorf("got %v, want four identifiers", got)
+	if got := kinds(toks); !eqKinds(got, []Kind{Ident, Semi, Ident, Ident, Ident}) {
+		t.Errorf("got %v, want an identifier, an inserted `;`, then three identifiers", got)
+	}
+}
+
+func TestSemicolonInsertion(t *testing.T) {
+	// spec/01-lexical.md's three rules, one case each way.
+	cases := []struct {
+		name string
+		src  string
+		want []Kind
+	}{
+		{"a line break after a value terminates",
+			"a\nb", []Kind{Ident, Semi, Ident}},
+		{"a line break after an operator does not",
+			"a +\nb", []Kind{Ident, Plus, Ident}},
+		{"rule 2: never inside parentheses",
+			"f(a\n, b)", []Kind{Ident, LParen, Ident, Comma, Ident, RParen}},
+		{"rule 2: never inside brackets",
+			"[a\nb]", []Kind{LBracket, Ident, Ident, RBracket}},
+		{"rule 3: never before a closing brace, so a tail expression stays one",
+			"{ a\n}", []Kind{LBrace, Ident, RBrace}},
+		{"`}` is not a trigger, so match arms keep their commas",
+			"{ a }\nb", []Kind{LBrace, Ident, RBrace, Ident}},
+		{"a keyword that ends a statement triggers",
+			"break\na", []Kind{KwBreak, Semi, Ident}},
+		{"a keyword that cannot end one does not",
+			"else\na", []Kind{KwElse, Ident}},
+		{"depth is restored, so a break after the call terminates",
+			"f(a)\nb", []Kind{Ident, LParen, Ident, RParen, Semi, Ident}},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			toks, bag := lexAll(t, tt.src)
+			if bag.HasErrors() {
+				t.Fatalf("unexpected errors:\n%s", bag)
+			}
+			if got := kinds(toks); !eqKinds(got, tt.want) {
+				t.Errorf("%q\n got %v\nwant %v", tt.src, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnInsertedSemicolonSitsAtTheEndOfItsLine(t *testing.T) {
+	// The span is the zero-width position after the statement's last token, which is where
+	// a reader would have typed it -- and, because tests/selfhost compares spans, a rule
+	// stage1's lexer has to reproduce exactly.
+	toks, bag := lexAll(t, "ab\ncd")
+	if bag.HasErrors() {
+		t.Fatalf("unexpected errors:\n%s", bag)
+	}
+	if len(toks) < 2 || toks[1].Kind != Semi {
+		t.Fatalf("expected an inserted semicolon, got %v", kinds(toks))
+	}
+	if s := toks[1].Span; s.Start != 2 || s.End != 2 {
+		t.Errorf("inserted semicolon spans [%d,%d), want the zero-width position [2,2)", s.Start, s.End)
 	}
 }
 

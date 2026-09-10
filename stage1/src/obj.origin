@@ -239,15 +239,15 @@ fn header_size(t: Target) -> i64 {
         // Every load command a Mach-O can carry is reserved unconditionally, whether or not
         // this image turns out to have debug information: the header sits below the text, and
         // the text's address is decided before there is any code to say what the file needs.
-        return MACHO_HEADER_SIZE
-            + MACHO_SEGMENT_CMD_SIZE                        // __PAGEZERO
-            + MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE   // __TEXT with __text
-            + MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE   // __DATA with __data
-            + MACHO_UNIXTHREAD_CMD_SIZE
-            + MACHO_SEGMENT_CMD_SIZE + 3 * MACHO_SECTION_SIZE // __DWARF (ADR-0023)
-            + MACHO_SYMTAB_CMD_SIZE
-            + MACHO_SEGMENT_CMD_SIZE                        // __LINKEDIT (ADR-0024)
-            + MACHO_CODE_SIG_CMD_SIZE;
+        return MACHO_HEADER_SIZE +
+            MACHO_SEGMENT_CMD_SIZE +                        // __PAGEZERO
+            MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE +   // __TEXT with __text
+            MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE +   // __DATA with __data
+            MACHO_UNIXTHREAD_CMD_SIZE +
+            MACHO_SEGMENT_CMD_SIZE + 3 * MACHO_SECTION_SIZE + // __DWARF (ADR-0023)
+            MACHO_SYMTAB_CMD_SIZE +
+            MACHO_SEGMENT_CMD_SIZE +                        // __LINKEDIT (ADR-0024)
+            MACHO_CODE_SIG_CMD_SIZE;
     }
     ELF_HEADER_SIZE + 2 * ELF_PROG_HEADER_SIZE
 }
@@ -885,12 +885,12 @@ fn write_macho(img: Image) -> Written {
 
     // __PAGEZERO, __TEXT, __DATA, __LINKEDIT, LC_SYMTAB, LC_UNIXTHREAD.
     let mut ncmds = 6;
-    let mut sizeofcmds = MACHO_SEGMENT_CMD_SIZE                           // __PAGEZERO
-        + MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE                     // __TEXT
-        + MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE                     // __DATA
-        + MACHO_SEGMENT_CMD_SIZE                                          // __LINKEDIT
-        + MACHO_SYMTAB_CMD_SIZE
-        + MACHO_UNIXTHREAD_CMD_SIZE;
+    let mut sizeofcmds = MACHO_SEGMENT_CMD_SIZE +                           // __PAGEZERO
+        MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE +                     // __TEXT
+        MACHO_SEGMENT_CMD_SIZE + MACHO_SECTION_SIZE +                     // __DATA
+        MACHO_SEGMENT_CMD_SIZE +                                          // __LINKEDIT
+        MACHO_SYMTAB_CMD_SIZE +
+        MACHO_UNIXTHREAD_CMD_SIZE;
     if tr.dwarf_size > 0 {
         ncmds = ncmds + 1;
         sizeofcmds = sizeofcmds + MACHO_SEGMENT_CMD_SIZE + 3 * MACHO_SECTION_SIZE;

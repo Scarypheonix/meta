@@ -177,8 +177,8 @@ pub fn is_terminator(o: i64) -> bool {
 /// program. Deleting it would make `-O1` produce output `-O0` does not, which is exactly
 /// what the phase's differential is built to catch.
 pub fn may_trap_on_values(o: i64) -> bool {
-    o == OP_ADD || o == OP_SUB || o == OP_MUL || o == OP_DIV || o == OP_REM || o == OP_NEG
-        || o == OP_SHL || o == OP_SHR || o == OP_CAST
+    o == OP_ADD || o == OP_SUB || o == OP_MUL || o == OP_DIV || o == OP_REM || o == OP_NEG ||
+        o == OP_SHL || o == OP_SHR || o == OP_CAST
 }
 
 /// Whether an operation creates a heap object.
@@ -187,15 +187,15 @@ pub fn may_trap_on_values(o: i64) -> bool {
 /// analysis is for -- but two allocations may never be shared, because they produce
 /// distinct objects and `ref_eq` can tell them apart (spec/04-expressions.md).
 pub fn allocates(o: i64) -> bool {
-    o == OP_STRUCT || o == OP_TUPLE || o == OP_VARIANT || o == OP_CLOSURE
-        || o == OP_BOX_FN || o == OP_TO_STR
+    o == OP_STRUCT || o == OP_TUPLE || o == OP_VARIANT || o == OP_CLOSURE ||
+        o == OP_BOX_FN || o == OP_TO_STR
 }
 
 /// Whether an operation does something beyond producing its value. An instruction with an
 /// effect is never removed and never reordered past another.
 pub fn has_effect(o: i64) -> bool {
-    o == OP_SET_FIELD || o == OP_CALL || o == OP_CALL_CLOSURE || o == OP_CALL_BUILTIN
-        || o == OP_TRAP
+    o == OP_SET_FIELD || o == OP_CALL || o == OP_CALL_CLOSURE || o == OP_CALL_BUILTIN ||
+        o == OP_TRAP
 }
 
 /// Whether an unused instance of an operation may be deleted.
@@ -824,8 +824,8 @@ fn print_value(v: Value, prog: bytecode::Program) -> String {
             out = "\(out) \(v.a)";
         }
     }
-    if v.op == OP_CALL || v.op == OP_CALL_BUILTIN || v.op == OP_STRUCT || v.op == OP_TUPLE
-        || v.op == OP_CLOSURE || v.op == OP_CAST {
+    if v.op == OP_CALL || v.op == OP_CALL_BUILTIN || v.op == OP_STRUCT || v.op == OP_TUPLE ||
+        v.op == OP_CLOSURE || v.op == OP_CAST {
         out = "\(out) \(v.a) \(v.b)";
     }
     let mut i = 0;

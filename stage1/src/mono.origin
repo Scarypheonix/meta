@@ -185,8 +185,8 @@ impl Walker {
             }
         }
         let at = self.instance(decl, no_args(), ast::UNRESOLVED, ast::Span { start: 0, end: 0 });
-        if at >= 0 && decl.name.name == "main" && decl.self_param.is_none()
-            && self.entry < 0 {
+        if at >= 0 && decl.name.name == "main" && decl.self_param.is_none() &&
+            self.entry < 0 {
             self.entry = at;
         }
     }

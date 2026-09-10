@@ -1,0 +1,10 @@
+// EXPECT: reject E0002
+// spec: 01-lexical.md — a line ending in a value terminates the statement.
+
+// The one thing ADR-0040 makes illegal that used to be legal. `total` ends a line, so the
+// statement ends there and `+ 1` begins a new one, which is not an expression.
+fn main() {
+    let total = 1
+    let sum = total
+        + 1;
+}

@@ -116,9 +116,9 @@ fn main() {
         process::exit(2);
     }
     let command = argv.at(1);
-    if command != "dump-tokens" && command != "dump-ast" && command != "parse"
-        && command != "resolve" && command != "check" && command != "mono"
-        && command != "dump-bytecode" && command != "dump-ir" && command != "build" {
+    if command != "dump-tokens" && command != "dump-ast" && command != "parse" &&
+        command != "resolve" && command != "check" && command != "mono" &&
+        command != "dump-bytecode" && command != "dump-ir" && command != "build" {
         io::println("stage1: unknown command `\(command)`");
         io::println(USAGE);
         process::exit(2);
@@ -127,8 +127,8 @@ fn main() {
     // These are whole-package commands: a module cannot be resolved without the ones it
     // imports (spec/07-modules.md), nothing can be checked before it is resolved, nothing
     // can be monomorphized before it is checked, and nothing can be lowered before that.
-    if command == "resolve" || command == "check" || command == "mono"
-        || command == "dump-bytecode" || command == "dump-ir" || command == "build" {
+    if command == "resolve" || command == "check" || command == "mono" ||
+        command == "dump-bytecode" || command == "dump-ir" || command == "build" {
         if !run_package(argv, command, level, target, identifier) {
             process::exit(1);
         }
@@ -206,8 +206,8 @@ fn run_package(argv: List[String], command: String, level: i64, target: String,
                 // to refuse, which is what `originc` does by stopping here
                 // (spec/09-errors.md). Both halves of syntax count: a bad escape is the
                 // lexer's diagnostic, and it leaves a tree just as unusable.
-                if lowered_command(command)
-                    && (!lexed.errors.is_empty() || !parsed.errors.is_empty()) {
+                if lowered_command(command) &&
+                    (!lexed.errors.is_empty() || !parsed.errors.is_empty()) {
                     i = i + 1;
                     continue;
                 }
@@ -323,8 +323,8 @@ fn run_one_package(argv: List[String], command: String, prelude_path: String,
                 srcs.insert(paths.at(u), source::file(paths.at(u), src));
                 let lexed = lex::lex(src);
                 let parsed = parse::parse(lexed.tokens);
-                if lowered_command(command)
-                    && (!lexed.errors.is_empty() || !parsed.errors.is_empty()) {
+                if lowered_command(command) &&
+                    (!lexed.errors.is_empty() || !parsed.errors.is_empty()) {
                     io::println("stage1: \(paths.at(u)) does not parse");
                     return false;
                 }

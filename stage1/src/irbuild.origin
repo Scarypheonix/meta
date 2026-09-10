@@ -16,24 +16,24 @@ use ir;
 
 /// How many values an instruction pops. The table has to be exact (see the header).
 fn pops_of(x: bytecode::Instr) -> i64 {
-    if x.op == bytecode::OP_NOP || x.op == bytecode::OP_JUMP || x.op == bytecode::OP_TRAP
-        || x.op == bytecode::OP_HALT {
+    if x.op == bytecode::OP_NOP || x.op == bytecode::OP_JUMP || x.op == bytecode::OP_TRAP ||
+        x.op == bytecode::OP_HALT {
         return 0;
     }
-    if x.op == bytecode::OP_CONST || x.op == bytecode::OP_UNIT || x.op == bytecode::OP_TRUE
-        || x.op == bytecode::OP_FALSE || x.op == bytecode::OP_LOAD
-        || x.op == bytecode::OP_LOAD_CAPTURE || x.op == bytecode::OP_FUNC {
+    if x.op == bytecode::OP_CONST || x.op == bytecode::OP_UNIT || x.op == bytecode::OP_TRUE ||
+        x.op == bytecode::OP_FALSE || x.op == bytecode::OP_LOAD ||
+        x.op == bytecode::OP_LOAD_CAPTURE || x.op == bytecode::OP_FUNC {
         return 0;
     }
-    if x.op == bytecode::OP_STORE || x.op == bytecode::OP_POP
-        || x.op == bytecode::OP_JUMP_IF_FALSE || x.op == bytecode::OP_JUMP_IF_TRUE
-        || x.op == bytecode::OP_RETURN {
+    if x.op == bytecode::OP_STORE || x.op == bytecode::OP_POP ||
+        x.op == bytecode::OP_JUMP_IF_FALSE || x.op == bytecode::OP_JUMP_IF_TRUE ||
+        x.op == bytecode::OP_RETURN {
         return 1;
     }
-    if x.op == bytecode::OP_NEG || x.op == bytecode::OP_NEGF || x.op == bytecode::OP_NOT
-        || x.op == bytecode::OP_TO_STR || x.op == bytecode::OP_GET_FIELD
-        || x.op == bytecode::OP_GET_PAYLOAD || x.op == bytecode::OP_GET_TUPLE_ELEM
-        || x.op == bytecode::OP_IS_VARIANT || x.op == bytecode::OP_CAST {
+    if x.op == bytecode::OP_NEG || x.op == bytecode::OP_NEGF || x.op == bytecode::OP_NOT ||
+        x.op == bytecode::OP_TO_STR || x.op == bytecode::OP_GET_FIELD ||
+        x.op == bytecode::OP_GET_PAYLOAD || x.op == bytecode::OP_GET_TUPLE_ELEM ||
+        x.op == bytecode::OP_IS_VARIANT || x.op == bytecode::OP_CAST {
         return 1;
     }
     if x.op == bytecode::OP_SET_FIELD {
@@ -42,9 +42,9 @@ fn pops_of(x: bytecode::Instr) -> i64 {
     if x.op == bytecode::OP_CALL {
         return x.a + 1;
     }
-    if x.op == bytecode::OP_CALL_BUILTIN || x.op == bytecode::OP_CLOSURE
-        || x.op == bytecode::OP_STRUCT || x.op == bytecode::OP_TUPLE
-        || x.op == bytecode::OP_VARIANT {
+    if x.op == bytecode::OP_CALL_BUILTIN || x.op == bytecode::OP_CLOSURE ||
+        x.op == bytecode::OP_STRUCT || x.op == bytecode::OP_TUPLE ||
+        x.op == bytecode::OP_VARIANT {
         return x.b;
     }
     // Everything else is a binary operator.
@@ -52,13 +52,13 @@ fn pops_of(x: bytecode::Instr) -> i64 {
 }
 
 fn pushes_of(x: bytecode::Instr) -> i64 {
-    if x.op == bytecode::OP_NOP || x.op == bytecode::OP_JUMP || x.op == bytecode::OP_TRAP
-        || x.op == bytecode::OP_HALT {
+    if x.op == bytecode::OP_NOP || x.op == bytecode::OP_JUMP || x.op == bytecode::OP_TRAP ||
+        x.op == bytecode::OP_HALT {
         return 0;
     }
-    if x.op == bytecode::OP_STORE || x.op == bytecode::OP_POP
-        || x.op == bytecode::OP_JUMP_IF_FALSE || x.op == bytecode::OP_JUMP_IF_TRUE
-        || x.op == bytecode::OP_RETURN || x.op == bytecode::OP_SET_FIELD {
+    if x.op == bytecode::OP_STORE || x.op == bytecode::OP_POP ||
+        x.op == bytecode::OP_JUMP_IF_FALSE || x.op == bytecode::OP_JUMP_IF_TRUE ||
+        x.op == bytecode::OP_RETURN || x.op == bytecode::OP_SET_FIELD {
         return 0;
     }
     1
@@ -214,8 +214,8 @@ impl Builder {
                     work_depth.push(out);
                 } else {
                     // A return, a halt and a trap do not fall through.
-                    if x.op != bytecode::OP_RETURN && x.op != bytecode::OP_HALT
-                        && x.op != bytecode::OP_TRAP {
+                    if x.op != bytecode::OP_RETURN && x.op != bytecode::OP_HALT &&
+                        x.op != bytecode::OP_TRAP {
                         work_pc.push(pc + 1);
                         work_depth.push(out);
                     }
@@ -240,8 +240,8 @@ impl Builder {
         let mut pc = 0;
         while pc < n {
             let x = self.src.code.at(pc);
-            if x.op == bytecode::OP_JUMP || x.op == bytecode::OP_JUMP_IF_FALSE
-                || x.op == bytecode::OP_JUMP_IF_TRUE {
+            if x.op == bytecode::OP_JUMP || x.op == bytecode::OP_JUMP_IF_FALSE ||
+                x.op == bytecode::OP_JUMP_IF_TRUE {
                 if x.a >= 0 && x.a < is_leader.len() {
                     is_leader.set(x.a, true);
                 }
@@ -249,8 +249,8 @@ impl Builder {
                     is_leader.set(pc + 1, true);
                 }
             }
-            if x.op == bytecode::OP_RETURN || x.op == bytecode::OP_HALT
-                || x.op == bytecode::OP_TRAP {
+            if x.op == bytecode::OP_RETURN || x.op == bytecode::OP_HALT ||
+                x.op == bytecode::OP_TRAP {
                 if pc + 1 < is_leader.len() {
                     is_leader.set(pc + 1, true);
                 }
@@ -540,8 +540,8 @@ impl Builder {
             self.push(blk.append(v));
             return false;
         }
-        if x.op == bytecode::OP_STRUCT || x.op == bytecode::OP_TUPLE
-            || x.op == bytecode::OP_VARIANT {
+        if x.op == bytecode::OP_STRUCT || x.op == bytecode::OP_TUPLE ||
+            x.op == bytecode::OP_VARIANT {
             let args = self.pop_n(x.b);
             let mut op = ir::OP_STRUCT;
             if x.op == bytecode::OP_TUPLE { op = ir::OP_TUPLE; }

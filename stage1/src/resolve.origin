@@ -182,8 +182,8 @@ fn ref_module(m: Module) -> Ref {
 /// parent pointer -- a cycle. What identifies a reference is its kind and either the
 /// declaration it points at or the name it carries.
 fn same_ref(a: Ref, b: Ref) -> bool {
-    a.kind == b.kind && a.name == b.name && a.file == b.file && a.at == b.at
-        && a.builtin == b.builtin && a.member == b.member
+    a.kind == b.kind && a.name == b.name && a.file == b.file && a.at == b.at &&
+        a.builtin == b.builtin && a.member == b.member
 }
 
 // --- Scopes --------------------------------------------------------------------------

@@ -251,11 +251,11 @@ fn jumps_backwards(n: Numbering, b: ir::Block) -> bool {
 /// occurrence gets -- so every comparison is treated as call-clobbering, which is
 /// conservative for the common case and correct for both.
 pub fn clobbers_caller_saved(op: i64) -> bool {
-    op == ir::OP_CALL || op == ir::OP_CALL_CLOSURE || op == ir::OP_CALL_BUILTIN
-        || op == ir::OP_STRUCT || op == ir::OP_TUPLE || op == ir::OP_VARIANT
-        || op == ir::OP_CLOSURE || op == ir::OP_BOX_FN || op == ir::OP_TO_STR
-        || op == ir::OP_EQ || op == ir::OP_NE || op == ir::OP_LT || op == ir::OP_LE
-        || op == ir::OP_GT || op == ir::OP_GE
+    op == ir::OP_CALL || op == ir::OP_CALL_CLOSURE || op == ir::OP_CALL_BUILTIN ||
+        op == ir::OP_STRUCT || op == ir::OP_TUPLE || op == ir::OP_VARIANT ||
+        op == ir::OP_CLOSURE || op == ir::OP_BOX_FN || op == ir::OP_TO_STR ||
+        op == ir::OP_EQ || op == ir::OP_NE || op == ir::OP_LT || op == ir::OP_LE ||
+        op == ir::OP_GT || op == ir::OP_GE
 }
 
 /// A block's live-in and live-out sets, by block id and then by value id.

@@ -1,0 +1,21 @@
+// EXPECT: accept
+// spec: 01-lexical.md — `}` is not a trigger, so arms stay comma-separated.
+
+// If `}` terminated a line, a semicolon would land between these arms, where the grammar
+// allows only a comma. Excluding it is what saves the 442 arms written this way in this
+// repository (ADR-0040).
+use std::io
+
+fn describe(n: i64) -> String {
+    match n.cmp(0) {
+        Less => { "negative" }
+        Equal => { "zero" }
+        Greater => { "positive" }
+    }
+}
+
+fn main() {
+    io::println(describe(0 - 1))
+    io::println(describe(0))
+    io::println(describe(1))
+}

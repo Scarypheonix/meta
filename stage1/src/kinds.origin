@@ -127,8 +127,8 @@ fn check_phi_kinds(f: ir::Func) -> String {
 /// from the SSA builder -- this just reports it, or reports it as not yet known when the
 /// builder had nothing to seed it with.
 fn static_kind(v: ir::Value, prog: bytecode::Program) -> i64 {
-    if v.op == ir::OP_PARAM || v.op == ir::OP_CAPTURE || v.op == ir::OP_GET_FIELD
-        || v.op == ir::OP_CALL || v.op == ir::OP_CALL_CLOSURE {
+    if v.op == ir::OP_PARAM || v.op == ir::OP_CAPTURE || v.op == ir::OP_GET_FIELD ||
+        v.op == ir::OP_CALL || v.op == ir::OP_CALL_CLOSURE {
         return v.kind;
     }
     if v.op == ir::OP_CONST {
@@ -142,24 +142,24 @@ fn static_kind(v: ir::Value, prog: bytecode::Program) -> i64 {
     }
     if v.op == ir::OP_UNIT { return bytecode::KIND_UNIT; }
     if v.op == ir::OP_TRUE || v.op == ir::OP_FALSE { return bytecode::KIND_BOOL; }
-    if v.op == ir::OP_ADD || v.op == ir::OP_SUB || v.op == ir::OP_MUL || v.op == ir::OP_DIV
-        || v.op == ir::OP_REM || v.op == ir::OP_NEG || v.op == ir::OP_WRAP_ADD
-        || v.op == ir::OP_WRAP_SUB || v.op == ir::OP_WRAP_MUL || v.op == ir::OP_AND
-        || v.op == ir::OP_OR || v.op == ir::OP_XOR || v.op == ir::OP_SHL
-        || v.op == ir::OP_SHR {
+    if v.op == ir::OP_ADD || v.op == ir::OP_SUB || v.op == ir::OP_MUL || v.op == ir::OP_DIV ||
+        v.op == ir::OP_REM || v.op == ir::OP_NEG || v.op == ir::OP_WRAP_ADD ||
+        v.op == ir::OP_WRAP_SUB || v.op == ir::OP_WRAP_MUL || v.op == ir::OP_AND ||
+        v.op == ir::OP_OR || v.op == ir::OP_XOR || v.op == ir::OP_SHL ||
+        v.op == ir::OP_SHR {
         // Every one of these is an integer op. Every integer kind is "raw" to a stack map --
         // the only distinction that matters here -- so neither the width nor the signedness
         // the checker resolved needs to travel this far, and `KIND_I64` stands for "a
         // machine word that is not a reference".
         return bytecode::KIND_I64;
     }
-    if v.op == ir::OP_ADDF || v.op == ir::OP_SUBF || v.op == ir::OP_MULF
-        || v.op == ir::OP_DIVF || v.op == ir::OP_REMF || v.op == ir::OP_NEGF {
+    if v.op == ir::OP_ADDF || v.op == ir::OP_SUBF || v.op == ir::OP_MULF ||
+        v.op == ir::OP_DIVF || v.op == ir::OP_REMF || v.op == ir::OP_NEGF {
         return bytecode::KIND_FLOAT;
     }
-    if v.op == ir::OP_EQ || v.op == ir::OP_NE || v.op == ir::OP_LT || v.op == ir::OP_LE
-        || v.op == ir::OP_GT || v.op == ir::OP_GE || v.op == ir::OP_NOT
-        || v.op == ir::OP_IS_VARIANT {
+    if v.op == ir::OP_EQ || v.op == ir::OP_NE || v.op == ir::OP_LT || v.op == ir::OP_LE ||
+        v.op == ir::OP_GT || v.op == ir::OP_GE || v.op == ir::OP_NOT ||
+        v.op == ir::OP_IS_VARIANT {
         return bytecode::KIND_BOOL;
     }
     if v.op == ir::OP_FUNC {
@@ -168,8 +168,8 @@ fn static_kind(v: ir::Value, prog: bytecode::Program) -> i64 {
         // one reaching here really is just an address.
         return bytecode::KIND_I64;
     }
-    if v.op == ir::OP_STRUCT || v.op == ir::OP_TUPLE || v.op == ir::OP_VARIANT
-        || v.op == ir::OP_CLOSURE || v.op == ir::OP_BOX_FN {
+    if v.op == ir::OP_STRUCT || v.op == ir::OP_TUPLE || v.op == ir::OP_VARIANT ||
+        v.op == ir::OP_CLOSURE || v.op == ir::OP_BOX_FN {
         return bytecode::KIND_REF;
     }
     if v.op == ir::OP_TO_STR { return bytecode::KIND_STRING; }
@@ -190,12 +190,12 @@ fn static_kind(v: ir::Value, prog: bytecode::Program) -> i64 {
 /// gave it. Always raw, since `as` only converts between primitives, so only *which* raw
 /// kind is in question.
 fn cast_result_kind(k: i64, aux: i64) -> i64 {
-    if k == bytecode::CAST_INT_TO_FLOAT || k == bytecode::CAST_FLOAT_NARROW
-        || k == bytecode::CAST_FLOAT_WIDEN {
+    if k == bytecode::CAST_INT_TO_FLOAT || k == bytecode::CAST_FLOAT_NARROW ||
+        k == bytecode::CAST_FLOAT_WIDEN {
         return bytecode::KIND_FLOAT;
     }
-    if k == bytecode::CAST_INT_TRUNC || k == bytecode::CAST_FLOAT_TO_INT
-        || k == bytecode::CAST_BOOL_TO_INT || k == bytecode::CAST_CHAR_TO_INT {
+    if k == bytecode::CAST_INT_TRUNC || k == bytecode::CAST_FLOAT_TO_INT ||
+        k == bytecode::CAST_BOOL_TO_INT || k == bytecode::CAST_CHAR_TO_INT {
         if (aux & 256) != 0 { return bytecode::KIND_I64; }
         return bytecode::KIND_U64;
     }
@@ -205,17 +205,17 @@ fn cast_result_kind(k: i64, aux: i64) -> i64 {
 /// Each compiler-provided builtin's fixed result kind. `checked_*` wraps in `Option`,
 /// `saturating_*` never fails so it does not, and every `cmp_*` builds an `Ordering`.
 fn builtin_result_kind(idx: i64) -> i64 {
-    if idx == compile::BUILTIN_PRINT || idx == compile::BUILTIN_PRINTLN
-        || idx == compile::BUILTIN_PANIC {
+    if idx == compile::BUILTIN_PRINT || idx == compile::BUILTIN_PRINTLN ||
+        idx == compile::BUILTIN_PANIC {
         return bytecode::KIND_UNIT;
     }
     if idx == compile::BUILTIN_REF_EQ { return bytecode::KIND_BOOL; }
-    if idx == compile::BUILTIN_CMP_INT || idx == compile::BUILTIN_CMP_UINT
-        || idx == compile::BUILTIN_CMP_FLOAT || idx == compile::BUILTIN_CMP_STRING {
+    if idx == compile::BUILTIN_CMP_INT || idx == compile::BUILTIN_CMP_UINT ||
+        idx == compile::BUILTIN_CMP_FLOAT || idx == compile::BUILTIN_CMP_STRING {
         return bytecode::KIND_REF;
     }
-    if idx == compile::BUILTIN_FITS_ADD || idx == compile::BUILTIN_FITS_SUB
-        || idx == compile::BUILTIN_FITS_MUL {
+    if idx == compile::BUILTIN_FITS_ADD || idx == compile::BUILTIN_FITS_SUB ||
+        idx == compile::BUILTIN_FITS_MUL {
         return bytecode::KIND_BOOL;
     }
     if idx == compile::BUILTIN_CHAR_VALID { return bytecode::KIND_BOOL; }
@@ -225,12 +225,12 @@ fn builtin_result_kind(idx: i64) -> i64 {
     if idx == compile::BUILTIN_EXIT { return bytecode::KIND_UNIT; }
     if idx == compile::BUILTIN_FLOAT_BITS { return bytecode::KIND_U64; }
     if idx == compile::BUILTIN_FLOAT_FROM_BITS { return bytecode::KIND_FLOAT; }
-    if idx == compile::BUILTIN_SATURATING_ADD || idx == compile::BUILTIN_SATURATING_SUB
-        || idx == compile::BUILTIN_SATURATING_MUL {
+    if idx == compile::BUILTIN_SATURATING_ADD || idx == compile::BUILTIN_SATURATING_SUB ||
+        idx == compile::BUILTIN_SATURATING_MUL {
         return bytecode::KIND_I64;
     }
-    if idx == compile::BUILTIN_SPAWN || idx == compile::BUILTIN_CHANNEL
-        || idx == compile::BUILTIN_MUTEX {
+    if idx == compile::BUILTIN_SPAWN || idx == compile::BUILTIN_CHANNEL ||
+        idx == compile::BUILTIN_MUTEX {
         // A bare handle: an index into the runtime's own tables, which the lowering then
         // wraps in the prelude type the call's checked type names.
         return bytecode::KIND_I64;

@@ -194,8 +194,8 @@ fn cd_blob_size(identifier: String, n_code: i64) -> i64 {
 }
 
 fn super_blob_size(identifier: String, n_code: i64) -> i64 {
-    12 + 8 * 3 + cd_blob_size(identifier, n_code)
-        + requirements_blob().len() + cms_blob().len()
+    12 + 8 * 3 + cd_blob_size(identifier, n_code) +
+        requirements_blob().len() + cms_blob().len()
 }
 
 /// Big-endian, unlike everything else in a Mach-O.

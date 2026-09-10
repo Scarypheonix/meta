@@ -150,9 +150,9 @@ impl Parser {
 // --- Recovery ------------------------------------------------------------------------
 
 fn is_item_start(k: i64) -> bool {
-    k == lex::K_PUB || k == lex::K_FN || k == lex::K_STRUCT || k == lex::K_ENUM
-        || k == lex::K_TRAIT || k == lex::K_IMPL || k == lex::K_TYPE || k == lex::K_CONST
-        || k == lex::K_USE
+    k == lex::K_PUB || k == lex::K_FN || k == lex::K_STRUCT || k == lex::K_ENUM ||
+        k == lex::K_TRAIT || k == lex::K_IMPL || k == lex::K_TYPE || k == lex::K_CONST ||
+        k == lex::K_USE
 }
 
 impl Parser {
@@ -489,8 +489,8 @@ impl Parser {
         let mut self_param = Option::None;
         let mut first = true;
         while !self.at(lex::K_RPAREN) && !self.at_eof() {
-            let takes_self = self.at(lex::K_SELF_VALUE)
-                || (self.at(lex::K_MUT) && self.peek_is(1, lex::K_SELF_VALUE));
+            let takes_self = self.at(lex::K_SELF_VALUE) ||
+                (self.at(lex::K_MUT) && self.peek_is(1, lex::K_SELF_VALUE));
             if first && takes_self {
                 let mutable = self.eat(lex::K_MUT);
                 self.advance();
@@ -867,8 +867,8 @@ impl Parser {
 // --- Statements ----------------------------------------------------------------------
 
 fn starts_block_expr(k: i64) -> bool {
-    k == lex::K_LBRACE || k == lex::K_IF || k == lex::K_MATCH || k == lex::K_WHILE
-        || k == lex::K_FOR || k == lex::K_LOOP
+    k == lex::K_LBRACE || k == lex::K_IF || k == lex::K_MATCH || k == lex::K_WHILE ||
+        k == lex::K_FOR || k == lex::K_LOOP
 }
 
 fn is_block_expr(e: ast::Expr) -> bool {
@@ -1255,8 +1255,8 @@ impl Parser {
     /// `return` tell a value from the end of the statement.
     fn can_start_expr(self) -> bool {
         let k = self.cur().kind;
-        !(k == lex::K_SEMI || k == lex::K_RBRACE || k == lex::K_RPAREN
-            || k == lex::K_RBRACKET || k == lex::K_COMMA || k == lex::K_EOF)
+        !(k == lex::K_SEMI || k == lex::K_RBRACE || k == lex::K_RPAREN ||
+            k == lex::K_RBRACKET || k == lex::K_COMMA || k == lex::K_EOF)
     }
 
     fn primary(self) -> ast::Expr {
@@ -1588,8 +1588,8 @@ impl Parser {
         // parser restriction forbids. `Ident :` inside the brace is a field initializer and
         // nothing else -- Origin has no labels -- so the restriction can be named rather
         // than reported as a missing semicolon several tokens later.
-        if self.at(lex::K_LBRACE) && self.no_struct
-            && self.peek_is(1, lex::K_IDENT) && self.peek_is(2, lex::K_COLON) {
+        if self.at(lex::K_LBRACE) && self.no_struct &&
+            self.peek_is(1, lex::K_IDENT) && self.peek_is(2, lex::K_COLON) {
             let t = self.cur();
             self.error_at(t.start, t.end, "a struct literal cannot appear here");
             return self.struct_lit(start, path, args);
@@ -1778,8 +1778,8 @@ impl Parser {
             self.advance();
             return self.mk_pat(start, ast::PatKind::Wild);
         }
-        if k == lex::K_INT || k == lex::K_FLOAT || k == lex::K_STR || k == lex::K_CHAR
-            || k == lex::K_TRUE || k == lex::K_FALSE {
+        if k == lex::K_INT || k == lex::K_FLOAT || k == lex::K_STR || k == lex::K_CHAR ||
+            k == lex::K_TRUE || k == lex::K_FALSE {
             let lit = self.literal_for_pattern();
             return self.mk_pat(start, ast::PatKind::Lit(false, lit));
         }

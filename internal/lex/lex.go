@@ -86,6 +86,18 @@ type Lexer struct {
 	src  string
 	pos  int
 	bag  *diag.Bag
+	// last is the kind of the token most recently returned and lastEnd is where it ended.
+	// Together they are what decides whether a line break terminates a statement, and where
+	// the semicolon that terminates it is placed (spec/01-lexical.md, ADR-0040).
+	last    Kind
+	lastEnd int
+	// depth counts unclosed `(` and `[`. Inside either, a line break never terminates a
+	// statement, which is what lets a call or a list literal wrap freely.
+	depth int
+	// sawNewline records whether the trivia just skipped contained a line break. A newline
+	// inside a block comment counts, as it does in Go: the statement still ended on an
+	// earlier line than what follows.
+	sawNewline bool
 }
 
 // New returns a Lexer over f, reporting into bag.
@@ -182,9 +194,61 @@ func (l *Lexer) nextRune() rune {
 	return r
 }
 
-// Next returns the next token, skipping whitespace and comments.
+// Next returns the next token, supplying a statement-terminating semicolon at a line break
+// where §01's three rules call for one (ADR-0040).
+//
+// The token it supplies is an ordinary Semi, so nothing downstream can tell an inserted
+// semicolon from a written one and the grammar in §02 needs no rule about it. Its span is
+// the zero-width position at the end of the line's last token, which is where a reader
+// would have typed it.
 func (l *Lexer) Next() Token {
+	l.sawNewline = false
 	l.skipTrivia()
+	if l.terminatesStatement() {
+		l.last = Semi
+		// Text is the same ";" a written semicolon carries: nothing downstream, the
+		// selfhost token differential included, may be able to tell the two apart.
+		return Token{Kind: Semi, Span: l.span(l.lastEnd, l.lastEnd), Text: ";"}
+	}
+	t := l.scan()
+	switch t.Kind {
+	case LParen, LBracket:
+		l.depth++
+	case RParen, RBracket:
+		if l.depth > 0 {
+			l.depth--
+		}
+	}
+	l.last, l.lastEnd = t.Kind, t.Span.End
+	return t
+}
+
+// terminatesStatement applies §01's three rules, with the trivia already skipped.
+func (l *Lexer) terminatesStatement() bool {
+	if !l.sawNewline || l.depth > 0 || !endsStatement(l.last) {
+		return false
+	}
+	// Rule 3: never before a closing brace. This is what keeps a block's trailing
+	// expression the block's value rather than a statement, and what lets a brace-bodied
+	// `match` arm omit its comma. It is the one place the lexer looks at what comes next.
+	return l.atEnd() || l.src[l.pos] != '}'
+}
+
+// endsStatement reports whether a token can be the last one of a statement
+// (spec/01-lexical.md). `}` is deliberately absent; ADR-0040 says why.
+func endsStatement(k Kind) bool {
+	switch k {
+	case Ident, Int, Float, Str, Char,
+		KwTrue, KwFalse, KwSelfValue,
+		RParen, RBracket,
+		KwBreak, KwContinue, KwReturn:
+		return true
+	}
+	return false
+}
+
+// scan reads one real token, with trivia already skipped.
+func (l *Lexer) scan() Token {
 	start := l.pos
 	if l.atEnd() {
 		return Token{Kind: EOF, Span: l.span(start, start)}
@@ -210,7 +274,7 @@ func (l *Lexer) Next() Token {
 		l.nextRune()
 		l.errorf(start, l.pos, "invalid character %q in source", r).
 			Label("not valid anywhere in an Origin program")
-		return l.Next()
+		return l.scan()
 	}
 	if tok, ok := l.lexPunct(); ok {
 		return tok
@@ -227,6 +291,9 @@ func (l *Lexer) skipTrivia() {
 	for !l.atEnd() {
 		c := l.src[l.pos]
 		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f' {
+			if c == '\n' {
+				l.sawNewline = true
+			}
 			l.pos++
 			continue
 		}
@@ -260,6 +327,9 @@ func (l *Lexer) skipBlockComment() {
 				return
 			}
 			continue
+		}
+		if l.src[l.pos] == '\n' {
+			l.sawNewline = true
 		}
 		l.pos++
 	}

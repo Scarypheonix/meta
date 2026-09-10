@@ -1324,8 +1324,8 @@ impl Checker {
                         match b.trait_info {
                             Option::None => {}
                             Option::Some(tb) => {
-                                if ref_eq(ta, tb) && !(a.builtin && b.builtin)
-                                    && self.impls_overlap(a, b) {
+                                if ref_eq(ta, tb) && !(a.builtin && b.builtin) &&
+                                    self.impls_overlap(a, b) {
                                     self.report_overlap(a, b);
                                 }
                             }
@@ -1618,8 +1618,8 @@ impl Checker {
             let mut i = 0;
             while i < self.env.bounds.len() {
                 let b = self.env.bounds.at(i);
-                if same_rigid(b.ty, subject)
-                    && (ref_eq(b.trait_info, ti) || supertrait_reaches(b.trait_info, ti)) {
+                if same_rigid(b.ty, subject) &&
+                    (ref_eq(b.trait_info, ti) || supertrait_reaches(b.trait_info, ti)) {
                     return true;
                 }
                 i = i + 1;
@@ -2730,9 +2730,9 @@ impl Checker {
             }
             return types::Type::Prim(k);
         }
-        if r.kind == resolve::K_STRUCT || r.kind == resolve::K_ENUM
-            || r.kind == resolve::K_TRAIT || r.kind == resolve::K_ALIAS
-            || r.kind == resolve::K_PRIM {
+        if r.kind == resolve::K_STRUCT || r.kind == resolve::K_ENUM ||
+            r.kind == resolve::K_TRAIT || r.kind == resolve::K_ALIAS ||
+            r.kind == resolve::K_PRIM {
             self.error("E0423", e.span, "`\(p.text)` is a type, not a value");
             return types::error_type();
         }

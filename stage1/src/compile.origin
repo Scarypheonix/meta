@@ -1068,8 +1068,8 @@ impl Compiler {
                         let less = find_variant(ordering, "Less");
                         let equal = find_variant(ordering, "Equal");
                         let greater = find_variant(ordering, "Greater");
-                        if some.is_none() || none.is_none() || less.is_none()
-                            || equal.is_none() || greater.is_none() {
+                        if some.is_none() || none.is_none() || less.is_none() ||
+                            equal.is_none() || greater.is_none() {
                             return;
                         }
                         self.option_def = Option::Some(od);
@@ -2686,8 +2686,8 @@ fn wrapping_for(fits: i64) -> i64 {
 /// signed and unsigned integer width, both float widths, `char` and `String`; nothing else
 /// reaches here for a well-typed program.
 fn cmp_builtin_for(k: i64) -> i64 {
-    if k == bytecode::KIND_CHAR
-        || (bytecode::kind_is_integer(k) && bytecode::kind_is_signed(k)) {
+    if k == bytecode::KIND_CHAR ||
+        (bytecode::kind_is_integer(k) && bytecode::kind_is_signed(k)) {
         return BUILTIN_CMP_INT;
     }
     if bytecode::kind_is_integer(k) { return BUILTIN_CMP_UINT; }

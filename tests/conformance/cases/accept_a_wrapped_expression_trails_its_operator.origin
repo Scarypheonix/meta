@@ -1,0 +1,27 @@
+// EXPECT: accept
+// spec: 01-lexical.md — an expression that wraps puts the operator at the end of the line.
+
+// Rule 2 covers anything inside `(` or `[`; outside them the operator goes last, Go-style.
+// This is the one migration the rule costs, and it is what the 93 sites in this repository
+// were rewritten to (ADR-0040).
+use std::io
+
+fn wide(a: bool, b: bool, c: bool) -> bool {
+    a ||
+        b ||
+        c
+}
+
+fn total(x: i64, y: i64, z: i64) -> i64 {
+    // Inside the parentheses no insertion happens at all, by rule 2.
+    let inner = (x +
+        y +
+        z)
+    inner +
+        1
+}
+
+fn main() {
+    io::println("\(wide(false, false, true))")
+    io::println("\(total(1, 2, 3))")
+}

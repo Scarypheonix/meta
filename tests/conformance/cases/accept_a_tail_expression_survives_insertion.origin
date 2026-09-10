@@ -1,0 +1,28 @@
+// EXPECT: accept
+// spec: 01-lexical.md — rule 3: never insert before a closing brace.
+
+// The rule Go does not need. A block's value is its trailing expression written without a
+// semicolon, so inserting one before `}` would make every one of these return `()` and the
+// declared return types would stop matching (ADR-0040).
+use std::io
+
+fn shifted(w: i64) -> i64 {
+    1 << w
+}
+
+fn doubled(n: i64) -> i64 {
+    let d = n * 2
+    d
+}
+
+fn nested(n: i64) -> i64 {
+    if n > 0 {
+        n
+    } else {
+        0 - n
+    }
+}
+
+fn main() {
+    io::println("\(shifted(5)) \(doubled(21)) \(nested(0 - 7))")
+}

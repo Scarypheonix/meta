@@ -173,8 +173,8 @@ pub fn instr(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
     if op == ir::OP_CAST { cast(e, fs, v); return; }
     if op == ir::OP_AND || op == ir::OP_OR || op == ir::OP_XOR { bitwise(e, fs, v); return; }
     if op == ir::OP_SHL || op == ir::OP_SHR { shift(e, fs, v); return; }
-    if op == ir::OP_EQ || op == ir::OP_NE || op == ir::OP_LT
-        || op == ir::OP_LE || op == ir::OP_GT || op == ir::OP_GE {
+    if op == ir::OP_EQ || op == ir::OP_NE || op == ir::OP_LT ||
+        op == ir::OP_LE || op == ir::OP_GT || op == ir::OP_GE {
         compare(e, fs, v);
         return;
     }
@@ -281,8 +281,8 @@ fn constant(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
         return;
     }
     let c = e.prog.consts.at(v.a);
-    if c.kind == bytecode::CONST_INT || c.kind == bytecode::CONST_CHAR
-        || c.kind == bytecode::CONST_FLOAT {
+    if c.kind == bytecode::CONST_INT || c.kind == bytecode::CONST_CHAR ||
+        c.kind == bytecode::CONST_FLOAT {
         // Integers, chars and floats are all one word: the float's IEEE bits travel in a
         // general-purpose register and move to SSE only for arithmetic.
         e.a.mov_ri(regalloc::SCRATCH_A, c.bits);
@@ -1034,8 +1034,8 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
         def(e, fs, v, x86::RAX);
         return;
     }
-    if idx == compile::BUILTIN_STR_BYTE_AT || idx == compile::BUILTIN_STR_CHAR_AT
-        || idx == compile::BUILTIN_STR_CHAR_WIDTH {
+    if idx == compile::BUILTIN_STR_BYTE_AT || idx == compile::BUILTIN_STR_CHAR_AT ||
+        idx == compile::BUILTIN_STR_CHAR_WIDTH {
         if !arity(e, n, 2, "a string index") { return; }
         load_args_into(e, fs, v.args);
         if idx == compile::BUILTIN_STR_BYTE_AT {
@@ -1240,20 +1240,20 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
         def(e, fs, v, x86::RAX);
         return;
     }
-    if idx == compile::BUILTIN_CMP_INT || idx == compile::BUILTIN_CMP_UINT
-        || idx == compile::BUILTIN_CMP_FLOAT || idx == compile::BUILTIN_CMP_STRING {
+    if idx == compile::BUILTIN_CMP_INT || idx == compile::BUILTIN_CMP_UINT ||
+        idx == compile::BUILTIN_CMP_FLOAT || idx == compile::BUILTIN_CMP_STRING {
         if !arity(e, n, 2, "cmp") { return; }
         build_ordering(e, fs, v);
         return;
     }
-    if idx == compile::BUILTIN_FITS_ADD || idx == compile::BUILTIN_FITS_SUB
-        || idx == compile::BUILTIN_FITS_MUL {
+    if idx == compile::BUILTIN_FITS_ADD || idx == compile::BUILTIN_FITS_SUB ||
+        idx == compile::BUILTIN_FITS_MUL {
         if !arity(e, n, 2, "a fits-check") { return; }
         fits_check(e, fs, v);
         return;
     }
-    if idx == compile::BUILTIN_SATURATING_ADD || idx == compile::BUILTIN_SATURATING_SUB
-        || idx == compile::BUILTIN_SATURATING_MUL {
+    if idx == compile::BUILTIN_SATURATING_ADD || idx == compile::BUILTIN_SATURATING_SUB ||
+        idx == compile::BUILTIN_SATURATING_MUL {
         if !arity(e, n, 2, "a saturating operation") { return; }
         saturating_arith(e, fs, v);
         return;

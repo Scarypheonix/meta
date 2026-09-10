@@ -481,17 +481,17 @@ impl Program {
         if x.op == OP_CALL {
             return " \(x.a)  ; kind=\(kind_name(x.kind))";
         }
-        if x.op == OP_STRUCT || x.op == OP_TUPLE || x.op == OP_CALL_BUILTIN
-            || x.op == OP_CLOSURE {
+        if x.op == OP_STRUCT || x.op == OP_TUPLE || x.op == OP_CALL_BUILTIN ||
+            x.op == OP_CLOSURE {
             return " \(x.a) \(x.b)";
         }
-        if x.op == OP_GET_FIELD || x.op == OP_SET_FIELD || x.op == OP_GET_PAYLOAD
-            || x.op == OP_GET_TUPLE_ELEM {
+        if x.op == OP_GET_FIELD || x.op == OP_SET_FIELD || x.op == OP_GET_PAYLOAD ||
+            x.op == OP_GET_TUPLE_ELEM {
             return " \(x.a)  ; kind=\(kind_name(x.kind))";
         }
-        if x.op == OP_LOAD || x.op == OP_STORE || x.op == OP_LOAD_CAPTURE
-            || x.op == OP_JUMP || x.op == OP_JUMP_IF_FALSE || x.op == OP_JUMP_IF_TRUE
-            || x.op == OP_FUNC || x.op == OP_CAST || x.op == OP_TRAP {
+        if x.op == OP_LOAD || x.op == OP_STORE || x.op == OP_LOAD_CAPTURE ||
+            x.op == OP_JUMP || x.op == OP_JUMP_IF_FALSE || x.op == OP_JUMP_IF_TRUE ||
+            x.op == OP_FUNC || x.op == OP_CAST || x.op == OP_TRAP {
             return " \(x.a)";
         }
         ""

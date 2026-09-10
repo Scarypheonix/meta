@@ -1,0 +1,15 @@
+// EXPECT: accept
+// spec: 01-lexical.md — a line break terminates a statement (ADR-0040).
+
+// Not one written semicolon in this program except where `}` ends the line, which is not a
+// trigger. `use`, `let` and expression statements all take an inserted one.
+use std::io
+use std::list
+
+fn main() {
+    let a = 1
+    let b = a + 1
+    let xs = list::new[i64]()
+    xs.push(b)
+    io::println("\(xs.len()) \(b)")
+}
