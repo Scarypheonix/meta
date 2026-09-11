@@ -4,7 +4,7 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Phases 0 through 12 are complete** (see `docs/phases/`). **The compiler compiles itself**,
+**Phases 0 through 13 are complete** (see `docs/phases/`). **The compiler compiles itself**,
 and it runs in a browser. See Status, at the bottom of this file, for what exists and what is
 next.
 
@@ -195,6 +195,38 @@ This project outlasts any single context window.
   lives in one place with one test suite guarding it.
 
 ## Status
+
+**Phase 13 is complete** (`docs/phases/13-complete.md`). Origin has an iteration library:
+`range`, thirteen methods on `List[T]`, and four free functions -- **all ordinary Origin in the
+prelude, with no compiler change at all.** Every shape was verified expressible against the real
+checker before a line was written. stage1's driver had hand-rolled its own stable insertion sort
+and now calls the prelude's, 22 lines lighter. `./check` runs in 209s at 1,974 MiB, *down* from
+239s: Phase 7's unreached-prelude-dropping means a generous library costs no program anything.
+
+**Two limits found by writing it**, both now in `docs/deferred.md`. **Lazy adapters cannot be
+expressed**: typing a lazy `map` needs `I::Item` to *be* the function's argument type, a bound
+names a trait and its type arguments rather than a projection, and it fails with `expected A,
+found I::Item` -- so every transform is eager and §13 says so. **Candidate-impl probing is not
+speculative**: `lookupMethod` unifies the receiver against each candidate and checks whether
+that impl has the method *afterwards*, and `Unify` binds with no rollback, so an
+`impl List[i64]` beside `impl[T] List[T]` made `let w = ["a", "b"]` fail with `expected i64,
+found String`. That defect predates the library -- this is just the first prelude impl on a
+concrete instantiation to expose it. `sum`, `max`, `min` and `join` are free functions until it
+is fixed, which needs a trail in `internal/types` mirrored in stage1: a phase, not a patch.
+
+**The phase amended the one before it.** Using the library produced code ADR-0040 rejected --
+a method chain wrapped with the dot leading -- so rule 3 now suppresses insertion before `.` as
+well as `}`, on a *stronger* argument: nothing in the grammar can begin with a dot, so it trades
+away nothing. **The lesson: a grammar rule and a library are not independent.** ADR-0040's
+migration cost looked like 93 sites because the corpus had no fluent API in it, because the
+standard library had none to use. A rule validated against today's code can be wrong about
+tomorrow's.
+
+**Next action: the user's to set** (rule 7). Still held and untouched: **associated functions**
+(`List::new()` -- which would also make `sum` and `join` methods without the checker fix) and
+**tuple element access** (`t.0`). Still unbuilt: the **formatter**, referenced twice in the spec
+and never scheduled. And **18% of code lines are still nothing but a closing brace** -- only
+indentation sensitivity changes that, and it remains priced as a front-end redesign.
 
 **Phase 12 is complete** (`docs/phases/12-complete.md`). Semicolons are inserted at a line break
 (**ADR-0040**): 14,173 of the repository's 31,771 code lines end in one, and all of them are now
