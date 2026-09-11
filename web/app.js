@@ -15,11 +15,15 @@
   const els = {
     src: $("src"), run: $("run"), stop: $("stop"), share: $("share"),
     example: $("example"), engine: $("engine"), opt: $("opt"),
+    stdin: $("stdin"),
     stdout: $("stdout"), stderr: $("stderr"), host: $("host"), status: $("status"),
     kind: $("editor-kind"), forget: $("forget"),
   };
 
-  const STORE = { source: "origin.playground.source", engine: "origin.playground.engine", opt: "origin.playground.opt" };
+  const STORE = {
+    source: "origin.playground.source", engine: "origin.playground.engine",
+    opt: "origin.playground.opt", stdin: "origin.playground.stdin",
+  };
 
   // localStorage throws rather than returning null in some contexts -- a private window with
   // site data blocked, or an embedded view. The page must work with no storage at all, so
@@ -164,6 +168,7 @@
       source: editor.get(),
       engine: els.engine.value,
       opt: Number(els.opt.value),
+      stdin: els.stdin.value,
     });
   }
 
@@ -243,6 +248,8 @@
     if (engine) els.engine.value = engine;
     const opt = store.get(STORE.opt);
     if (opt) els.opt.value = opt;
+    const stdin = store.get(STORE.stdin);
+    if (stdin !== null) els.stdin.value = stdin;
 
     upgradeEditor();
     if (fromLink) say("this program came from a shared link.");
@@ -254,11 +261,16 @@
 
     els.engine.onchange = () => store.set(STORE.engine, els.engine.value);
     els.opt.onchange = () => store.set(STORE.opt, els.opt.value);
+    els.stdin.oninput = () => store.set(STORE.stdin, els.stdin.value);
 
     els.example.onchange = () => {
       const ex = exampleByName(els.example.value);
       if (!ex) return;
       editor.set(ex.source);
+      // An example that reads standard input brings its own, so choosing it from the list
+      // gives a program that runs rather than one that reads nothing and looks broken.
+      els.stdin.value = ex.stdin || "";
+      store.set(STORE.stdin, els.stdin.value);
       remember();
       els.stdout.textContent = "";
       els.stderr.textContent = "";
@@ -272,6 +284,7 @@
       store.remove(STORE.source);
       store.remove(STORE.engine);
       store.remove(STORE.opt);
+      store.remove(STORE.stdin);
       say("forgotten. What is in the editor now is not saved unless you change it.");
     };
 

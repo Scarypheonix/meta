@@ -127,6 +127,70 @@ button.link {
   font-size: inherit;
 }
 
+/* An anchor styled as a button, for the bar's link between the two pages. */
+a.button {
+  display: inline-block;
+  font-size: .875rem;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: .3rem .7rem;
+  text-decoration: none;
+}
+a.button:hover { border-color: var(--accent); }
+
+/* ---------- the tutorial page ---------- */
+/*
+   One column of prose and pictures, on the same ground as the playground and with the same
+   type. It is a second page rather than a panel on the first: someone learning is reading,
+   and someone playing is running.
+*/
+
+.doc {
+  flex: 1;
+  width: 100%;
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.1rem 2.5rem;
+  box-sizing: border-box;
+}
+
+.doc h1 { font-size: 1.6rem; margin: .2rem 0 .6rem; letter-spacing: -.01em; }
+.doc .lede { color: var(--muted); max-width: 60ch; }
+
+.doc .step { margin: 2.2rem 0; }
+
+.doc .step h2 {
+  font-size: 1.05rem;
+  margin: 0 0 .5rem;
+  padding-bottom: .35rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.doc .step p { max-width: 62ch; }
+
+.doc .step img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: .9rem 0 .5rem;
+  border-radius: 8px;
+}
+
+.doc .prints { color: var(--muted); font-size: .9rem; }
+
+.doc code {
+  font: 12.5px/1.4 var(--mono);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: .05rem .3rem;
+}
+
+.step-actions { display: flex; gap: 1rem; align-items: baseline; }
+.step-note { font-size: .85rem; }
+
 /* ---------- panes ---------- */
 
 main {
@@ -179,6 +243,24 @@ main {
   tab-size: 4;
 }
 #src:focus { outline: none; }
+
+/* The input box is the browser's standing in for standard input (spec/18-input.md). It is
+   the same field as the editor at a fixed small height, so it costs the program a few lines
+   of room rather than half the pane. */
+.stdin-head { border-top: 1px solid var(--line); }
+
+.stdin {
+  width: 100%;
+  height: 5.5rem;
+  border: 0;
+  resize: vertical;
+  padding: .75rem;
+  font: 13px/1.6 var(--mono);
+  color: var(--ink);
+  background: var(--panel);
+  tab-size: 4;
+}
+.stdin:focus { outline: none; }
 
 .streams { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: auto; }
 

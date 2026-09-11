@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="631" height="344" viewBox="0 0 631 344" role="img" aria-label="Origin source">
+<rect x="0" y="0" width="631" height="344" rx="8" fill="#ffffff" stroke="#e2e2df"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" xml:space="preserve">
+<text x="18" y="29.0"><tspan fill="#8a8a85" font-style="italic">// There is no null in Origin. A thing that might not be there is an Option,</tspan></text>
+<text x="18" y="49.8"><tspan fill="#8a8a85" font-style="italic">// and the compiler will not let you forget to check.</tspan></text>
+<text x="18" y="70.6"></text>
+<text x="18" y="91.4"><tspan fill="#8250a8">let</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#1a1a1a">names</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">=</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">[</tspan><tspan fill="#3f7a3f">"ada"</tspan><tspan fill="#55606b">,</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#3f7a3f">"grace"</tspan><tspan fill="#55606b">]</tspan></text>
+<text x="18" y="112.2"></text>
+<text x="18" y="133.0"><tspan fill="#8250a8">match</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#1a1a1a">names</tspan><tspan fill="#55606b">.</tspan><tspan fill="#2f5d7c">first</tspan><tspan fill="#55606b">(</tspan><tspan fill="#55606b">)</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">{</tspan></text>
+<text x="18" y="153.8"><tspan fill="#1a1a1a">    </tspan><tspan fill="#2f6f5e">Some</tspan><tspan fill="#55606b">(</tspan><tspan fill="#1a1a1a">n</tspan><tspan fill="#55606b">)</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">=&gt;</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#2f5d7c">println</tspan><tspan fill="#55606b">(</tspan><tspan fill="#3f7a3f">"first: \(n)"</tspan><tspan fill="#55606b">)</tspan><tspan fill="#55606b">,</tspan></text>
+<text x="18" y="174.6"><tspan fill="#1a1a1a">    </tspan><tspan fill="#2f6f5e">None</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">=&gt;</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#2f5d7c">println</tspan><tspan fill="#55606b">(</tspan><tspan fill="#3f7a3f">"the list is empty"</tspan><tspan fill="#55606b">)</tspan><tspan fill="#55606b">,</tspan></text>
+<text x="18" y="195.4"><tspan fill="#55606b">}</tspan></text>
+<text x="18" y="216.2"></text>
+<text x="18" y="237.0"><tspan fill="#8a8a85" font-style="italic">// And a thing that might go wrong is a Result, which is a value too.</tspan></text>
+<text x="18" y="257.8"><tspan fill="#8250a8">match</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#2f5d7c">read_to_string</tspan><tspan fill="#55606b">(</tspan><tspan fill="#3f7a3f">"notes.txt"</tspan><tspan fill="#55606b">)</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">{</tspan></text>
+<text x="18" y="278.6"><tspan fill="#1a1a1a">    </tspan><tspan fill="#2f6f5e">Ok</tspan><tspan fill="#55606b">(</tspan><tspan fill="#1a1a1a">text</tspan><tspan fill="#55606b">)</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">=&gt;</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#2f5d7c">println</tspan><tspan fill="#55606b">(</tspan><tspan fill="#3f7a3f">"\(text.len()) bytes"</tspan><tspan fill="#55606b">)</tspan><tspan fill="#55606b">,</tspan></text>
+<text x="18" y="299.4"><tspan fill="#1a1a1a">    </tspan><tspan fill="#2f6f5e">Err</tspan><tspan fill="#55606b">(</tspan><tspan fill="#1a1a1a">e</tspan><tspan fill="#55606b">)</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">=&gt;</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#2f5d7c">println</tspan><tspan fill="#55606b">(</tspan><tspan fill="#3f7a3f">"could not read it: \(e.to_str())"</tspan><tspan fill="#55606b">)</tspan><tspan fill="#55606b">,</tspan></text>
+<text x="18" y="320.2"><tspan fill="#55606b">}</tspan></text>
+</g>
+</svg>

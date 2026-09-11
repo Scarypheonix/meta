@@ -48,6 +48,9 @@ self.onmessage = async (e) => {
       engine: req.engine || "vm",
       opt: req.opt === undefined ? 1 : req.opt,
       args: req.args || [],
+      // Standard input, as one string. A browser has none, so the page's input box is it
+      // (spec/18-input.md, and the one place ADR-0033 does not extend).
+      stdin: req.stdin || "",
       // Chunks are delivered as the program produces them, so a program that prints and
       // then never returns still shows what it printed.
       onOutput: (stream, text) => self.postMessage({ kind: "output", stream, text }),

@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Learn Origin</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">
+    <strong>Origin</strong>
+    <span class="sub">learn</span>
+  </div>
+  <div class="controls">
+    <a class="button" href="index.html">Playground</a>
+  </div>
+</header>
+
+<article class="doc">
+
+<h1>Learn Origin in nine steps</h1>
+
+<p class="lede">
+  You do not need to install anything. Every program below runs in your own browser, in the
+  playground, and nothing you write is ever sent anywhere. Each step has a
+  <strong>Run it</strong> button that opens the playground with that program already in it.
+</p>
+
+<!-- Each step: a picture of the program, what it does, and what it prints. The pictures and
+     the programs behind the buttons are both generated from one source by
+     tests/web/picture_test.go, so they cannot disagree. -->
+
+<section class="step" data-program="01-hello">
+  <h2>1 · Say something</h2>
+  <p>
+    This is a whole Origin program. Not the interesting part of one — the whole thing. There
+    is no <code>main</code> to write, no imports, no boilerplate: the lines in the file are
+    the program, and they run from the top.
+  </p>
+  <img src="pictures/01-hello.svg" alt="println(&quot;Hello, Origin.&quot;)" />
+  <p class="prints">prints <code>Hello, Origin.</code></p>
+</section>
+
+<section class="step" data-program="02-ask">
+  <h2>2 · Ask a question</h2>
+  <p>
+    <code>ask</code> prints a question and waits for an answer. Whatever is typed comes back
+    as text, and <code>\(name)</code> inside a string drops that text into it.
+  </p>
+  <img src="pictures/02-ask.svg" alt="let name = ask(&quot;What is your name? &quot;)" />
+  <p class="prints">
+    In the playground there is no keyboard to wait for, so the <strong>input</strong> box
+    under the editor is what the program reads. Type <code>Ada</code> in it and this prints
+    <code>Hello, Ada!</code>
+  </p>
+</section>
+
+<section class="step" data-program="03-numbers">
+  <h2>3 · Get a number</h2>
+  <p>
+    An answer is always text, even when it looks like a number, so you turn it into one with
+    <code>parse_int()</code>. That might not work — somebody can type <code>banana</code> —
+    so it gives you back a <em>maybe</em>, and <code>if let Some(n)</code> is how you ask
+    “did it work?”. Origin will not let you skip that question, which is why an Origin
+    program cannot crash on a number that was never there.
+  </p>
+  <img src="pictures/03-numbers.svg" alt="parsing a number from an answer" />
+  <p class="prints">with <code>4</code> in the input box, prints <code>That is 8 halves.</code></p>
+</section>
+
+<section class="step" data-program="04-choices">
+  <h2>4 · Make a choice</h2>
+  <p>
+    <code>if</code> does what you expect. <code>match</code> is the other way to choose: you
+    list the answers you care about, and the last one catches everything else.
+  </p>
+  <img src="pictures/04-choices.svg" alt="if, else if, else, and match" />
+  <p class="prints">prints <code>a pass</code> and then <code>weekend</code></p>
+</section>
+
+<section class="step" data-program="05-repeating">
+  <h2>5 · Do it again</h2>
+  <p>
+    <code>for n in range(1, 4)</code> counts 1, 2, 3 — the second number is where it stops,
+    not the last one it uses. <code>while</code> keeps going until you say otherwise. A name
+    you want to change has to say <code>mut</code>; anything else cannot be reassigned, which
+    catches a whole family of mistakes before the program runs.
+  </p>
+  <img src="pictures/05-repeating.svg" alt="a for loop and a while loop" />
+  <p class="prints">prints <code>1...</code> <code>2...</code> <code>3...</code> <code>go</code>, then counts down</p>
+</section>
+
+<section class="step" data-program="06-lists">
+  <h2>6 · Keep several things</h2>
+  <p>
+    Square brackets make a list. Once you have one you can ask it things
+    (<code>len</code>), stick it together (<code>join</code>), keep only some of it
+    (<code>filter</code>), or change every item (<code>map</code>). The
+    <code>|n| n.len() &gt; 4</code> bit is a small unnamed function: <em>given an n, is it
+    longer than four?</em>
+  </p>
+  <img src="pictures/06-lists.svg" alt="lists and the methods on them" />
+  <p class="prints">prints the count, the names joined by commas, then the long ones</p>
+</section>
+
+<section class="step" data-program="07-functions">
+  <h2>7 · Name a piece of work</h2>
+  <p>
+    A function says what goes in and what comes out — <code>n: i64</code> in,
+    <code>-&gt; i64</code> out. Origin makes you write those down. It is two more words than
+    a language that guesses, and in exchange the compiler catches the mistake where you hand
+    a function the wrong thing.
+  </p>
+  <p>
+    The last line of a function is what it gives back, with no <code>return</code> needed.
+  </p>
+  <img src="pictures/07-functions.svg" alt="a recursive fibonacci function" />
+  <p class="prints">prints the first eleven Fibonacci numbers</p>
+</section>
+
+<section class="step" data-program="08-your-own-types">
+  <h2>8 · Make your own kind of thing</h2>
+  <p>
+    A <code>struct</code> groups values under one name. A field you want to be able to change
+    says <code>mut</code>, and one that does not cannot be changed by anybody — not by you,
+    not by a function you pass it to.
+  </p>
+  <img src="pictures/08-your-own-types.svg" alt="a struct with a mutable field" />
+  <p class="prints">prints <code>Rex has had 2 treats</code></p>
+</section>
+
+<section class="step" data-program="09-nothing-and-errors">
+  <h2>9 · When there is nothing, and when it goes wrong</h2>
+  <p>
+    Origin has no <code>null</code>. Something that might not be there is an
+    <code>Option</code>: either <code>Some(value)</code> or <code>None</code>, and you have
+    to say what you would do in each case. Something that might fail is a
+    <code>Result</code>: <code>Ok(value)</code> or <code>Err(reason)</code>, and the same
+    rule applies.
+  </p>
+  <p>
+    That is the whole error story. There are no exceptions to catch and nothing that throws
+    from somewhere you were not looking.
+  </p>
+  <img src="pictures/09-nothing-and-errors.svg" alt="matching on Option and Result" />
+</section>
+
+<section class="step">
+  <h2>Where to go next</h2>
+  <p>
+    The <a href="index.html">playground</a>’s <strong>Example</strong> menu has bigger
+    programs: green threads, a garbage-collection stress test, generics with a trait bound.
+    They are the same programs the compiler’s own test suite runs, so if one of them works
+    here, it works.
+  </p>
+  <p class="muted">
+    Everything on this page is a program the project compiles as part of its tests. If one of
+    them ever stopped compiling, the build would fail before you ever saw it.
+  </p>
+</section>
+
+</article>
+
+<footer>
+  <p>
+    <strong>Everything here runs in this tab.</strong> The playground compiles and executes
+    your program with a WebAssembly build of the Origin compiler inside your own browser. It
+    is never uploaded, and no server &mdash; including the one that served this page &mdash;
+    ever sees it or runs it.
+  </p>
+</footer>
+
+<script src="share.js"></script>
+<script src="tutorial-programs.js"></script>
+<script src="tutorial.js"></script>
+
+</body>
+</html>

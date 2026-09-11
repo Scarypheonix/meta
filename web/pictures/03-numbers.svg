@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="178" viewBox="0 0 420 178" role="img" aria-label="Origin source">
+<rect x="0" y="0" width="420" height="178" rx="8" fill="#ffffff" stroke="#e2e2df"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" xml:space="preserve">
+<text x="18" y="29.0"><tspan fill="#8250a8">let</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#1a1a1a">answer</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">=</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#2f5d7c">ask</tspan><tspan fill="#55606b">(</tspan><tspan fill="#3f7a3f">"How many slices? "</tspan><tspan fill="#55606b">)</tspan></text>
+<text x="18" y="49.8"></text>
+<text x="18" y="70.6"><tspan fill="#8250a8">if</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#8250a8">let</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#2f6f5e">Some</tspan><tspan fill="#55606b">(</tspan><tspan fill="#1a1a1a">n</tspan><tspan fill="#55606b">)</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">=</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#1a1a1a">answer</tspan><tspan fill="#55606b">.</tspan><tspan fill="#2f5d7c">parse_int</tspan><tspan fill="#55606b">(</tspan><tspan fill="#55606b">)</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">{</tspan></text>
+<text x="18" y="91.4"><tspan fill="#1a1a1a">    </tspan><tspan fill="#2f5d7c">println</tspan><tspan fill="#55606b">(</tspan><tspan fill="#3f7a3f">"That is \(n * 2) halves."</tspan><tspan fill="#55606b">)</tspan></text>
+<text x="18" y="112.2"><tspan fill="#55606b">}</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#8250a8">else</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">{</tspan></text>
+<text x="18" y="133.0"><tspan fill="#1a1a1a">    </tspan><tspan fill="#2f5d7c">println</tspan><tspan fill="#55606b">(</tspan><tspan fill="#3f7a3f">"I could not read that as a number."</tspan><tspan fill="#55606b">)</tspan></text>
+<text x="18" y="153.8"><tspan fill="#55606b">}</tspan></text>
+</g>
+</svg>

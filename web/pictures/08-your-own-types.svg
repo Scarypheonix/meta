@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="435" height="302" viewBox="0 0 435 302" role="img" aria-label="Origin source">
+<rect x="0" y="0" width="435" height="302" rx="8" fill="#ffffff" stroke="#e2e2df"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" xml:space="preserve">
+<text x="18" y="29.0"><tspan fill="#8250a8">struct</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#2f6f5e">Dog</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">{</tspan></text>
+<text x="18" y="49.8"><tspan fill="#1a1a1a">    </tspan><tspan fill="#1a1a1a">name</tspan><tspan fill="#55606b">:</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#2f6f5e">String</tspan><tspan fill="#55606b">,</tspan></text>
+<text x="18" y="70.6"><tspan fill="#1a1a1a">    </tspan><tspan fill="#8250a8">mut</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#1a1a1a">treats</tspan><tspan fill="#55606b">:</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#1a1a1a">i64</tspan><tspan fill="#55606b">,</tspan></text>
+<text x="18" y="91.4"><tspan fill="#55606b">}</tspan></text>
+<text x="18" y="112.2"></text>
+<text x="18" y="133.0"><tspan fill="#8250a8">fn</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#2f5d7c">feed</tspan><tspan fill="#55606b">(</tspan><tspan fill="#1a1a1a">d</tspan><tspan fill="#55606b">:</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#2f6f5e">Dog</tspan><tspan fill="#55606b">)</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">{</tspan></text>
+<text x="18" y="153.8"><tspan fill="#1a1a1a">    </tspan><tspan fill="#1a1a1a">d</tspan><tspan fill="#55606b">.</tspan><tspan fill="#1a1a1a">treats</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">=</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#1a1a1a">d</tspan><tspan fill="#55606b">.</tspan><tspan fill="#1a1a1a">treats</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">+</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#9a5518">1</tspan></text>
+<text x="18" y="174.6"><tspan fill="#55606b">}</tspan></text>
+<text x="18" y="195.4"></text>
+<text x="18" y="216.2"><tspan fill="#8250a8">let</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#1a1a1a">rex</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">=</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#2f6f5e">Dog</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">{</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#1a1a1a">name</tspan><tspan fill="#55606b">:</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#3f7a3f">"Rex"</tspan><tspan fill="#55606b">,</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#1a1a1a">treats</tspan><tspan fill="#55606b">:</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#9a5518">0</tspan><tspan fill="#1a1a1a"> </tspan><tspan fill="#55606b">}</tspan><tspan fill="#55606b">;</tspan></text>
+<text x="18" y="237.0"><tspan fill="#2f5d7c">feed</tspan><tspan fill="#55606b">(</tspan><tspan fill="#1a1a1a">rex</tspan><tspan fill="#55606b">)</tspan></text>
+<text x="18" y="257.8"><tspan fill="#2f5d7c">feed</tspan><tspan fill="#55606b">(</tspan><tspan fill="#1a1a1a">rex</tspan><tspan fill="#55606b">)</tspan></text>
+<text x="18" y="278.6"><tspan fill="#2f5d7c">println</tspan><tspan fill="#55606b">(</tspan><tspan fill="#3f7a3f">"\(rex.name) has had \(rex.treats) treats"</tspan><tspan fill="#55606b">)</tspan></text>
+</g>
+</svg>

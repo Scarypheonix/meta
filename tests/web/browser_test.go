@@ -102,7 +102,7 @@ const plan = JSON.parse(require('fs').readFileSync(process.argv[3], 'utf8'));
     codemirror: await page.evaluate(() => !!document.querySelector('.cm-editor')),
     kind: await page.textContent('#editor-kind'),
   };
-  await page.evaluate(() => { document.getElementById('src').value = 'use std::io;\nfn main() { io::println("fallback"); }\n'; });
+  await page.evaluate(() => { document.getElementById('src').value = 'println("fallback")\n'; });
   await page.click('#run');
   await page.waitForFunction(
     () => document.getElementById('host').textContent.includes('exit status'),
@@ -152,13 +152,19 @@ type browserResult struct {
 //
 // What a browser answers and Node cannot is whether the *page* is wired: that a program
 // reaches the module from the editor, that both streams reach the DOM, that a non-zero exit
-// is reported, and that the engine control selects an engine rather than being decorative.
-// Three runs establish that. The rest of this test -- the editor, the menu, sharing, the
-// fallback -- is the part Node could never have covered, and none of it was cut.
+// is reported, that the engine control selects an engine rather than being decorative, and
+// that the input box is what standard input reads. Four runs establish that. The rest of this
+// test -- the editor, the menu, sharing, the fallback -- is the part Node could never have
+// covered, and none of it was cut.
 var browserRuns = []struct{ name, engine string }{
 	{"hello", "vm"},              // stdout reaches the page at all
 	{"overflow_traps", "vm"},     // so do stderr and a non-zero exit status
 	{"overflow_traps", "interp"}, // and the engine control reaches a second engine
+	// The input box is standard input in the browser (spec/18-input.md), and it is page
+	// wiring rather than module behaviour: tests/wasm already proves the module reads the
+	// string it is handed, and what this proves is that the box is where the string comes
+	// from. Choosing the example fills the box, exactly as a visitor's choosing it does.
+	{"ask_a_question", "vm"},
 }
 
 func TestThePlaygroundRunsItsExamplesInABrowser(t *testing.T) {

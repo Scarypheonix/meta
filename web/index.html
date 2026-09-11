@@ -29,6 +29,7 @@
       <select id="opt"><option>0</option><option selected>1</option><option>2</option></select>
     </label>
     <button id="share">Copy link</button>
+    <a class="button" href="tutorial.html">Learn Origin</a>
   </div>
 </header>
 
@@ -39,6 +40,15 @@
          the bundle is available and leaves it alone when it is not. ADR-0034 requires the
          editor to stay off the critical path to running a program. -->
     <textarea id="src" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+    <!-- Standard input (spec/18-input.md). A browser has none, so the page supplies it:
+         whatever is typed here is what `input()`, `ask()` and `read_line()` read, a line at
+         a time. -->
+    <div class="pane-head stdin-head">
+      <span>input</span>
+      <span class="muted">what <code>input()</code> and <code>ask()</code> read, a line at a time</span>
+    </div>
+    <textarea id="stdin" class="stdin" spellcheck="false" autocomplete="off"
+              autocapitalize="off" placeholder="type the answers your program will read"></textarea>
   </section>
 
   <section class="pane output-pane">
