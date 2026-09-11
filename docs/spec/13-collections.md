@@ -120,24 +120,21 @@ fn (l: List[T]) skip(n: i64) -> List[T]
 fn (l: List[T]) first() -> Option[T]
 fn (l: List[T]) last() -> Option[T]
 
-fn sum(xs: List[i64]) -> i64
-fn max(xs: List[i64]) -> Option[i64]
-fn min(xs: List[i64]) -> Option[i64]
-fn join(xs: List[String], sep: String) -> String
+fn (l: List[i64]) sum() -> i64
+fn (l: List[i64]) max() -> Option[i64]
+fn (l: List[i64]) min() -> Option[i64]
+fn (l: List[String]) join(sep: String) -> String
 ```
 
-`range`, `sum`, `max`, `min` and `join` need no `use`: they are prelude functions, like
-`read_to_string` (§07).
+`range` needs no `use`: it is a prelude function like `read_to_string` (§07). **Nothing in
+this section needs an import**, and neither does the list literal (§13's "The literal form"),
+so a program that builds, transforms and prints a collection has no `use` line at all.
 
-The last four are **free functions rather than methods**, which is an inconsistency worth
-explaining rather than hiding. Each applies to one instantiation — `List[i64]`,
-`List[String]` — and an `impl` on one instantiation is not usable today: method lookup
-probes each candidate impl by unifying the receiver against it, and that unification is not
-speculative, so probing `impl List[i64]` against a receiver whose element type is still a
-variable binds it to `i64` for good, even when the impl is then rejected for not having the
-method. `let w = ["a", "b"]` starts failing with `expected i64, found String`. The defect is
-the checker's, it predates this library, and it is recorded in `docs/deferred.md`. When it is
-fixed these become methods and the spelling changes from `sum(xs)` to `xs.sum()`.
+The last four apply to one instantiation, which is a shape the checker could not handle
+until Phase 14: method lookup probed each candidate impl by unifying the receiver against it
+*before* asking whether that impl even had the method, and the unification is not
+speculative, so a rejected `impl List[i64]` left a receiver's element type bound to `i64`.
+Asking first is the fix, and it is why these read as methods rather than free functions.
 
 Every method above returns a **new** list; none mutates the receiver. `sort_by` is stable —
 elements the comparison calls equal keep their original order — because an unstable sort

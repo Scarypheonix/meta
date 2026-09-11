@@ -11,7 +11,7 @@ fn main() {
         .filter(|n| n.len() > 2)
         .map(|n| n.concat("!"))
 
-    println(join(shouted, " "))
+    println(shouted.join(" "))
 
     // An arithmetic wrap still puts its operator last: only `.` is special.
     let wide = names.len() > 0 &&

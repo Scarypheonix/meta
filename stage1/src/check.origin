@@ -3918,43 +3918,50 @@ impl Checker {
         let mut j = 0;
         while j < cands.len() {
             let info = cands.at(j);
-            let inst = self.instantiate_impl_self(info);
-            match types::unify(inst.self_ty, recv) {
-                Option::Some(_) => {}
+            // Ask whether this impl declares the method *before* unifying against it.
+            //
+            // `unify` binds and nothing rolls it back, so a candidate about to be
+            // rejected must not touch the receiver first. `self_key` buckets every `List`
+            // impl together, so `impl List[i64]` sits beside `impl[T] List[T]`; probing
+            // the former for `push` used to bind a receiver whose element type was still a
+            // variable, and `let w = ["a", "b"]` failed with `expected i64, found String`
+            // from an impl that has no `push` at all.
+            let mut decl = no_fn_decl();
+            let mut have = false;
+            match info.methods.get(name) {
+                Option::Some(m) => { decl = m; have = true; }
                 Option::None => {
-                    let mut decl = no_fn_decl();
-                    let mut have = false;
-                    match info.methods.get(name) {
-                        Option::Some(m) => { decl = m; have = true; }
-                        Option::None => {
-                            // A trait impl may inherit a default method body from the
-                            // trait, and a compiler-provided impl has no bodies at all:
-                            // its methods are the trait's declarations, implemented by
-                            // the runtimes.
-                            match info.trait_info {
-                                Option::Some(ti) => {
-                                    match ti.methods.get(name) {
-                                        Option::Some(d) => {
-                                            let has_body = match d.body {
-                                                Option::Some(_) => true,
-                                                Option::None => false,
-                                            };
-                                            if has_body || info.builtin {
-                                                decl = d;
-                                                have = true;
-                                            }
-                                        }
-                                        Option::None => {}
+                    // A trait impl may inherit a default method body from the trait, and
+                    // a compiler-provided impl has no bodies at all: its methods are the
+                    // trait's declarations, implemented by the runtimes.
+                    match info.trait_info {
+                        Option::Some(ti) => {
+                            match ti.methods.get(name) {
+                                Option::Some(d) => {
+                                    let has_body = match d.body {
+                                        Option::Some(_) => true,
+                                        Option::None => false,
+                                    };
+                                    if has_body || info.builtin {
+                                        decl = d;
+                                        have = true;
                                     }
                                 }
                                 Option::None => {}
                             }
                         }
+                        Option::None => {}
                     }
-                    if have {
-                        match self.sig_of(decl, info, name) {
-                            Option::None => {}
-                            Option::Some(sig) => {
+                }
+            }
+            if have {
+                match self.sig_of(decl, info, name) {
+                    Option::None => {}
+                    Option::Some(sig) => {
+                        let inst = self.instantiate_impl_self(info);
+                        match types::unify(inst.self_ty, recv) {
+                            Option::Some(_) => {}
+                            Option::None => {
                                 let cand = Candidate {
                                     ok: true, decl: decl, sig: sig, subst: inst.subst,
                                     trait_info: info.trait_info,

@@ -600,61 +600,55 @@ impl[T] List[T] {
     }
 }
 
-/// The sum of every element.
-///
-/// A free function rather than a `List[i64]` method, and so are `max`, `min` and `join`.
-/// An `impl` on one instantiation is not usable here: method lookup probes each candidate
-/// impl by *unifying* the receiver against it (`internal/check/traits.go`), and that
-/// unification is not speculative -- probing `impl List[i64]` against a receiver whose
-/// element type is still a variable binds it to `i64` permanently, even when the impl is
-/// then rejected for not having the method. `let w = ["a", "b"]` starts failing with
-/// `expected i64, found String`. The defect is the checker's and predates this library;
-/// `docs/deferred.md` records it. Free functions take a concrete parameter type and never
-/// enter that probe.
-pub fn sum(xs: List[i64]) -> i64 {
-    let mut n = 0;
-    for v in xs {
-        n = n + v;
+impl List[i64] {
+    /// The sum of every element.
+    pub fn sum(self) -> i64 {
+        let mut n = 0;
+        for v in self {
+            n = n + v;
+        }
+        n
     }
-    n
+
+    /// The largest element, or `None` when there are none.
+    pub fn max(self) -> Option[i64] {
+        let mut best = Option::None;
+        for v in self {
+            match best {
+                Option::Some(b) => { if v > b { best = Option::Some(v); } }
+                Option::None => { best = Option::Some(v); }
+            }
+        }
+        best
+    }
+
+    /// The smallest element, or `None` when there are none.
+    pub fn min(self) -> Option[i64] {
+        let mut best = Option::None;
+        for v in self {
+            match best {
+                Option::Some(b) => { if v < b { best = Option::Some(v); } }
+                Option::None => { best = Option::Some(v); }
+            }
+        }
+        best
+    }
 }
 
-/// The largest element, or `None` when there are none.
-pub fn max(xs: List[i64]) -> Option[i64] {
-    let mut best = Option::None;
-    for v in xs {
-        match best {
-            Option::Some(b) => { if v > b { best = Option::Some(v); } }
-            Option::None => { best = Option::Some(v); }
+impl List[String] {
+    /// The elements run together with `sep` between each pair.
+    pub fn join(self, sep: String) -> String {
+        let mut out = "";
+        let mut i = 0;
+        while i < self.len() {
+            if i > 0 {
+                out = out.concat(sep);
+            }
+            out = out.concat(self.at(i));
+            i = i + 1;
         }
+        out
     }
-    best
-}
-
-/// The smallest element, or `None` when there are none.
-pub fn min(xs: List[i64]) -> Option[i64] {
-    let mut best = Option::None;
-    for v in xs {
-        match best {
-            Option::Some(b) => { if v < b { best = Option::Some(v); } }
-            Option::None => { best = Option::Some(v); }
-        }
-    }
-    best
-}
-
-/// The strings run together with `sep` between each pair.
-pub fn join(xs: List[String], sep: String) -> String {
-    let mut out = "";
-    let mut i = 0;
-    while i < xs.len() {
-        if i > 0 {
-            out = out.concat(sep);
-        }
-        out = out.concat(xs.at(i));
-        i = i + 1;
-    }
-    out
 }
 
 /// The half-open sequence `lo..hi`, walked lazily.

@@ -29,11 +29,11 @@ fn main() {
 
     // The transforms, chained.
     let xs = [5, 3, 9, 1, 7]
-    println("\(sum(xs)) \(sum(xs.map(|n| n * 2)))")
-    println("\(join(xs.sort_by(|a, b| a < b).map(|n| "\(n)"), ","))")
+    println("\(xs.sum()) \(xs.map(|n| n * 2).sum())")
+    println("\(xs.sort_by(|a, b| a < b).map(|n| "\(n)").join(","))")
     println("\(xs.filter(|n| n > 4).len()) \(xs.fold(100, |a, b| a + b))")
     println("\(xs.any(|n| n > 8)) \(xs.all(|n| n > 0)) \(xs.contains(3))")
-    println("\(max(xs).unwrap_or(0)) \(min(xs).unwrap_or(0))")
-    println("\(join(["a", "b", "c"], "-"))")
-    println("\(sum(xs.take(2))) \(sum(xs.skip(3))) \(xs.reverse().first().unwrap_or(0))")
+    println("\(xs.max().unwrap_or(0)) \(xs.min().unwrap_or(0))")
+    println("\(["a", "b", "c"].join("-"))")
+    println("\(xs.take(2).sum()) \(xs.skip(3).sum()) \(xs.reverse().first().unwrap_or(0))")
 }

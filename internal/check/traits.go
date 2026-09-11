@@ -389,10 +389,14 @@ func (c *Checker) lookupMethod(recv types.Type, name string) (*methodCandidate, 
 
 	var inherent, viaTrait []*methodCandidate
 	for _, info := range c.candidateImpls(recv) {
-		self, subst := c.instantiateImplSelf(info)
-		if types.Unify(self, recv) != nil {
-			continue
-		}
+		// Ask whether this impl declares the method *before* unifying against it.
+		//
+		// `types.Unify` binds, and nothing rolls it back, so a candidate that is about to
+		// be rejected must not be allowed to touch the receiver first. `selfKey` buckets
+		// every `List` impl together, so `impl List[i64]` sits beside `impl[T] List[T]`;
+		// probing the former for `push` used to bind a receiver whose element type was
+		// still a variable, and `let w = ["a", "b"]` failed with `expected i64, found
+		// String` from an impl that has no `push` at all.
 		decl, ok := info.Methods[name]
 		if !ok && info.Trait != nil {
 			// A trait impl may inherit a default method body from the trait, and a
@@ -411,6 +415,10 @@ func (c *Checker) lookupMethod(recv types.Type, name string) (*methodCandidate, 
 			sig = info.Trait.Sigs[name]
 		}
 		if sig == nil {
+			continue
+		}
+		self, subst := c.instantiateImplSelf(info)
+		if types.Unify(self, recv) != nil {
 			continue
 		}
 		cand := &methodCandidate{Decl: decl, Sig: sig, Subst: subst, Trait: info.Trait, Impl: info}
