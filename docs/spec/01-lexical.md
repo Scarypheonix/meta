@@ -58,7 +58,7 @@ the parser cannot tell an inserted semicolon from a written one.
 2. The lexer is not inside an unclosed `(` or `[`. A call, a type argument list or a list
    literal may therefore be split across lines freely, with or without a trailing comma.
 
-3. The next token that is not whitespace or a comment is not `}`.
+3. The next token that is not whitespace or a comment is neither `}` nor `.`.
 
 Written semicolons remain legal wherever they are legal today; insertion only ever supplies
 one where the source could have written it.
@@ -84,7 +84,16 @@ statement never needed one (§02's `ExprStmt`), so `if c { a }` on its own line 
 ### Continuing an expression across lines
 
 An expression that wraps must not leave a trigger token at the end of a line. Put the
-operator there instead:
+operator there instead — except for a method chain, which rule 3 lets you wrap with the dot
+leading, because nothing in the grammar can begin with `.`:
+
+```origin
+let live = people
+    .filter(|p| p.active)
+    .map(|p| p.name)          // fine: each line begins with `.`
+```
+
+Every other operator goes at the end of the line it continues from:
 
 ```origin
 let big = a_long_condition ||
@@ -105,7 +114,7 @@ Inside `(` or `[` this does not apply, by rule 2. There is no line-continuation 
 | `1u64 << w` then `}` | **no** | rule 3: the block's value |
 | `Point { x: 1 }` then `let y = 2` | **no** | `}` is not a trigger |
 | `foo(a,` then `b)` | no | ends in `,`, and rule 2 applies |
-| `xs.get(0)` then `.unwrap_or(3)` | yes — REJECTED | move `.` to the previous line |
+| `xs.get(0)` then `.unwrap_or(3)` | **no** | rule 3: a method chain may wrap with the dot leading |
 | `x` then `+ y` | yes — REJECTED | move `+` to the previous line |
 | `f(x` then `+ y)` | no | rule 2: inside `(` |
 | `A => { g() }` then `B => 1,` | **no** | `}` is not a trigger; arms stay comma-separated |

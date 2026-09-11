@@ -56,7 +56,7 @@ A semicolon is inserted at a line break when **all three** hold:
    float, string or character literal, `true`, `false`, `self`, `)`, `]`, or one of `break`,
    `continue`, `return`. **`}` is deliberately not in this set;**
 2. the lexer is not inside an unclosed `(` or `[`;
-3. the next token that is not whitespace or a comment is not `}`.
+3. the next token that is not whitespace or a comment is neither `}` nor `.`.
 
 Written semicolons remain legal everywhere they are legal today. Nothing in the corpus is
 reformatted to drop them.
@@ -97,3 +97,30 @@ reformatted to drop them.
   where the source could legally have written one. Programs written *after* it, with the
   semicolons omitted, would not — which is the asymmetry that makes this worth an ADR rather
   than a note.
+
+## Amendment, Phase 13: rule 3 covers a leading `.`
+
+Phase 13 added an iteration library, and using it immediately produced this:
+
+```origin
+let words = text.split("\n")
+    .filter(|w| !w.is_empty())     // REJECTED: the line above ended in `)`
+```
+
+Putting the operator last is the migration this ADR asked of 93 wrapped expressions, and for
+arithmetic it is unobjectionable. For a method chain it is not: every language with fluent
+chains — Rust, Java, JavaScript, Python — wraps with the dot **leading**, and `xs.split(s).`
+followed by `filter(...)` reads as a typo. Requiring it would have made the library this
+project just built unpleasant to wrap, which is a bad trade for a rule whose whole purpose is
+to reduce noise.
+
+Rule 3 therefore suppresses insertion before a leading `.` as well as before `}`, and the
+justification is stronger than for `}`: **nothing in the grammar can begin with `.`**. A float
+literal requires digits on both sides (§01 rejects `.5`), and `Primary` has no production
+starting with a dot. So a line break followed by `.` is *always* mid-expression, and
+suppressing there cannot swallow a statement boundary — where the `}` rule trades away
+`let p = Point { .. }` needing its own semicolon, this one trades away nothing at all.
+
+`?` is postfix and equally unable to start a statement, so the same argument would admit it.
+It is left out because no corpus line wraps before a `?`, and a rule with no evidence behind
+it is how the trigger set grows without anyone deciding to grow it.

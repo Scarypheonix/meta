@@ -437,10 +437,15 @@ impl Lexer {
         if !self.saw_newline || self.depth > 0 || !ends_statement(self.last) {
             return false;
         }
-        // Rule 3: never before a closing brace. That is what keeps a block's trailing
-        // expression the block's value, and what lets a brace-bodied `match` arm omit its
-        // comma. It is the one place the lexer looks at what comes next.
-        self.at_end() || self.src.byte_at(self.pos) != 125
+        // Rule 3: never before a closing brace (125) or a leading dot (46). The brace keeps
+        // a block's trailing expression the block's value and lets a brace-bodied `match`
+        // arm omit its comma; the dot lets a method chain wrap with the dot leading, which
+        // is safe because nothing in the grammar can begin with one.
+        if self.at_end() {
+            return true;
+        }
+        let c = self.src.byte_at(self.pos);
+        c != 125 && c != 46
     }
 
     /// One real token, with trivia already skipped.

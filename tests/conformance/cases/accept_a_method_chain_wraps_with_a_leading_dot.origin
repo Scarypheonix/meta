@@ -1,0 +1,20 @@
+// EXPECT: accept
+// spec: 01-lexical.md — rule 3 suppresses insertion before a leading `.`.
+
+// ADR-0040's Phase 13 amendment. Every language with fluent chains wraps with the dot
+// leading, and nothing in Origin's grammar can begin with one — a float literal needs
+// digits on both sides — so suppressing there cannot swallow a statement boundary.
+fn main() {
+    let names = ["Ada", "Bob", "Cy"]
+
+    let shouted = names
+        .filter(|n| n.len() > 2)
+        .map(|n| n.concat("!"))
+
+    println(join(shouted, " "))
+
+    // An arithmetic wrap still puts its operator last: only `.` is special.
+    let wide = names.len() > 0 &&
+        shouted.len() > 0
+    println("\(wide)")
+}

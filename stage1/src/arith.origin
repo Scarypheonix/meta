@@ -173,12 +173,12 @@ fn mul_hi(a: u64, b: u64) -> u64 {
 
     // The middle column, carried in a wider accumulator: (p00 >> 32) + low(p01) + low(p10)
     // cannot overflow sixty-four bits, since each term is below 2^32 except the first.
-    let mid = (p00 >> 32u64).
-        wrapping_add(p01 & lo_mask).
-        wrapping_add(p10 & lo_mask);
-    p11.wrapping_add(p01 >> 32u64).
-        wrapping_add(p10 >> 32u64).
-        wrapping_add(mid >> 32u64)
+    let mid = (p00 >> 32u64)
+        .wrapping_add(p01 & lo_mask)
+        .wrapping_add(p10 & lo_mask);
+    p11.wrapping_add(p01 >> 32u64)
+        .wrapping_add(p10 >> 32u64)
+        .wrapping_add(mid >> 32u64)
 }
 
 /// `div` and `rem` truncate toward zero, so `a == (a/b)*b + (a%b)` holds whenever neither

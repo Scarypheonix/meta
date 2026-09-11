@@ -228,10 +228,17 @@ func (l *Lexer) terminatesStatement() bool {
 	if !l.sawNewline || l.depth > 0 || !endsStatement(l.last) {
 		return false
 	}
-	// Rule 3: never before a closing brace. This is what keeps a block's trailing
-	// expression the block's value rather than a statement, and what lets a brace-bodied
-	// `match` arm omit its comma. It is the one place the lexer looks at what comes next.
-	return l.atEnd() || l.src[l.pos] != '}'
+	// Rule 3: never before a closing brace or a leading dot. The brace keeps a block's
+	// trailing expression the block's value rather than a statement, and lets a
+	// brace-bodied `match` arm omit its comma; the dot lets a method chain wrap the way
+	// every language with fluent chains wraps one. Nothing in the grammar can *begin* with
+	// `.` -- a float literal needs digits on both sides -- so suppressing there can never
+	// swallow a statement boundary. It is the one place the lexer looks at what comes next.
+	if l.atEnd() {
+		return true
+	}
+	c := l.src[l.pos]
+	return c != '}' && c != '.'
 }
 
 // endsStatement reports whether a token can be the last one of a statement
