@@ -228,19 +228,21 @@ stdout: `2\ntrue\ntrue\nfalse\n` · exit: `0`
 ## 11. `for` over an iterator
 
 ```origin
-use std::io;
-use std::iter;
-
 fn main() {
-    let mut total = 0;
-    for i in iter::range(1, 5) {
-        total = total + i;
+    let mut total = 0
+    for i in range(1, 5) {
+        total = total + i
     }
-    io::println(total.to_str());
+    println("\(total)")
 }
 ```
 
 stdout: `10\n` · exit: `0` — `range` is half-open, so this sums 1..=4.
+
+This example spent Phases 7 to 12 not compiling: it was written against a `std::iter` module
+that was never built, and nothing checked it. `range` is a prelude function now (§13), so it
+needs no `use` at all, and the program is `tests/e2e/cases/range_and_iteration.origin` so
+that the next divergence fails a test instead of sitting in the specification.
 
 ## 12. Green threads and channels *(Phase 6)*
 

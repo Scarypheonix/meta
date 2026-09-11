@@ -101,6 +101,69 @@ to have in scope. There is no literal for `Map`, whose constructor is `map::new`
 `List[T]` implements `IntoIterator`, so `for x in xs` walks it in order, front to back. The
 iterator yields each element once and does not observe a `push` that happens during the walk.
 
+### Walking and transforming
+
+```origin
+fn range(lo: i64, hi: i64) -> Range        // half-open: lo..hi, lazy, allocates nothing
+
+fn (l: List[T]) map[B](f: fn(T) -> B) -> List[B]
+fn (l: List[T]) filter(keep: fn(T) -> bool) -> List[T]
+fn (l: List[T]) fold[B](init: B, f: fn(B, T) -> B) -> B
+fn (l: List[T]) any(pred: fn(T) -> bool) -> bool
+fn (l: List[T]) all(pred: fn(T) -> bool) -> bool
+fn (l: List[T]) sort_by(less: fn(T, T) -> bool) -> List[T]   // stable
+fn (l: List[T]) reverse() -> List[T]
+fn (l: List[T]) contains(v: T) -> bool
+fn (l: List[T]) index_of(v: T) -> Option[i64]
+fn (l: List[T]) take(n: i64) -> List[T]
+fn (l: List[T]) skip(n: i64) -> List[T]
+fn (l: List[T]) first() -> Option[T]
+fn (l: List[T]) last() -> Option[T]
+
+fn sum(xs: List[i64]) -> i64
+fn max(xs: List[i64]) -> Option[i64]
+fn min(xs: List[i64]) -> Option[i64]
+fn join(xs: List[String], sep: String) -> String
+```
+
+`range`, `sum`, `max`, `min` and `join` need no `use`: they are prelude functions, like
+`read_to_string` (§07).
+
+The last four are **free functions rather than methods**, which is an inconsistency worth
+explaining rather than hiding. Each applies to one instantiation — `List[i64]`,
+`List[String]` — and an `impl` on one instantiation is not usable today: method lookup
+probes each candidate impl by unifying the receiver against it, and that unification is not
+speculative, so probing `impl List[i64]` against a receiver whose element type is still a
+variable binds it to `i64` for good, even when the impl is then rejected for not having the
+method. `let w = ["a", "b"]` starts failing with `expected i64, found String`. The defect is
+the checker's, it predates this library, and it is recorded in `docs/deferred.md`. When it is
+fixed these become methods and the spelling changes from `sum(xs)` to `xs.sum()`.
+
+Every method above returns a **new** list; none mutates the receiver. `sort_by` is stable —
+elements the comparison calls equal keep their original order — because an unstable sort
+would make a program's output depend on the algorithm, which §04's determinism does not
+permit an implementation to vary.
+
+`contains` and `index_of` use structural `==`, which is total for every non-function type
+(§04, ADR-0011), so they need no bound.
+
+### Why the transforms are eager and the sources are not
+
+`range` is lazy: it is a struct with a `next`, and walking it allocates nothing. Every
+transform on `List` is eager: it builds and returns a new list.
+
+That split is forced rather than chosen. A lazy `map` would be a struct wrapping an
+iterator `I` and a function `fn(A) -> B`, and typing its `next` requires stating that `I`'s
+associated `Item` **is** `A`. Origin has no syntax for that — a bound names a trait and its
+type arguments (§06), and `Iterator`'s `Item` is an associated type, not a parameter — so
+the body fails to check with `expected A, found I::Item`. Associated-type equality bounds
+are recorded in `docs/deferred.md`; until they exist, a lazy adapter cannot be written in
+Origin at all, and the honest library is one that says so rather than one that pretends.
+
+The cost is an intermediate list per step: `xs.filter(p).map(f)` allocates twice. For a
+pipeline over a large collection, a `for` loop with one `push` still beats it, and that is
+the trade the reader is making.
+
 A `List` has `mut` fields, so it is **not `Send`** (§08, ADR-0014): a list cannot cross a
 channel, because two threads sharing a growable buffer is exactly the race `Send` refuses.
 `Mutex[List[T]]` is how a list is shared.

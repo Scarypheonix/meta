@@ -1,0 +1,39 @@
+// spec/10-examples.md #11, plus the library it needed (§13).
+//
+// The specification's own example did not compile for five phases: it was written against a
+// `std::iter` module nobody built, and no test ran it. It is here so the next divergence
+// between the specification and the compiler fails a test rather than sitting in a document.
+//
+// The rest of the case covers what the example was standing in for -- walking a source that
+// allocates nothing, and the eager transforms that replace a hand-rolled `while`.
+fn main() {
+    // The example itself.
+    let mut total = 0
+    for i in range(1, 5) {
+        total = total + i
+    }
+    println("\(total)")
+
+    // A range allocates nothing: this walks ten thousand values and builds no list.
+    let mut wide = 0
+    for i in range(0, 10000) {
+        wide = wide + i
+    }
+    println("\(wide)")
+
+    // An empty range is empty rather than an error.
+    let mut never = 0
+    for i in range(5, 5) { never = never + 1 }
+    for i in range(9, 2) { never = never + 1 }
+    println("\(never)")
+
+    // The transforms, chained.
+    let xs = [5, 3, 9, 1, 7]
+    println("\(sum(xs)) \(sum(xs.map(|n| n * 2)))")
+    println("\(join(xs.sort_by(|a, b| a < b).map(|n| "\(n)"), ","))")
+    println("\(xs.filter(|n| n > 4).len()) \(xs.fold(100, |a, b| a + b))")
+    println("\(xs.any(|n| n > 8)) \(xs.all(|n| n > 0)) \(xs.contains(3))")
+    println("\(max(xs).unwrap_or(0)) \(min(xs).unwrap_or(0))")
+    println("\(join(["a", "b", "c"], "-"))")
+    println("\(sum(xs.take(2))) \(sum(xs.skip(3))) \(xs.reverse().first().unwrap_or(0))")
+}

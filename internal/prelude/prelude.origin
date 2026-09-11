@@ -443,6 +443,254 @@ impl[T] List[T] {
     pub fn clear(self) {
         array::truncate(self.buf, 0)
     }
+
+    // --- Walking and transforming (spec/13-collections.md) ------------------------------
+    //
+    // Every one of these returns a new list and leaves the receiver alone. They are eager
+    // because a lazy adapter cannot be typed in Origin at all: it would need to say that
+    // its iterator's `Item` *is* its function's argument type, and a bound names a trait
+    // and its type arguments, never a projection (docs/deferred.md).
+
+    /// A new list holding `f` applied to each element, in order.
+    pub fn map[B](self, f: fn(T) -> B) -> List[B] {
+        let out = list::new[B]();
+        for x in self {
+            out.push(f(x));
+        }
+        out
+    }
+
+    /// A new list of the elements `keep` accepts, in order.
+    pub fn filter(self, keep: fn(T) -> bool) -> List[T] {
+        let out = list::new[T]();
+        for x in self {
+            if keep(x) {
+                out.push(x);
+            }
+        }
+        out
+    }
+
+    /// Combines every element into one value, left to right.
+    pub fn fold[B](self, init: B, f: fn(B, T) -> B) -> B {
+        let mut acc = init;
+        for x in self {
+            acc = f(acc, x);
+        }
+        acc
+    }
+
+    /// Whether `pred` accepts at least one element. Stops at the first it does.
+    pub fn any(self, pred: fn(T) -> bool) -> bool {
+        for x in self {
+            if pred(x) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether `pred` accepts every element. Stops at the first it does not.
+    pub fn all(self, pred: fn(T) -> bool) -> bool {
+        for x in self {
+            if !pred(x) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// A new list in the reverse order.
+    pub fn reverse(self) -> List[T] {
+        let out = list::new[T]();
+        let mut i = self.len();
+        while i > 0 {
+            i = i - 1;
+            out.push(self.at(i));
+        }
+        out
+    }
+
+    /// Whether any element is `==` to `v`. Equality is structural and total (ADR-0011), so
+    /// this needs no bound.
+    pub fn contains(self, v: T) -> bool {
+        for x in self {
+            if x == v {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The position of the first element `==` to `v`.
+    pub fn index_of(self, v: T) -> Option[i64] {
+        let mut i = 0;
+        while i < self.len() {
+            if self.at(i) == v {
+                return Option::Some(i);
+            }
+            i = i + 1;
+        }
+        Option::None
+    }
+
+    /// The first `n` elements, or all of them when there are fewer.
+    pub fn take(self, n: i64) -> List[T] {
+        let out = list::new[T]();
+        let mut i = 0;
+        while i < n && i < self.len() {
+            out.push(self.at(i));
+            i = i + 1;
+        }
+        out
+    }
+
+    /// Everything past the first `n` elements.
+    pub fn skip(self, n: i64) -> List[T] {
+        let out = list::new[T]();
+        let mut i = n;
+        if i < 0 {
+            i = 0;
+        }
+        while i < self.len() {
+            out.push(self.at(i));
+            i = i + 1;
+        }
+        out
+    }
+
+    pub fn first(self) -> Option[T] {
+        self.get(0)
+    }
+
+    pub fn last(self) -> Option[T] {
+        self.get(self.len() - 1)
+    }
+
+    /// A new list in the order `less` describes, by insertion sort.
+    ///
+    /// **Stable**: an element is inserted after every element the comparison does not call
+    /// strictly greater, so equal elements keep their original order. That is a promise
+    /// rather than an accident of the algorithm -- an unstable sort would let a program's
+    /// output depend on how the prelude happens to be written, which §04 does not permit an
+    /// implementation to vary.
+    pub fn sort_by(self, less: fn(T, T) -> bool) -> List[T] {
+        let out = list::new[T]();
+        for x in self {
+            let mut at = out.len();
+            let mut i = 0;
+            while i < out.len() {
+                if less(x, out.at(i)) {
+                    at = i;
+                    i = out.len();
+                } else {
+                    i = i + 1;
+                }
+            }
+            out.push(x);
+            let mut j = out.len() - 1;
+            while j > at {
+                let tmp = out.at(j - 1);
+                out.set(j - 1, out.at(j));
+                out.set(j, tmp);
+                j = j - 1;
+            }
+        }
+        out
+    }
+}
+
+/// The sum of every element.
+///
+/// A free function rather than a `List[i64]` method, and so are `max`, `min` and `join`.
+/// An `impl` on one instantiation is not usable here: method lookup probes each candidate
+/// impl by *unifying* the receiver against it (`internal/check/traits.go`), and that
+/// unification is not speculative -- probing `impl List[i64]` against a receiver whose
+/// element type is still a variable binds it to `i64` permanently, even when the impl is
+/// then rejected for not having the method. `let w = ["a", "b"]` starts failing with
+/// `expected i64, found String`. The defect is the checker's and predates this library;
+/// `docs/deferred.md` records it. Free functions take a concrete parameter type and never
+/// enter that probe.
+pub fn sum(xs: List[i64]) -> i64 {
+    let mut n = 0;
+    for v in xs {
+        n = n + v;
+    }
+    n
+}
+
+/// The largest element, or `None` when there are none.
+pub fn max(xs: List[i64]) -> Option[i64] {
+    let mut best = Option::None;
+    for v in xs {
+        match best {
+            Option::Some(b) => { if v > b { best = Option::Some(v); } }
+            Option::None => { best = Option::Some(v); }
+        }
+    }
+    best
+}
+
+/// The smallest element, or `None` when there are none.
+pub fn min(xs: List[i64]) -> Option[i64] {
+    let mut best = Option::None;
+    for v in xs {
+        match best {
+            Option::Some(b) => { if v < b { best = Option::Some(v); } }
+            Option::None => { best = Option::Some(v); }
+        }
+    }
+    best
+}
+
+/// The strings run together with `sep` between each pair.
+pub fn join(xs: List[String], sep: String) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < xs.len() {
+        if i > 0 {
+            out = out.concat(sep);
+        }
+        out = out.concat(xs.at(i));
+        i = i + 1;
+    }
+    out
+}
+
+/// The half-open sequence `lo..hi`, walked lazily.
+///
+/// A source, unlike every transform above, so it allocates nothing: `for i in range(0, n)`
+/// costs one struct, not a list of n elements.
+pub struct Range {
+    mut at: i64,
+    hi: i64,
+}
+
+impl Iterator for Range {
+    type Item = i64;
+    fn next(mut self) -> Option[i64] {
+        if self.at >= self.hi {
+            return Option::None;
+        }
+        let v = self.at;
+        self.at = self.at + 1;
+        Option::Some(v)
+    }
+}
+
+impl IntoIterator for Range {
+    type Item = i64;
+    type Iter = Range;
+    fn into_iter(self) -> Range {
+        self
+    }
+}
+
+/// `lo` up to but not including `hi`. Empty when `hi <= lo`.
+///
+/// A prelude function, so it needs no `use` -- the same standing `read_to_string` has (§07).
+pub fn range(lo: i64, hi: i64) -> Range {
+    Range { at: lo, hi: hi }
 }
 
 /// Walks a list front to back. It reads the list as it goes, so it yields what the list

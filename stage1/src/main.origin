@@ -488,22 +488,6 @@ fn before(a_file: String, a_start: i64, a_end: i64, b_file: String, b_start: i64
     a_end < b_end
 }
 
-/// A stable insertion sort, which is what `sort.SliceStable` gives the Go driver:
-/// entries that compare equal keep the order the passes emitted them in.
-fn sort_by[T](xs: List[T], less: fn(T, T) -> bool) {
-    let mut i = 1;
-    while i < xs.len() {
-        let cur = xs.at(i);
-        let mut j = i;
-        while j > 0 && less(cur, xs.at(j - 1)) {
-            xs.set(j, xs.at(j - 1));
-            j = j - 1;
-        }
-        xs.set(j, cur);
-        i = i + 1;
-    }
-}
-
 fn report_check(out: check::Checked, command: String) -> bool {
     // Everything but `dump-bytecode` writes diagnostics and nothing else, so a warning
     // belongs in the output. `dump-bytecode`'s output is the artefact, and a warning is
@@ -511,8 +495,7 @@ fn report_check(out: check::Checked, command: String) -> bool {
     // stderr and the bytecode to stdout, and stage1 has only one stream to write to.
     let artefact = lowered_command(command);
     let with_trace = command == "check";
-    let errors = out.errors;
-    sort_by(errors, |a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
+    let errors = out.errors.sort_by(|a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
     let mut e = 0;
     while e < errors.len() {
         let err = errors.at(e);
@@ -547,8 +530,7 @@ fn any_error(errors: List[check::CheckError]) -> bool {
 }
 
 fn report_mono(out: mono::Result, with_trace: bool) -> bool {
-    let errors = out.errors;
-    sort_by(errors, |a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
+    let errors = out.errors.sort_by(|a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
     let mut e = 0;
     while e < errors.len() {
         let err = errors.at(e);
@@ -686,8 +668,7 @@ fn report_ir(prog: bytecode::Program, level: i64) -> bool {
 }
 
 fn report_resolution(out: resolve::Resolved, with_trace: bool) -> bool {
-    let errors = out.errors;
-    sort_by(errors, |a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
+    let errors = out.errors.sort_by(|a, b| before(a.file, a.start, a.end, b.file, b.start, b.end));
     let mut e = 0;
     while e < errors.len() {
         let err = errors.at(e);
