@@ -178,6 +178,7 @@ type runtimeLabels struct {
 	fsWrite    x86.Label
 	fsExists   x86.Label
 	fsTaken    x86.Label
+	stdinRead  x86.Label
 	// outOfMemory is the trap message the allocator jumps to; it lives in read-only
 	// data like every other trap message.
 	outOfMemoryAddr uint64
@@ -251,6 +252,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.rt.fsWrite = e.a.NewLabel("rt_fs_write")
 	e.rt.fsExists = e.a.NewLabel("rt_fs_exists")
 	e.rt.fsTaken = e.a.NewLabel("rt_fs_taken")
+	e.rt.stdinRead = e.a.NewLabel("rt_stdin_read")
 	e.rt.floatMod = e.a.NewLabel("rt_float_mod")
 
 	e.emitStart(mainLabel)
@@ -313,6 +315,7 @@ func (e *emitter) emitRuntime(mainLabel x86.Label) {
 	e.emitFsWrite()
 	e.emitFsExists()
 	e.emitFsTaken()
+	e.emitStdinRead()
 	e.emitFloatMod()
 	e.emitCollect()
 }

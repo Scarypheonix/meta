@@ -1069,11 +1069,25 @@ func (e *emitter) builtin(v *ir.Value) error {
 		e.def(v, x86.RAX)
 		return nil
 
-	case compile.BuiltinTakenText:
+	case compile.BuiltinTakenText, compile.BuiltinTakenLine:
 		if len(v.Args) != 0 {
-			return fmt.Errorf("this is a compiler bug: fs::taken_text takes no arguments, got %d", len(v.Args))
+			return fmt.Errorf("this is a compiler bug: a take of held text takes no arguments, got %d", len(v.Args))
 		}
+		// One held-text slot serves both (spec/18-input.md): `io::taken_line` is
+		// `fs::taken_text` under another name, and giving standard input a slot of its
+		// own would be a second thing for the collector to scan for no gain.
 		e.a.Call(e.rt.fsTaken)
+		e.def(v, x86.RAX)
+		return nil
+
+	case compile.BuiltinReadLine:
+		if len(v.Args) != 0 {
+			return fmt.Errorf("this is a compiler bug: io::read_line takes no arguments, got %d", len(v.Args))
+		}
+		e.a.Call(e.rt.stdinRead)
+		// It allocates the String it read into, so the call site is a safepoint like any
+		// other allocation in user code (ADR-0021).
+		e.recordCall(v)
 		e.def(v, x86.RAX)
 		return nil
 

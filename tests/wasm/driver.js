@@ -59,6 +59,9 @@ async function main() {
         engine: c.engine,
         opt: c.opt,
         args: c.args || [],
+        // The case's `.in` file, byte for byte. A case with none reads nothing, which is
+        // what the native run of it does too (spec/18-input.md).
+        stdin: c.stdin || "",
       });
     } catch (err) {
       r = { thrown: String((err && err.message) || err) };

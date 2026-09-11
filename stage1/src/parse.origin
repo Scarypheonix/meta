@@ -273,7 +273,11 @@ impl Parser {
                             // the way a block's is.
                             match st.tail {
                                 Option::Some(e) => {
-                                    loose.push(ast::Stmt::ExprStmt(e, true));
+                                    // No semicolon: a tail here is a block-like statement
+                                    // that ended with `}`, which is not a statement
+                                    // terminator (ADR-0040). Recording one would claim the
+                                    // source had punctuation it does not have.
+                                    loose.push(ast::Stmt::ExprStmt(e, false));
                                 }
                                 Option::None => {}
                             }

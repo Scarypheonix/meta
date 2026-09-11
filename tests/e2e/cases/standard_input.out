@@ -1,0 +1,8 @@
+Name? Hello, World!
+Age? Ten years on: 25
+1: [alpha] 5
+2: [] 0
+3: [beta] 4
+4: [omega] 5
+that was everything: 4
+past the end, read_line is None and input is empty: []

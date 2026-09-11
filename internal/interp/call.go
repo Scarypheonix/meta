@@ -10,6 +10,7 @@ import (
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/resolve"
+	"github.com/scarypheonix/meta/internal/stdin"
 )
 
 func (in *Interp) evalCall(c *ast.Call) (Value, ctrl) {
@@ -143,6 +144,24 @@ func (in *Interp) callBuiltin(name string, args []Value, c *ast.Call) Value {
 			fmt.Fprint(in.stdout, s.S)
 		}
 		return Unit{}
+
+	// Standard input (spec/18-input.md). The stream is the runtime's, because the
+	// position in it belongs to the process; the line one read produced is this
+	// thread's, until `io::taken_line` takes it.
+	case "io::read_line":
+		in.rt.inMu.Lock()
+		if in.rt.in == nil {
+			in.rt.in = stdin.New(stdin.Default())
+		}
+		line, status := in.rt.in.ReadLine()
+		in.rt.inMu.Unlock()
+		in.takenText = line
+		return Int(status)
+
+	case "io::taken_line":
+		s := in.takenText
+		in.takenText = ""
+		return &Str{S: s}
 
 	case "panic":
 		if len(args) != 1 {

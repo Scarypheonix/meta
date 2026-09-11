@@ -66,7 +66,7 @@ func main() {
 
 // run compiles and runs one program. It is the whole boundary.
 //
-// Request:  {source, name?, engine?, opt?, args?, onOutput?}
+// Request:  {source, name?, engine?, opt?, args?, stdin?, onOutput?}
 // Response: {stdout, stderr, exit, truncated, internalError?}
 //
 // stdout, stderr and exit are exactly what `originc run` produces for the same program on
@@ -128,6 +128,7 @@ func execute(req js.Value, stdout, stderr *capture) int {
 	if req.Get("engine").String() == "interp" {
 		in := interp.New(prog.Resolved, prog.Types, prog.Mono, stdout, stderr)
 		in.SetArgs(argv)
+		in.SetStdin(strings.NewReader(standardInput(req)))
 		return in.Run()
 	}
 
@@ -140,7 +141,21 @@ func execute(req js.Value, stdout, stderr *capture) int {
 		stderr.WriteString("originc: " + err.Error() + "\n")
 		return driver.ExitDiagnostics
 	}
-	return vm.New(code, vm.Config{Args: argv}, stdout, stderr).Run()
+	return vm.New(code, vm.Config{Args: argv, Stdin: strings.NewReader(standardInput(req))}, stdout, stderr).Run()
+}
+
+// standardInput is what `read_line` reads (spec/18-input.md).
+//
+// This is the one place ADR-0033 does not extend. A host with no filesystem fails every
+// file operation, because there is no file and nothing on the page could be one; a host
+// with no standard input is a different case, because a page *can* have text in a box and
+// the caller can hand it over. A caller that hands over nothing gets an empty stream, which
+// is what a program run with its input closed gets anywhere.
+func standardInput(req js.Value) string {
+	if v := req.Get("stdin"); v.Type() == js.TypeString {
+		return v.String()
+	}
+	return ""
 }
 
 // level reads the optimization level, defaulting to -O1 as `originc build` does. It is

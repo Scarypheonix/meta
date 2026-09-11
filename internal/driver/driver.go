@@ -32,8 +32,19 @@ import (
 	"github.com/scarypheonix/meta/internal/prelude"
 	"github.com/scarypheonix/meta/internal/resolve"
 	"github.com/scarypheonix/meta/internal/source"
+	"github.com/scarypheonix/meta/internal/stdin"
 	"github.com/scarypheonix/meta/internal/vm"
 )
+
+// emptyIfNil is what "this program was given no standard input" means: a reader with
+// nothing in it, so the first `read_line` is the end of input on every engine
+// (spec/18-input.md). It is not the host's own — see RunAtInput.
+func emptyIfNil(r io.Reader) io.Reader {
+	if r == nil {
+		return strings.NewReader("")
+	}
+	return r
+}
 
 // Exit statuses, per spec/09-errors.md.
 const (
@@ -253,6 +264,16 @@ func RunWith(path string, engine Engine, stdout, stderr io.Writer, args ...strin
 // itself, so that a program's argument vector has the same shape on every engine
 // (spec/17-process.md).
 func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer, args ...string) int {
+	return RunAtInput(path, engine, level, stdin.Default(), stdout, stderr, args...)
+}
+
+// RunAtInput is RunAt with the program's standard input named (spec/18-input.md).
+//
+// A nil reader is *empty* input, not the host's: the end-to-end suite passes a case's
+// `.in` file or nothing, and a case with no `.in` file must read nothing on all three
+// engines rather than inheriting whatever the test runner was started with. RunAt, which
+// is what the command line calls, passes the host's own explicitly.
+func RunAtInput(path string, engine Engine, level opt.Level, in io.Reader, stdout, stderr io.Writer, args ...string) int {
 	argv := append([]string{path}, args...)
 	units, err := LoadUnits(path)
 	if err != nil {
@@ -264,9 +285,10 @@ func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer
 		return ExitDiagnostics
 	}
 	if engine == Interpreter {
-		in := interp.New(prog.Resolved, prog.Types, prog.Mono, stdout, stderr)
-		in.SetArgs(argv)
-		return in.Run()
+		ip := interp.New(prog.Resolved, prog.Types, prog.Mono, stdout, stderr)
+		ip.SetArgs(argv)
+		ip.SetStdin(emptyIfNil(in))
+		return ip.Run()
 	}
 	code, err := compile.Program(prog.Resolved, prog.Types, prog.Mono, prog.AllASTs...)
 	if err != nil {
@@ -278,9 +300,9 @@ func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer
 		return ExitDiagnostics
 	}
 	if engine == Native {
-		return runNative(code, stdout, stderr, argv)
+		return runNative(code, in, stdout, stderr, argv)
 	}
-	return vm.New(code, vm.Config{Args: argv}, stdout, stderr).Run()
+	return vm.New(code, vm.Config{Args: argv, Stdin: emptyIfNil(in)}, stdout, stderr).Run()
 }
 
 // runNative compiles to an executable for the host, runs it, and returns its exit
@@ -291,7 +313,7 @@ func RunAt(path string, engine Engine, level opt.Level, stdout, stderr io.Writer
 // virtual machine. Only the host's own format can be run, which is why the container
 // verifies ELF and the Mach-O acceptance criterion belongs to the user's machine
 // (ADR-0003).
-func runNative(code *bytecode.Program, stdout, stderr io.Writer, argv []string) int {
+func runNative(code *bytecode.Program, in io.Reader, stdout, stderr io.Writer, argv []string) int {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		fmt.Fprintln(stderr, "originc: this host cannot run what it builds; use `originc build`")
 		return ExitUsage
@@ -321,6 +343,9 @@ func runNative(code *bytecode.Program, stdout, stderr io.Writer, argv []string) 
 	// end-to-end differential compares their stdout byte for byte (spec/17-process.md).
 	cmd.Args = argv
 	cmd.Stdout, cmd.Stderr = stdout, stderr
+	// A nil Stdin is an empty one for the child, which is what "no standard input" means
+	// on every engine: the first `read_line` is `None` (spec/18-input.md).
+	cmd.Stdin = in
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
@@ -397,6 +422,12 @@ func defaultOutputName(path string) string {
 // RunRoundTrip executes a program through the IR with no optimization passes, which
 // isolates SSA construction and emission from the passes built on them.
 func RunRoundTrip(path string, stdout, stderr io.Writer, args ...string) int {
+	return RunRoundTripInput(path, stdin.Default(), stdout, stderr, args...)
+}
+
+// RunRoundTripInput is RunRoundTrip with the program's standard input named. A nil reader
+// is empty input, for RunAtInput's reason.
+func RunRoundTripInput(path string, in io.Reader, stdout, stderr io.Writer, args ...string) int {
 	units, err := LoadUnits(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
@@ -415,7 +446,7 @@ func RunRoundTrip(path string, stdout, stderr io.Writer, args ...string) int {
 		fmt.Fprintf(stderr, "originc: %v\n", err)
 		return ExitDiagnostics
 	}
-	return vm.New(code, vm.Config{Args: append([]string{path}, args...)}, stdout, stderr).Run()
+	return vm.New(code, vm.Config{Args: append([]string{path}, args...), Stdin: emptyIfNil(in)}, stdout, stderr).Run()
 }
 
 // Run compiles a file and interprets it, returning the program's exit status.

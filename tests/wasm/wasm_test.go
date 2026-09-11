@@ -53,6 +53,7 @@ type request struct {
 	Name   string   `json:"name"`
 	Path   string   `json:"path"`
 	Args   []string `json:"args"`
+	Stdin  string   `json:"stdin"`
 	Engine string   `json:"engine"`
 	Opt    int      `json:"opt"`
 }
@@ -75,6 +76,7 @@ type expectation struct {
 	source string // repository-relative, and therefore argv[0] and the name in diagnostics
 	abs    string
 	args   []string
+	stdin  string
 	stdout string
 	stderr string
 	exit   int
@@ -93,7 +95,8 @@ func TestTheCorpusRunsInTheBrowserBuild(t *testing.T) {
 	for _, c := range cases {
 		for _, e := range engines {
 			reqs = append(reqs, request{
-				Case: c.name, Name: c.source, Path: c.abs, Args: c.args, Engine: e.name, Opt: e.opt,
+				Case: c.name, Name: c.source, Path: c.abs, Args: c.args, Stdin: c.stdin,
+				Engine: e.name, Opt: e.opt,
 			})
 		}
 	}
@@ -273,6 +276,9 @@ func loadCorpus(t *testing.T, root string) []expectation {
 		}
 		if raw, err := os.ReadFile(stem + ".args"); err == nil && len(raw) > 0 {
 			e.args = strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+		}
+		if raw, err := os.ReadFile(stem + ".in"); err == nil {
+			e.stdin = string(raw)
 		}
 		out = append(out, e)
 	}

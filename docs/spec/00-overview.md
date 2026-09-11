@@ -32,6 +32,7 @@ must be corrected in the same commit that changes behaviour.
 | `15-files.md` | Reading and writing whole files |
 | `16-floats.md` | What `to_str` on a float produces, exactly |
 | `17-process.md` | Command-line arguments and the exit status |
+| `18-input.md` | Standard input, a line at a time |
 
 ## Design pillars
 

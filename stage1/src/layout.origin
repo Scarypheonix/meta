@@ -63,6 +63,12 @@ pub const OBJ_ARRAY: i64 = 5;
 /// on one engine and a success on another.
 pub const MAX_STRING_BYTES: i64 = 134217712;
 
+/// The longest line `io::read_line` will read (spec/18-input.md). A longer one traps rather
+/// than being truncated into text that is not what was typed.
+///
+/// It is here for MAX_STRING_BYTES's reason: three engines have to refuse the same input.
+pub const MAX_INPUT_LINE: i64 = 65536;
+
 // --- WordKind ------------------------------------------------------------------------
 //
 // How one payload word is to be read.

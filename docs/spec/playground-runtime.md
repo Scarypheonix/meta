@@ -47,10 +47,10 @@ in a browser sandbox, and `originc build` has no counterpart here.
 run(request) -> response
 ```
 
-`request` carries the program's text, the engine to run it on, the optimization level, and
-the argument vector. `response` carries captured stdout, captured stderr, the exit status,
-and whether the run ended by returning, by trapping, by `process::exit`, or by exhausting a
-limit this document sets.
+`request` carries the program's text, the engine to run it on, the optimization level, the
+argument vector, and the program's standard input as one string (§18). `response` carries
+captured stdout, captured stderr, the exit status, and whether the run ended by returning,
+by trapping, by `process::exit`, or by exhausting a limit this document sets.
 
 The exact JavaScript shape is `cmd/originwasm`'s contract and is documented there. What is
 normative here is that the boundary is **data only**. No callback, no host object and no
@@ -69,6 +69,7 @@ Linux and macOS, a system call underneath it, and each says what the browser doe
 | `std::fs` (§15) | `openat`, `read`, `write` | every operation fails; see §3 | **yes, and it is the only one** |
 | `process::exit` (§17) | `exit_group` | unwinds to the entry point, which reports the status | none observable |
 | `args()` (§17) | the kernel's argument vector | supplied by the caller across the boundary | none observable |
+| `read_line`, `input`, `ask` (§18) | `read(0)` | the caller's `stdin` string, a line at a time | none observable |
 | Green threads, channels, `Mutex` (§12) | goroutines, preempted by the host | goroutines, yielding explicitly at a back edge | **§08's preemption had to be asked for**; see §5 |
 | Traps and panics (§08, ADR-0005, ADR-0026) | a message on stderr, exit 101 | the same message on captured stderr, exit 101 | none |
 | Allocation and collection (§08) | Go's heap (interpreter), `internal/gc` (VM) | identical — both are Go | none |
@@ -87,6 +88,13 @@ exist in Origin**:
   `docs/spec/12-concurrency.md` §"Recorded in `docs/deferred.md`" amends that and says why:
   *"Origin has no I/O to be asynchronous about — `io::println` is the entire surface."* It
   was never built. `docs/deferred.md` still carries it. There is no event loop to port.
+
+**Standard input is not a second gap.** ADR-0033 fails every file operation because there
+is no file and nothing on the page could be one; a page *can* hold text in a box, so the
+caller hands it over and §18 reads it exactly as it reads a pipe -- the same lines, the same
+end, the same limit. The playground's input box is what fills it. A caller that supplies
+nothing gives the program an empty stream, which is what a program run with its input closed
+gets anywhere.
 
 The filesystem is the only gap in what a program can *observe*, and §3 is the whole of it.
 One thing in the table cost implementation work to keep in the "none" column rather than

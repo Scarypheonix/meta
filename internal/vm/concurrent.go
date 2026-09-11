@@ -7,6 +7,7 @@ import (
 
 	"github.com/scarypheonix/meta/internal/diag"
 	"github.com/scarypheonix/meta/internal/layout"
+	"github.com/scarypheonix/meta/internal/stdin"
 )
 
 // The virtual machine's concurrency runtime (spec/12-concurrency.md).
@@ -51,6 +52,13 @@ type world struct {
 	channels map[int64]*vmChannel
 	mutexes  map[int64]*vmMutex
 	next     int64
+
+	// in is standard input, shared by every thread because the position in the stream
+	// belongs to the process (spec/18-input.md). inMu is its own lock and not mu or
+	// exec: a read blocks until someone types, and holding the world lock across that
+	// would stop every other thread until they did.
+	in   *stdin.Reader
+	inMu sync.Mutex
 
 	// waiters holds each parked thread's condition, so deadlock means "every thread is
 	// parked and not one of their conditions holds" rather than merely "every thread is

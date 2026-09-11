@@ -345,6 +345,22 @@ func (v *VM) callBuiltin(index, argCount int, kind bytecode.Kind, span diag.Span
 	case compile.BuiltinExit:
 		panic(exitRequest{code: int(args[0].Int()) & 0xFF})
 
+	// Standard input (spec/18-input.md). The reader is the world's, because the position
+	// in the stream belongs to the process; the line it produced is this VM's, until
+	// `io::taken_line` takes it.
+	case compile.BuiltinReadLine:
+		v.w.inMu.Lock()
+		line, status := v.w.in.ReadLine()
+		v.w.inMu.Unlock()
+		v.takenText = line
+		v.push(intVal(int64(status)))
+		return
+	case compile.BuiltinTakenLine:
+		s := v.takenText
+		v.takenText = ""
+		v.push(refVal(v.newString(s, span)))
+		return
+
 	case compile.BuiltinCharValid:
 		// Only the predicate: internal/compile builds the `Option` out of this and the
 		// value itself, which needs no conversion (spec/04-expressions.md).

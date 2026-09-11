@@ -340,7 +340,9 @@ var globalBuiltins = map[string]string{
 // that `use std::io;` and `io::println(..)` go through ordinary module resolution
 // instead of a special case. Phase 7 replaces them with Origin source.
 var stdModules = map[string][]string{
-	"std::io": {"print", "println"},
+	// Phase 15 adds `read_line` and `taken_line` (spec/18-input.md): the prelude's
+	// `read_line`, `input` and `ask` are Origin source over the pair.
+	"std::io": {"print", "println", "read_line", "taken_line"},
 	// Phase 7 (spec/13-collections.md). The operations on the one built-in collection;
 	// `List` and `Map` are Origin source in the prelude, written in terms of these.
 	"std::array": {"new", "len", "cap", "at", "set", "push", "truncate"},

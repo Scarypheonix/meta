@@ -1,0 +1,127 @@
+// Standard input, in machine code (spec/18-input.md, ADR-0043).
+//
+// A translation of `internal/backend/input.go`.
+//
+// One routine. It reads **one byte per `read`**, which is the part worth defending: a
+// buffered read consumes bytes past the newline, and `io::read_line` is stateless by
+// construction -- there is no handle in the language to hold the remainder in -- so the only
+// place to keep it would be runtime-global state every green thread would have to share and
+// lock. Standard input is not a throughput path; a program that wants one reads a file
+// (§15), which does use a sized read.
+//
+// The line travels to the caller through the running thread's TCB slot -- the same slot
+// `rt_fs_read` fills and `rt_fs_taken` empties -- rather than being returned, because the
+// routine has to return a status and that slot is the one place the collector already scans.
+// `io::taken_line` lowers to `rt_fs_taken`: one held-text slot, so the two engines that hold
+// it in a field hold it in one field too.
+
+use compile;
+use emitter;
+use layout;
+use sched;
+use strings;
+use thread;
+use x86;
+
+/// Where the accumulated line sits in the routine's own frame, below the four callee-saved
+/// registers `runtime_prologue` pushes, and the single byte each `read` lands in below that.
+const LINE_BUF_OFF: i64 = 0 - 40 - layout::MAX_INPUT_LINE;
+const LINE_CHAR_OFF: i64 = LINE_BUF_OFF - 8;
+
+/// The one byte that ends a line. A `\r` before it is left on: the prelude strips it, so the
+/// rule is written once rather than once per engine.
+const NEWLINE_BYTE: i64 = 10;
+
+/// Writes `rt_stdin_read() -> status rax`, leaving the line in this thread's TCB slot for
+/// `rt_fs_taken` to collect.
+pub fn emit_stdin_read(e: emitter::Emitter) {
+    let a = e.a;
+    a.align(16);
+    a.bind(e.rt.stdin_read);
+
+    sched::runtime_prologue(e);
+    // rsp is rbp-40 here, which is 8 mod 16; the frame is the line buffer, the one-byte
+    // landing place, and eight more bytes to put rsp back on a 16-byte boundary for the call
+    // to rt_str_alloc below.
+    a.sub_ri(x86::RSP, layout::MAX_INPUT_LINE + 24);
+
+    let loop_top = a.new_label("stdin_loop");
+    let end_of_line = a.new_label("stdin_end_of_line");
+    let at_eof = a.new_label("stdin_eof");
+    let too_long = a.new_label("stdin_too_long");
+    let failed = a.new_label("stdin_failed");
+    let end_of_input = a.new_label("stdin_end_of_input");
+
+    a.xor_rr(x86::R12, x86::R12); // bytes accumulated
+
+    a.bind(loop_top);
+    // read(0, &byte, 1)
+    a.mov_ri(x86::RAX, e.target.sys_read as u64);
+    a.xor_rr(x86::RDI, x86::RDI);
+    a.lea(x86::RSI, x86::at(x86::RBP, LINE_CHAR_OFF));
+    a.mov_ri(x86::RDX, 1);
+    a.syscall();
+    a.cmp_ri(x86::RAX, 0);
+    a.jcc(x86::LESS, failed);
+    a.jcc(x86::EQUAL, at_eof);
+
+    a.xor_rr(x86::RDX, x86::RDX);
+    a.mov_rm8(x86::RDX, x86::at(x86::RBP, LINE_CHAR_OFF));
+    a.cmp_ri(x86::RDX, NEWLINE_BYTE);
+    a.jcc(x86::EQUAL, end_of_line);
+
+    // The capacity check is *after* the byte is read, not before: a line of exactly
+    // MAX_INPUT_LINE bytes followed by a newline is a legal line, and there is no way to know
+    // which one this is without having the byte in hand.
+    a.cmp_ri(x86::R12, layout::MAX_INPUT_LINE);
+    a.jcc(x86::GREATER_EQUAL, too_long);
+    a.lea(x86::RCX, x86::at(x86::RBP, LINE_BUF_OFF));
+    a.add_rr(x86::RCX, x86::R12);
+    a.mov_mr8(x86::at(x86::RCX, 0), x86::RDX);
+    a.add_ri(x86::R12, 1);
+    a.jmp(loop_top);
+
+    // End of file with nothing accumulated is the end of the input; with something
+    // accumulated it is a last line that had no terminator, which is a line.
+    a.bind(at_eof);
+    a.test_rr(x86::R12, x86::R12);
+    a.jcc(x86::EQUAL, end_of_input);
+
+    a.bind(end_of_line);
+    // The String to hand back. Nothing of the caller's is in a register across this, and the
+    // line itself is on the stack, so a collection here has nothing to move.
+    a.mov_rr(x86::RDI, x86::R12);
+    a.call(e.rt.str_alloc);
+    a.mov_rr(x86::RBX, x86::RAX); // the String, across the copy: it clobbers rdx
+
+    a.mov_rr(x86::RDI, x86::RAX);
+    a.add_ri(x86::RDI, emitter::STR_BYTES_OFF);
+    a.lea(x86::RSI, x86::at(x86::RBP, LINE_BUF_OFF));
+    a.mov_rr(x86::RCX, x86::R12);
+    strings::str_copy_bytes(e);
+
+    a.mov_rm(x86::RCX, x86::at(x86::R15, emitter::RT_CURRENT_OFF));
+    a.mov_mr(x86::at(x86::RCX, thread::TCB_TAKEN_OFF), x86::RBX);
+    a.mov_mi(x86::at(x86::RCX, thread::TCB_TAKEN_IS_REF_OFF), 1);
+    a.mov_ri(x86::RAX, compile::IO_OK as u64);
+    stdin_return(e);
+
+    a.bind(end_of_input);
+    a.mov_ri(x86::RAX, compile::IO_END_OF_INPUT as u64);
+    stdin_return(e);
+
+    a.bind(too_long);
+    a.mov_ri(x86::RAX, compile::IO_TOO_LONG as u64);
+    stdin_return(e);
+
+    a.bind(failed);
+    a.mov_ri(x86::RAX, compile::IO_OTHER as u64);
+    stdin_return(e);
+}
+
+/// Unwinds the frame `emit_stdin_read`'s four exits share.
+fn stdin_return(e: emitter::Emitter) {
+    e.a.add_ri(x86::RSP, layout::MAX_INPUT_LINE + 24);
+    sched::runtime_epilogue(e);
+    e.a.ret();
+}

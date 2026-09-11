@@ -53,6 +53,16 @@ const (
 // trap on one engine and a success on another.
 const MaxStringBytes = (int64(maxWordSize) - 1) * 8
 
+// MaxInputLine is the longest line `io::read_line` will read (spec/18-input.md). A longer
+// one traps rather than being truncated into text that is not what was typed.
+//
+// It is here for the same reason MaxStringBytes is: three engines have to refuse the same
+// input. It is not a fact about the header -- it is a bound the native runtime needs
+// because the routine reads into its own frame and a stateless operation has nowhere else
+// to put the bytes (ADR-0043) -- but it is a bound the other two engines must share, and
+// this package is where a number two subsystems must agree on lives (process rule 5).
+const MaxInputLine = 64 << 10
+
 // MakeHeader builds a header for an object of the given type and payload size.
 func MakeHeader(t TypeID, words uint64) Header {
 	if words > maxWordSize {

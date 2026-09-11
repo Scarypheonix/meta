@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 
 	"github.com/scarypheonix/meta/internal/diag"
+	"github.com/scarypheonix/meta/internal/stdin"
 )
 
 // The interpreter's concurrency runtime (spec/12-concurrency.md).
@@ -68,6 +69,13 @@ type runtime struct {
 	// out serializes writes to stdout, so two threads printing cannot interleave within
 	// one line.
 	out sync.Mutex
+
+	// in is standard input, shared by every thread because the position in the stream
+	// belongs to the process (spec/18-input.md). inMu is its own lock rather than mu:
+	// a read blocks until someone types, and holding the scheduler's lock across that
+	// would park every other thread behind a person's keyboard.
+	in   *stdin.Reader
+	inMu sync.Mutex
 
 	// wg tracks spawned threads, so the process can outlive `main` returning exactly as
 	// long as a thread is still running (spec/12-concurrency.md).

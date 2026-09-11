@@ -151,6 +151,8 @@ pub struct RuntimeLabels {
     pub mut fs_write: x86::Label,
     pub mut fs_exists: x86::Label,
     pub mut fs_taken: x86::Label,
+    /// Standard input, a line at a time (`input.origin`, spec/18-input.md).
+    pub mut stdin_read: x86::Label,
     /// `%` on floats, which SSE has no instruction for (`float.origin`).
     pub mut float_mod: x86::Label,
 }
@@ -226,6 +228,7 @@ pub fn no_labels() -> RuntimeLabels {
         fs_write: none,
         fs_exists: none,
         fs_taken: none,
+        stdin_read: none,
         float_mod: none,
     }
 }

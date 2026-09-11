@@ -384,7 +384,7 @@ fn is_prim_const(name: String) -> bool {
 /// a special case.
 fn std_modules() -> List[List[String]] {
     let out = list::new[List[String]]();
-    out.push(mod_entry("std::io", "print println"));
+    out.push(mod_entry("std::io", "print println read_line taken_line"));
     out.push(mod_entry("std::array", "new len cap at set push truncate"));
     out.push(mod_entry("std::list", "new"));
     out.push(mod_entry("std::map", "new"));

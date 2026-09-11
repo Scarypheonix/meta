@@ -19,6 +19,7 @@ use std::str;
 use std::fs;
 use std::float;
 use std::env;
+use std::io;
 
 pub enum Option[T] {
     None,
@@ -1427,6 +1428,61 @@ pub fn args() -> List[String] {
         i = i + 1;
     }
     out
+}
+
+/// The next line of standard input, or `None` when there is no more input.
+///
+/// The line carries no terminator: the runtimes drop the `\n` and this drops a `\r` before
+/// it, so text typed on Windows reads the same as text typed anywhere else. The last line
+/// of the input needs no terminator to be a line (spec/18-input.md).
+///
+/// The two failures trap rather than returning an error. A missing file is an ordinary
+/// thing a program plans for and can name a path for; standard input being unreadable is
+/// neither, and §17's `args()` treats bad input the same way.
+pub fn read_line() -> Option[String] {
+    let status = io::read_line();
+    if status == 4 {
+        return Option::None;
+    }
+    if status == 5 {
+        panic("a line of standard input is too long");
+    }
+    if status != 0 {
+        panic("standard input could not be read");
+    }
+    let line = io::taken_line();
+    if !is_valid_utf8(line) {
+        panic("standard input is not valid UTF-8");
+    }
+    Option::Some(without_trailing_cr(line))
+}
+
+/// The next line of standard input, or `""` when there is no more input.
+///
+/// This is the one to reach for when a program is asking a person a question, and it is
+/// deliberately the one that cannot tell an empty line from the end of the input. A program
+/// that must tell the difference uses `read_line` and gets the honest answer.
+pub fn input() -> String {
+    match read_line() {
+        Option::Some(line) => line,
+        Option::None => ""
+    }
+}
+
+/// Prints the prompt, with no newline after it, and reads a line.
+pub fn ask(prompt: String) -> String {
+    io::print(prompt);
+    input()
+}
+
+/// Drops a trailing carriage return, and nothing else. A `\r` anywhere but the end is an
+/// ordinary byte of the line.
+fn without_trailing_cr(line: String) -> String {
+    let n = line.len();
+    if n > 0 && line.byte_at(n - 1) == 13 {
+        return line.slice(0, n - 1);
+    }
+    line
 }
 
 /// The whole file, as text.

@@ -1,0 +1,24 @@
+// Standard input, a line at a time (spec/18-input.md, ADR-0043).
+//
+// One case covers every rule §18's table states, because they are rules about where a line
+// ends and there is no way to check one without the input that surrounds it: a prompt and
+// an answer, a parse of an answer, an empty line in the middle, a `\r\n` line, a last line
+// with no terminator, and what `read_line` and `input` each say once the input has run out.
+
+let name = ask("Name? ")
+println("Hello, \(name)!")
+
+let age = ask("Age? ").parse_int()
+if let Some(n) = age {
+    println("Ten years on: \(n + 10)")
+} else {
+    println("That was not a number.")
+}
+
+let mut count = 0
+while let Some(line) = read_line() {
+    count = count + 1
+    println("\(count): [\(line)] \(line.len())")
+}
+println("that was everything: \(count)")
+println("past the end, read_line is None and input is empty: [\(input())]")

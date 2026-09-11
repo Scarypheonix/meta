@@ -4685,6 +4685,10 @@ impl Checker {
         if name == "fs::taken_text" { return types::Type::Func(list::new[types::Type](), str); }
         if name == "fs::write_file" { return types::Type::Func(two_types(str, str), i64t); }
         if name == "fs::file_exists" { return types::Type::Func(one_type(str), bool_t); }
+        // Standard input (spec/18-input.md), split into a status and a take exactly as the
+        // file read above is, and for the same reason.
+        if name == "io::read_line" { return types::Type::Func(list::new[types::Type](), i64t); }
+        if name == "io::taken_line" { return types::Type::Func(list::new[types::Type](), str); }
         if name == "env::arg_count" { return types::Type::Func(list::new[types::Type](), i64t); }
         if name == "env::arg_at" { return types::Type::Func(one_type(i64t), str); }
         if name == "process::exit" { return types::Type::Func(one_type(i64t), types::never()); }

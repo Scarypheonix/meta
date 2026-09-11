@@ -22,6 +22,7 @@ import (
 	"github.com/scarypheonix/meta/internal/gc"
 	"github.com/scarypheonix/meta/internal/layout"
 	"github.com/scarypheonix/meta/internal/prelude"
+	"github.com/scarypheonix/meta/internal/stdin"
 )
 
 // exitRequest carries `process::exit`'s status out through the machine's own stack. It is
@@ -116,6 +117,9 @@ type VM struct {
 	// takenText is the same arrangement for `fs::read_file` (spec/15-files.md). It is a
 	// Go string rather than a heap object, so unlike `taken` it is not a collection root:
 	// nothing in the heap points at it until `fs::taken_text` allocates the String.
+	// `io::read_line` fills the same slot (spec/18-input.md): the stream is the world's,
+	// and one held-text slot serves both, which is what the native runtime does too --
+	// `io::taken_line` is `rt_fs_taken`.
 	takenText string
 	hasTaken  bool
 }
@@ -127,6 +131,9 @@ type Config struct {
 	MaxStack  int
 	// Args is the process's command line, program path first (spec/17-process.md).
 	Args []string
+	// Stdin is what `io::read_line` reads (spec/18-input.md). A nil one is the host's
+	// own standard input, which on a host that has none is empty.
+	Stdin io.Reader
 }
 
 // New builds a VM for a program.
@@ -149,6 +156,11 @@ func New(prog *bytecode.Program, cfg Config, stdout, stderr io.Writer) *VM {
 		w:         newWorld(),
 		tid:       1,
 	}
+	src := cfg.Stdin
+	if src == nil {
+		src = stdin.Default()
+	}
+	v.w.in = stdin.New(src)
 	v.w.vms[v.tid] = v
 	// The collector sees every thread's roots, not only this one's: with more than one
 	// thread each has its own stack, and a root missed is an object collected while it

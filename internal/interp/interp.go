@@ -12,6 +12,7 @@ import (
 	"github.com/scarypheonix/meta/internal/mono"
 	"github.com/scarypheonix/meta/internal/prelude"
 	"github.com/scarypheonix/meta/internal/resolve"
+	"github.com/scarypheonix/meta/internal/stdin"
 )
 
 // TrapExitCode is the process exit status after a trap (spec/04-expressions.md).
@@ -119,6 +120,9 @@ type Interp struct {
 	// takenText is the same arrangement for `fs::read_file` (spec/15-files.md): the bytes
 	// it read, held on this thread until the prelude's `read_to_string` takes them with
 	// `fs::taken_text`.
+	// `io::read_line` fills the same slot (spec/18-input.md): the *stream* is shared by
+	// every thread and lives on the runtime, and one held-text slot serves both, which is
+	// what the native runtime does too -- `io::taken_line` is `rt_fs_taken`.
 	takenText string
 }
 
@@ -811,3 +815,9 @@ func (in *Interp) evalTry(t *ast.Try) (Value, ctrl) {
 // `env::arg_at`. The driver supplies it; index 0 is the program's own path, so a program
 // sees the same shape here as it does when it has been compiled (spec/17-process.md).
 func (in *Interp) SetArgs(args []string) { in.args = args }
+
+// SetStdin installs what `io::read_line` reads (spec/18-input.md). The driver supplies the
+// process's own standard input; the browser build supplies the playground's input box. An
+// interpreter that is never told reads the host's default, which on a host with no standard
+// input is empty rather than absent.
+func (in *Interp) SetStdin(r io.Reader) { in.rt.in = stdin.New(r) }

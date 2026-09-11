@@ -60,6 +60,9 @@ var builtinIndex = map[string]int{
 	"fs::taken_text":  BuiltinTakenText,
 	"fs::write_file":  BuiltinWriteFile,
 	"fs::file_exists": BuiltinFileExists,
+
+	"io::read_line":  BuiltinReadLine,
+	"io::taken_line": BuiltinTakenLine,
 }
 
 func (c *Compiler) call(v *ast.Call) error {

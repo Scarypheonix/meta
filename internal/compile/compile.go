@@ -126,6 +126,12 @@ const (
 	BuiltinTakenText
 	BuiltinWriteFile
 	BuiltinFileExists
+
+	// Standard input (spec/18-input.md). The pair splits the way `fs::read_file` and
+	// `fs::taken_text` do, and for the same reason: the operation has to return a
+	// status, and a compiler-provided operation cannot return a prelude type (ADR-0025).
+	BuiltinReadLine
+	BuiltinTakenLine
 )
 
 // The file-operation statuses (spec/15-files.md), which `fs::read_file` and
@@ -140,6 +146,14 @@ const (
 	IONotFound   = 1
 	IOPermission = 2
 	IOOther      = 3
+	// IOEndOfInput and IOTooLong are the two conditions a file read does not have:
+	// `io::read_line` reports the end of standard input, and a line longer than
+	// layout.MaxInputLine (spec/18-input.md). They are in this set rather than one of
+	// their own because the prelude reads all of these as plain numbers through one
+	// vocabulary -- and they are two statuses rather than one `IOOther` because the two
+	// traps say different things and a status that could mean either could not choose.
+	IOEndOfInput = 4
+	IOTooLong    = 5
 )
 
 // Compiler holds the state of one program's lowering.

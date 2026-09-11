@@ -1140,9 +1140,21 @@ fn builtin(e: emitter::Emitter, fs: stackmap::FnState, v: ir::Value) {
         def(e, fs, v, x86::RAX);
         return;
     }
-    if idx == compile::BUILTIN_TAKEN_TEXT {
-        if !arity(e, n, 0, "fs::taken_text") { return; }
+    if idx == compile::BUILTIN_TAKEN_TEXT || idx == compile::BUILTIN_TAKEN_LINE {
+        if !arity(e, n, 0, "a take of held text") { return; }
+        // One held-text slot serves both (spec/18-input.md): `io::taken_line` is
+        // `fs::taken_text` under another name, and giving standard input a slot of its own
+        // would be a second thing for the collector to scan for no gain.
         a.call(e.rt.fs_taken);
+        def(e, fs, v, x86::RAX);
+        return;
+    }
+    if idx == compile::BUILTIN_READ_LINE {
+        if !arity(e, n, 0, "io::read_line") { return; }
+        a.call(e.rt.stdin_read);
+        // It allocates the String it read into, so the call site is a safepoint like any
+        // other allocation in user code (ADR-0021).
+        stackmap::record_call(e, fs, v);
         def(e, fs, v, x86::RAX);
         return;
     }

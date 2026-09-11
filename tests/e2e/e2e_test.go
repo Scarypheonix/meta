@@ -7,6 +7,7 @@
 //	NAME.exit   exact expected exit status, one line (required)
 //	NAME.err    exact expected stderr (optional; absent means stderr must be empty)
 //	NAME.args   the program's own arguments, one per line (optional; absent means none)
+//	NAME.in     the program's standard input, exactly (optional; absent means empty)
 //
 // Cases are derived from docs/spec/10-examples.md, which is normative. When a case and
 // the specification disagree, one of them is a bug; the fix is never to edit the
@@ -45,6 +46,10 @@ type caseFile struct {
 	// engine gets the same ones, which is what makes a case that reads its command line
 	// part of the differential rather than an exception to it.
 	Args []string
+	// Stdin is the case's standard input, byte for byte (spec/18-input.md). A case with
+	// no `.in` file reads nothing -- not the test runner's own input, which would make
+	// the result depend on how the suite was started.
+	Stdin string
 }
 
 func loadCases(t *testing.T) []caseFile {
@@ -92,6 +97,9 @@ func loadCases(t *testing.T) []caseFile {
 		// argument -- which a command line can hold and a program has to survive.
 		if rawArgs, err := os.ReadFile(stem + ".args"); err == nil && len(rawArgs) > 0 {
 			c.Args = strings.Split(strings.TrimSuffix(string(rawArgs), "\n"), "\n")
+		}
+		if in, err := os.ReadFile(stem + ".in"); err == nil {
+			c.Stdin = string(in)
 		}
 		if wantErr, err := os.ReadFile(stem + ".err"); err == nil {
 			c.WantErr, c.HasErr = string(wantErr), true
@@ -282,7 +290,7 @@ func runCase(t *testing.T, root string, c caseFile, e engineSpec) (string, strin
 	defer func() { _ = os.Chdir(wd) }()
 
 	var stdout, stderr bytes.Buffer
-	code := driver.RunAt(c.RelPath, e.engine, e.level, &stdout, &stderr, c.Args...)
+	code := driver.RunAtInput(c.RelPath, e.engine, e.level, strings.NewReader(c.Stdin), &stdout, &stderr, c.Args...)
 	return stdout.String(), stderr.String(), code
 }
 
