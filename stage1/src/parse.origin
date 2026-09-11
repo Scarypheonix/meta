@@ -245,6 +245,11 @@ impl Parser {
         while self.at(lex::K_USE) {
             uses.push(self.use_decl());
         }
+        // Statements written at the top level become the body of a synthesized `main`, in
+        // source order (ADR-0042). They are collected rather than desugared as they are
+        // read, because `main` is not built until the whole file has been seen.
+        let loose = list::new[ast::Stmt]();
+        let mut loose_start = 0 - 1;
         while !self.at_eof() {
             if self.at(lex::K_USE) {
                 let t = self.cur();
@@ -253,13 +258,73 @@ impl Parser {
                 uses.push(u);
             } else {
                 let before = self.pos;
-                items.push(self.item());
+                if is_item_start(self.cur().kind) {
+                    items.push(self.item());
+                } else {
+                    if loose_start < 0 {
+                        loose_start = self.pos;
+                    }
+                    let st = self.stmt();
+                    match st.stmt {
+                        Option::Some(v) => { loose.push(v); }
+                        Option::None => {
+                            // A tail expression at the top level is a statement: `main`
+                            // returns `()`, and a file's last expression is not its value
+                            // the way a block's is.
+                            match st.tail {
+                                Option::Some(e) => {
+                                    loose.push(ast::Stmt::ExprStmt(e, true));
+                                }
+                                Option::None => {}
+                            }
+                        }
+                    }
+                }
                 if self.pos == before {
                     self.advance();
                 }
             }
         }
+        if !loose.is_empty() {
+            items.push(self.synthesize_main(items, loose, loose_start));
+        }
         ast::File { uses: uses, items: items }
+    }
+
+    /// Wraps a file's top-level statements in `fn main() { ... }` (ADR-0042).
+    ///
+    /// A file that also declares `main` is rejected: two entry points is a mistake about
+    /// what the program does, and picking either silently would make the other dead code.
+    fn synthesize_main(self, items: List[ast::Item], stmts: List[ast::Stmt],
+                       start: i64) -> ast::Item {
+        let mut i = 0;
+        let mut clash = false;
+        while i < items.len() {
+            match items.at(i) {
+                ast::Item::Fn(d) => { if d.name.name == "main" { clash = true; } }
+                _ => {}
+            }
+            i = i + 1;
+        }
+        let at = self.span_from(start);
+        if clash {
+            self.error_at(at.start, at.end,
+                "this file has top-level statements and also declares `main`");
+        }
+        let body = ast::expr(at, ast::ExprKind::Block(ast::BlockBody {
+            stmts: stmts, tail: Option::None,
+        }));
+        let none_ty: Option[ast::Type] = Option::None;
+        let none_self: Option[bool] = Option::None;
+        ast::Item::Fn(ast::FnDecl {
+            span: at, file: "", info: ast::UNRESOLVED, public: false,
+            name: ast::Ident { name: "main", start: at.start, end: at.end,
+                               res: ast::UNRESOLVED },
+            generics: list::new[ast::GenericParam](),
+            where_preds: list::new[ast::WherePred](),
+            self_param: none_self, params: list::new[ast::Param](),
+            ret: none_ty, body: Option::Some(body),
+        })
     }
 
     fn use_decl(self) -> ast::Use {

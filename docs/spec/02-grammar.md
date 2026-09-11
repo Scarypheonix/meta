@@ -11,7 +11,7 @@ a value; that distinction is made during name resolution (§07).
 ## Source file
 
 ```ebnf
-SourceFile   = { UseDecl } { Item } EOF ;
+SourceFile   = { UseDecl } { Item | Stmt } EOF ;
 
 UseDecl      = "use" Path [ "::" "{" UseList "}" ] ";" ;
 UseList      = Ident { "," Ident } [ "," ] ;
@@ -26,6 +26,20 @@ ItemKind     = FnDecl
              | TypeAliasDecl
              | ConstDecl ;
 ```
+
+A `Stmt` written at the top level is not a declaration: the file's top-level statements are
+collected, in source order, into a synthesized `fn main()` (ADR-0042). So
+
+```origin
+println("hi")
+```
+
+is a complete program. A file that has top-level statements **and** declares `main` is
+REJECTED — two entry points would make one of them dead code.
+
+Items still hoist. A top-level statement may call a function declared further down the file,
+because §07 resolves every item in a package before it resolves any body; only the
+*statements* run in the order they are written.
 
 ## Items
 

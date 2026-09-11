@@ -228,6 +228,12 @@ func (p *Parser) parseFile() *ast.File {
 			f.Uses = append(f.Uses, u)
 		}
 	}
+	// Statements written at the top level become the body of a synthesized `main`, in
+	// source order (ADR-0042). They are collected here rather than desugared as they are
+	// read, because `main` is not built until the whole file has been seen.
+	var loose []ast.Stmt
+	looseStart := -1
+
 	for !p.atEOF() {
 		if p.at(lex.KwUse) {
 			u := p.parseUse()
@@ -240,14 +246,55 @@ func (p *Parser) parseFile() *ast.File {
 			continue
 		}
 		before := p.pos
-		f.Items = append(f.Items, p.parseItem())
+		if isItemStart(p.cur().Kind) {
+			f.Items = append(f.Items, p.parseItem())
+		} else {
+			if looseStart < 0 {
+				looseStart = p.pos
+			}
+			// A tail expression at the top level is a statement: `main` returns `()`, and
+			// a file's last expression is not its value the way a block's is.
+			st, tail := p.parseStmt()
+			if st != nil {
+				loose = append(loose, st)
+			} else if tail != nil {
+				es := &ast.ExprStmt{X: tail}
+				es.Base = p.base(before)
+				loose = append(loose, es)
+			}
+		}
 		if p.pos == before {
 			// No progress: force one token forward so the parser always terminates.
 			p.advance()
 		}
 	}
+	if len(loose) > 0 {
+		f.Items = append(f.Items, p.synthesizeMain(f.Items, loose, looseStart))
+	}
 	f.Base = p.base(start)
 	return f
+}
+
+// synthesizeMain wraps a file's top-level statements in `fn main() { ... }` (ADR-0042).
+//
+// A file that also declares `main` is rejected: two entry points is a mistake about what
+// the program does, and picking either silently would make the other dead code.
+func (p *Parser) synthesizeMain(items []ast.Item, stmts []ast.Stmt, start int) ast.Item {
+	for _, it := range items {
+		fn, ok := it.(*ast.FnDecl)
+		if ok && fn.Name.Name == "main" {
+			p.errorAt(p.toks[start].Span, "this file has top-level statements and also declares `main`").
+				Label("these statements would be a second entry point").
+				Note("top-level statements become the body of `main`").
+				Help("move them inside `main`, or delete the `fn main` declaration")
+			break
+		}
+	}
+	body := &ast.Block{Stmts: stmts}
+	body.Base = p.base(start)
+	fn := &ast.FnDecl{Name: ast.Ident{Name: "main", Loc: body.Loc}, Body: body}
+	fn.Base = p.base(start)
+	return fn
 }
 
 func (p *Parser) parseUse() *ast.Use {

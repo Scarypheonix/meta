@@ -1,0 +1,22 @@
+// The smallest program Origin can express, and a realistic one (ADR-0042).
+//
+// This case exists because the *absence* of `fn main` is the feature: a regression looks
+// like a parse error, and every other case in the corpus declares one, so nothing else here
+// would catch it. It also pins that items still hoist -- `grade` is called above where it is
+// declared -- which is what makes this a wrapper rather than a script.
+let scores = [7, 9, 4, 10, 6]
+
+println("count \(scores.len())")
+println("best \(scores.max().unwrap_or(0))")
+println("total \(scores.sum())")
+
+let good = scores.filter(|s| s >= 7)
+println("good \(good.len())")
+
+for s in scores.sort_by(|a, b| a > b) {
+    println("\(s) is \(grade(s))")
+}
+
+fn grade(n: i64) -> String {
+    if n >= 9 { "top" } else { if n >= 7 { "fine" } else { "low" } }
+}

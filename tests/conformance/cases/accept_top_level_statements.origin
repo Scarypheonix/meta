@@ -1,0 +1,14 @@
+// EXPECT: accept
+// spec: 02-grammar.md — top-level statements become the body of `main`.
+
+// ADR-0042. No `fn main`, no imports, no semicolons. Items still hoist, so `shout` may be
+// called above where it is declared.
+let names = ["ada", "bob"]
+
+for n in names {
+    println(shout(n))
+}
+
+fn shout(s: String) -> String {
+    s.concat("!")
+}

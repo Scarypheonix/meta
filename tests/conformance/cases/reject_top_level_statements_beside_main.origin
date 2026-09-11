@@ -1,0 +1,7 @@
+// EXPECT: reject E0002
+// spec: 02-grammar.md — two entry points would make one of them dead code.
+println("loose")
+
+fn main() {
+    println("declared")
+}
