@@ -21,13 +21,17 @@ import (
 )
 
 // examples are the worked examples of docs/spec/10-examples.md, in its order, named for a
-// reader rather than for a test runner.
+// reader rather than for a test runner, with two of the corpus's own programs added at the
+// front: the first thing someone wants after printing is to read something back (§18), and
+// the second is a list (§13). Both are end-to-end cases like every other entry here.
 //
 // §17's word-frequency report is deliberately absent: it reads its input from a file, and on
 // a host with no filesystem it correctly prints an I/O error (ADR-0033). That is the right
 // behaviour and a poor first thing to show someone, so the playground does not offer it.
 var examples = []struct{ title, name string }{
 	{"Hello", "hello"},
+	{"Ask a question", "ask_a_question"},
+	{"Lists and loops", "lists_and_loops"},
 	{"Recursive fibonacci", "fib"},
 	{"Closure counter", "closure_counter"},
 	{"Recursive enum: a linked list", "linked_list"},
@@ -89,8 +93,15 @@ func renderExamples(t *testing.T, root string) string {
 	b.WriteString("window.originExamples = [\n")
 	for _, e := range examples {
 		src := readCase(t, root, e.name, ".origin")
-		fmt.Fprintf(&b, "  { title: %s, name: %s, source: %s },\n",
-			jsString(e.title), jsString(e.name), jsString(src))
+		// A case that reads standard input brings its own, so choosing it from the
+		// playground's list gives a program that runs rather than one that reads nothing
+		// and looks broken (spec/18-input.md).
+		stdin := ""
+		if raw, err := os.ReadFile(filepath.Join(root, "tests", "e2e", "cases", e.name+".in")); err == nil {
+			stdin = string(raw)
+		}
+		fmt.Fprintf(&b, "  { title: %s, name: %s, source: %s, stdin: %s },\n",
+			jsString(e.title), jsString(e.name), jsString(src), jsString(stdin))
 	}
 	b.WriteString("];\n")
 	return b.String()

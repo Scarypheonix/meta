@@ -1,8 +1,4 @@
-use std::io;
-
-fn main() {
-    let x = 9223372036854775807;
-    io::println("before");
-    let y = x + 1;
-    io::println(y.to_str());
-}
+let x = 9223372036854775807
+println("before")
+let y = x + 1
+println(y.to_str())

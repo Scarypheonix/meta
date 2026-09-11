@@ -1,0 +1,19 @@
+// Lists, and the methods on them (spec/13-collections.md).
+//
+// `[a, b, c]` builds a `List`; `range(lo, hi)` counts; and the transforms are ordinary
+// Origin in the prelude rather than anything the compiler knows about.
+
+let names = ["ada", "grace", "alan", "edsger"]
+
+println("there are \(names.len()) of them")
+println(names.join(", "))
+
+let long = names.filter(|n| n.len() > 4)
+println("longer than four letters: \(long.join(", "))")
+
+let lengths = names.map(|n| n.len())
+println("letters in total: \(lengths.sum())")
+
+for n in range(1, 6) {
+    println("\(n) squared is \(n * n)")
+}

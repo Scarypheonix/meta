@@ -1,0 +1,18 @@
+// Standard input, a line at a time (spec/18-input.md, ADR-0043).
+//
+// `ask` prints a prompt and reads one line. `input` reads a line with no prompt, and
+// `read_line` is the honest one: `Option[String]`, so `None` is the end of the input and
+// an empty line is `Some("")`.
+//
+// In the playground there is no terminal to type into, so the box below the editor is
+// standard input: whatever is in it, this program reads.
+
+let name = ask("What is your name? ")
+println("Hello, \(name)!")
+
+let answer = ask("How old are you? ")
+if let Some(age) = answer.parse_int() {
+    println("In ten years you will be \(age + 10).")
+} else {
+    println("`\(answer)` is not a number, but that is all right.")
+}

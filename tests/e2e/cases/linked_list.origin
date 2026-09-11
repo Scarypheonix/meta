@@ -1,15 +1,11 @@
-use std::io;
+enum Chain { Nil, Cons(i64, Chain) }
 
-enum List { Nil, Cons(i64, List) }
-
-fn sum(l: List) -> i64 {
-    match l {
-        List::Nil => 0,
-        List::Cons(head, tail) => head + sum(tail),
+fn total(c: Chain) -> i64 {
+    match c {
+        Chain::Nil => 0,
+        Chain::Cons(head, tail) => head + total(tail),
     }
 }
 
-fn main() {
-    let l = List::Cons(1, List::Cons(2, List::Cons(3, List::Nil)));
-    io::println(sum(l).to_str());
-}
+let c = Chain::Cons(1, Chain::Cons(2, Chain::Cons(3, Chain::Nil)))
+println(total(c).to_str())
