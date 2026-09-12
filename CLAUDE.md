@@ -230,17 +230,31 @@ end a statement -- and `tests/selfhost` immediately reported a **Phase 14 defect
 every top-level tail expression as having a semicolon, and nothing caught it because no corpus file
 had a top-level statement ending in `}` until this phase wrote one. **A differential oracle is only
 as wide as its corpus, and the cheapest way to widen it is to write the programs you would show
-someone.** `./check` runs in 205s at 1,917 MiB.
+someone.**
+
+**The suite has no headroom left, and the next phase must cut before it adds.** `./check`
+measured 192s, 205s and 211s during this phase and then **301s -- one second over the ceiling**
+-- before passing again at 292s. Measured rather than re-run until green: `originc` checks all
+34,700 lines of `stage1/src` in **0.40s** and builds it in **3.8s**, and the slowdown scales with
+how long a package runs (floats, 26s of work: +8%; wasm, 55s: +63%; selfhost, 280s: +50%) rather
+than with anything in the diff. That is a CPU quota with burst credit on this host, not a
+regression -- but the honest number is the slow one. Phase 9's rule applies: look for the question
+being asked more than once, *before* adding.
 
 **The tutorial's pictures are generated, not drawn** (`tests/web/picture_test.go`): rendered from
 source with the project's own lexer and golden-checked, six of nine from corpus cases and the rest
 compiled by that test. The buttons' programs come from the same sources, so a picture and what it
 copies cannot disagree.
 
-**Named for whoever revisits ADR-0040**: neither `}` nor `?` is a statement terminator, so
-`let cell = Cell { value: 0 };` and `let x = f(a)?;` still need their semicolons. `}` is settled and
-measured (805 functions). **`?` was never measured**, because nothing in the corpus ended a line
-with one until this phase. Start from the count.
+**ADR-0040 gained a trigger.** `?` is a statement terminator now, so `let x = f(a)?` needs no
+semicolon. It had never been measured, because nothing in the corpus ended a line with one until
+this phase rewrote `result_and_try`; measured, it is free -- **26 semicolons become optional, 0
+lines could continue the expression, 0 programs change meaning**, because `?` is postfix and the
+character has no other use in the grammar. `let cell = Cell { value: 0 };` still needs its
+semicolon and always will: `}` is settled at 805 value-returning functions. **The reusable part is
+the shape**: "a rule with no evidence behind it is how the trigger set grows without anyone
+deciding to grow it" is a standing instruction to go and get the evidence, not to leave the
+question open. It took four minutes.
 
 **Phase 14 is complete** (`docs/phases/14-complete.md`). Two things Phase 13 left on the floor.
 

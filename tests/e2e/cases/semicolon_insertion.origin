@@ -15,6 +15,8 @@
 //     a trailing comma
 //   - an expression wrapped with the operator trailing, the one form the rule requires
 //   - `break`, `continue` and `return`, which end statements and so must trigger
+//   - `?`, which Phase 15 added to the trigger set, in both the position where it ends a
+//     statement and the position where rule 3 must still leave it as a block's value
 use std::io
 use std::list
 
@@ -99,6 +101,9 @@ fn main() {
     // `return` ends a statement, so the line break after it terminates one.
     io::println("\(early(5))")
     io::println("\(early(0 - 5))")
+
+    io::println("\(show(quarter_terse(20))) \(show(quarter_explicit(20)))")
+    io::println("\(show(quarter_terse(6))) \(show(quarter_explicit(6)))")
 }
 
 fn early(n: i64) -> i64 {
@@ -106,4 +111,30 @@ fn early(n: i64) -> i64 {
         return 0
     }
     n * 2
+}
+
+fn maybe_half(n: i64) -> Option[i64] {
+    if n % 2 == 0 { Some(n / 2) } else { None }
+}
+
+// `?` ends a statement (Phase 15's amendment to ADR-0040), so neither `let` here needs a
+// semicolon -- and the last line is still the block's value, because rule 3 suppresses
+// insertion before `}` whatever the trigger was.
+fn quarter_terse(n: i64) -> Option[i64] {
+    let a = maybe_half(n)?
+    let b = maybe_half(a)?
+    Some(b)
+}
+
+fn quarter_explicit(n: i64) -> Option[i64] {
+    let a = maybe_half(n)?;
+    let b = maybe_half(a)?;
+    Some(b)
+}
+
+fn show(o: Option[i64]) -> String {
+    match o {
+        Some(n) => "\(n)",
+        None => "none",
+    }
 }

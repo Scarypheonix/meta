@@ -6,8 +6,35 @@ had carried standard input since Phase 0 with the reason attached: *"it is a str
 has so far avoided handles entirely (ADR-0030)."* So the phase is the feature, and then the
 pages that teach it.
 
-**Status:** met. `./check` passes in **205s at 1,917 MiB** against budgets of 300s and
-3,072 MiB. **43 ADRs, 21 specification documents.**
+**Status:** met. `./check` passes at **1,973 MiB** against a 3,072 MiB budget. **43 ADRs, 21
+specification documents.** The time needs its own paragraph — see below.
+
+## The suite tripped its ceiling once, and the cause is the host
+
+`./check` measured **192s, 205s and 211s** during this phase and then **301s** — one second
+over — before passing again at **292s**. That is the stop-work condition in `CLAUDE.md`, so
+it was measured rather than re-run until it went green:
+
+| | before | after |
+|---|---|---|
+| `tests/floats` (26s of work) | 24.1s | 26.0s (+8%) |
+| `tests/wasm` (55s of work) | 33.9s | 55.2s (+63%) |
+| `tests/selfhost` (280s of work), standalone | 187s | 280s (+50%) |
+| `originc check stage1/src` | — | **0.40s** |
+| `originc build -O1 stage1/src` | — | **3.8s** |
+
+**The slowdown scales with how long a job runs and not with anything in the diff.** The
+front end compiles all 34,700 lines of `stage1/src` in four tenths of a second and builds
+the whole self-hosted compiler in under four; the only change to it this phase was one `||`
+in `ends_statement`, and a package that runs for 26 seconds barely moved while one that runs
+for five minutes lost half its speed. That is a CPU quota with burst credit, not a
+regression.
+
+It is recorded here rather than shrugged off because **the honest number is the slow one**:
+the suite has no headroom left on a host that throttles, and the ceiling exists to be
+believed. `docs/phases/9-complete.md` says what to do when it crosses — look for the
+question being asked more than once — and the next phase should do that *before* it adds
+anything, not after.
 
 ## What was built
 
@@ -104,22 +131,38 @@ differential oracle is only as wide as the corpus it runs on, and **the cheapest
 it is to write the programs you would show someone.** Three phases of syntax work were
 validated against a corpus that did not use the syntax.
 
-## Two things ADR-0040 will be asked about
+## One of the two semicolons ADR-0040 still asked for is gone
 
 Writing the examples surfaced the two places a reader reaches for a line break and does not
-get one, because neither `}` nor `?` is a statement terminator:
+get one, because neither `}` nor `?` was a statement terminator:
 
 ```origin
-let cell = Cell { value: 0 };     // the `;` is required
-let x = parse_digit(a)?;          // and here
+let cell = Cell { value: 0 };     // still required
+let x = parse_digit(a)?;          // no longer
 ```
 
 `}` is settled: ADR-0040 measured it and a trigger there would have made **805
-value-returning functions quietly return `()`**. `?` was not measured, because nothing in
-the corpus ended a line with one until `result_and_try` was rewritten. It is left alone
-rather than added quietly — the trigger set is ADR-0040's decision and widening it is a
-decision, not a patch — and it is named here so that whoever revisits it starts from the
-count rather than from the annoyance.
+value-returning functions quietly return `()`**. `?` had never been measured, because
+nothing in the corpus ended a line with one until `result_and_try` was rewritten — so it was
+measured, and the answer was free:
+
+| | |
+|---|---|
+| lines ending `?;`, whose semicolon becomes optional | **26** |
+| lines ending in a bare `?` whose next line could continue the expression | **0** |
+| existing programs whose meaning changes | **0** |
+
+`?` is postfix and the character has no other use in the grammar — no ternary, no
+optional-type suffix — so a line ending in one has always just finished a postfix-try
+expression. It is now in rule 1's trigger set, and the one bare `g()?` in the repository
+sits before a `}`, where rule 3 leaves it as the block's value and E0277 still lands on the
+same span.
+
+**The shape of that decision is the reusable part.** The Phase 13 amendment had already
+written down why `?` was excluded: *"no corpus line wraps before a `?`, and a rule with no
+evidence behind it is how the trigger set grows without anyone deciding to grow it."* Which
+is right, and is also a standing instruction to go and get the evidence rather than to leave
+the question open forever. The measurement took four minutes.
 
 ## The pages
 

@@ -49,11 +49,13 @@ the parser cannot tell an inserted semicolon from a written one.
 
    ```
    Ident   IntLit   FloatLit   StringLit   CharLit
-   true    false    self       )           ]
+   true    false    self       )           ]        ?
    break   continue return
    ```
 
-   **`}` is deliberately not in this set** — see below.
+   **`}` is deliberately not in this set** — see below. `?` is in it: it is postfix and
+   the character has no other use in the grammar, so a line ending in one always ends a
+   postfix-try expression.
 
 2. The lexer is not inside an unclosed `(` or `[`. A call, a type argument list or a list
    literal may therefore be split across lines freely, with or without a trailing comma.
@@ -120,6 +122,8 @@ Inside `(` or `[` this does not apply, by rule 2. There is no line-continuation 
 | `A => { g() }` then `B => 1,` | **no** | `}` is not a trigger; arms stay comma-separated |
 | `return` then `}` | no | rule 3 |
 | `break` then `let x = 1` | yes | `break` ends a statement |
+| `let a = f(x)?` then `let b = 2` | yes | `?` ends a statement |
+| `g()?` then `}` | **no** | rule 3: still the block's value |
 
 ## Keywords
 

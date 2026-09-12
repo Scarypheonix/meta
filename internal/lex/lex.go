@@ -243,11 +243,16 @@ func (l *Lexer) terminatesStatement() bool {
 
 // endsStatement reports whether a token can be the last one of a statement
 // (spec/01-lexical.md). `}` is deliberately absent; ADR-0040 says why.
+//
+// `?` joined the set in Phase 15, once it had been measured: it is postfix and Origin has no
+// other use for the character, so a line ending in one always ends a postfix-try expression.
+// The corpus had 26 `foo()?;` statements whose semicolon it makes optional and not one line
+// ending in `?` whose next line could continue the expression.
 func endsStatement(k Kind) bool {
 	switch k {
 	case Ident, Int, Float, Str, Char,
 		KwTrue, KwFalse, KwSelfValue,
-		RParen, RBracket,
+		RParen, RBracket, Question,
 		KwBreak, KwContinue, KwReturn:
 		return true
 	}

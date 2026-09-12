@@ -337,7 +337,7 @@ pub struct Lexer {
 fn ends_statement(k: i64) -> bool {
     k == K_IDENT || k == K_INT || k == K_FLOAT || k == K_STR || k == K_CHAR ||
         k == K_TRUE || k == K_FALSE || k == K_SELF_VALUE ||
-        k == K_RPAREN || k == K_RBRACKET ||
+        k == K_RPAREN || k == K_RBRACKET || k == K_QUESTION ||
         k == K_BREAK || k == K_CONTINUE || k == K_RETURN
 }
 

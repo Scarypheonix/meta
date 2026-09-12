@@ -124,3 +124,42 @@ suppressing there cannot swallow a statement boundary — where the `}` rule tra
 `?` is postfix and equally unable to start a statement, so the same argument would admit it.
 It is left out because no corpus line wraps before a `?`, and a rule with no evidence behind
 it is how the trigger set grows without anyone deciding to grow it.
+
+## Amendment, Phase 15: `?` is a trigger
+
+Rewriting the corpus into the syntax of Phases 11–14 surfaced the one place the rule still
+asks for a semicolon that nothing in the language needs:
+
+```origin
+fn parse_two(a: char, b: char) -> Result[i64, ParseError] {
+    let x = parse_digit(a)?;      // the `;` was required
+    let y = parse_digit(b)?;
+    Ok(x * 10 + y)
+}
+```
+
+The amendment above left `?` out of *rule 3* for want of evidence, and said so. This is the
+other half of the question — rule 1, the trigger set — and it now has the evidence:
+
+| | |
+|---|---|
+| lines ending `?;`, whose semicolon becomes optional | **26** |
+| lines ending in a bare `?` whose next line could continue the expression | **0** |
+| existing programs whose meaning changes | **0** |
+
+**The argument is the same one that admitted a leading `.`, read the other way round.** `?`
+is postfix, and the character has no other use anywhere in the grammar — there is no ternary
+and no optional-type suffix — so a line ending in `?` has always just finished a postfix-try
+expression. Nothing can follow it on the next line except a new statement, unless a binary
+operator does, and the corpus contains no such wrap. The one bare `g()?` in the repository
+sits immediately before a `}`, where rule 3 suppresses insertion and it stays the block's
+value; `tests/conformance/cases/err_try_in_non_result_function.origin` still reports E0277
+at the same span.
+
+**Additive, like everything else here.** All 26 semicolons remain legal. The only source
+rewritten is `tests/e2e/cases/result_and_try.origin`, because it is one of the programs the
+playground offers and it carried a comment explaining a restriction that no longer exists.
+
+**What this does not do** is add `?` to rule 3's suppression list. A line *beginning* with
+`?` is still not a thing the corpus does, and the amendment above's reasoning stands: a rule
+with no evidence behind it is how the trigger set grows without anyone deciding to grow it.

@@ -154,9 +154,10 @@ fn parse_digit(c: char) -> Result[i64, ParseError] {
 }
 
 fn parse_two(a: char, b: char) -> Result[i64, ParseError] {
-    // `?` is not a statement terminator either, so these two keep their semicolons.
-    let x = parse_digit(a)?;
-    let y = parse_digit(b)?;
+    // `?` ends a statement, so neither of these needs a semicolon (ADR-0040, amended in
+    // Phase 15). The last line has none either, and that is what makes it the value.
+    let x = parse_digit(a)?
+    let y = parse_digit(b)?
     Ok(x * 10 + y)
 }
 
