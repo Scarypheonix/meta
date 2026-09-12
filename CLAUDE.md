@@ -4,7 +4,7 @@ Origin is a statically typed, garbage-collected language and its complete toolch
 built from nothing until the compiler compiles itself. This file is the source of truth
 for how to work in this repository. The project origin prompt is superseded by it.
 
-**Phases 0 through 15 are complete** (see `docs/phases/`). **The compiler compiles itself**,
+**Phases 0 through 16 are complete** (see `docs/phases/`). **The compiler compiles itself**,
 and it runs in a browser. See Status, at the bottom of this file, for what exists and what is
 next.
 
@@ -57,7 +57,8 @@ internal/ir/          the SSA intermediate representation, built from bytecode (
 internal/opt/         the optimizer: folding, CSE, LICM, escape analysis, inlining, DCE
 internal/mono/        monomorphization of call dispatch (ADR-0010)
 internal/compile/     AST -> bytecode, per monomorphized instance
-internal/vm/          the bytecode virtual machine
+internal/vm/          the bytecode virtual machine, and the engine most people actually
+                      run: it is what the browser build executes (Phase 16)
 internal/prelude/     the standard library, written in Origin: Option and Result and their
                       methods, Ordering, Cell, the concurrency handles, List, Map, the Str
                       trait, IoError and files, and the shortest-decimal float rendering
@@ -201,6 +202,44 @@ This project outlasts any single context window.
   lives in one place with one test suite guarding it.
 
 ## Status
+
+**Phase 16 is complete** (`docs/phases/16-complete.md`). **The web build is 40-48% faster**, and
+the phase exists because the user pointed out who the compiler is for: *most people will use the
+playground, not the native backend.* Phases 5 through 9 made native code good; nobody visiting a
+web page runs it.
+
+**The decomposition is the finding.** Running the same programs down all three paths:
+the bytecode VM costs **11-55x** over native codegen and **WebAssembly itself only ~4.5x**. So the
+web build is not slow because it is WebAssembly -- it is slow because it interprets bytecode, and
+the native backend cannot help (it emits x86-64, which `docs/spec/playground-runtime.md` excludes
+from the build on purpose). The interpreter was the whole target.
+
+```
+                     before     after      vs CPython 3.11
+  fib(30)           1956 ms    1182 ms     19x  ->  11x
+  10M integer loop  6097 ms    3172 ms     6.1x ->  3.1x
+  1M allocations     689 ms     418 ms     4.4x ->  2.5x
+```
+
+Four changes, all in `internal/vm`, no ADR because none is irreversible: the instruction is taken
+**by pointer** (`bytecode.Instr` is 40 bytes and was copied on every dispatch -- one line, -30% in
+wasm alone, and almost nothing natively); **`pc` and `code` hoisted into locals** for as long as a
+frame runs, safe because nothing outside `run` reads `frame.pc`; **`world.spawned`**, an
+`atomic.Bool`, because `safepoint` was taking a mutex with a `defer` on **every loop back edge of
+every single-threaded program** while its own comment claimed such programs "should not pay for
+this" -- `internal/interp` has had that atomic since Phase 10 and **the VM never got it**; and
+`frame` caching `fn.Code`.
+
+**One experiment failed and is recorded because of what it teaches.** A VM-private decoded
+instruction stream -- splitting the 24-byte `diag.Span` out to walk 16-byte instructions instead of
+40-byte ones -- measured **4-8% slower** and was reverted. **Struct size only matters when you copy
+the struct**, and the pointer change had already stopped the copy; splitting one array into two
+then added a second memory stream on the hottest opcodes. *The optimization was obsolete when it
+was proposed, by the optimization before it.* **Re-profile after every change, not every batch.**
+
+**Refused on principle**: an i64 arithmetic fast path worth ~4%, because it would be a second
+definition of integer overflow semantics -- what `internal/arith` and process rule 5 exist to
+prevent. `./check` runs in 211s at 1,918 MiB.
 
 **Phase 15 is complete** (`docs/phases/15-complete.md`). **Origin can read what you type**
 (**ADR-0043**, `docs/spec/18-input.md`), and the site now teaches the language rather than only
