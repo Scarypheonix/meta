@@ -21,161 +21,197 @@ import (
 func (v *VM) run(floor int) {
 	for len(v.frames) > floor {
 		f := &v.frames[len(v.frames)-1]
-		if f.pc >= len(f.fn.Code) {
-			// A function whose code runs off the end returns unit; the compiler always
-			// emits a return, so reaching this is a compiler bug.
-			panic(fmt.Sprintf("vm: fell off the end of %s", f.fn.Name))
-		}
-		in := f.fn.Code[f.pc]
-		f.pc++
+		// code and pc live in locals for as long as this frame runs uninterrupted. They
+		// are what every single instruction touches, and reaching them through the frame
+		// costs a bounds-checked index into v.frames plus a load and a store on each one.
+		//
+		// Only four opcodes can change the frame stack -- OpCall, OpCallBuiltin, OpReturn
+		// and OpHalt -- and each publishes pc back to the frame before it acts and then
+		// breaks out to this loop, which re-acquires f, code and pc. That is also what
+		// makes a stale f impossible: only pushFrame can reallocate v.frames, and nothing
+		// reaches it without publishing and breaking first. Nothing outside run reads
+		// frame.pc, so there is no other moment at which it has to be current.
+		code := f.code
+		pc := f.pc
 
-		switch in.Op {
-		case bytecode.OpNop:
-
-		case bytecode.OpConst:
-			v.push(v.constValue(int(in.A), in.Span))
-		case bytecode.OpUnit:
-			v.push(unitVal())
-		case bytecode.OpTrue:
-			v.push(boolVal(true))
-		case bytecode.OpFalse:
-			v.push(boolVal(false))
-		case bytecode.OpPop:
-			v.pop()
-
-		case bytecode.OpLoad:
-			v.push(v.stack[f.base+int(in.A)])
-		case bytecode.OpStore:
-			v.stack[f.base+int(in.A)] = v.pop()
-		case bytecode.OpLoadCapture:
-			if f.closure == layout.Nil {
-				panic("vm: capture read outside a closure")
+	running:
+		for {
+			if pc >= len(code) {
+				// A function whose code runs off the end returns unit; the compiler always
+				// emits a return, so reaching this is a compiler bug.
+				panic(fmt.Sprintf("vm: fell off the end of %s", f.fn.Name))
 			}
-			desc := v.prog.Types.Get(v.heap.TypeOf(f.closure))
-			v.push(v.readField(desc, f.closure, int(in.A)+1))
+			// By pointer, not by value: bytecode.Instr is 40 bytes and this is the hottest
+			// line in the engine. The slice it points into belongs to the program and is
+			// never reallocated.
+			in := &code[pc]
+			pc++
 
-		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv, bytecode.OpRem,
-			bytecode.OpAnd, bytecode.OpOr, bytecode.OpXor, bytecode.OpShl, bytecode.OpShr,
-			bytecode.OpWrapAdd, bytecode.OpWrapSub, bytecode.OpWrapMul:
-			b := v.pop()
-			a := v.pop()
-			v.push(v.intOp(in.Op, bytecode.Kind(in.A), a.N, b.N, in.Span))
+			switch in.Op {
+			case bytecode.OpNop:
 
-		case bytecode.OpNeg:
-			a := v.pop()
-			r, trap := arith.Neg(bytecode.Kind(in.A), a.N)
-			if trap != "" {
-				v.trap(in.Span, "%s", trap)
-			}
-			v.push(Value{Tag: layout.TagInt, N: r})
+			case bytecode.OpConst:
+				v.push(v.constValue(int(in.A), in.Span))
+			case bytecode.OpUnit:
+				v.push(unitVal())
+			case bytecode.OpTrue:
+				v.push(boolVal(true))
+			case bytecode.OpFalse:
+				v.push(boolVal(false))
+			case bytecode.OpPop:
+				v.pop()
 
-		case bytecode.OpAddF, bytecode.OpSubF, bytecode.OpMulF, bytecode.OpDivF, bytecode.OpRemF:
-			b := v.pop()
-			a := v.pop()
-			v.push(floatVal(floatOp(in.Op, a.Float(), b.Float())))
+			case bytecode.OpLoad:
+				v.push(v.stack[f.base+int(in.A)])
+			case bytecode.OpStore:
+				v.stack[f.base+int(in.A)] = v.pop()
+			case bytecode.OpLoadCapture:
+				if f.closure == layout.Nil {
+					panic("vm: capture read outside a closure")
+				}
+				desc := v.prog.Types.Get(v.heap.TypeOf(f.closure))
+				v.push(v.readField(desc, f.closure, int(in.A)+1))
 
-		case bytecode.OpNegF:
-			v.push(floatVal(-v.pop().Float()))
+			case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv, bytecode.OpRem,
+				bytecode.OpAnd, bytecode.OpOr, bytecode.OpXor, bytecode.OpShl, bytecode.OpShr,
+				bytecode.OpWrapAdd, bytecode.OpWrapSub, bytecode.OpWrapMul:
+				b := v.pop()
+				a := v.pop()
+				v.push(v.intOp(in.Op, bytecode.Kind(in.A), a.N, b.N, in.Span))
 
-		case bytecode.OpNot:
-			v.push(boolVal(!v.pop().Bool()))
+			case bytecode.OpNeg:
+				a := v.pop()
+				r, trap := arith.Neg(bytecode.Kind(in.A), a.N)
+				if trap != "" {
+					v.trap(in.Span, "%s", trap)
+				}
+				v.push(Value{Tag: layout.TagInt, N: r})
 
-		case bytecode.OpEq, bytecode.OpNe:
-			b := v.pop()
-			a := v.pop()
-			eq := v.equal(a, b, in.Span)
-			v.push(boolVal(eq == (in.Op == bytecode.OpEq)))
+			case bytecode.OpAddF, bytecode.OpSubF, bytecode.OpMulF, bytecode.OpDivF, bytecode.OpRemF:
+				b := v.pop()
+				a := v.pop()
+				v.push(floatVal(floatOp(in.Op, a.Float(), b.Float())))
 
-		case bytecode.OpLt, bytecode.OpLe, bytecode.OpGt, bytecode.OpGe:
-			b := v.pop()
-			a := v.pop()
-			v.push(boolVal(v.compareOp(in.Op, bytecode.Kind(in.A), a, b, in.Span)))
+			case bytecode.OpNegF:
+				v.push(floatVal(-v.pop().Float()))
 
-		case bytecode.OpJump:
-			// §08 puts a safepoint on every loop back edge, so a compute loop cannot
-			// starve the scheduler. A backward jump is what a back edge compiles to.
-			if int(in.A) <= f.pc {
-				v.safepoint()
-			}
-			f.pc = int(in.A)
-		case bytecode.OpJumpIfFalse:
-			if !v.pop().Bool() {
-				f.pc = int(in.A)
-			}
-		case bytecode.OpJumpIfTrue:
-			if v.pop().Bool() {
-				f.pc = int(in.A)
-			}
+			case bytecode.OpNot:
+				v.push(boolVal(!v.pop().Bool()))
 
-		case bytecode.OpReturn:
-			result := v.pop()
-			v.stack = v.stack[:f.base]
-			v.frames = v.frames[:len(v.frames)-1]
-			v.push(result)
-			if len(v.frames) == floor {
+			case bytecode.OpEq, bytecode.OpNe:
+				b := v.pop()
+				a := v.pop()
+				eq := v.equal(a, b, in.Span)
+				v.push(boolVal(eq == (in.Op == bytecode.OpEq)))
+
+			case bytecode.OpLt, bytecode.OpLe, bytecode.OpGt, bytecode.OpGe:
+				b := v.pop()
+				a := v.pop()
+				v.push(boolVal(v.compareOp(in.Op, bytecode.Kind(in.A), a, b, in.Span)))
+
+			case bytecode.OpJump:
+				// §08 puts a safepoint on every loop back edge, so a compute loop cannot
+				// starve the scheduler. A backward jump is what a back edge compiles to.
+				//
+				// The spawned test is inlined here rather than left to safepoint, so a
+				// program that never started a thread pays one atomic load and a branch
+				// at each back edge instead of a call.
+				if int(in.A) <= pc && v.w != nil && v.w.spawned.Load() {
+					v.safepoint()
+				}
+				pc = int(in.A)
+			case bytecode.OpJumpIfFalse:
+				if !v.pop().Bool() {
+					pc = int(in.A)
+				}
+			case bytecode.OpJumpIfTrue:
+				if v.pop().Bool() {
+					pc = int(in.A)
+				}
+
+			case bytecode.OpReturn:
+				// No publish: this frame is about to be discarded.
+				result := v.pop()
+				v.stack = v.stack[:f.base]
+				v.frames = v.frames[:len(v.frames)-1]
+				v.push(result)
+				if len(v.frames) == floor {
+					return
+				}
+				break running
+
+			case bytecode.OpFunc:
+				v.push(Value{Tag: layout.TagFn, N: uint64(in.A)})
+
+			case bytecode.OpCall:
+				// doCall pushes a frame, which can reallocate v.frames and leave f
+				// dangling, so pc is published before it runs and the outer loop
+				// re-acquires everything afterwards.
+				f.pc = pc
+				v.doCall(int(in.A), in.Span)
+				break running
+
+			case bytecode.OpCallBuiltin:
+				// Most builtins touch no frame at all, but `with_lock` and a spawned
+				// thread's body run an Origin closure through callValue, which pushes
+				// frames and re-enters run. Publishing and re-acquiring for every
+				// builtin is far cheaper than telling the two cases apart.
+				f.pc = pc
+				v.callBuiltin(int(in.A), int(in.B), in.Kind, in.Span)
+				break running
+
+			case bytecode.OpClosure:
+				v.makeClosure(int(in.A), in.Span)
+
+			case bytecode.OpStruct:
+				v.makeObject(v.prog.Structs[in.A], int(in.B), in.Span)
+
+			case bytecode.OpTuple:
+				v.makeObject(layout.TypeID(in.A), int(in.B), in.Span)
+
+			case bytecode.OpVariant:
+				info := v.prog.Variants[in.A]
+				v.makeObject(info.Type, int(in.B), in.Span)
+
+			case bytecode.OpGetField, bytecode.OpGetPayload, bytecode.OpGetTupleElem:
+				obj := v.pop()
+				if obj.Tag != layout.TagRef {
+					panic("vm: field read on a value that is not an object")
+				}
+				desc := v.prog.Types.Get(v.heap.TypeOf(obj.R))
+				v.push(v.readField(desc, obj.R, int(in.A)))
+
+			case bytecode.OpSetField:
+				val := v.pop()
+				obj := v.pop()
+				if obj.Tag != layout.TagRef {
+					panic("vm: field write on a value that is not an object")
+				}
+				desc := v.prog.Types.Get(v.heap.TypeOf(obj.R))
+				v.writeField(desc, obj.R, int(in.A), val, in.Span)
+
+			case bytecode.OpIsVariant:
+				obj := v.pop()
+				want := v.prog.Variants[in.A].Type
+				v.push(boolVal(obj.Tag == layout.TagRef && v.heap.TypeOf(obj.R) == want))
+
+			case bytecode.OpCast:
+				v.push(v.cast(bytecode.CastKind(in.A), int(in.B), v.pop(), in.Span))
+
+			case bytecode.OpToStr:
+				s := v.displayAt(bytecode.Kind(in.A), v.pop())
+				v.push(refVal(v.newString(s, in.Span)))
+
+			case bytecode.OpTrap:
+				v.trap(in.Span, "%s", v.prog.Consts[in.A].Str)
+
+			case bytecode.OpHalt:
+				v.frames = v.frames[:0]
 				return
+
+			default:
+				panic(fmt.Sprintf("vm: unimplemented opcode %s", in.Op))
 			}
-
-		case bytecode.OpFunc:
-			v.push(Value{Tag: layout.TagFn, N: uint64(in.A)})
-
-		case bytecode.OpCall:
-			v.doCall(int(in.A), in.Span)
-
-		case bytecode.OpCallBuiltin:
-			v.callBuiltin(int(in.A), int(in.B), in.Kind, in.Span)
-
-		case bytecode.OpClosure:
-			v.makeClosure(int(in.A), in.Span)
-
-		case bytecode.OpStruct:
-			v.makeObject(v.prog.Structs[in.A], int(in.B), in.Span)
-
-		case bytecode.OpTuple:
-			v.makeObject(layout.TypeID(in.A), int(in.B), in.Span)
-
-		case bytecode.OpVariant:
-			info := v.prog.Variants[in.A]
-			v.makeObject(info.Type, int(in.B), in.Span)
-
-		case bytecode.OpGetField, bytecode.OpGetPayload, bytecode.OpGetTupleElem:
-			obj := v.pop()
-			if obj.Tag != layout.TagRef {
-				panic("vm: field read on a value that is not an object")
-			}
-			desc := v.prog.Types.Get(v.heap.TypeOf(obj.R))
-			v.push(v.readField(desc, obj.R, int(in.A)))
-
-		case bytecode.OpSetField:
-			val := v.pop()
-			obj := v.pop()
-			if obj.Tag != layout.TagRef {
-				panic("vm: field write on a value that is not an object")
-			}
-			desc := v.prog.Types.Get(v.heap.TypeOf(obj.R))
-			v.writeField(desc, obj.R, int(in.A), val, in.Span)
-
-		case bytecode.OpIsVariant:
-			obj := v.pop()
-			want := v.prog.Variants[in.A].Type
-			v.push(boolVal(obj.Tag == layout.TagRef && v.heap.TypeOf(obj.R) == want))
-
-		case bytecode.OpCast:
-			v.push(v.cast(bytecode.CastKind(in.A), int(in.B), v.pop(), in.Span))
-
-		case bytecode.OpToStr:
-			s := v.displayAt(bytecode.Kind(in.A), v.pop())
-			v.push(refVal(v.newString(s, in.Span)))
-
-		case bytecode.OpTrap:
-			v.trap(in.Span, "%s", v.prog.Consts[in.A].Str)
-
-		case bytecode.OpHalt:
-			v.frames = v.frames[:0]
-			return
-
-		default:
-			panic(fmt.Sprintf("vm: unimplemented opcode %s", in.Op))
 		}
 	}
 }

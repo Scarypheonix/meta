@@ -70,7 +70,11 @@ func (v Value) Bool() bool     { return v.N != 0 }
 
 // frame is one function activation.
 type frame struct {
-	fn      *bytecode.Fn
+	fn *bytecode.Fn
+	// code is fn.Code, copied here because the interpreter loop indexes it on every
+	// single instruction and reaching it through fn costs two dereferences each time.
+	// It is the same slice header, not a copy of the code.
+	code    []bytecode.Instr
 	fnIndex int
 	pc      int
 	// base is where this frame's locals start in the value stack.
@@ -343,7 +347,7 @@ func (v *VM) pushFrame(index int, fn *bytecode.Fn, closure layout.Ref, argCount 
 	for i := argCount; i < fn.Locals; i++ {
 		v.push(unitVal())
 	}
-	v.frames = append(v.frames, frame{fn: fn, fnIndex: index, base: base, closure: closure, retSpan: span})
+	v.frames = append(v.frames, frame{fn: fn, code: fn.Code, fnIndex: index, base: base, closure: closure, retSpan: span})
 }
 
 // stringConst interns a string constant into the heap.

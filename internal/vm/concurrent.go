@@ -2,6 +2,7 @@ package vm
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/scarypheonix/meta/internal/compile"
 
@@ -67,6 +68,18 @@ type world struct {
 	waiters    map[int64]func() bool
 	nextWaiter int64
 	nextTid    int64
+
+	// spawned records that the program has started a thread at some point. It is read
+	// without the lock, at every loop back edge, by safepoint -- a program that never
+	// spawned has nothing to yield to and must not pay more than a load to establish
+	// that. It is never cleared: a thread that has finished still means this program is
+	// one that uses threads.
+	//
+	// internal/interp's runtime has carried exactly this field since Phase 10 and the VM
+	// did not, so the VM was taking w.mu (with a defer) on every back edge of every loop
+	// in every single-threaded program. The two engines answer the same question the same
+	// way now.
+	spawned atomic.Bool
 
 	// wg tracks spawned threads, so `main` returning does not end the program while one
 	// is still running (spec/12-concurrency.md).
@@ -193,7 +206,7 @@ func (w *world) anyReady() bool {
 // function entry, loop back edge and allocation, which is what stops a compute loop
 // from starving the scheduler.
 func (v *VM) safepoint() {
-	if v.w == nil || v.w.singleThreaded() {
+	if v.w == nil || !v.w.spawned.Load() {
 		return
 	}
 	v.w.exec.Unlock()
@@ -205,15 +218,6 @@ func (v *VM) safepoint() {
 	if fatal {
 		panic(dying{})
 	}
-}
-
-// singleThreaded reports whether the program has never spawned, in which case every
-// safepoint is a pair of uncontended lock operations that buys nothing. The overwhelming
-// majority of programs never spawn at all, and they should not pay for this.
-func (w *world) singleThreaded() bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.nextTid == 2 && w.live == 1
 }
 
 // visitWorldRoots hands the collector every thread's roots, not just the one that
@@ -272,6 +276,7 @@ func (v *VM) spawn(body Value, span diag.Span) int64 {
 	h := w.handle()
 	tid := w.nextTid
 	w.nextTid++
+	w.spawned.Store(true)
 	w.threads[h] = &vmThread{}
 	w.live++
 

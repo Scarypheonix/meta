@@ -85,7 +85,7 @@ func Build(prog *bytecode.Program, target obj.Target) (*obj.Image, error) {
 // every back edge would otherwise carry is pure cost -- not just the two instructions, but
 // the call site it makes of every back edge, which pushes each loop-carried value into one
 // of four callee-saved registers or onto the stack. The virtual machine draws the same line
-// at run time (its `singleThreaded`); here it is a static property of the program, so the
+// at run time (its `world.spawned`); here it is a static property of the program, so the
 // loops of a single-threaded one are exactly what they were before Phase 6.
 func canSpawn(funcs []*ir.Func) bool {
 	for _, f := range funcs {
